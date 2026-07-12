@@ -1,9 +1,1 @@
 .idea
-*netsvr.toml
-*business.toml
-*stress.toml
-build
-netSvr.log
-rsa.cert
-rsa.key
-nohup.out
