@@ -54,15 +54,8 @@ func (r *Router) register(method, path string, handler any, groupMiddlewares []M
 		panic(err.Error())
 	}
 
-	// 注册阶段扫描整个类型树，检测 default 标签误用（包含路由信息以便定位）
+	// 注册阶段扫描 Req 类型树，检测 default 标签误用（包含路由信息以便定位）
 	checkUnsupportedDefaults(entry.reqElemType, true, method, path, entry.handlerName, entry.handlerFile, entry.handlerLine, map[reflect.Type]bool{})
-	var resElemType reflect.Type
-	if entry.resIsPtr {
-		resElemType = entry.resType.Elem()
-	} else {
-		resElemType = entry.resType
-	}
-	checkUnsupportedDefaults(resElemType, true, method, path, entry.handlerName, entry.handlerFile, entry.handlerLine, map[reflect.Type]bool{})
 
 	if existing, ok := r.routes[method][path]; ok {
 		panic(fmt.Sprintf(
