@@ -3,53 +3,56 @@ package zchttp
 import (
 	"context"
 	"encoding/json"
+	"mime/multipart"
+	"reflect"
 	"testing"
+	"time"
 )
 
 // oaCreateUserReq 覆盖 OpenAPIMeta 嵌入、required、default、指针等场景
 type oaCreateUserReq struct {
 	OpenAPIMeta `tags:"User Management/Account" summary:"创建用户" description:"创建一个新的用户账户"`
-	Name        string       `json:"name" required:"true" description:"真实名字"`
+	Name        string       `json:"name" nonzero:"true" description:"真实名字"`
 	Nickname    string       `json:"nickname" default:"" description:"昵称"`
 	Age         *int         `json:"age" description:"年龄"`
-	MailboxList []*oaMailbox `json:"mailboxList" required:"true" description:"可用的邮箱列表"`
+	MailboxList []*oaMailbox `json:"mailboxList" nonzero:"true" description:"可用的邮箱列表"`
 	Company     *OaCompany   `json:"company" description:"供职的公司信息"`
-	School      OaSchool     `json:"school" required:"true" description:"就读的学校信息"`
+	School      OaSchool     `json:"school" nonzero:"true" description:"就读的学校信息"`
 	Family      []OaFamily   `json:"family" description:"家庭成员信息"`
 }
 
 type OaFamily struct {
-	Name       string       `json:"name" required:"true" description:"家庭成员名称"`
-	Relation   string       `json:"relation" required:"true" description:"家庭成员关系"`
+	Name       string       `json:"name" nonzero:"true" description:"家庭成员名称"`
+	Relation   string       `json:"relation" nonzero:"true" description:"家庭成员关系"`
 	IsMinor    *bool        `json:"isMinor" description:"是否未成年" default:"true"`
 	BankList   []OaBank     `json:"bankList" description:"家庭成员银行信息"`
 	HealthInfo OaHealthInfo `json:"healthInfo" description:"家庭成员健康信息"`
 }
 
 type OaHealthInfo struct {
-	Height int `json:"height" required:"true" description:"身高"`
-	Weight int `json:"weight" required:"true" description:"体重"`
+	Height int `json:"height" nonzero:"true" description:"身高"`
+	Weight int `json:"weight" nonzero:"true" description:"体重"`
 }
 
 type OaBank struct {
-	Name    string `json:"name" required:"true" description:"银行名称"`
-	Account string `json:"account" required:"true" description:"银行账户"`
+	Name    string `json:"name" nonzero:"true" description:"银行名称"`
+	Account string `json:"account" nonzero:"true" description:"银行账户"`
 }
 
 type OaSchool struct {
-	Name    string `json:"name" required:"true" description:"学校名称"`
+	Name    string `json:"name" nonzero:"true" description:"学校名称"`
 	Address string `json:"address" description:"学校地址"`
 }
 
 type OaCompany struct {
-	Name    string  `json:"name" required:"true" description:"公司名称"`
+	Name    string  `json:"name" nonzero:"true" description:"公司名称"`
 	Address string  `json:"address" description:"公司地址"`
 	Phone   string  `json:"phone"  description:"公司电话"`
-	Email   *string `json:"email" required:"false" description:"公司邮箱"`
+	Email   *string `json:"email" nonzero:"false" description:"公司邮箱"`
 }
 
 type oaMailbox struct {
-	Email    string  `json:"email" required:"true"`
+	Email    string  `json:"email" nonzero:"true"`
 	Category *string `json:"category" default:"工作邮箱" example:"工作邮箱|个人邮箱|学校邮箱"`
 }
 
@@ -61,7 +64,7 @@ type oaCreateUserRes struct {
 // oaListReq 覆盖 query 参数、ignore、default、required、指针、切片
 type oaListReq struct {
 	Keyword string   `json:"keyword" default:""`
-	Email   string   `json:"email" required:"true"`
+	Email   string   `json:"email" nonzero:"true"`
 	Name    string   `json:"name"`
 	Avatar  *string  `json:"avatar"`
 	Tags    []string `json:"tags"`
@@ -80,16 +83,27 @@ func oaList(_ context.Context, _ oaListReq) (oaListRes, error) {
 	return oaListRes{}, nil
 }
 
+// oaQueryDefaultReq 含 default 标签的值类型/指针类型字段，用于验证 GET query 参数的 default 展示
+type oaQueryDefaultReq struct {
+	Page int    `json:"page" default:"1"`
+	Sort string `json:"sort" default:"asc"`
+	Size *int   `json:"size" default:"10"`
+}
+
+func oaQueryDefault(_ context.Context, _ oaQueryDefaultReq) (oaListRes, error) {
+	return oaListRes{}, nil
+}
+
 // ---- 嵌套结构体与嵌套结构体切片 OpenAPI 文档测试 ----
 
 type oaAddress struct {
-	City   string `json:"city" required:"true"`
+	City   string `json:"city" nonzero:"true"`
 	Street string `json:"street" description:"街道名称"`
 }
 
 type oaNestedReq struct {
 	OpenAPIMeta `tags:"Nested" summary:"嵌套结构体请求"`
-	Name        string    `json:"name" required:"true"`
+	Name        string    `json:"name" nonzero:"true"`
 	Addr        oaAddress `json:"addr"`
 	Tags        []string  `json:"tags" default:"go,test"`
 }
@@ -104,7 +118,7 @@ func oaNestedHandler(_ context.Context, _ oaNestedReq) (oaNestedRes, error) {
 
 type oaNestedSliceReq struct {
 	OpenAPIMeta `tags:"NestedSlice" summary:"嵌套结构体切片请求"`
-	Name        string      `json:"name" required:"true"`
+	Name        string      `json:"name" nonzero:"true"`
 	Addresses   []oaAddress `json:"addresses"`
 }
 
@@ -216,8 +230,8 @@ func TestGenerateOpenAPI_NestedStructSlice(t *testing.T) {
 
 type oaNestedPtrReq struct {
 	OpenAPIMeta `tags:"NestedPtr" summary:"嵌套结构体指针请求"`
-	Name        string     `json:"name" required:"true"`
-	Addr        *oaAddress `json:"addr" required:"true"`
+	Name        string     `json:"name" nonzero:"true"`
+	Addr        *oaAddress `json:"addr" nonzero:"true"`
 }
 
 type oaNestedPtrRes struct {
@@ -250,7 +264,7 @@ func TestGenerateOpenAPI_NestedStructPtr(t *testing.T) {
 		t.Errorf("oaAddress.required = %v, want [city]", addrRequired)
 	}
 
-	// oaNestedPtrReq 的 required 列表应包含 addr（指针字段标记了 required:"true"）
+	// oaNestedPtrReq 的 required 列表应包含 addr（指针字段标记了 nonzero:"true"）
 	reqSchema := schemas["oaNestedPtrReq"].(map[string]any)
 	reqRequired := reqSchema["required"].([]any)
 	foundAddr := false
@@ -287,8 +301,8 @@ func TestGenerateOpenAPI_NestedStructPtr(t *testing.T) {
 
 type oaNestedPtrSliceReq struct {
 	OpenAPIMeta `tags:"NestedPtrSlice" summary:"嵌套结构体指针切片请求"`
-	Name        string       `json:"name" required:"true"`
-	Addresses   []*oaAddress `json:"addresses" required:"true"`
+	Name        string       `json:"name" nonzero:"true"`
+	Addresses   []*oaAddress `json:"addresses" nonzero:"true"`
 }
 
 type oaNestedPtrSliceRes struct {
@@ -360,8 +374,8 @@ func TestGenerateOpenAPI_NestedStructPtrSlice(t *testing.T) {
 
 // Category 商品分类：Children 自引用形成树形嵌套
 type Category struct {
-	ID       int         `json:"id" required:"true" description:"分类ID"`
-	Name     string      `json:"name" required:"true" description:"分类名称"`
+	ID       int         `json:"id" nonzero:"true" description:"分类ID"`
+	Name     string      `json:"name" nonzero:"true" description:"分类名称"`
 	ParentID *int        `json:"parentId" description:"父分类ID"`
 	Children []*Category `json:"children" description:"子分类列表"`
 }
@@ -536,7 +550,7 @@ func TestGenerateOpenAPI_Routing(t *testing.T) {
 }
 
 // TestGenerateOpenAPI_QueryRequired 验证 GET query 参数的 required 判定规则：
-// ignore → 不出现、有 default → optional、required:"true" → required、指针/切片 → optional
+// ignore → 不出现、有 default → optional、nonzero:"true" → required、指针/切片 → optional
 func TestGenerateOpenAPI_QueryRequired(t *testing.T) {
 	r := NewRouter()
 	r.GET("/users", oaList)
@@ -575,6 +589,38 @@ func TestGenerateOpenAPI_QueryRequired(t *testing.T) {
 	}
 	if requiredByName["tags"] {
 		t.Errorf("tags is slice, should be optional")
+	}
+}
+
+// TestGenerateOpenAPI_QueryParamDefault 验证 GET query 参数的 default 展示：
+// 顶层 Req 属于值嵌套路径，注册阶段模板预填可靠，值类型与指针类型字段均应展示 default
+func TestGenerateOpenAPI_QueryParamDefault(t *testing.T) {
+	r := NewRouter()
+	r.GET("/query-default", oaQueryDefault)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Test API", Version: "1.0.0"})
+
+	paths := doc["paths"].(map[string]any)
+	item := paths["/query-default"].(map[string]any)
+	get := item["get"].(map[string]any)
+	params, ok := get["parameters"].([]any)
+	if !ok {
+		t.Fatalf("parameters missing for GET")
+	}
+	schemaByName := map[string]map[string]any{}
+	for _, p := range params {
+		pm := p.(map[string]any)
+		schemaByName[pm["name"].(string)] = pm["schema"].(map[string]any)
+	}
+
+	if got := schemaByName["page"]["default"]; got != int64(1) {
+		t.Errorf("page.default = %v, want 1", got)
+	}
+	if got := schemaByName["sort"]["default"]; got != "asc" {
+		t.Errorf("sort.default = %v, want asc", got)
+	}
+	if got := schemaByName["size"]["default"]; got != int64(10) {
+		t.Errorf("size.default = %v, want 10", got)
 	}
 }
 
@@ -669,7 +715,7 @@ func TestGenerateOpenAPI_PointerNestedSchema(t *testing.T) {
 }
 
 // TestGenerateOpenAPI_ValueNestedSchema 验证值类型嵌套 OaSchool 的独立 schema：
-// 字段应有正确的 description、required 仅包含标记 required:"true" 且无 default 的字段
+// 字段应有正确的 description、required 仅包含标记 nonzero:"true" 且无 default 的字段
 func TestGenerateOpenAPI_ValueNestedSchema(t *testing.T) {
 	r := NewRouter()
 	r.POST("/users", oaCreateUser)
@@ -933,7 +979,7 @@ func TestGenerateOpenAPI_ReqNestedFields(t *testing.T) {
 		t.Errorf("family.items.$ref = %v, want #/components/schemas/OaFamily", famItems)
 	}
 
-	// required: name, mailboxList, school（均标记 required:"true"），不含 company、family（未标记 required）
+	// required: name, mailboxList, school（均标记 nonzero:"true"），不含 company、family（未标记 required）
 	reqRequired := reqSchema["required"].([]any)
 	hasName, hasMB, hasComp, hasSchool := false, false, false, false
 	for _, r := range reqRequired {
@@ -972,26 +1018,26 @@ func TestGenerateOpenAPI_ReqNestedFields(t *testing.T) {
 
 // resNestedInfo 响应值类型嵌套
 type resNestedInfo struct {
-	Code    string `json:"code" required:"true" description:"信息编码"`
+	Code    string `json:"code" nonzero:"true" description:"信息编码"`
 	Message string `json:"message" description:"信息内容"`
 }
 
 // resNestedTag 响应值类型切片元素
 type resNestedTag struct {
-	ID   int    `json:"id" required:"true" description:"标签ID"`
+	ID   int    `json:"id" nonzero:"true" description:"标签ID"`
 	Name string `json:"name" description:"标签名称"`
 }
 
 // resNestedDetail 响应指针类型切片元素
 type resNestedDetail struct {
-	Address string  `json:"address" required:"true" description:"详细地址"`
+	Address string  `json:"address" nonzero:"true" description:"详细地址"`
 	ZipCode *string `json:"zipCode" default:"000000" description:"邮编"`
 }
 
 // resNestedUser 覆盖四维响应嵌套：值类型 Info、指针类型 Manager（自引用）、值切片 Tags、指针切片 Details
 type resNestedUser struct {
-	ID      int                `json:"id" required:"true" description:"用户ID"`
-	Name    string             `json:"name" required:"true" description:"用户名"`
+	ID      int                `json:"id" nonzero:"true" description:"用户ID"`
+	Name    string             `json:"name" nonzero:"true" description:"用户名"`
 	Info    resNestedInfo      `json:"info" description:"用户扩展信息"`
 	Manager *resNestedUser     `json:"manager" description:"直属上级"`
 	Tags    []resNestedTag     `json:"tags" description:"用户标签"`
@@ -1000,7 +1046,7 @@ type resNestedUser struct {
 
 type resNestedReq struct {
 	OpenAPIMeta `tags:"ResNested" summary:"获取嵌套响应"`
-	ID          int `json:"id" required:"true"`
+	ID          int `json:"id" nonzero:"true"`
 }
 
 func resNestedHandler(_ context.Context, _ resNestedReq) (resNestedUser, error) {
@@ -1178,14 +1224,14 @@ func TestGenerateOpenAPI_ResNested(t *testing.T) {
 // ---- 嵌套值类型结构体中 default 的文档展示 ----
 
 type oaSchoolWithDefault struct {
-	Name    string  `json:"name" default:"巡天大学" required:"true" description:"学校名称"`
+	Name    string  `json:"name" default:"巡天大学" nonzero:"true" description:"学校名称"`
 	Address *string `json:"address" default:"银河系" description:"学校地址"`
 }
 
 type oaSchoolDefaultReq struct {
 	OpenAPIMeta `tags:"SchoolDefault" summary:"测试值类型default展示"`
 	Nickname    string              `json:"nickname" default:"无情剑客" description:"昵称"`
-	School      oaSchoolWithDefault `json:"school" required:"true" description:"就读的学校信息"`
+	School      oaSchoolWithDefault `json:"school" nonzero:"true" description:"就读的学校信息"`
 }
 
 type oaSchoolDefaultRes struct {
@@ -1275,7 +1321,7 @@ type oaCompanyWithDefault struct {
 type oaPtrNestedDefaultReq struct {
 	OpenAPIMeta `tags:"PtrNestedDefault" summary:"测试指针嵌套default展示"`
 	Nickname    string                `json:"nickname" default:"无情剑客" description:"昵称"`
-	School      oaSchoolWithDefault   `json:"school" required:"true" description:"就读的学校信息"`
+	School      oaSchoolWithDefault   `json:"school" nonzero:"true" description:"就读的学校信息"`
 	Company     *oaCompanyWithDefault `json:"company" description:"供职的公司信息"`
 }
 
@@ -1346,6 +1392,722 @@ func TestGenerateOpenAPI_PtrNestedValueTypeDefault(t *testing.T) {
 	}
 
 	// ---- 可序列化 ----
+	if _, err := json.Marshal(doc); err != nil {
+		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// ======== P0 补充测试 ========
+
+// ---- 自定义 ResponseWrapper ----
+
+// oaCustomResponse 自定义响应包装结构：通过 any 字段占位 data
+type oaCustomResponse struct {
+	Result  any    `json:"result"`
+	ErrCode int    `json:"errCode"`
+	ErrMsg  string `json:"errMsg"`
+	TraceID string `json:"traceId"`
+}
+
+type oaWrapperReq struct {
+	OpenAPIMeta `tags:"Wrapper" summary:"测试自定义包装"`
+	Name        string `json:"name" nonzero:"true"`
+}
+
+type oaWrapperRes struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+func oaWrapperHandler(_ context.Context, _ oaWrapperReq) (oaWrapperRes, error) {
+	return oaWrapperRes{}, nil
+}
+
+// TestGenerateOpenAPI_CustomResponseWrapper 验证自定义 ResponseWrapper 生效：
+// any 字段替换为 Res schema，其他字段正常生成
+func TestGenerateOpenAPI_CustomResponseWrapper(t *testing.T) {
+	r := NewRouter()
+	r.POST("/wrapper", oaWrapperHandler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{
+		Title:           "Wrapper Test",
+		Version:         "1.0.0",
+		ResponseWrapper: oaCustomResponse{},
+	})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+
+	// Response_oaWrapperRes 包装层应存在
+	wrapSchema, ok := schemas["Response_oaWrapperRes"]
+	if !ok {
+		t.Fatalf("Response_oaWrapperRes schema missing")
+	}
+	wrapObj := wrapSchema.(map[string]any)
+	wrapProps := wrapObj["properties"].(map[string]any)
+
+	// result 字段（any 占位符）应引用 oaWrapperRes
+	resultField := wrapProps["result"].(map[string]any)
+	if ref, ok := resultField["$ref"]; !ok || ref != "#/components/schemas/oaWrapperRes" {
+		t.Errorf("result.$ref = %v, want #/components/schemas/oaWrapperRes", resultField)
+	}
+
+	// errCode 应为 integer
+	errCodeField := wrapProps["errCode"].(map[string]any)
+	if errCodeField["type"] != "integer" {
+		t.Errorf("errCode.type = %v, want integer", errCodeField["type"])
+	}
+
+	// errMsg 应为 string
+	errMsgField := wrapProps["errMsg"].(map[string]any)
+	if errMsgField["type"] != "string" {
+		t.Errorf("errMsg.type = %v, want string", errMsgField["type"])
+	}
+
+	// traceId 应为 string
+	traceField := wrapProps["traceId"].(map[string]any)
+	if traceField["type"] != "string" {
+		t.Errorf("traceId.type = %v, want string", traceField["type"])
+	}
+
+	// 不应包含默认的 data/code/message
+	if _, ok := wrapProps["data"]; ok {
+		t.Errorf("custom wrapper should not have default 'data' field")
+	}
+	if _, ok := wrapProps["code"]; ok {
+		t.Errorf("custom wrapper should not have default 'code' field")
+	}
+
+	if _, err := json.Marshal(doc); err != nil {
+		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// ---- 文件上传 multipart/form-data ----
+
+type oaFileUploadReq struct {
+	OpenAPIMeta `tags:"Upload" summary:"单文件上传"`
+	Title       string                `json:"title" nonzero:"true"`
+	File        *multipart.FileHeader `json:"file"`
+}
+
+type oaFileUploadRes struct {
+	OK bool `json:"ok"`
+}
+
+func oaFileUploadHandler(_ context.Context, _ oaFileUploadReq) (oaFileUploadRes, error) {
+	return oaFileUploadRes{}, nil
+}
+
+type oaMultiFileReq struct {
+	OpenAPIMeta `tags:"Upload" summary:"多文件上传"`
+	Title       string                  `json:"title"`
+	Files       []*multipart.FileHeader `json:"files"`
+}
+
+type oaMultiFileRes struct {
+	OK bool `json:"ok"`
+}
+
+func oaMultiFileHandler(_ context.Context, _ oaMultiFileReq) (oaMultiFileRes, error) {
+	return oaMultiFileRes{}, nil
+}
+
+// TestGenerateOpenAPI_FileUpload 验证含文件字段时 requestBody content-type 为 multipart/form-data
+func TestGenerateOpenAPI_FileUpload(t *testing.T) {
+	r := NewRouter()
+	r.POST("/upload", oaFileUploadHandler)
+	r.POST("/multi-upload", oaMultiFileHandler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "File Test", Version: "1.0.0"})
+
+	paths := doc["paths"].(map[string]any)
+
+	// 单文件上传
+	uploadItem := paths["/upload"].(map[string]any)
+	post := uploadItem["post"].(map[string]any)
+	reqBody := post["requestBody"].(map[string]any)
+	content := reqBody["content"].(map[string]any)
+	if _, ok := content["multipart/form-data"]; !ok {
+		t.Errorf("/upload: expected multipart/form-data, got keys: %v", content)
+	}
+	if _, ok := content["application/json"]; ok {
+		t.Errorf("/upload: should NOT have application/json when file field present")
+	}
+
+	// 多文件上传
+	multiItem := paths["/multi-upload"].(map[string]any)
+	mPost := multiItem["post"].(map[string]any)
+	mReqBody := mPost["requestBody"].(map[string]any)
+	mContent := mReqBody["content"].(map[string]any)
+	if _, ok := mContent["multipart/form-data"]; !ok {
+		t.Errorf("/multi-upload: expected multipart/form-data")
+	}
+
+	// 验证 schema 中 file 字段为 {type:string, format:binary}
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+	uploadSchema := schemas["oaFileUploadReq"].(map[string]any)
+	uploadProps := uploadSchema["properties"].(map[string]any)
+	fileField := uploadProps["file"].(map[string]any)
+	if fileField["type"] != "string" || fileField["format"] != "binary" {
+		t.Errorf("file schema = %v, want {type:string, format:binary}", fileField)
+	}
+
+	// 多文件字段为 {type:array, items:{type:string, format:binary}}
+	multiSchema := schemas["oaMultiFileReq"].(map[string]any)
+	multiProps := multiSchema["properties"].(map[string]any)
+	filesField := multiProps["files"].(map[string]any)
+	if filesField["type"] != "array" {
+		t.Errorf("files.type = %v, want array", filesField["type"])
+	}
+	filesItems := filesField["items"].(map[string]any)
+	if filesItems["type"] != "string" || filesItems["format"] != "binary" {
+		t.Errorf("files.items = %v, want {type:string, format:binary}", filesItems)
+	}
+
+	if _, err := json.Marshal(doc); err != nil {
+		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// ---- time.Time 字段 schema ----
+
+type oaTimeReq struct {
+	OpenAPIMeta `tags:"Time" summary:"时间字段测试"`
+	CreatedAt   time.Time `json:"createdAt" description:"创建时间"`
+	UnixTS      time.Time `json:"unixTs" time_format:"unix" description:"Unix时间戳"`
+	MilliTS     time.Time `json:"milliTs" time_format:"unixmilli" description:"毫秒时间戳"`
+	CustomFmt   time.Time `json:"customFmt" time_format:"2006-01-02" description:"自定义格式"`
+}
+
+type oaTimeRes struct {
+	OK bool `json:"ok"`
+}
+
+func oaTimeHandler(_ context.Context, _ oaTimeReq) (oaTimeRes, error) {
+	return oaTimeRes{}, nil
+}
+
+// TestGenerateOpenAPI_TimeField 验证 time.Time 字段根据 time_format 生成不同 schema
+func TestGenerateOpenAPI_TimeField(t *testing.T) {
+	r := NewRouter()
+	r.POST("/time", oaTimeHandler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Time Test", Version: "1.0.0"})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+	timeSchema := schemas["oaTimeReq"].(map[string]any)
+	props := timeSchema["properties"].(map[string]any)
+
+	// createdAt: 无 time_format → string + date-time
+	createdField := props["createdAt"].(map[string]any)
+	if createdField["type"] != "string" {
+		t.Errorf("createdAt.type = %v, want string", createdField["type"])
+	}
+	if createdField["format"] != "date-time" {
+		t.Errorf("createdAt.format = %v, want date-time", createdField["format"])
+	}
+	if createdField["description"] != "创建时间" {
+		t.Errorf("createdAt.description = %v, want 创建时间", createdField["description"])
+	}
+
+	// unixTs: time_format:"unix" → integer + int64
+	unixField := props["unixTs"].(map[string]any)
+	if unixField["type"] != "integer" {
+		t.Errorf("unixTs.type = %v, want integer", unixField["type"])
+	}
+	if unixField["format"] != "int64" {
+		t.Errorf("unixTs.format = %v, want int64", unixField["format"])
+	}
+
+	// milliTs: time_format:"unixmilli" → integer + int64
+	milliField := props["milliTs"].(map[string]any)
+	if milliField["type"] != "integer" {
+		t.Errorf("milliTs.type = %v, want integer", milliField["type"])
+	}
+	if milliField["format"] != "int64" {
+		t.Errorf("milliTs.format = %v, want int64", milliField["format"])
+	}
+
+	// customFmt: time_format:"2006-01-02" → string + date-time
+	customField := props["customFmt"].(map[string]any)
+	if customField["type"] != "string" {
+		t.Errorf("customFmt.type = %v, want string", customField["type"])
+	}
+	if customField["format"] != "date-time" {
+		t.Errorf("customFmt.format = %v, want date-time", customField["format"])
+	}
+
+	if _, err := json.Marshal(doc); err != nil {
+		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// ---- map 类型 additionalProperties ----
+
+type oaMapReq struct {
+	OpenAPIMeta `tags:"Map" summary:"Map类型测试"`
+	Name        string            `json:"name" nonzero:"true"`
+	Attrs       map[string]string `json:"attrs" description:"属性集合"`
+	Scores      map[string]int    `json:"scores"`
+	Codes       map[int]string    `json:"codes" description:"状态码映射"`
+}
+
+type oaMapRes struct {
+	OK bool `json:"ok"`
+}
+
+func oaMapHandler(_ context.Context, _ oaMapReq) (oaMapRes, error) {
+	return oaMapRes{}, nil
+}
+
+// TestGenerateOpenAPI_MapType 验证 map 类型生成 additionalProperties schema
+func TestGenerateOpenAPI_MapType(t *testing.T) {
+	r := NewRouter()
+	r.POST("/map", oaMapHandler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Map Test", Version: "1.0.0"})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+	mapSchema := schemas["oaMapReq"].(map[string]any)
+	props := mapSchema["properties"].(map[string]any)
+
+	// attrs: map[string]string → {type:object, additionalProperties:{type:string}}
+	attrsField := props["attrs"].(map[string]any)
+	if attrsField["type"] != "object" {
+		t.Errorf("attrs.type = %v, want object", attrsField["type"])
+	}
+	attrsAP := attrsField["additionalProperties"].(map[string]any)
+	if attrsAP["type"] != "string" {
+		t.Errorf("attrs.additionalProperties.type = %v, want string", attrsAP["type"])
+	}
+	if attrsField["description"] != "属性集合" {
+		t.Errorf("attrs.description = %v, want 属性集合", attrsField["description"])
+	}
+
+	// scores: map[string]int → {type:object, additionalProperties:{type:integer}}
+	scoresField := props["scores"].(map[string]any)
+	if scoresField["type"] != "object" {
+		t.Errorf("scores.type = %v, want object", scoresField["type"])
+	}
+	scoresAP := scoresField["additionalProperties"].(map[string]any)
+	if scoresAP["type"] != "integer" {
+		t.Errorf("scores.additionalProperties.type = %v, want integer", scoresAP["type"])
+	}
+
+	// codes: map[int]string → 非 string key，description 中应包含 key type 信息
+	codesField := props["codes"].(map[string]any)
+	if codesField["type"] != "object" {
+		t.Errorf("codes.type = %v, want object", codesField["type"])
+	}
+	codesAP := codesField["additionalProperties"].(map[string]any)
+	if codesAP["type"] != "string" {
+		t.Errorf("codes.additionalProperties.type = %v, want string", codesAP["type"])
+	}
+	// description 应包含 key type 注解
+	codesDesc, _ := codesField["description"].(string)
+	if codesDesc == "" {
+		t.Errorf("codes.description should contain key type info, got empty")
+	}
+
+	if _, err := json.Marshal(doc); err != nil {
+		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// ======== P1 补充测试 ========
+
+// TestGenerateOpenAPI_InfoServersAndDescription 验证 Servers 和 Description 字段正确生成
+func TestGenerateOpenAPI_InfoServersAndDescription(t *testing.T) {
+	r := NewRouter()
+	r.GET("/ping", func(_ context.Context, _ struct{}) (struct{}, error) { return struct{}{}, nil })
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{
+		Title:       "Server Test",
+		Version:     "2.0.0",
+		Description: "测试描述",
+		Servers: []OpenAPIServer{
+			{URL: "https://api.example.com", Description: "生产环境"},
+			{URL: "http://localhost:8080"},
+		},
+	})
+
+	// info.description
+	infoMap := doc["info"].(map[string]any)
+	if infoMap["description"] != "测试描述" {
+		t.Errorf("info.description = %v, want 测试描述", infoMap["description"])
+	}
+	if infoMap["title"] != "Server Test" {
+		t.Errorf("info.title = %v, want Server Test", infoMap["title"])
+	}
+	if infoMap["version"] != "2.0.0" {
+		t.Errorf("info.version = %v, want 2.0.0", infoMap["version"])
+	}
+
+	// servers
+	servers, ok := doc["servers"].([]any)
+	if !ok || len(servers) != 2 {
+		t.Fatalf("servers = %v, want 2 entries", doc["servers"])
+	}
+	sv0 := servers[0].(map[string]any)
+	if sv0["url"] != "https://api.example.com" {
+		t.Errorf("servers[0].url = %v, want https://api.example.com", sv0["url"])
+	}
+	if sv0["description"] != "生产环境" {
+		t.Errorf("servers[0].description = %v, want 生产环境", sv0["description"])
+	}
+	sv1 := servers[1].(map[string]any)
+	if sv1["url"] != "http://localhost:8080" {
+		t.Errorf("servers[1].url = %v, want http://localhost:8080", sv1["url"])
+	}
+	// 无 description 时不应包含该字段
+	if _, hasDesc := sv1["description"]; hasDesc {
+		t.Errorf("servers[1] should not have description")
+	}
+}
+
+// TestGenerateOpenAPI_DeleteHeadQueryParams 验证 DELETE/HEAD 与 GET 一样使用 query 参数
+func TestGenerateOpenAPI_DeleteHeadQueryParams(t *testing.T) {
+	type dhReq struct {
+		ID   int    `json:"id" nonzero:"true"`
+		Name string `json:"name"`
+	}
+	type dhRes struct {
+		OK bool `json:"ok"`
+	}
+	handler := func(_ context.Context, _ dhReq) (dhRes, error) { return dhRes{}, nil }
+
+	r := NewRouter()
+	r.DELETE("/item", handler)
+	r.HEAD("/item", handler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "DH Test", Version: "1.0.0"})
+
+	paths := doc["paths"].(map[string]any)
+	itemPath := paths["/item"].(map[string]any)
+
+	for _, method := range []string{"delete", "head"} {
+		op, ok := itemPath[method].(map[string]any)
+		if !ok {
+			t.Fatalf("%s operation missing", method)
+		}
+		params, ok := op["parameters"].([]any)
+		if !ok || len(params) == 0 {
+			t.Fatalf("%s: parameters missing or empty", method)
+		}
+		// 应有 query 参数，无 requestBody
+		if _, hasBody := op["requestBody"]; hasBody {
+			t.Errorf("%s: should not have requestBody", method)
+		}
+		// id 应为 required
+		foundID := false
+		for _, p := range params {
+			pm := p.(map[string]any)
+			if pm["name"] == "id" {
+				foundID = true
+				if pm["required"] != true {
+					t.Errorf("%s: id should be required", method)
+				}
+				if pm["in"] != "query" {
+					t.Errorf("%s: id.in = %v, want query", method, pm["in"])
+				}
+			}
+		}
+		if !foundID {
+			t.Errorf("%s: id parameter not found", method)
+		}
+	}
+}
+
+// TestGenerateOpenAPI_ScalarTypeFormats 验证标量类型的 format 正确性
+func TestGenerateOpenAPI_ScalarTypeFormats(t *testing.T) {
+	type scalarReq struct {
+		OpenAPIMeta `tags:"Scalar" summary:"标量类型"`
+		Age         int     `json:"age"`
+		Score       float64 `json:"score"`
+		Ratio       float32 `json:"ratio"`
+		Count       uint    `json:"count"`
+		Small       int32   `json:"small"`
+		Tiny        int8    `json:"tiny"`
+		Big         uint64  `json:"big"`
+		Flag        bool    `json:"flag"`
+	}
+	type scalarRes struct {
+		OK bool `json:"ok"`
+	}
+
+	r := NewRouter()
+	r.POST("/scalar", func(_ context.Context, _ scalarReq) (scalarRes, error) { return scalarRes{}, nil })
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Scalar Test", Version: "1.0.0"})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+	sSchema := schemas["scalarReq"].(map[string]any)
+	props := sSchema["properties"].(map[string]any)
+
+	cases := []struct {
+		name   string
+		wantT  string
+		wantF  string
+		wantMn any // minimum 字段，仅 uint 类型有
+	}{
+		{"age", "integer", "int64", nil},
+		{"score", "number", "double", nil},
+		{"ratio", "number", "float", nil},
+		{"count", "integer", "int64", 0},
+		{"small", "integer", "int32", nil},
+		{"tiny", "integer", "int32", nil},
+		{"big", "integer", "int64", 0},
+		{"flag", "boolean", "", nil},
+	}
+	for _, c := range cases {
+		f := props[c.name].(map[string]any)
+		if f["type"] != c.wantT {
+			t.Errorf("%s.type = %v, want %v", c.name, f["type"], c.wantT)
+		}
+		if c.wantF != "" && f["format"] != c.wantF {
+			t.Errorf("%s.format = %v, want %v", c.name, f["format"], c.wantF)
+		}
+		if c.wantMn != nil {
+			if f["minimum"] != c.wantMn {
+				t.Errorf("%s.minimum = %v, want %v", c.name, f["minimum"], c.wantMn)
+			}
+		}
+	}
+}
+
+// TestGenerateOpenAPI_ShortFuncNameFallback 验证无 OpenAPIMeta 时使用函数名作为 summary
+func TestGenerateOpenAPI_ShortFuncNameFallback(t *testing.T) {
+	r := NewRouter()
+	// oaList 没有嵌入 OpenAPIMeta，应使用函数名作为 summary
+	r.GET("/list", oaList)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "FuncName Test", Version: "1.0.0"})
+
+	paths := doc["paths"].(map[string]any)
+	listItem := paths["/list"].(map[string]any)
+	get := listItem["get"].(map[string]any)
+
+	summary, ok := get["summary"].(string)
+	if !ok || summary == "" {
+		t.Fatalf("summary missing for handler without OpenAPIMeta")
+	}
+	// shortFuncName 会取函数名最后一段（去除包前缀和 -fm 后缀）
+	if summary != "oaList" {
+		t.Errorf("summary = %q, want 'oaList'", summary)
+	}
+}
+
+// selfPtr 病态自引用指针类型：Elem() 返回自身，无限解引用
+type selfPtr *selfPtr
+
+// TestDerefType_SelfReferentialPtr 验证自引用指针类型不会使 derefType 死循环
+func TestDerefType_SelfReferentialPtr(t *testing.T) {
+	done := make(chan reflect.Type, 1)
+	go func() {
+		done <- derefType(reflect.TypeOf((selfPtr)(nil)))
+	}()
+	select {
+	case got := <-done:
+		// 达到深度上限后应原样返回（仍为指针类型），而非死循环
+		if got.Kind() != reflect.Ptr {
+			t.Errorf("derefType(selfPtr) kind = %v, want Ptr", got.Kind())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("confirmed: derefType infinite loop on self-referential pointer type (timed out)")
+	}
+}
+
+// TestGenerateOpenAPI_MultiLayerContainerDefault 验证多层容器中指针字段的 default 不展示
+func TestGenerateOpenAPI_MultiLayerContainerDefault(t *testing.T) {
+	// 定义仅在多层容器中使用的结构体
+	type MultiLayerItem struct {
+		Name     string `json:"name" nonzero:"true" description:"深度名字"`
+		IsActive *bool  `json:"isActive" default:"true" description:"是否激活"`
+	}
+
+	type MultiLayerReq struct {
+		OpenAPIMeta `tags:"MultiLayer" summary:"多层容器测试"`
+		// 多层容器：指针字段 default 不应展示
+		DeepMap map[string][]MultiLayerItem `json:"deepMap" description:"多层容器"`
+	}
+	type MultiLayerRes struct {
+		OK bool `json:"ok"`
+	}
+
+	handler := func(_ context.Context, _ MultiLayerReq) (MultiLayerRes, error) {
+		return MultiLayerRes{}, nil
+	}
+
+	r := NewRouter()
+	r.POST("/multi", handler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "MultiLayer Test", Version: "1.0.0"})
+
+	// 获取 MultiLayerItem 的 schema
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+	itemSchema, ok := schemas["MultiLayerItem"]
+	if !ok {
+		t.Fatalf("MultiLayerItem schema missing from components/schemas")
+	}
+	itemObj := itemSchema.(map[string]any)
+	props := itemObj["properties"].(map[string]any)
+
+	// 验证 isActive 字段
+	isActiveField := props["isActive"].(map[string]any)
+
+	// description 应始终展示
+	if isActiveField["description"] != "是否激活" {
+		t.Errorf("isActive.description = %v, want 是否激活", isActiveField["description"])
+	}
+
+	// default 不应展示（因为 MultiLayerItem 仅在多层容器中，框架知道 default 无法生效）
+	if _, hasDefault := isActiveField["default"]; hasDefault {
+		t.Errorf("isActive should NOT have default in multi-layer container, but got: %v", isActiveField["default"])
+	}
+
+	// 验证 required 计算：Name 有 nonzero 且无 default，应为 required
+	required, ok := itemObj["required"].([]any)
+	if !ok {
+		t.Fatalf("MultiLayerItem.required missing")
+	}
+	foundName := false
+	for _, r := range required {
+		if r == "name" {
+			foundName = true
+		}
+	}
+	if !foundName {
+		t.Errorf("name should be in required array, got: %v", required)
+	}
+
+	// isActive 没有 nonzero 标签，所以不会在 required 中
+	for _, r := range required {
+		if r == "isActive" {
+			t.Errorf("isActive should NOT be in required array")
+		}
+	}
+}
+
+// ========== 指针包裹容器 OpenAPI schema 测试 ==========
+
+// oaPtrContainerItem 作为指针包裹容器的元素类型
+type oaPtrContainerItem struct {
+	Name   string  `json:"name" nonzero:"true" description:"项目名称"`
+	Qty    *int    `json:"qty" default:"1" description:"数量"`
+	Status *string `json:"status" default:"active" description:"状态"`
+}
+
+type oaPtrContainerReq struct {
+	OpenAPIMeta `tags:"PtrContainer" summary:"指针包裹容器请求"`
+	OrderNo     string                         `json:"orderNo" nonzero:"true"`
+	Items       *[]oaPtrContainerItem          `json:"items" nonzero:"true" description:"指针包裹的切片"`
+	Extras      *map[string]oaPtrContainerItem `json:"extras" description:"指针包裹的 map"`
+}
+
+type oaPtrContainerRes struct {
+	OK bool `json:"ok"`
+}
+
+func oaPtrContainerHandler(_ context.Context, _ oaPtrContainerReq) (oaPtrContainerRes, error) {
+	return oaPtrContainerRes{OK: true}, nil
+}
+
+// TestGenerateOpenAPI_PtrWrappedSlice 验证 *[]Struct 在 OpenAPI 文档中生成 nullable array + items $ref
+func TestGenerateOpenAPI_PtrWrappedSlice(t *testing.T) {
+	r := NewRouter()
+	r.POST("/ptr-container", oaPtrContainerHandler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Ptr Container Test", Version: "1.0.0"})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+
+	// oaPtrContainerItem 的独立 schema 必须存在
+	if _, ok := schemas["oaPtrContainerItem"]; !ok {
+		t.Fatalf("oaPtrContainerItem schema missing from components/schemas")
+	}
+
+	// 验证 oaPtrContainerReq 的 items 字段：*[]Struct → nullable array, items $ref
+	reqSchema := schemas["oaPtrContainerReq"].(map[string]any)
+	reqProps := reqSchema["properties"].(map[string]any)
+
+	itemsField := reqProps["items"].(map[string]any)
+	if itemsField["nullable"] != true {
+		t.Errorf("items.nullable = %v, want true (pointer-wrapped slice)", itemsField["nullable"])
+	}
+	if itemsField["type"] != "array" {
+		t.Errorf("items.type = %v, want array", itemsField["type"])
+	}
+	if itemsField["description"] != "指针包裹的切片" {
+		t.Errorf("items.description = %v, want 指针包裹的切片", itemsField["description"])
+	}
+	itemsItems := itemsField["items"].(map[string]any)
+	if ref, ok := itemsItems["$ref"]; !ok || ref != "#/components/schemas/oaPtrContainerItem" {
+		t.Errorf("items.items.$ref = %v, want #/components/schemas/oaPtrContainerItem", itemsItems)
+	}
+
+	// items 标记了 nonzero:"true"，应在 required 中
+	reqRequired := reqSchema["required"].([]any)
+	foundItems := false
+	for _, r := range reqRequired {
+		if r == "items" {
+			foundItems = true
+		}
+	}
+	if !foundItems {
+		t.Errorf("oaPtrContainerReq.required = %v, should contain 'items'", reqRequired)
+	}
+
+	// 可序列化
+	if _, err := json.Marshal(doc); err != nil {
+		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// TestGenerateOpenAPI_PtrWrappedMap 验证 *map[K]Struct 在 OpenAPI 文档中生成 nullable object + additionalProperties $ref
+func TestGenerateOpenAPI_PtrWrappedMap(t *testing.T) {
+	r := NewRouter()
+	r.POST("/ptr-container", oaPtrContainerHandler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Ptr Container Test", Version: "1.0.0"})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+
+	reqSchema := schemas["oaPtrContainerReq"].(map[string]any)
+	reqProps := reqSchema["properties"].(map[string]any)
+
+	// extras 字段：*map[string]Struct → nullable object, additionalProperties $ref
+	extrasField := reqProps["extras"].(map[string]any)
+	if extrasField["nullable"] != true {
+		t.Errorf("extras.nullable = %v, want true (pointer-wrapped map)", extrasField["nullable"])
+	}
+	if extrasField["type"] != "object" {
+		t.Errorf("extras.type = %v, want object", extrasField["type"])
+	}
+	if extrasField["description"] != "指针包裹的 map" {
+		t.Errorf("extras.description = %v, want 指针包裹的 map", extrasField["description"])
+	}
+	addProps := extrasField["additionalProperties"].(map[string]any)
+	if ref, ok := addProps["$ref"]; !ok || ref != "#/components/schemas/oaPtrContainerItem" {
+		t.Errorf("extras.additionalProperties.$ref = %v, want #/components/schemas/oaPtrContainerItem", addProps)
+	}
+
+	// extras 未标记 nonzero，不应在 required 中
+	reqRequired := reqSchema["required"].([]any)
+	for _, r := range reqRequired {
+		if r == "extras" {
+			t.Errorf("extras should NOT be in required array, got: %v", reqRequired)
+		}
+	}
+
+	// 可序列化
 	if _, err := json.Marshal(doc); err != nil {
 		t.Fatalf("doc not JSON-serializable: %v", err)
 	}

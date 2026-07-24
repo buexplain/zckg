@@ -4,7 +4,7 @@
 
 绑定与校验分为两个独立函数：
 - `bindRequestData(r, reqPtr)`：仅执行数据绑定（query/body），在路由命中后立即调用。
-- `validateRequest(reqPtr)`：仅执行参数校验（required + Validator），在洋葱模型 core 层调用。
+- `validateRequest(reqPtr)`：仅执行参数校验（nonzero + Validator），在洋葱模型 core 层调用。
 
 > 默认值（`default` 标签）采用两阶段填充：注册阶段预填模板零值字段，请求阶段绑定后补填动态创建的子元素中的 nil 指针字段。详见[默认值机制](#六默认值机制)。
 
@@ -155,12 +155,23 @@ func upload(ctx context.Context, req UploadReq) (Res, error) {
 
 通过 `default` 标签为字段设置默认值。框架采用**两阶段填充**策略，在注册阶段和请求阶段各执行一次 `applyDefaults`，保证不同嵌套场景下默认值均正确生效。
 
+### default 标签支持范围
+
+`default` 标签仅在以下类型上生效（`isDefaultSupported` 返回 true，`hasDefault` 置为 true）：
+
+- 标量：`string`、`bool`、`int/uint` 全系列、`float32`/`float64`
+- 标量指针：`*string`、`*int`、`*bool` 等
+- 标量切片：`[]string`、`[]int`、`[]*int` 等
+
 ### 两阶段填充规则
 
 | 阶段 | 时机 | 填充条件 | 说明 |
 | --- | --- | --- | --- |
 | **注册阶段** | 路由注册时（`buildEntry`） | 所有零值字段（`IsZero()`） | 对空模板一次性预填，生成 `defaultReq` |
 | **请求阶段** | JSON/表单绑定后（`httpEngine`） | 仅 nil 指针字段（`Kind==Ptr && IsNil()`） | 补填动态创建的子元素（slice/map/nested ptr），值类型跳过 |
+
+- **注册阶段**：模板为空，所有零值的 `default` 字段被预填，生成 `defaultReq`。`int`/`string`/`[]string`/`*int` 等均参与。
+- **请求阶段**：JSON 解析动态创建了 slice 元素 / map value / nested ptr struct 后，递归进入并对其中 nil 的**指针字段**补填默认值。**值类型（`int`/`string`/`bool`）跳过**，避免覆盖用户显式传入的零值（如 `{"qty": 0}` 不应被改成 `1`）。
 
 ### 完整示例
 
@@ -233,14 +244,14 @@ type OrderReq struct {
 1. **`hasDefault=true` 的字段**（标量/标量指针/标量切片）在注册阶段**全部填充**；请求阶段仅**指针类型**的 nil 字段填充，值类型跳过以避免覆盖用户显式传入的零值（如 `{"page": 0}` 不应被改成 `1`）。
 2. **`hasDefault=false` 的容器字段**（struct/map/切片）自身不支持 `default` 标签，但注册阶段会穷尽其内部所有零值字段；请求阶段在绑定创建子元素后，再对 nil 指针子字段补填。
 3. **值 struct 与指针 struct 的关键差异**：`Addr Address` 模板为零值 struct → 注册阶段递归预填子字段；`BillAddr *Address` 模板为 nil → 注册阶段跳过，其子字段默认值仅在请求阶段（JSON 传入后）生效。
-4. **OpenAPI 文档**仅对指针类型字段展示 `default` 属性，与请求阶段的填充保证一致（值类型的 default 不出现在文档中）。
+4. **OpenAPI 文档**展示 `default` 的规则与填充保证一致：**指针类型**字段在其所属 struct 可被 `applyDefaults` 到达时展示（`reachedByDefaults` 追踪）；**值类型**字段仅在其所在 struct 被值嵌套可达（顶层或值类型 struct 字段链）时展示（`reachedViaValue` 追踪）。多层容器（如 `map[K][]Struct`）中的 struct 不可达，其指针和值字段的 `default` 均不展示。详见 `openapi.md` 中 decorate 决策矩阵。
 5. **不支持 default 的类型**（`map`、`any`、`*struct`、`[]struct`、`time.Time` 等）设置 `default` 标签无效，`isDefaultSupported` 返回 false，`hasDefault` 恒为 false，标签值被静默忽略。
 
 ### 注册阶段：模板预填
 
 路由注册时，`applyDefaults` 遍历 Req 结构体树，将所有带 `default` 标签的零值字段填入默认值，生成 `defaultReq` 模板。值类型嵌套结构体会被递归进入并预填。指针类型嵌套结构体（模板中为 nil）跳过。
 
-请求时通过 `reflect.New` + `Set(defaultReq)` 浅拷贝获得带默认值的实例，再执行 JSON/表单绑定覆盖。
+请求时通过 `reflect.New` + `Set(defaultReq)` 浅拷贝获得带默认值的实例。若模板中存在非 nil 的指针/切片/map 字段（`needsDeepCopy` 为 true），还会先执行 `deepCopyDefaults` 断开这些引用类型字段的共享引用，确保并发安全，然后再执行 JSON/表单绑定覆盖。
 
 ### 请求阶段：仅 nil 指针补填
 
@@ -248,10 +259,12 @@ JSON 绑定会**动态创建** slice 元素、map value、指针嵌套结构体�
 
 **关键约束**：请求阶段仅对 **nil 指针字段** 填充默认值，值类型（`int`/`string`/`bool` 等）一律跳过。原因是值类型的零值（`0`、`""`、`false`）无法区分"用户未传"与"用户显式传了零值"——直接填充会覆盖用户的合法零值输入。
 
+**容器嵌套深度限制**：`applyDefaults` 仅支持单层容器（`[]Struct`、`[]*Struct`、`map[K]Struct`、`map[K]*Struct`）及其指针包裹形式（`*[]Struct`、`*[]*Struct`、`*map[K]Struct`、`*map[K]*Struct`，指针解引用后穿透进入元素）。多层容器（如 `map[K][]Struct`、`[][]Struct`）的内部元素无法被穿透，其默认值填充、nonzero 校验均不生效。详见 `request.md` 中"容器嵌套深度限制"章节。
+
 ```go
 // ✅ 嵌套容器中的默认值字段推荐使用指针类型
 type Item struct {
-    Name   string  `json:"name" required:"true"`
+    Name   string  `json:"name" nonzero:"true"`
     Qty    *int    `json:"qty" default:"1"`     // *int：nil="未传"，&0="传了0"
     Status *string `json:"status" default:"ok"`  // *string：nil="未传"，&""="传了空串"
 }
@@ -263,10 +276,6 @@ type Req struct {
 
 - 不传 `qty` → JSON 解码为 nil → `IsNil()=true` → 填充 `&1` ✅
 - 传 `qty: 0` → JSON 解码为 `&0`（非 nil） → `IsNil()=false` → 跳过，保留 0 ✅
-
-### default 标签支持范围
-
-`default` 标签仅对标量类型（`string`/`bool`/`int`/`uint`/`float` 全系列）及其切片、指针生效。`time.Time`、`struct`、`map`、指针到结构体等非标量类型设置 `default` 标签无效（`isDefaultSupported` 返回 false，`hasDefault` 不会被置为 true）。
 
 ### 覆盖规则
 
@@ -280,5 +289,5 @@ type Req struct {
 
 - 默认值由注册阶段 `applyDefaults` 一次性填充到模板中，请求时浅拷贝获得带默认值的实例。
 - 若模板中存在非 nil 的指针/切片/map 字段（`needsDeepCopy` 为 true），请求时会先执行 `deepCopyDefaults` 断开共享引用，再执行绑定覆盖。
-- 显式传递等于零值的值（如 `page=0`、`active=false`）在顶层字段中会被正确保留（模板预填后被 JSON 覆盖）；在嵌套容器（slice/map 元素）中，值类型字段的零值输入**不会被请求阶段覆盖**（因其不填值类型），但也不会被错误地改为默认值。
+- 显式传递等于零值的值（如 `page=0`、`active=false`）在顶层字段中会被正确保留（模板预填后被 JSON 覆盖）；在嵌套容器（slice/map 元素）中，值类型字段若用户传了零值，该零值也会被保留——请求阶段仅填充 nil 指针，不处理值类型，因此不会用默认值覆盖用户的零值输入。
 - 切片默认值以逗号分隔（如 `default:"a,b,c"`）。

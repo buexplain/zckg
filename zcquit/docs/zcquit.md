@@ -15,6 +15,7 @@ zcquit 是一个轻量级优雅退出（Graceful Shutdown）模块，提供两�
 ```
 zcquit/
 ├── quit.go        # 核心实现：全局上下文初始化、信号监听、handler 注册与并发执行
+├── quit_test.go   # 单元测试
 └── docs/
     └── zcquit.md  # 本文档
 ```
@@ -127,14 +128,14 @@ zcquit/
 | 组件 | 用途 |
 |------|------|
 | `listenOnce`（`sync.Once`） | 保证 `listen` goroutine 全局仅启动一次 |
-| `waitChan`（`chan struct{}`） | `Listen` 阻塞在此通道上，`listen` 返回时关闭，解除阻塞 |
-| `signalHandlerMux`（`sync.RWMutex`） | `AddSigHandler` 写锁追加到 map；`doShutdown` 读锁快照后立即释放（handler 在锁外分批执行） |
+| `waitChan`（`chan struct{}`） | `Listen` 阻塞在此通道上，`executeShutdown` 完成所有 handler 执行后关闭，解除阻塞 |
+| `signalHandlerMux`（`sync.RWMutex`） | `AddSigHandler` 写锁追加到 map；`executeShutdown` 读锁快照后立即释放（handler 在锁外分批执行） |
 | `wg`（`sync.WaitGroup`） | 等待所有并发 handler 完成 |
 
 ## 线程安全
 
 - **`Ctx` / `cancel`**：`context.WithCancel` 返回的 cancel 函数并发安全，可被多次调用（仅首次生效）。
-- **`AddSigHandler`**：持 `Lock` 追加 handler 到 map，与 `doShutdown` 快照时的 `RLock` 互斥。
+- **`AddSigHandler`**：持 `Lock` 追加 handler 到 map，与 `executeShutdown` 快照时的 `RLock` 互斥。
 - **handler 执行**：在 `RLock` 释放后启动 goroutine，因此 handler 内部可安全调用 `AddSigHandler`（不会死锁）。
 - **panic 隔离**：每个 handler 有独立的 `recover`，单个 handler panic 不影响其他 handler，错误通过 `slog` 记录。
 
@@ -298,7 +299,7 @@ func main() {
 
 3. **handler panic 隔离**：每个 handler 有独立的 `recover`，单个 panic 会被 `slog.Error` 记录（含所在 level），不影响同级别或后续级别的 handler 执行，也不影响 `Listen` 最终返回。
 
-4. **handler 中可安全调用 `AddSigHandler`**：`doShutdown` 在执行前已快照 handler map 并释放锁，因此 handler 中调用 `AddSigHandler` 不会死锁。但新增的 handler 仅在下次退出时生效（本次快照已固化）。
+4. **handler 中可安全调用 `AddSigHandler`**：`executeShutdown` 在执行前已快照 handler map 并释放锁，因此 handler 中调用 `AddSigHandler` 不会死锁。但新增的 handler 仅在下次退出时生效（本次快照已固化）。
 
 5. **SIGHUP 被忽略**：SIGHUP 通常由终端会话断开触发，不代表程序需要终止。如需响应 SIGHUP（如重新加载配置），可自行扩展。
 

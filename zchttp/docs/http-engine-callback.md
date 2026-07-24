@@ -67,14 +67,14 @@ func WantHtml(r *http.Request) bool
 中间件链或 handler 产生的 error 传播到最外层后，`ServeHTTP` 通过 `errors.As` 区分错误类型：
 
 - 若命中 `*BindingError`（绑定失败，如 JSON 格式错误）→ 交由 `OnValidationError`（默认 400）。
-- 若命中 `*ValidationError`（参数校验失败，来自 `required` 非零值校验或 `Validate()` 业务校验）→ 交由 `OnValidationError`（默认 400）。
+- 若命中 `*ValidationError`（参数校验失败，来自 `nonzero` 非零值校验或 `Validate()` 业务校验）→ 交由 `OnValidationError`（默认 400）。
 - 其余错误 → 交由 `OnError`（默认 500）。
 
-> `*BindingError` 与 `*ValidationError` 的定义及参数校验规则详见 `request.md`。
+> `*BindingError` 的定义及参数绑定细节详见 `parameter-binding.md`；`*ValidationError` 的定义及参数校验规则详见 `parameter-validate.md`。
 
 ## 四、panic 恢复
 
-`ServeHTTP` 入口处通过 `defer recover` 捕获整个请求生命周期（含中间件链与 handler）中的 panic，交由 `OnPanic` 回调处理。默认 `DefaultPanicHandler` 在 `slog.Error` 中输出完整的请求信息、panic 值及调用栈，随后向客户端返回 500。
+`ServeHTTP` 入口处通过 `defer recover` 捕获整个请求生命周期（含中间件链与 handler）中的 panic，交由 `OnPanic` 回调处理。默认 `DefaultPanicHandler` 在 `slog.Error` 中输出请求方法与路径、panic 值及调用栈，随后向客户端返回 500。
 
 ```go
 func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) {
@@ -92,7 +92,7 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
 
 ## 五、"是否已写入"的判定
 
-引擎用 `responseWriter` 包装原始 `http.ResponseWriter`，记录 `WriteHeader` / `Write` 是否被调用过（`Written()`）。`IsResponseWritten` 通过接口断言判定：
+引擎用 `responseWriter` 包装原始 `http.ResponseWriter`，记录 `WriteHeader` / `Write` / `Flush` / `Hijack` / `Push` 是否被调用过（`Written()`）。`IsResponseWritten` 通过接口断言判定：
 
 ```go
 func IsResponseWritten(w http.ResponseWriter) bool {
@@ -184,7 +184,7 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 2. **panic 保护**：`defer recover` 包裹全流程，捕获 panic → `OnPanic`（`slog.Error` + 堆栈）。
 3. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body；绑定错误（`*BindingError`）随 Req 注入 ctx。
 4. **中间件链执行**：洋葱模型从外到内递归执行中间件；各中间件可通过 `BoundReqFromContext[T]` 获取已绑定的 Req。
-5. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateRequired` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
+5. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateNonzero` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
 6. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler，成功 → `OnResponse(w, r, res)`，Res 同时注入 ctx 供后置中间件通过 `BoundResFromContext[T]` 获取。
 7. **错误分发**：任一环节返回 error，按类型分发：
     - `*BindingError` / `*ValidationError` → `OnValidationError`（默认 400）

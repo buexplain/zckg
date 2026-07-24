@@ -54,7 +54,7 @@ var cancel context.CancelFunc
 var listenOnce = sync.Once{}
 
 // waitChan 用于同步：退出流程完成后关闭此通道，从而解除 [Listen] 的阻塞。
-// 该通道在 [doShutdown] 中关闭。
+// 该通道在 [executeShutdown] 中关闭。
 var waitChan = make(chan struct{})
 
 // signalHandlerMux 保护 signalHandlerMap 的并发读写安全。
@@ -127,49 +127,55 @@ func listen() {
 // 参数 sig 为触发退出的信号：OS 信号到达时传入具体信号值，[Shutdown] 调用时传入 nil。
 func doShutdown(sig os.Signal) {
 	shutdownOnce.Do(func() {
-		// 步骤 1：先取消全局上下文，通知所有业务协程准备退出
-		cancel()
-
-		// 步骤 2：按 level 升序分批执行 handler
-		// 先快照 handler 映射（持读锁），释放锁后再执行，避免长时间持锁
-		signalHandlerMux.RLock()
-		snapshot := make(map[int][]SigHandler, len(signalHandlerMap))
-		for level, handlers := range signalHandlerMap {
-			snapshot[level] = handlers
-		}
-		signalHandlerMux.RUnlock()
-
-		// 收集所有级别并升序排序
-		levels := make([]int, 0, len(snapshot))
-		for level := range snapshot {
-			levels = append(levels, level)
-		}
-		sort.Ints(levels)
-
-		// 按级别从小到大分批执行：同级别内 handler 并发执行，级别间串行等待
-		for _, level := range levels {
-			handlers := snapshot[level]
-			wg := sync.WaitGroup{}
-			for _, handler := range handlers {
-				wg.Add(1)
-				h := handler // Go 1.22+ 循环变量自动独立，此处显式捕获以兼容旧版本阅读习惯
-				go func() {
-					defer wg.Done()
-					defer func() {
-						if panicErr := recover(); panicErr != nil {
-							slog.Default().Error("退出处理函数运行时发生 panic", "level", level, "panicErr", panicErr)
-						}
-					}()
-					h(sig)
-				}()
-			}
-			// 等待当前级别所有 handler 执行完毕，再进入下一级别
-			wg.Wait()
-		}
-
-		// 步骤 3：关闭 waitChan，解除 Listen 的阻塞
-		close(waitChan)
+		executeShutdown(sig)
 	})
+}
+
+// executeShutdown 是退出流程的实际执行逻辑，不依赖 sync.Once，可被测试直接调用。
+// 参数 sig 为触发退出的信号：OS 信号到达时传入具体信号值，[Shutdown] 调用时传入 nil。
+func executeShutdown(sig os.Signal) {
+	// 步骤 1：先取消全局上下文，通知所有业务协程准备退出
+	cancel()
+
+	// 步骤 2：按 level 升序分批执行 handler
+	// 先快照 handler 映射（持读锁），释放锁后再执行，避免长时间持锁
+	signalHandlerMux.RLock()
+	snapshot := make(map[int][]SigHandler, len(signalHandlerMap))
+	for level, handlers := range signalHandlerMap {
+		snapshot[level] = handlers
+	}
+	signalHandlerMux.RUnlock()
+
+	// 收集所有级别并升序排序
+	levels := make([]int, 0, len(snapshot))
+	for level := range snapshot {
+		levels = append(levels, level)
+	}
+	sort.Ints(levels)
+
+	// 按级别从小到大分批执行：同级别内 handler 并发执行，级别间串行等待
+	for _, level := range levels {
+		handlers := snapshot[level]
+		wg := sync.WaitGroup{}
+		for _, handler := range handlers {
+			wg.Add(1)
+			h := handler // Go 1.22+ 循环变量自动独立，此处显式捕获以兼容旧版本阅读习惯
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if panicErr := recover(); panicErr != nil {
+						slog.Default().Error("退出处理函数运行时发生 panic", "level", level, "panicErr", panicErr)
+					}
+				}()
+				h(sig)
+			}()
+		}
+		// 等待当前级别所有 handler 执行完毕，再进入下一级别
+		wg.Wait()
+	}
+
+	// 步骤 3：关闭 waitChan，解除 Listen 的阻塞
+	close(waitChan)
 }
 
 // doListen 通过 sync.Once 确保 listen goroutine 只启动一次。

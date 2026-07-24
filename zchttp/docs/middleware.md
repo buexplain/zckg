@@ -53,7 +53,7 @@ Middleware A ── 前置逻辑
 响应返回
 ```
 
-该链由 `runChain` 递归构建：`middlewares[0]` 在最外层，`finalHandler`（handler 调用）在最内层。
+该链由 `runChain` 递归构建：`middlewares[0]` 在最外层，`finalHandler`（handler 调用）在最内层。每层的 `next` 仅允许调用一次，重复调用不会重新执行下游链与 handler，而是直接返回 `ErrNextCalledMultipleTimes`，避免业务副作用被重复触发。
 
 ## 三、短路控制
 
@@ -88,7 +88,7 @@ func authMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request,
 }
 ```
 
-> 此时 Req 已完成数据绑定但尚未做参数校验（required / Validate），校验在 core 层执行。若绑定阶段出错，`BoundReqFromContext` 会返回 `*BindingError`。
+> 此时 Req 已完成数据绑定但尚未做参数校验（nonzero / Validate），校验在 core 层执行。若绑定阶段出错，`BoundReqFromContext` 会返回 `*BindingError`。
 
 ### 在中间件中获取 handler 的响应 Res
 
@@ -128,7 +128,8 @@ func recoverError(ctx context.Context, w http.ResponseWriter, r *http.Request, n
 `HttpEngine.ServeHTTP` 内置 `defer recover`，捕获 handler 或中间件中的 panic，交由 `OnPanic` 回调处理（默认 `DefaultPanicHandler`）。中间件无需自行处理 panic，引擎层已覆盖：
 
 ```go
-// 默认 panic 处理：输出 slog.Error + 堆栈，返回 500 错误
+// 默认 panic 处理：输出 slog.Error + 堆栈，返回 500 错误；
+// 若响应已写入（IsResponseWritten）则跳过，避免重复写头；支持 HTML 格式（WantHtml）
 DefaultPanicHandler(w, r, recovered)
 ```
 

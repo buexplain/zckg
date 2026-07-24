@@ -1,6 +1,6 @@
-# 请求结构体（Req）定义与校验规则
+# 请求结构体（Req）定义与标签
 
-本文档介绍 handler 的请求结构体（`Req`）如何定义、支持哪些标签，以及绑定完成后的校验规则。参数绑定的来源与类型转换细节见 `parameter-binding.md`；本文聚焦结构体定义与校验。相关实现位于 `binding.go` 与 `buildEntry.go`。
+本文档介绍 handler 的请求结构体（`Req`）如何定义、支持哪些标签。参数绑定的来源与类型转换细节见 `parameter-binding.md`；校验规则见 `parameter-validate.md`。相关实现位于 `binding.go` 与 `buildEntry.go`。
 
 ## 一、handler 签名与 Req 形态
 
@@ -16,7 +16,7 @@ func(ctx context.Context, req Req) (Res, error)
 
 ```go
 type CreateUserReq struct {
-    Name string `json:"name" required:"true"`
+    Name string `json:"name" nonzero:"true"`
     Age  *int   `json:"age"`
 }
 
@@ -33,163 +33,292 @@ func CreateUser(ctx context.Context, req CreateUserReq) (CreateUserRes, error) {
 | `default` | 默认值 | 仅对标量类型（及其切片/指针）生效；注册阶段预填充到模板，详见 `parameter-binding.md` |
 | `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，详见 `parameter-binding.md` |
 | `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`；解析失败降级并输出 `slog.Warn` |
-| `required` | 必填校验 | `"true"` 必填、`"false"` 可选，参与运行时非零值校验与 OpenAPI 文档 |
+| `nonzero` | 非零值校验 | `"true"` 校验非零值、`"false"` 不校验；详见 `parameter-validate.md` |
 | `ignore` | 文档排除 | `ignore:"true"` 仅将字段从 OpenAPI 文档中排除，不影响绑定与校验 |
 | `example` / `description` | 文档信息 | 仅用于 OpenAPI 文档生成，详见 `openapi.md` |
 
 此外，可在 `Req` 中嵌入 `zchttp.OpenAPIMeta` 声明操作级元信息（`tags`/`summary`/`description`），它是空结构体，不参与绑定与校验，详见 `openapi.md`。
 
-```go
-type ListUserReq struct {
-    zchttp.OpenAPIMeta `tags:"User/Account" summary:"用户列表"`
-    Keyword string `json:"keyword" default:"" description:"搜索关键字"`
-    Page    int    `json:"page" default:"1"`
-    Status  string `json:"status" required:"true"`
-    secret  string // 未导出，跳过
-}
-```
+## 三、标签示例
 
-### default 标签支持范围
+### `json` — 绑定名 / 序列化名
 
-`default` 标签（由 `isDefaultSupported` 判定）仅对以下类型生效：
-
-- 标量：`string`、`bool`、`int`/`int8`/`int16`/`int32`/`int64`、`uint`/`uint8`/`uint16`/`uint32`/`uint64`、`float32`/`float64`
-- 标量的切片：`[]string`、`[]int` 等
-- 标量的指针：`*string`、`*int` 等
-
-以下类型设置 `default` 标签无效（标签值被忽略，不会参与模板预填充与 OpenAPI schema 生成）：
-
-- `struct`、`*struct`、`[]struct`、`[]*struct`
-- `map[K]V`、`*map[K]V`
-- 任意非标量的指针/切片/数组
-
-## 三、必填校验（required）
-
-必填判定在注册阶段由 `buildStructMeta` 一次性计算并存入 `fieldMeta.required`，运行时 `validateRequired` 和 OpenAPI 文档生成均直接读取该预计算结果，两者天然一致。注意：`buildStructMeta` 仅计算当前结构体的顶层字段（`indices` 为单层），嵌套结构体的 meta 在递归校验时按需现场计算。
-
-判定优先级如下：
-
-1. 字段带 `default` 标签且类型支持 default（`isDefaultSupported`）→ **可选**（有默认值即非必填，优先级最高）。
-2. 否则带 `required` 标签：`required:"true"` → **必填**；`required:"false"` → **可选**。
-3. 否则（未标注 `required`）→ **可选**（不做类型推断）。
-
-### 递归校验
-
-`validateRequired` 会递归进入嵌套结构体和结构体指针字段，遍历整棵结构体树校验所有 `required:"true"` 字段。规则如下：
-
-| 本级字段 | 零值 | 行为 |
-|---------|------|------|
-| `required:"true"` | 是 | 报错 `"is required"`，不递归 |
-| `required:"true"` | 否 | 校验通过，若为嵌套结构体/指针则递归进入子字段 |
-| 未标注 `required` | 是 | 跳过，不报错，不递归 |
-| 未标注 `required` | 否 | 不报本级，但若为嵌套结构体/指针则递归进入子字段 |
-
-典型场景——收货地址必填，发票选填但填了就必须校验抬头和金额：
+绑定名解析优先级：`form` > `json` > 字段名（取逗号前部分）。
 
 ```go
 type Req struct {
-    Name    string   `json:"name" required:"true"`
-    Addr    Address  `json:"addr" required:"true" description:"收货地址"`
-    Invoice *Invoice `json:"invoice" description:"发票，选填"`
+    UserName string `json:"user_name"` // 绑定名为 "user_name"
+    Email    string `json:"email,omitempty"` // 绑定名为 "email"（取逗号前部分）
 }
+```
 
+### `form` — 绑定名（优先级高于 `json`）
+
+常用于 query 参数或表单字段，当 `form` 与 `json` 同时存在时，`form` 优先。
+
+```go
+type Req struct {
+    Keyword string `json:"keyword" form:"q"` // 绑定名为 "q"（form 优先）
+    Page    int    `json:"page" form:"page"` // 绑定名为 "page"
+}
+```
+
+### `default` — 默认值
+
+为字段设置默认值，仅对标量类型（及其切片/指针）生效。默认值的填充分**两个阶段**：
+
+| 阶段 | 时机 | 填充范围 | 说明 |
+| --- | --- | --- | --- |
+| 注册阶段 | 路由注册时 | 所有零值字段 | 预填充到模板，作为每个请求的初始值 |
+| 请求阶段 | 参数绑定后 | 仅 nil 指针字段 | 补填绑定过程中动态创建的子元素中的默认值，值类型跳过以避免覆盖用户显式传入的零值 |
+
+#### 顶层字段
+
+顶层 Req 中的所有字段（无论值类型还是指针类型）均在**注册阶段**被填充到模板，请求时通过模板浅拷贝继承：
+
+```go
+type ListReq struct {
+    Page     int      `json:"page" default:"1"`          // 值类型：注册阶段填充 → 请求未传时为 1
+    Keyword  string   `json:"keyword" default:"all"`     // 值类型：注册阶段填充 → 请求未传时为 "all"
+    Sort     *string  `json:"sort" default:"created_at"` // 指针类型：注册阶段填充 → 请求未传时为 "created_at"
+    Tags     []string `json:"tags" default:"go,web"`     // 切片：逗号分隔，注册阶段填充
+}
+```
+
+#### 嵌套值结构（值嵌套 struct）
+
+值嵌套的 struct 在注册阶段已存在（非 nil），其内部字段可被注册阶段到达并填充：
+
+```go
 type Address struct {
-    City       string `json:"city" required:"true"`
-    PostalCode string `json:"postalCode" required:"true"`
-    Phone      string `json:"phone"`
+    City    string  `json:"city" default:"Beijing"`     // ✅ 值类型：注册阶段可到达 → 填充生效
+    Zip     *string `json:"zip" default:"100000"`       // ✅ 指针类型：注册阶段递归进入 Address 后填充 → 填充生效
 }
 
-type Invoice struct {
-    Header string `json:"header" required:"true" description:"抬头"`
-    Amount string `json:"amount" required:"true" description:"金额"`
-    Email  string `json:"email"`
+type CreateUserReq struct {
+    Name    string  `json:"name" nonzero:"true"`
+    Address Address `json:"address"`                    // 值嵌套：注册阶段 Address 已存在，递归可达
 }
+// City 未传 → "Beijing"，Zip 未传 → "100000"（均在注册阶段填充到模板）
 ```
 
-- `Addr` 为 required 且非零 → 递归校验 `City`、`PostalCode`。
-- `Invoice` 未标 required：`nil` → 跳过；非 `nil` → 递归校验 `Header`、`Amount`。
+#### 嵌套指针结构体（`*Struct`）
 
-递归过程通过 `visited map[uintptr]bool` 记录已访问的结构体指针，防止循环引用导致无限递归。
-
-### 零值判定与快速跳过
-
-运行时 `validateRequired` 遍历 `meta.fields`，零值判定使用 `reflect.Value.IsZero`：nil 指针/切片、空字符串、数字 0、bool false 等均视为零值。`structMeta.hasRequired` 标记是否存在 required 字段，若为 `false` 则直接跳过遍历，加速请求阶段校验。
-
-要点：
-
-- 校验仅针对显式 `required:"true"` 的字段，普通字段传零值不会报错。
-- `default` 与 `required:"true"` 同时出现时，注册阶段即判定为 `hasDefault=true`、`required=false`，避免「有默认值却又必填」的矛盾。
-- 嵌套结构体的 `required` 字段仅在**父字段非零**时才会被递归校验；父字段为零值时子字段的 required 被跳过。
-- 仅顶层 Req 的 `Validate()` 方法会被自动调用；嵌套结构体若需自定义校验逻辑，请在顶层 `Validate()` 中手动调用。
-
-## 四、自定义业务校验（Validate）
-
-声明式 `required` 只能表达单字段非零值。若需跨字段、业务规则等更丰富的校验，可让 `Req` 结构体实现 `Validator` 接口：
+指针嵌套的 struct 在注册阶段为 nil，其内部的**值类型字段**无法被注册阶段到达，default 不生效；**指针类型字段**在请求阶段绑定创建子结构体后可被补填：
 
 ```go
-type Validator interface {
-    Validate() error
+type Company struct {
+    Name    string  `json:"name" default:"Acme"`
+    Country *string `json:"country" default:"CN"`
 }
+
+type CreateUserReq struct {
+    Name    string   `json:"name" nonzero:"true"`
+    Company *Company `json:"company"`                   // 指针嵌套：注册阶段为 nil
+}
+// Company 未传 → Company 整体为 nil，Name/Country 均无默认值
+// Company 传了 {} → Name 为空字符串（default 不生效），Country 为 "CN"（指针补填生效）
+//
+// Name 为何不生效：请求阶段动态创建的结构体中，只有指针字段才能区分客户端是否传递（nil = 未传，非 nil = 已传），
+// 值类型字段无法区分“未传”与“显式传零值”，故请求阶段不填充值类型字段。
 ```
 
-绑定与 `required` 校验均通过后，若 `Req` 实现了该接口（值接收者或指针接收者均可），引擎会自动调用其 `Validate()`。注册阶段通过 `structMeta.implementsValidator` 预判断是否实现该接口，避免请求阶段重复反射：
+#### 切片 / Map 中的结构体元素
+
+切片和 Map 的元素是绑定阶段动态创建的，行为与指针嵌套类似——只有指针类型字段的 default 能在请求阶段补填：
 
 ```go
-type CreateEventReq struct {
-    Start int `json:"start" required:"true"`
-    End   int `json:"end" required:"true"`
+type Item struct {
+    Qty    *int    `json:"qty" default:"1"`             // ✅ 指针类型：请求阶段补填 → 生效
+    Status *string `json:"status" default:"active"`     // ✅ 指针类型：请求阶段补填 → 生效
+    Note   string  `json:"note" default:"none"`         // ❌ 值类型：动态创建的元素无法被注册阶段到达 → 不生效，在请求阶段无法区分零值 → 不生效
 }
 
-func (r CreateEventReq) Validate() error {
-    if r.Start >= r.End {
-        return &zchttp.ValidationError{Field: "end", Message: "must be greater than start"}
-    }
-    return nil
+type OrderReq struct {
+    OrderNo string             `json:"orderNo" nonzero:"true"`
+    Items   []Item             `json:"items"`           // 值元素切片
+    Extras  map[string]*Item   `json:"extras"`          // 指针元素 map
 }
+// Items[0] 传 {"qty":null,"status":null} → Qty=1, Status="active"（nil 指针被补填）
+// Items[0] 传 {} → Note 仍为空字符串（值类型 default 不生效）
 ```
 
-`Validate()` 返回值处理：
+#### 不支持的类型
 
-- 返回 `nil` → 校验通过；
-- 返回 `*ValidationError` → 直接透传（可携带 `Field` 等结构化信息）；
-- 返回其他普通 `error` → 自动兜底包装为 `*ValidationError`（保留原始错误链，`errors.Is/As` 可穿透）。
+以下类型的 `default` 标签值会被忽略（注册时会输出 `slog.Warn`）：`struct`、`*struct`、`[]struct`、`[]*struct`、`map[K]V`、`*map[K]V`、`time.Time`、任意非标量的指针/切片/数组。
 
-> `Validate()` 是运行时任意 Go 代码，不会被反射提取为 OpenAPI schema 约束，因此不影响生成的文档。
+#### 容器嵌套深度限制
 
-## 五、校验执行顺序与错误处理
+框架对**默认值填充**、**nonzero 校验**、**OpenAPI 文档生成**的支持范围不同，以下按容器类型分类说明：
 
-`ServeHTTP` 的执行流程分为两阶段：
+##### 支持的单层容器
 
-**阶段一：路由命中后立即绑定（`bindRequestData`）**
+| 容器类型 | 默认值填充 | nonzero 校验 | Schema 结构 | default 展示 | description/example | required 计算 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `[]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+| `[]*Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+| `map[K]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+| `map[K]*Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
 
-```
-浅拷贝模板（含默认值）→ 深拷贝引用字段 → 绑定（query/form/multipart/JSON）
-```
+##### 不支持的多层容器
 
-绑定完成后将 Req 注入 `ctx`，中间件可通过 `BoundReqFromContext` 提前检查。此时尚未做参数校验。若绑定失败，错误（`*BindingError`）随 Req 一同注入 ctx，core 层统一处理。
+| 容器类型 | 默认值填充 | nonzero 校验 | Schema 结构 | default 展示 | description/example | required 计算 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `[][]Struct` | ❌ 无法穿透第二层切片 | ❌ 无法穿透第二层切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
+| `[]map[K]Struct` | ❌ 无法穿透切片+map | ❌ 无法穿透切片+map | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
+| `map[K][]Struct` | ❌ 无法穿透 map+切片 | ❌ 无法穿透 map+切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
+| `map[K][]*Struct` | ❌ 无法穿透 map+切片 | ❌ 无法穿透 map+切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
+| `map[K]map[K]Struct` | ❌ 无法穿透 map+map | ❌ 无法穿透 map+map | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
 
-**阶段二：洋葱模型 core 层校验（`validateRequest`）**
+> ¹ 若该结构体类型同时被用在单层容器中，则 `default` 会展示（类型可达性是按类型标记的，非按路径）
 
-```
-validateRequired → validateCustom(Validate)
-```
+##### 指针包裹容器（与对应单层容器行为一致）
 
-所有中间件执行完毕后，core 层从 `ctx` 取出已绑定的 Req 进行校验。
+| 容器类型 | 默认值填充 | nonzero 校验 | Schema 结构 | default 展示 | description/example | required 计算 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `*[]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+| `*map[K]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
 
-任一校验失败都会产生 `*ValidationError`：
+> 指针本身不阻断可达性：`applyDefaults`、`validateNonzero` 与 OpenAPI 可达性分析均会穿透非 nil 指针，因此 `*[]Struct` 与 `[]Struct`、`*map[K]Struct` 与 `map[K]Struct` 的行为完全一致。
+
+##### 示例：多层容器的行为差异
 
 ```go
-type ValidationError struct {
-    Field   string // 校验失败的字段名（绑定名），业务校验可留空
-    Message string // 失败原因
-    Err     error  // 可选：包装底层错误，支持 errors.Is/As 穿透
+// 单层容器中的结构体
+type SingleItem struct {
+    Name     string `json:"name" nonzero:"true"`              // 必填字段
+    IsActive *bool  `json:"isActive" default:"true"`          // 指针字段有默认值
+}
+
+// 多层容器中的结构体（与 SingleItem 字段相同，但仅用于多层容器）
+type MultiItem struct {
+    Name     string `json:"name" nonzero:"true"`              // 必填字段
+    IsActive *bool  `json:"isActive" default:"true"`          // 指针字段有默认值
+}
+
+type Req struct {
+    // ✅ 单层容器：指针字段默认值生效，nonzero 校验生效
+    Items    []SingleItem           `json:"items"`             // 指针 default✅ nonzero✅
+    Extras   map[string]*SingleItem `json:"extras"`            // 指针 default✅ nonzero✅
+    
+    // ❌ 多层容器：默认值和校验均不生效
+    DeepMap  map[string][]MultiItem `json:"deepMap"`           // 指针 default❌ nonzero❌
+    Nested   [][]MultiItem          `json:"nested"`            // 指针 default❌ nonzero❌
 }
 ```
 
-`*BindingError`（绑定失败）与 `*ValidationError`（校验失败）在 `ServeHTTP` 中通过 `errors.As` 被识别，统一路由到 `OnValidationError` 回调（默认 `DefaultValidationErrorHandler`，返回 **400**）；其余非校验错误走 `OnError`（默认 **500**）。回调的自定义方式见 `http-engine-callback.md`。
+**行为说明：**
 
-## 六、相关文档
+- `Items[0].Name`（`SingleItem`）：nonzero 校验生效，空字符串会报错
+- `Items[0].IsActive`（`SingleItem`）：未传时自动填充 `true`（请求阶段补填 nil 指针）
+- `SingleItem` 的值类型字段（如 `Name`）即使带 `default` 也**不生效**（切片元素的值类型字段无法被注册阶段到达，请求阶段也不填充值类型）
+- `DeepMap["key"][0].Name`（`MultiItem`）：nonzero 校验**不生效**，空字符串不会报错（框架无法穿透 `map[K][]Struct`）
+- `DeepMap["key"][0].IsActive`（`MultiItem`）：未传时**不会**自动填充 `true`（框架无法穿透 `map[K][]Struct`）
+- OpenAPI 文档中 `SingleItem` 的 `IsActive` 的 `default` 值**展示**；`MultiItem` 的 `IsActive` 的 `default` 值**不展示**（因为框架知道该默认值无法生效）
+
+##### 启动期警告
+
+当检测到多层容器中的字段带有 `default` 标签时，框架会在启动时输出警告日志：
+
+```
+WARN default tag on pointer field in non-defaults-reachable struct, never applied
+  route=POST /api/create
+  handler=main.CreateHandler
+  struct=MultiItem
+  field=IsActive
+  type=*bool
+```
+
+该警告帮助开发者及时发现 `default` 标签配置错误（虽然 JSON 反序列化不受影响，但框架增强功能无法生效）。
+
+### `time_format` — 时间解析格式
+
+指定 `time.Time` 字段的解析格式。支持 `unix`/`unixmilli`/`unixmicro`/`unixnano` 或 Go layout 字符串。
+
+```go
+type Req struct {
+    CreatedAt time.Time `json:"created_at" time_format:"2006-01-02"`          // Go layout
+    Timestamp time.Time `json:"timestamp" time_format:"unix"`                 // Unix 秒级时间戳
+    Milli     time.Time `json:"milli" time_format:"unixmilli"`               // Unix 毫秒时间戳
+}
+```
+
+### `time_location` — 时间解析时区
+
+指定时间解析的时区，默认 `time.Local`。解析失败时降级为 `time.Local` 并输出 `slog.Warn`。
+
+```go
+type Req struct {
+    MeetingTime time.Time `json:"meeting_time" time_format:"2006-01-02 15:04" time_location:"Asia/Shanghai"`
+}
+```
+
+### `nonzero` — 非零值校验
+
+标记字段是否必须为非零值。`"true"` 表示校验，`"false"` 或不标注表示不校验。校验的详细规则（递归行为、与 `default` 的关系等）见 `parameter-validate.md`。
+
+```go
+type Req struct {
+    Name   string `json:"name" nonzero:"true"`   // 必填：空字符串会报错
+    Age    int    `json:"age" nonzero:"false"`   // 不校验：传 0 不报错
+    Email  string `json:"email"`                 // 不校验：未标注等同于 nonzero:"false"
+}
+```
+
+### `ignore` — 文档排除
+
+`ignore:"true"` 将字段从 OpenAPI 文档中排除，不影响绑定与校验。
+
+```go
+type Req struct {
+    Name   string `json:"name" nonzero:"true"`
+    Secret string `json:"secret" ignore:"true"` // 文档中不展示，但绑定与校验正常
+}
+```
+
+### `example` / `description` — 文档信息
+
+仅用于 OpenAPI 文档生成。`example` 按字段类型自动转换为对应的 JSON 类型。
+
+```go
+type Req struct {
+    Name  string `json:"name" nonzero:"true" description:"用户姓名" example:"张三"`
+    Age   int    `json:"age" description:"年龄" example:"25"`
+    Active bool  `json:"active" description:"是否激活" example:"true"`
+}
+```
+
+### `OpenAPIMeta` 嵌入 — 操作级元信息
+
+在 `Req` 中嵌入 `zchttp.OpenAPIMeta`，声明操作标签、摘要、描述。
+
+```go
+type ListUserReq struct {
+    zchttp.OpenAPIMeta `tags:"User/Account" summary:"用户列表" description:"分页查询用户"`
+    Keyword string `json:"keyword" default:"" description:"搜索关键字"`
+    Page    int    `json:"page" default:"1"`
+}
+```
+
+## 四、综合示例
+
+```go
+type CreateUserReq struct {
+    zchttp.OpenAPIMeta `tags:"User Management" summary:"创建用户" description:"创建一个新的用户账户"`
+
+    Name      string    `json:"name" nonzero:"true" description:"用户姓名" example:"张三"`
+    Email     string    `json:"email" nonzero:"true" description:"邮箱地址" example:"user@example.com"`
+    Age       *int      `json:"age" description:"年龄" example:"25"`
+    Status    string    `json:"status" default:"active" description:"账户状态"`
+    Tags      []string  `json:"tags" default:"new" description:"用户标签"`
+    Birthday  time.Time `json:"birthday" time_format:"2006-01-02" time_location:"Asia/Shanghai" description:"生日"`
+    Internal  string    `json:"internal" ignore:"true"` // 不参与文档
+}
+```
+
+## 五、相关文档
 
 - 参数绑定来源、字段类型、`time.Time` 解析、`default` 机制、文件上传：`parameter-binding.md`
+- 校验规则（`nonzero` 递归校验、`Validate()` 自定义校验、错误处理）：`parameter-validate.md`
 - OpenAPI 文档生成、`OpenAPIMeta`、字段级文档标签：`openapi.md`
 - 回调机制与错误分发、自定义响应/错误/校验失败处理：`http-engine-callback.md`

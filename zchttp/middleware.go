@@ -2,8 +2,14 @@ package zchttp
 
 import (
 	"context"
+	"errors"
 	"net/http"
 )
+
+// ErrNextCalledMultipleTimes 表示某个中间件对 next() 的调用超过一次。
+// 重复调用不会重新执行下游链与 handler，而是直接返回此错误，
+// 避免写库等业务副作用被静默重复触发。
+var ErrNextCalledMultipleTimes = errors.New("middleware next() called multiple times")
 
 // NextFunc 调用后继续执行下一层中间件，若当前已是最后一层则执行路由 handler
 // 返回值 error 为下游（后续中间件或 handler）产生的错误
@@ -25,12 +31,19 @@ type NextFunc func() error
 type MiddlewareHandler func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error
 
 // runChain 从外到内依次执行中间件，最内层执行 finalHandler
-// 这构成了洋葱模型：middlewares[0] 在最外层，finalHandler 在最内层
+// 这构成了洋葱模型：middlewares[0] 在最外层，finalHandler 在最内层。
+// 每层的 next 仅允许调用一次，重复调用返回 ErrNextCalledMultipleTimes，
+// 防止下游中间件与 handler 被重复执行。
 func runChain(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler func() error) error {
 	if len(middlewares) == 0 {
 		return finalHandler()
 	}
+	called := false
 	return middlewares[0](ctx, w, r, func() error {
+		if called {
+			return ErrNextCalledMultipleTimes
+		}
+		called = true
 		return runChain(middlewares[1:], ctx, w, r, finalHandler)
 	})
 }

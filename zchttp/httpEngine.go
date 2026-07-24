@@ -1,12 +1,14 @@
 package zchttp
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"reflect"
 	"runtime/debug"
@@ -167,6 +169,31 @@ func (w *responseWriter) Written() bool {
 	return w.written
 }
 
+// Flush 透传 http.Flusher，支持 SSE 等流式响应场景；底层不支持时静默忽略
+func (w *responseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		w.written = true
+		f.Flush()
+	}
+}
+
+// Hijack 透传 http.Hijacker，支持 WebSocket 等协议升级场景；底层不支持时返回错误
+func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		w.written = true
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// Push 透传 http.Pusher，支持 HTTP/2 服务端推送；底层不支持时返回 ErrNotSupported
+func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
+}
+
 func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 包装 ResponseWriter 以跟踪响应是否已被写入（提前包装，以便 panic 恢复时也能使用）
 	rw := &responseWriter{ResponseWriter: w}
@@ -224,11 +251,17 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 请求阶段重新应用默认值：补填 JSON/表单绑定后动态创建的子元素（切片/map/nested struct ptr）中的默认值。
 	// requestPhase=true：仅填充 nil 指针字段，值类型（int/string/bool）跳过以避免覆盖用户显式传入的零值。
-	_ = applyDefaults(reqPtr, entry.reqMeta, true)
+	// 仅当注册阶段预计算存在带 default 的指针字段时才执行，避免无意义的递归遍历。
+	if entry.needsRequestPhaseDefaults {
+		_ = applyDefaults(reqPtr, entry.reqMeta, true)
+	}
 
 	// 4. 将解析后的 Req 注入 ctx，供中间件与 core 层获取
 	//    （即使绑定失败也注入，中间件可通过 BoundReqFromContext 拿到错误）
 	ctx = withBoundReq(ctx, reqPtr.Interface())
+
+	// 将 Res 共享容器注入 ctx，使 core 层写入的 Res 对所有中间件层（包括后置阶段）可见
+	ctx = withBoundResContainer(ctx)
 
 	// 5. 洋葱模型核心层：参数校验 + 反射调用 handler
 	core := func() error {
@@ -264,8 +297,8 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return errVal.(error)
 		}
 
-		// 成功：将 Res 写入 ctx，再交由响应回调处理（默认 JSON，可自定义为文件等）
-		ctx = withBoundRes(ctx, results[0].Interface())
+		// 成功：将 Res 写入共享容器，再交由响应回调处理（默认 JSON，可自定义为文件等）
+		setBoundRes(ctx, results[0].Interface())
 		e.OnResponse(rw, r, results[0].Interface())
 		return nil
 	}

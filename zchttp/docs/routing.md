@@ -28,16 +28,23 @@ r.TRACE("/debug", traceHandler)
 
 路由匹配为**精确匹配**：请求先按 method 查表，再按归一化后的 `r.URL.Path` 精确查找，未命中则走 `OnNotFound`。
 
-### 路径末尾斜杠归一化（normalizePath）
+### 路径归一化（normalizePath）
 
-注册与匹配都会先经过 `normalizePath` 去除路径末尾的 `/`，使 `/hello` 与 `/hello/` 视为同一路由：
+注册与匹配都会先经过 `normalizePath` 对路径做两项规范化处理：
 
-- 非根路径去除末尾 `/`（如 `/hello/` → `/hello`、`/api/users/` → `/api/users`）。
-- 根路径 `/` 特殊保护，不会被裁剪为空串；空串也统一归一化为 `/`。
-- 归一化在两处生效：
-    - **注册时**（`register`）：`/hello` 与 `/hello/` 归一到同一 key，重复注册会正确触发冲突检测。
-    - **匹配时**（`ServeHTTP`）：请求 `/hello/` 能命中注册的 `/hello`。
-- 作用于**含分组前缀的完整路径**，如 `api.GET("/hello/")` 最终注册为 `/api/hello`。
+1. **补全前导 `/`**：若路径不以 `/` 开头则自动补上（如 `hello` → `/hello`），确保与 `r.URL.Path` 格式一致。
+2. **去除末尾 `/`**：非根路径去除末尾的 `/`（如 `/hello/` → `/hello`、`/api/users/` → `/api/users`），使 `/hello` 与 `/hello/` 视为同一路由。
+
+特殊路径处理：
+
+- 根路径 `/` 不会被裁剪为空串；空串也统一归一化为 `/`。
+
+归一化在两处生效：
+
+- **注册时**（`register`）：`/hello` 与 `/hello/` 归一到同一 key，重复注册会正确触发冲突检测。
+- **匹配时**（`ServeHTTP`）：请求 `/hello/` 能命中注册的 `/hello`。
+
+归一化作用于**含分组前缀的完整路径**，如 `api.GET("/hello/")` 最终注册为 `/api/hello`。
 
 ## 三、handler 签名约束
 
@@ -77,11 +84,12 @@ handler 注册时，`buildEntry` 会通过反射一次性预计算以下信息�
 
 - **handler 反射值**（`handlerVal`）：`reflect.ValueOf(handler)`，请求时直接 `Call` 调用，避免重复获取。
 - **Req/Res 类型信息**（`reqType`/`resType`/`reqElemType`/`reqIsPtr`/`resIsPtr`）：`reqElemType` 是解引用指针后的 Req 具体类型，用于 `reflect.New` 创建实例；`reqIsPtr`/`resIsPtr` 标记 handler 声明的是值还是指针，决定 core 层传入值还是传指针。
-- **Req/Res 元信息**（`reqMeta`/`resMeta`，类型 `structMeta`）：缓存 Req/Res 顶层字段的绑定名、`required` 判定、`default` 标签值、`time_format`/`time_location`、文件字段标记等，绑定、校验与 OpenAPI 生成阶段直接使用。嵌套结构体的 meta 不在注册阶段计算，由递归校验按需现场构建。
+- **Req/Res 元信息**（`reqMeta`/`resMeta`，类型 `structMeta`）：缓存 Req/Res 顶层字段的绑定名、`nonzero` 判定、`default` 标签值、`time_format`/`time_location`、文件字段标记等，绑定、校验与 OpenAPI 生成阶段直接使用。嵌套结构体的 meta 不在注册阶段计算，由递归校验按需现场构建。
 - **Req 模板**（`defaultReq`）：创建 Req 实例并通过 `applyDefaults` 初始化 `default` 标签字段（注册阶段：所有零值字段均填充）。请求阶段浅拷贝复用，绑定后再次调用 `applyDefaults(requestPhase=true)` 补填动态创建的子元素（slice/map/nested ptr）中的 nil 指针字段。详见[默认值机制](parameter-binding.md#六默认值机制)。
 - **操作级元信息**（`opMeta`，类型 `operationMeta`）：从 Req 嵌入的 `OpenAPIMeta` 中提取 `tags`/`summary`/`description`，供 OpenAPI 文档生成。
 - **中间件快照**（`middlewares`）：注册时将当前 `[全局中间件..., 分组中间件...]` 的副本固定到该路由条目，后续 `Use(...)` 不影响已注册路由。
 - **深拷贝标记**（`needsDeepCopy`）：若模板中存在非 nil 的指针/切片/map 字段，标记为需深拷贝，请求时对模板浅拷贝后通过 `deepCopyDefaults` 断开共享引用。
+- **请求阶段默认值标记**（`needsRequestPhaseDefaults`）：通过 `hasRequestPhaseDefaults` 扫描结构体树，判断是否存在带 `default` 的指针字段。仅当该标记为 `true` 时，请求阶段才执行 `applyDefaults(requestPhase=true)` 补填 nil 指针字段，避免无意义的递归遍历。
 - **handler 位置信息**（`handlerName`/`handlerFile`/`handlerLine`）：通过 `runtime.FuncForPC` 提取全限定函数名与定义位置，用于路由冲突提示与 OpenAPI 操作摘要。
 
 ## 四、路由冲突检测

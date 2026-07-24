@@ -18,28 +18,33 @@ type OpenAPIServer struct {
 
 // OpenAPIInfo 文档元信息，由调用方在生成时提供
 type OpenAPIInfo struct {
-	Title       string
-	Description string
-	Version     string
-	Servers     []OpenAPIServer
+	Title           string
+	Description     string
+	Version         string
+	Servers         []OpenAPIServer
+	ResponseWrapper any // 自定义响应包装结构体样例（如 MyResponse{}），为 nil 时使用默认 Response{data,code,message}
 }
 
 // openAPIGenerator 承载一次生成过程中的可复用状态
 type openAPIGenerator struct {
-	schemas         map[string]any          // components/schemas
-	typeNames       map[reflect.Type]string // 已注册类型 → schema 名，避免重复与循环递归
-	nameToType      map[string]reflect.Type // schema 名 → 类型，用于命名去重
-	reachedViaValue map[reflect.Type]bool   // struct 类型是否被"值嵌套"路径到达（含顶层）
-	currentType     reflect.Type            // 当前正在生成 schema 的 struct 类型（decorate 据此判断上下文）
+	schemas           map[string]any          // components/schemas
+	typeNames         map[reflect.Type]string // 已注册类型 → schema 名，避免重复与循环递归
+	nameToType        map[string]reflect.Type // schema 名 → 类型，用于命名去重
+	reachedViaValue   map[reflect.Type]bool   // struct 类型是否被"值嵌套"路径到达（含顶层）
+	reachedByDefaults map[reflect.Type]bool   // struct 类型是否可被 applyDefaults 递归到达
+	currentType       reflect.Type            // 当前正在生成 schema 的 struct 类型（decorate 据此判断上下文）
+	responseWrapper   any                     // 自定义响应包装结构体样例
 }
 
 // GenerateOpenAPI 遍历路由表，通过反射生成 OpenAPI 3.0 文档（map 形式，可序列化为 JSON）
 func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 	g := &openAPIGenerator{
-		schemas:         map[string]any{},
-		typeNames:       map[reflect.Type]string{},
-		nameToType:      map[string]reflect.Type{},
-		reachedViaValue: map[reflect.Type]bool{},
+		schemas:           map[string]any{},
+		typeNames:         map[reflect.Type]string{},
+		nameToType:        map[string]reflect.Type{},
+		reachedViaValue:   map[reflect.Type]bool{},
+		reachedByDefaults: map[reflect.Type]bool{},
+		responseWrapper:   info.ResponseWrapper,
 	}
 
 	// Pass 1：收集所有 struct 类型的嵌套上下文（值嵌套 vs 指针嵌套）。
@@ -47,6 +52,10 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 	// 指针嵌套（*Struct）→ 注册阶段无法到达，仅请求阶段 fill nil 指针。
 	// 此信息在 decorate 中判断值类型字段的 default 是否应展示。
 	g.collectTypeUsages(r)
+
+	// Pass 1b：收集所有 struct 类型是否可被 applyDefaults 递归到达。
+	// 指针字段的 default 仅在所属 struct 可被 defaults 到达时才展示。
+	g.collectDefaultsReachability(r)
 
 	paths := map[string]any{}
 	for method, routes := range r.routes {
@@ -153,8 +162,100 @@ func (g *openAPIGenerator) walkTypeUsage(t reflect.Type, viaValue bool, visiting
 			elem := ft.Elem()
 			if elem.Kind() == reflect.Ptr {
 				g.walkTypeUsage(elem.Elem(), false, visiting)
+			} else if elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array {
+				// map 值类型为切片/数组：穿透到元素类型
+				subElem := elem.Elem()
+				if subElem.Kind() == reflect.Ptr {
+					g.walkTypeUsage(subElem.Elem(), false, visiting)
+				} else {
+					g.walkTypeUsage(subElem, false, visiting)
+				}
 			} else {
 				g.walkTypeUsage(elem, false, visiting)
+			}
+		default:
+			// Interface / Func / Chan / UnsafePointer 等无法反射出 struct，无需处理
+		}
+	}
+}
+
+// collectDefaultsReachability 收集所有 struct 类型是否可被 applyDefaults 递归到达。
+// 与 collectTypeUsages 的区别：
+//   - collectTypeUsages 追踪"值嵌套"可达性（viaValue），仅值类型 default 展示依赖它
+//   - collectDefaultsReachability 追踪"默认值填充"可达性（viaDefaults），指针字段 default 展示依赖它
+//
+// 可达性规则（与 applyDefaultsWithVisiting 一致）：
+//   - 顶层 Req/Res：可达
+//   - 值类型 struct 字段：继承父级可达性
+//   - 指针字段（*Struct）：继承父级可达性（applyDefaults 可跟随非 nil 指针）
+//   - 切片/数组元素：继承父级可达性（applyDefaults 可遍历切片元素）
+//   - map 值类型为 Struct 或 *Struct：继承父级可达性
+//   - map 值类型为 Slice/Array：不可达（applyDefaults 无法穿透此类多层容器）
+func (g *openAPIGenerator) collectDefaultsReachability(r *Router) {
+	for _, routes := range r.routes {
+		for _, entry := range routes {
+			if entry.reqType != nil {
+				g.walkDefaultsReachability(derefType(entry.reqType), true, map[reflect.Type]bool{})
+			}
+			if entry.resType != nil {
+				g.walkDefaultsReachability(derefType(entry.resType), true, map[reflect.Type]bool{})
+			}
+		}
+	}
+}
+
+// walkDefaultsReachability 递归遍历类型树，标记 struct 类型是否可被 applyDefaults 到达。
+// viaDefaults 表示从顶层到当前类型路径上是否所有边都可通过 applyDefaults 穿透。
+// visiting 用于检测自引用循环，防止无限递归。
+func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults bool, visiting map[reflect.Type]bool) {
+	t = derefType(t)
+	if t.Kind() != reflect.Struct {
+		return
+	}
+	if viaDefaults {
+		g.reachedByDefaults[t] = true
+	}
+	// 自引用循环检测
+	if visiting[t] {
+		return
+	}
+	visiting[t] = true
+	defer delete(visiting, t)
+
+	meta := buildStructMeta(t)
+	for _, fm := range meta.fields {
+		f := t.Field(fm.indices[0])
+		ft := f.Type
+		switch ft.Kind() {
+		case reflect.Ptr:
+			// *Struct：applyDefaults 可跟随非 nil 指针，viaDefaults 不变
+			g.walkDefaultsReachability(ft.Elem(), viaDefaults, visiting)
+		case reflect.Struct:
+			// 值类型嵌套 struct：继承父级上下文
+			g.walkDefaultsReachability(ft, viaDefaults, visiting)
+		case reflect.Slice, reflect.Array:
+			// 切片/数组元素：applyDefaults 可遍历，viaDefaults 不变
+			elem := ft.Elem()
+			if elem.Kind() == reflect.Ptr {
+				g.walkDefaultsReachability(elem.Elem(), viaDefaults, visiting)
+			} else {
+				g.walkDefaultsReachability(elem, viaDefaults, visiting)
+			}
+		case reflect.Map:
+			// map 值类型为 Struct 或 *Struct：applyDefaults 可穿透，viaDefaults 不变
+			// map 值类型为 Slice/Array：applyDefaults 无法穿透，viaDefaults=false
+			elem := ft.Elem()
+			if elem.Kind() == reflect.Ptr {
+				g.walkDefaultsReachability(elem.Elem(), viaDefaults, visiting)
+			} else if elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array {
+				subElem := elem.Elem()
+				if subElem.Kind() == reflect.Ptr {
+					g.walkDefaultsReachability(subElem.Elem(), false, visiting)
+				} else {
+					g.walkDefaultsReachability(subElem, false, visiting)
+				}
+			} else {
+				g.walkDefaultsReachability(elem, viaDefaults, visiting)
 			}
 		default:
 			// Interface / Func / Chan / UnsafePointer 等无法反射出 struct，无需处理
@@ -206,11 +307,16 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry) map[
 }
 
 // buildQueryParams 为 GET/DELETE/HEAD 生成 query 参数列表。
-// meta 为注册阶段预计算的 structMeta，直接使用其字段名和 required 判定，避免重复反射遍历。
+// meta 为注册阶段预计算的 structMeta，直接使用其字段名和 nonzero+default 判定，避免重复反射遍历。
 func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMeta) []any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
 	}
+	// 设置当前类型上下文（与 registerStructSchema 一致），
+	// 否则 decorate 无法判定顶层 Req 的值类型字段 default 是否应展示
+	prevType := g.currentType
+	g.currentType = reqType
+	defer func() { g.currentType = prevType }()
 	var params []any
 	for _, fm := range meta.fields {
 		if fm.name == "" || fm.name == "-" {
@@ -223,7 +329,7 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 		params = append(params, map[string]any{
 			"name":     fm.name,
 			"in":       "query",
-			"required": fm.required,
+			"required": fm.nonzero && !fm.hasDefault,
 			"schema":   g.typeToSchema(f.Type, f),
 		})
 	}
@@ -231,7 +337,7 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 }
 
 // buildRequestBody 为携带请求体的方法生成 requestBody；含文件字段时使用 multipart/form-data。
-// meta 为注册阶段预计算的 structMeta，透传给 registerStructSchema 以复用 required 判定。
+// meta 为注册阶段预计算的 structMeta，透传给 registerStructSchema 以复用 nonzero+default 判定。
 func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMeta) map[string]any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
@@ -265,7 +371,8 @@ func (g *openAPIGenerator) buildResponses(resType reflect.Type, meta structMeta)
 	}
 }
 
-// wrapResponseSchema 将 Res 结构体包装进统一的 Response{data,code,message} 结构。
+// wrapResponseSchema 将 Res 结构体包装进统一的响应结构。
+// 若设置了 responseWrapper，则通过反射推导自定义包装 schema；否则使用默认 Response{data,code,message}。
 // meta 为注册阶段预计算的 Res 结构体的 structMeta。
 func (g *openAPIGenerator) wrapResponseSchema(resType reflect.Type, meta structMeta) map[string]any {
 	rt := derefType(resType)
@@ -276,7 +383,17 @@ func (g *openAPIGenerator) wrapResponseSchema(resType reflect.Type, meta structM
 	}
 	wrapName := "Response_" + resName
 	if _, ok := g.schemas[wrapName]; !ok {
-		g.schemas[wrapName] = map[string]any{
+		g.schemas[wrapName] = g.buildWrapperProperties(dataSchema)
+	}
+	return refSchema(wrapName)
+}
+
+// buildWrapperProperties 根据 responseWrapper 构建响应包装的 schema properties。
+// 若 responseWrapper 为 nil，返回默认 {data, code, message}；
+// 否则通过反射读取自定义结构体的 json 标签，将 any/interface{} 类型字段视为 data 占位符。
+func (g *openAPIGenerator) buildWrapperProperties(dataSchema map[string]any) map[string]any {
+	if g.responseWrapper == nil {
+		return map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"data":    dataSchema,
@@ -285,11 +402,56 @@ func (g *openAPIGenerator) wrapResponseSchema(resType reflect.Type, meta structM
 			},
 		}
 	}
-	return refSchema(wrapName)
+
+	wt := reflect.TypeOf(g.responseWrapper)
+	wt = derefType(wt)
+	if wt.Kind() != reflect.Struct {
+		return map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"data":    dataSchema,
+				"code":    map[string]any{"type": "integer"},
+				"message": map[string]any{"type": "string"},
+			},
+		}
+	}
+
+	props := map[string]any{}
+	for i := 0; i < wt.NumField(); i++ {
+		f := wt.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		jsonName := parseJSONName(f.Tag.Get("json"))
+		if jsonName == "" || jsonName == "-" {
+			continue
+		}
+		// any/interface{} 类型字段视为 data 占位符，替换为实际 Res schema
+		if f.Type.Kind() == reflect.Interface {
+			props[jsonName] = dataSchema
+		} else {
+			props[jsonName] = g.typeToSchema(f.Type, f)
+		}
+	}
+	return map[string]any{
+		"type":       "object",
+		"properties": props,
+	}
+}
+
+// parseJSONName 从 json 标签中提取字段名（去掉 omitempty 等选项）
+func parseJSONName(tag string) string {
+	if tag == "" {
+		return ""
+	}
+	if idx := strings.Index(tag, ","); idx != -1 {
+		return tag[:idx]
+	}
+	return tag
 }
 
 // registerStructSchema 将结构体注册到 components/schemas 并返回 $ref 引用。
-// meta 为 structMeta（来自 routeEntry 或 buildStructMeta 现算），提供字段名和 required 判定。
+// meta 为 structMeta（来自 routeEntry 或 buildStructMeta 现算），提供字段名和 nonzero+default 判定。
 func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta) map[string]any {
 	t = derefType(t)
 	if t.Kind() != reflect.Struct {
@@ -320,7 +482,7 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta)
 			continue
 		}
 		props[fm.name] = g.typeToSchema(f.Type, f)
-		if fm.required {
+		if fm.nonzero && !fm.hasDefault {
 			required = append(required, fm.name)
 		}
 	}
@@ -415,16 +577,23 @@ func (g *openAPIGenerator) timeSchema(field reflect.StructField) map[string]any 
 //   - 请求阶段（post-bind）：仅 nil 指针字段被填充，值类型跳过
 //
 // 因此：
-//   - 指针类型（*int/*string 等）：请求阶段可靠填充 → 始终展示 default
+//   - 指针类型（*int/*string 等）：仅当所属 struct 可被 applyDefaults 到达时展示 default
+//     （reachedByDefaults 追踪，与 applyDefaultsWithVisiting 可达性一致）
 //   - 值类型（int/string 等）：仅当所属 struct 被"值嵌套"到达时才展示 default（注册阶段可靠）
 func (g *openAPIGenerator) decorate(schema map[string]any, field reflect.StructField) map[string]any {
 	if field.Tag == "" {
 		return schema
 	}
 	if def, ok := field.Tag.Lookup("default"); ok && isDefaultSupported(field.Type) {
-		// 指针类型：请求阶段 fill nil 指针 → 始终展示
+		// 指针类型：请求阶段 fill nil 指针 → 仅当所属 struct 可被 defaults 到达时展示
 		// 值类型：仅当所属 struct 被值嵌套到达（注册阶段 fill）才展示
-		if field.Type.Kind() == reflect.Ptr || g.reachedViaValue[g.currentType] {
+		showDefault := false
+		if field.Type.Kind() == reflect.Ptr {
+			showDefault = g.reachedByDefaults[g.currentType]
+		} else {
+			showDefault = g.reachedViaValue[g.currentType]
+		}
+		if showDefault {
 			schema["default"] = coerceExample(schema, def)
 		}
 	}
@@ -507,9 +676,10 @@ func (g *openAPIGenerator) uniqueName(t reflect.Type) string {
 	}
 }
 
-// derefType 解引用指针类型直到得到非指针类型
+// derefType 解引用指针类型直到得到非指针类型；
+// 带深度上限，防自引用指针类型（如 type P *P）死循环，超限时原样返回
 func derefType(t reflect.Type) reflect.Type {
-	for t.Kind() == reflect.Ptr {
+	for i := 0; t.Kind() == reflect.Ptr && i < maxPtrDerefDepth; i++ {
 		t = t.Elem()
 	}
 	return t

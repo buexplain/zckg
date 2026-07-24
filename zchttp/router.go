@@ -55,7 +55,7 @@ func (r *Router) register(method, path string, handler any, groupMiddlewares []M
 	}
 
 	// 注册阶段扫描 Req 类型树，检测 default 标签误用（包含路由信息以便定位）
-	checkUnsupportedDefaults(entry.reqElemType, true, method, path, entry.handlerName, entry.handlerFile, entry.handlerLine, map[reflect.Type]bool{})
+	checkUnsupportedDefaults(entry.reqElemType, true, true, method, path, entry.handlerName, entry.handlerFile, entry.handlerLine, map[reflect.Type]bool{})
 
 	if existing, ok := r.routes[method][path]; ok {
 		panic(fmt.Sprintf(
@@ -180,9 +180,13 @@ func normalizePrefix(p string) string {
 	return p
 }
 
-// normalizePath 规范化路由路径：去除末尾的 "/"（如 /hello/ -> /hello），
+// normalizePath 规范化路由路径：补全前导的 "/"（r.URL.Path 永远以 "/" 开头，
+// 不补全会导致路由永不命中），并去除末尾的 "/"（如 /hello/ -> /hello），
 // 使 /hello 与 /hello/ 等价；根路径 "/" 与空串统一返回 "/"
 func normalizePath(p string) string {
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
 	if len(p) > 1 {
 		p = strings.TrimRight(p, "/")
 	}

@@ -48,7 +48,7 @@ func (b *Builder) SelectRaw(expression string) *Builder {
 	return b
 }
 
-// SelectSub 添加一个子查询作为 SELECT 列。
+// SelectSubquery 添加一个子查询作为 SELECT 列。
 func (b *Builder) SelectSubquery(sub *Builder, alias string) *Builder {
 	b.selectSubs = append(b.selectSubs, SelectSub{Query: sub, Alias: alias})
 	return b
