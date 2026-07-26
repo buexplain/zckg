@@ -1,7 +1,8 @@
 package zcdb
 
 import (
-	"database/sql"
+	"context"
+	"fmt"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -11,48 +12,55 @@ import (
 
 // openMySQLTestDB 打开 MySQL 连接，自动创建测试数据库（若不存在），然后清理并重建 users/orders 相关表，保证测试隔离。
 // docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
-func openMySQLTestDB(t *testing.T) *sql.DB {
+func openMySQLTestDB(t *testing.T) *DBDao {
 	t.Helper()
-	dsn := "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local"
-	db, err := sql.Open("mysql", dsn)
+	pool, err := NewPool(PoolConfig{
+		DriverName: "mysql",
+		DSN:        "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local",
+	})
 	if err != nil {
 		t.Fatalf("failed to open mysql: %v", err)
 	}
-	if err := db.Ping(); err != nil {
+	dao, err := NewDBDao(pool, "mysql", nil)
+	if err != nil {
+		t.Fatalf("failed to open mysql: %v", err)
+	}
+	if err := dao.Pool().Ping(context.Background()); err != nil {
 		t.Fatalf("failed to ping mysql: %v", err)
 	}
+
 	// 创建测试数据库（若不存在）并切换
-	_, err = db.Exec("CREATE DATABASE IF NOT EXISTS `zckg_test_integ` DEFAULT CHARACTER SET utf8mb4")
+	_, err = dao.Exec(context.Background(), "CREATE DATABASE IF NOT EXISTS `zckg_test_integ` DEFAULT CHARACTER SET utf8mb4")
 	if err != nil {
 		t.Fatalf("failed to create database: %v", err)
 	}
-	_, err = db.Exec("USE `zckg_test_integ`")
+	_, err = dao.Exec(context.Background(), "USE `zckg_test_integ`")
 	if err != nil {
 		t.Fatalf("failed to use database: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = dao.Close() })
 	// 清理旧表
-	dropMySQLTables(t, db)
-	return db
+	dropMySQLTables(t, dao)
+	return dao
 }
 
 // dropMySQLTables 清除所有测试用表
-func dropMySQLTables(t *testing.T, db *sql.DB) {
+func dropMySQLTables(t *testing.T, db *DBDao) {
 	t.Helper()
-	tables := []string{"users_archive", "orders", "users"}
+	tables := []string{"users_archive", "profiles", "orders", "users"}
 	for _, table := range tables {
-		_, _ = db.Exec("DROP TABLE IF EXISTS `" + table + "`")
+		_, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS `"+table+"`")
 	}
 }
 
 // setupMySQLUsersTable 创建 MySQL 版 users 表并预填 5 条数据。
-func setupMySQLUsersTable(t *testing.T, db *sql.DB) {
+func setupMySQLUsersTable(t *testing.T, db *DBDao) {
 	t.Helper()
 	mustExec(t, db, `CREATE TABLE users (
 		id     BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name   VARCHAR(64) NOT NULL,
 		age    INT NULL,
-		email  VARCHAR(128) NOT NULL,
+		email  VARCHAR(128) NULL,
 		status VARCHAR(16) NOT NULL DEFAULT 'active',
 		UNIQUE KEY uk_email (email)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
@@ -65,7 +73,7 @@ func setupMySQLUsersTable(t *testing.T, db *sql.DB) {
 }
 
 // setupMySQLOrdersTable 创建 MySQL 版 orders 表并预填数据。
-func setupMySQLOrdersTable(t *testing.T, db *sql.DB) {
+func setupMySQLOrdersTable(t *testing.T, db *DBDao) {
 	t.Helper()
 	mustExec(t, db, `CREATE TABLE orders (
 		id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -83,9 +91,20 @@ func setupMySQLOrdersTable(t *testing.T, db *sql.DB) {
 		(4, 150.00, 'Camera')`)
 }
 
-// newMySQLBuilder 创建使用 MySQLGrammar 的 Builder。
-func newMySQLBuilder() *Builder {
-	return NewBuilder(NewMySQLGrammar())
+// setupMySQLProfilesTable 创建 MySQL 版 profiles 表并预填数据。
+func setupMySQLProfilesTable(t *testing.T, db *DBDao) {
+	t.Helper()
+	mustExec(t, db, `CREATE TABLE profiles (
+		id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		user_id BIGINT UNSIGNED NOT NULL,
+		bio     TEXT,
+		active  BIGINT UNSIGNED DEFAULT 1,
+		KEY idx_user (user_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	mustExec(t, db, `INSERT INTO profiles (user_id, bio, active) VALUES
+		(1, 'Alice bio', 99),
+		(2, 'Bob bio', 99),
+		(3, 'Charlie bio', 99)`)
 }
 
 // ==================== Group 1: INSERT ====================
@@ -94,22 +113,16 @@ func newMySQLBuilder() *Builder {
 func TestMySQLInteg_InsertSingle(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
-
 	type insertData struct {
 		Name  string `db:"name"`
 		Age   int    `db:"age"`
 		Email string `db:"email"`
 	}
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		ToInsert(insertData{Name: "frank", Age: 40, Email: "frank@test.com"})
+	_, err := db.Builder().Table("users").Insert(context.Background(), insertData{Name: "frank", Age: 40, Email: "frank@test.com"})
 	if err != nil {
-		t.Fatalf("ToInsert error: %v", err)
+		t.Fatalf("Insert error: %v", err)
 	}
-
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name = 'frank'")
+	count, _ := db.Builder().Table("users").Where("name", "=", "frank").Count(context.Background())
 	if count != 1 {
 		t.Errorf("expected 1 row for frank, got %d", count)
 	}
@@ -129,18 +142,44 @@ func TestMySQLInteg_InsertBatch(t *testing.T) {
 		{Name: "frank", Age: 40, Email: "frank@test.com"},
 		{Name: "grace", Age: 22, Email: "grace@test.com"},
 	}
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		ToInsert(data)
+	_, err := db.Builder().Table("users").Insert(context.Background(), data)
 	if err != nil {
-		t.Fatalf("ToInsert error: %v", err)
+		t.Fatalf("Insert error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name IN ('frank', 'grace')")
+	count, _ := db.Builder().Table("users").WhereIn("name", []any{"frank", "grace"}).Count(context.Background())
 	if count != 2 {
 		t.Errorf("expected 2 rows, got %d", count)
+	}
+}
+
+// TestMySQLInteg_InsertPartial 验证指针字段部分插入：nil 指针字段不参与 INSERT，对应列使用数据库默认值。
+func TestMySQLInteg_InsertPartial(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type insertData struct {
+		Name   *string `db:"name"`
+		Age    *int    `db:"age"`
+		Email  *string `db:"email"`
+		Status *string `db:"status"`
+	}
+	name := "frank"
+	age := 40
+	email := "frank@test.com"
+	// Status 为 nil，应被跳过，使用数据库默认值 'active'
+	_, err := db.Builder().Table("users").Insert(context.Background(), insertData{Name: &name, Age: &age, Email: &email})
+	if err != nil {
+		t.Fatalf("Insert error: %v", err)
+	}
+
+	type row struct {
+		Status string `db:"status"`
+	}
+	var rows []row
+	_ = db.Builder().Table("users").Select("status").Where("name", "=", "frank").Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Status != "active" {
+		t.Errorf("expected default status 'active', got %v", rows)
 	}
 }
 
@@ -156,21 +195,68 @@ func TestMySQLInteg_InsertPtrPartial(t *testing.T) {
 	}
 	name := "frank"
 	email := "frank@test.com"
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		ToInsert(insertPtrData{Name: &name, Email: &email})
+	_, err := db.Builder().Table("users").Insert(context.Background(), insertPtrData{Name: &name, Email: &email})
 	if err != nil {
-		t.Fatalf("ToInsert error: %v", err)
+		t.Fatalf("Insert error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	var age sql.NullInt64
-	if err := db.QueryRow("SELECT age FROM users WHERE name = 'frank'").Scan(&age); err != nil {
+	var age *int
+	err = db.Builder().Table("users").Select("age").Where("name", "=", "frank").Value(context.Background(), &age)
+	if err != nil {
 		t.Fatalf("query error: %v", err)
 	}
-	if age.Valid {
-		t.Errorf("expected NULL age, got %d", age.Int64)
+	if age != nil {
+		t.Errorf("expected NULL age, got %d", *age)
+	}
+}
+
+// TestMySQLInteg_InsertPtrAllNil 验证全 nil 指针插入：所有指针字段均为 nil 时返回 ErrNoFields 错误。
+func TestMySQLInteg_InsertPtrAllNil(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type insertPtrData struct {
+		Name  *string `db:"name"`
+		Age   *int    `db:"age"`
+		Email *string `db:"email"`
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), insertPtrData{})
+	if err == nil {
+		t.Fatalf("expected error for all-nil insert, got nil")
+	}
+}
+
+// TestMySQLInteg_InsertBatchPtr 验证指针字段批量插入：以首行确定列，后续行 nil 字段传入 nil。
+func TestMySQLInteg_InsertBatchPtr(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type insertPtrData struct {
+		Name  *string `db:"name"`
+		Age   *int    `db:"age"`
+		Email *string `db:"email"`
+	}
+	n1, e1 := "frank", "frank@test.com"
+	a1 := 40
+	n2 := "grace"
+	a2 := 22
+	data := []insertPtrData{
+		{Name: &n1, Age: &a1, Email: &e1},
+		{Name: &n2, Age: &a2},
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), data)
+	if err != nil {
+		t.Fatalf("Insert error: %v", err)
+	}
+
+	// grace 的 email 应为 NULL
+	var email *string
+	err = db.Builder().Table("users").Select("email").Where("name", "=", "grace").Value(context.Background(), &email)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if email != nil {
+		t.Errorf("expected NULL email for grace, got %s", *email)
 	}
 }
 
@@ -184,20 +270,16 @@ func TestMySQLInteg_InsertOrIgnore(t *testing.T) {
 		Age   int    `db:"age"`
 		Email string `db:"email"`
 	}
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		ToInsertOrIgnore(insertData{Name: "alice_dup", Age: 99, Email: "alice@test.com"})
+	_, err := db.Builder().Table("users").InsertOrIgnore(context.Background(), insertData{Name: "alice_dup", Age: 99, Email: "alice@test.com"})
 	if err != nil {
-		t.Fatalf("ToInsertOrIgnore error: %v", err)
+		t.Fatalf("InsertOrIgnore error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name = 'alice_dup'")
+	count, _ := db.Builder().Table("users").Where("name", "=", "alice_dup").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 rows for alice_dup (ignored), got %d", count)
 	}
-	total := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	total, _ := db.Builder().Table("users").Count(context.Background())
 	if total != 5 {
 		t.Errorf("expected 5 total users, got %d", total)
 	}
@@ -210,25 +292,16 @@ func TestMySQLInteg_SelectAll(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Id int `db:"id"`
 	}
-
-	rows, err := db.Query(sqlStr, args...)
+	var rows []row
+	err := db.Builder().Table("users").Find(context.Background(), &rows)
 	if err != nil {
 		t.Fatalf("query error: %v", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	count := 0
-	for rows.Next() {
-		count++
-	}
-	if count != 5 {
-		t.Errorf("expected 5 rows, got %d", count)
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows))
 	}
 }
 
@@ -237,22 +310,17 @@ func TestMySQLInteg_SelectColumns(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name", "age").
-		Where("id", "=", 1).
-		ToSelect()
+	type row struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name", "age").Where("id", "=", 1).Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	var name string
-	var age int
-	if err := db.QueryRow(sqlStr, args...).Scan(&name, &age); err != nil {
-		t.Fatalf("scan error: %v", err)
-	}
-	if name != "alice" || age != 25 {
-		t.Errorf("expected alice/25, got %s/%d", name, age)
+	if len(rows) != 1 || rows[0].Name != "alice" || rows[0].Age != 25 {
+		t.Errorf("expected alice/25, got %v", rows)
 	}
 }
 
@@ -261,18 +329,16 @@ func TestMySQLInteg_SelectDistinct(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("status").
-		Distinct().
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Status string `db:"status"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 {
-		t.Errorf("expected 2 distinct statuses, got %d: %v", len(results), results)
+	var rows []row
+	err := db.Builder().Table("users").Select("status").Distinct().Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("expected 2 distinct statuses, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -281,18 +347,39 @@ func TestMySQLInteg_SelectWhereBasic(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		Where("age", "=", 25).
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").Where("age", "=", 25).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" {
+		t.Errorf("expected [alice], got %v", rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 1 || results[0] != "alice" {
-		t.Errorf("expected [alice], got %v", results)
+// TestMySQLInteg_SelectWithWhere 验证多条件 AND WHERE 组合。
+func TestMySQLInteg_SelectWithWhere(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		Where("age", ">", 20).
+		Where("status", "=", "active").
+		OrderBy("age", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// alice(25,active), bob(30,active), diana(28,active) → 3 rows
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -301,20 +388,20 @@ func TestMySQLInteg_SelectWhereOr(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		Where("age", "=", 25).
 		OrWhere("age", "=", 30).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 || results[0] != "alice" || results[1] != "bob" {
-		t.Errorf("expected [alice, bob], got %v", results)
+	if len(rows) != 2 || rows[0].Name != "alice" || rows[1].Name != "bob" {
+		t.Errorf("expected [alice, bob], got %v", rows)
 	}
 }
 
@@ -323,19 +410,19 @@ func TestMySQLInteg_SelectWhereIn(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereIn("id", []any{1, 3, 5}).
 		OrderBy("id", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 rows, got %d: %v", len(results), results)
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -344,19 +431,19 @@ func TestMySQLInteg_SelectWhereNotIn(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereNotIn("id", []any{1, 2}).
 		OrderBy("id", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 rows, got %d: %v", len(results), results)
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -367,18 +454,16 @@ func TestMySQLInteg_SelectWhereNull(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		WhereNull("age").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 1 || results[0] != "eve" {
-		t.Errorf("expected [eve], got %v", results)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNull("age").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "eve" {
+		t.Errorf("expected [eve], got %v", rows)
 	}
 }
 
@@ -387,19 +472,16 @@ func TestMySQLInteg_SelectWhereNotNull(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		WhereNotNull("age").
-		OrderBy("id", "ASC").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 4 {
-		t.Errorf("expected 4 rows, got %d", len(results))
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNotNull("age").OrderBy("id", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d", len(rows))
 	}
 }
 
@@ -408,19 +490,16 @@ func TestMySQLInteg_SelectWhereBetween(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		WhereBetween("age", 25, 30).
-		OrderBy("age", "ASC").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 rows, got %d: %v", len(results), results)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereBetween("age", 25, 30).OrderBy("age", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -429,18 +508,16 @@ func TestMySQLInteg_SelectWhereNotBetween(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		WhereNotBetween("age", 25, 30).
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 1 || results[0] != "charlie" {
-		t.Errorf("expected [charlie], got %v", results)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNotBetween("age", 25, 30).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "charlie" {
+		t.Errorf("expected [charlie], got %v", rows)
 	}
 }
 
@@ -449,24 +526,24 @@ func TestMySQLInteg_SelectWhereNested(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereNested(func(b *Builder) {
 			b.Where("age", ">", 25).Where("status", "=", "active")
 		}).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 {
-		t.Errorf("expected 2 rows, got %d: %v", len(results), results)
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rows, got %d: %v", len(rows), rows)
 	}
-	if results[0] != "diana" || results[1] != "bob" {
-		t.Errorf("expected [diana, bob], got %v", results)
+	if len(rows) >= 2 && (rows[0].Name != "diana" || rows[1].Name != "bob") {
+		t.Errorf("expected [diana, bob], got %v", rows)
 	}
 }
 
@@ -475,18 +552,16 @@ func TestMySQLInteg_SelectWhereRaw(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		WhereRaw("age > ? AND name LIKE ?", 28, "b%").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 1 || results[0] != "bob" {
-		t.Errorf("expected [bob], got %v", results)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereRaw("age > ? AND name LIKE ?", 28, "b%").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "bob" {
+		t.Errorf("expected [bob], got %v", rows)
 	}
 }
 
@@ -498,20 +573,20 @@ func TestMySQLInteg_InnerJoin(t *testing.T) {
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("users.name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name").
 		Join("orders", "users.id", "=", "orders.user_id").
 		Distinct().
 		OrderBy("users.name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 4 {
-		t.Errorf("expected 4 users with orders, got %d: %v", len(results), results)
+	if len(rows) != 4 {
+		t.Errorf("expected 4 users with orders, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -521,20 +596,20 @@ func TestMySQLInteg_LeftJoin(t *testing.T) {
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("users.name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name").
 		LeftJoin("orders", "users.id", "=", "orders.user_id").
 		Distinct().
 		OrderBy("users.name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 5 {
-		t.Errorf("expected 5 users with left join, got %d: %v", len(results), results)
+	if len(rows) != 5 {
+		t.Errorf("expected 5 users with left join, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -544,16 +619,10 @@ func TestMySQLInteg_CrossJoin(t *testing.T) {
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		SelectRaw("COUNT(*) as cnt").
-		CrossJoin("orders").
-		ToSelect()
+	count, err := db.Builder().Table("users").SelectRaw("COUNT(*) as cnt").CrossJoin("orders").Count(context.Background())
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	count := queryCount(t, db, sqlStr, args...)
 	if count != 30 {
 		t.Errorf("expected 30 cross join rows, got %d", count)
 	}
@@ -565,31 +634,109 @@ func TestMySQLInteg_JoinOn(t *testing.T) {
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("users.name", "orders.product").
+	type row struct {
+		Name    string `db:"name"`
+		Product string `db:"product"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "orders.product").
 		JoinOn("orders", func(j *JoinBuilder) {
 			j.On("users.id", "=", "orders.user_id").
 				Where("orders.amount", ">", 100)
 		}).
 		OrderBy("users.name", "ASC").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
-	}
-
-	rows, err := db.Query(sqlStr, args...)
+		Find(context.Background(), &rows)
 	if err != nil {
 		t.Fatalf("query error: %v", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	count := 0
-	for rows.Next() {
-		count++
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows with amount > 100, got %d", len(rows))
 	}
-	if count != 3 {
-		t.Errorf("expected 3 rows with amount > 100, got %d", count)
+}
+
+// TestMySQLInteg_JoinOnMultiple 验证 JoinOn 多 ON 条件（AND 连接）。
+func TestMySQLInteg_JoinOnMultiple(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	type row struct {
+		Name    string `db:"name"`
+		Product string `db:"product"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "orders.product").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id").
+				Where("orders.amount", ">", 100)
+		}).
+		OrderBy("users.name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// alice(Laptop=120), bob(TV=200), diana(Camera=150) → 3 rows
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestMySQLInteg_JoinOnOrCondition 验证 JoinOn OR 条件：OrOn 生成 OR 连接的 ON 条件。
+func TestMySQLInteg_JoinOnOrCondition(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLProfilesTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name").
+		JoinOn("profiles", func(j *JoinBuilder) {
+			j.On("users.id", "=", "profiles.user_id").
+				OrOn("users.id", "=", "profiles.user_id")
+		}).
+		Distinct().
+		OrderBy("users.name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// alice, bob, charlie have profiles → 3 distinct users
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestMySQLInteg_LeftJoinOn 验证 LeftJoinOn 多 ON 条件：LEFT JOIN + 多 ON 条件（AND 连接）。
+func TestMySQLInteg_LeftJoinOn(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLProfilesTable(t, db)
+
+	type row struct {
+		Name string  `db:"name"`
+		Bio  *string `db:"bio"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "profiles.bio").
+		LeftJoinOn("profiles", func(j *JoinBuilder) {
+			j.On("users.id", "=", "profiles.user_id").
+				On("profiles.active", "=", "users.id")
+		}).
+		OrderBy("users.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// profiles.active=99 不匹配任何 users.id，所以 LEFT JOIN 全部为 NULL
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows))
+	}
+	for _, r := range rows {
+		if r.Bio != nil {
+			t.Errorf("expected NULL bio for %s, got %s", r.Name, *r.Bio)
+		}
 	}
 }
 
@@ -601,20 +748,44 @@ func TestMySQLInteg_GroupByHaving(t *testing.T) {
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("orders").
-		Select("user_id").
+	type row struct {
+		UserId int `db:"user_id"`
+	}
+	var rows []row
+	err := db.Builder().Table("orders").Select("user_id").
 		GroupBy("user_id").
 		HavingRaw("SUM(amount) > ?", 100).
 		OrderBy("user_id", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 groups with total > 100, got %d: %v", len(rows), rows)
+	}
+}
 
-	results := queryInts(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 groups with total > 100, got %d: %v", len(results), results)
+// TestMySQLInteg_HavingBetween 验证 HAVING BETWEEN 聚合过滤。
+func TestMySQLInteg_HavingBetween(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	type row struct {
+		UserId int `db:"user_id"`
+	}
+	var rows []row
+	err := db.Builder().Table("orders").Select("user_id").
+		GroupBy("user_id").
+		HavingBetween("SUM(amount)", 100, 200).
+		OrderBy("user_id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// user1=170, user2=280, user3=30, user4=150 → user1(170) and user4(150) in [100,200]
+	if len(rows) != 2 {
+		t.Errorf("expected 2 groups, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -623,21 +794,21 @@ func TestMySQLInteg_OrderByLimitOffset(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereNotNull("age").
 		OrderBy("age", "DESC").
 		Limit(2).
 		Offset(1).
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 || results[0] != "bob" || results[1] != "diana" {
-		t.Errorf("expected [bob, diana], got %v", results)
+	if len(rows) != 2 || rows[0].Name != "bob" || rows[1].Name != "diana" {
+		t.Errorf("expected [bob, diana], got %v", rows)
 	}
 }
 
@@ -646,19 +817,37 @@ func TestMySQLInteg_ForPage(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		OrderBy("id", "ASC").
-		ForPage(2, 2).
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(2, 2).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Name != "charlie" || rows[1].Name != "diana" {
+		t.Errorf("expected [charlie, diana], got %v", rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 || results[0] != "charlie" || results[1] != "diana" {
-		t.Errorf("expected [charlie, diana], got %v", results)
+// TestMySQLInteg_ForPageFirst 验证第一页分页：第 1 页不生成 OFFSET。
+func TestMySQLInteg_ForPageFirst(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(1, 3).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(rows))
+	}
+	if rows[0].Name != "alice" {
+		t.Errorf("expected first row alice, got %s", rows[0].Name)
 	}
 }
 
@@ -667,18 +856,16 @@ func TestMySQLInteg_InRandomOrder(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		InRandomOrder().
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 5 {
-		t.Errorf("expected 5 rows, got %d", len(results))
+	var rows []row
+	err := db.Builder().Table("users").Select("name").InRandomOrder().Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows))
 	}
 }
 
@@ -687,15 +874,10 @@ func TestMySQLInteg_SelectRaw(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		SelectRaw("COUNT(*) as cnt").
-		ToSelect()
+	count, err := db.Builder().Table("users").SelectRaw("COUNT(*) as cnt").Count(context.Background())
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	count := queryCount(t, db, sqlStr, args...)
 	if count != 5 {
 		t.Errorf("expected 5, got %d", count)
 	}
@@ -708,21 +890,21 @@ func TestMySQLInteg_WhereSub(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereSub("age", ">", func(sub *Builder) {
 			sub.Table("users").SelectRaw("AVG(age)").WhereNotNull("age")
 		}).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 || results[0] != "bob" || results[1] != "charlie" {
-		t.Errorf("expected [bob, charlie], got %v", results)
+	if len(rows) != 2 || rows[0].Name != "bob" || rows[1].Name != "charlie" {
+		t.Errorf("expected [bob, charlie], got %v", rows)
 	}
 }
 
@@ -732,21 +914,46 @@ func TestMySQLInteg_WhereInSub(t *testing.T) {
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereInSub("id", func(sub *Builder) {
 			sub.Table("orders").Select("user_id").Where("amount", ">", 100)
 		}).
 		OrderBy("name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 users, got %d: %v", len(rows), rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 users, got %d: %v", len(results), results)
+// TestMySQLInteg_WhereNotInSub 验证 WHERE NOT IN 子查询。
+func TestMySQLInteg_WhereNotInSub(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereNotInSub("id", func(sub *Builder) {
+			sub.Table("orders").Select("user_id")
+		}).
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// eve(id=5) has no orders
+	if len(rows) != 1 || rows[0].Name != "eve" {
+		t.Errorf("expected [eve], got %v", rows)
 	}
 }
 
@@ -756,23 +963,50 @@ func TestMySQLInteg_WhereExists(t *testing.T) {
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereExists(func(sub *Builder) {
 			sub.Table("orders").
 				Select("orders.user_id").
 				WhereColumn("orders.user_id", "=", "users.id")
 		}).
 		OrderBy("name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 users with orders, got %d: %v", len(rows), rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 4 {
-		t.Errorf("expected 4 users with orders, got %d: %v", len(results), results)
+// TestMySQLInteg_WhereNotExists 验证 WHERE NOT EXISTS 子查询：只保留在 orders 表中不存在关联记录的用户。
+func TestMySQLInteg_WhereNotExists(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereNotExists(func(sub *Builder) {
+			sub.Table("orders").
+				Select("orders.id").
+				WhereColumn("orders.user_id", "=", "users.id")
+		}).
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// eve(id=5) has no orders
+	if len(rows) != 1 || rows[0].Name != "eve" {
+		t.Errorf("expected [eve], got %v", rows)
 	}
 }
 
@@ -781,20 +1015,47 @@ func TestMySQLInteg_FromSub(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sub := newMySQLBuilder().Table("users").Select("name", "age").WhereNotNull("age")
-	sqlStr, args, err := newMySQLBuilder().
+	sub := db.Builder().Table("users").Select("name", "age").WhereNotNull("age")
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().
 		FromSub(sub, "sub").
 		Select("name").
 		Where("age", ">", 28).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 2 || rows[0].Name != "bob" || rows[1].Name != "charlie" {
+		t.Errorf("expected [bob, charlie], got %v", rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 || results[0] != "bob" || results[1] != "charlie" {
-		t.Errorf("expected [bob, charlie], got %v", results)
+// TestMySQLInteg_SelectSubquery 验证 SELECT 子句中的子查询。
+func TestMySQLInteg_SelectSubquery(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	sub := db.Builder().Table("orders").SelectRaw("COUNT(*)").WhereRaw("`orders`.`user_id` = `users`.`id`")
+	type row struct {
+		Name        string `db:"name"`
+		OrdersCount int    `db:"orders_count"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("name").
+		SelectSubquery(sub, "orders_count").
+		Where("id", "=", 1).
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" || rows[0].OrdersCount != 2 {
+		t.Errorf("expected alice with 2 orders, got %v", rows)
 	}
 }
 
@@ -809,23 +1070,83 @@ func TestMySQLInteg_UpdateBasic(t *testing.T) {
 		Name string `db:"name"`
 		Age  int    `db:"age"`
 	}
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToUpdate(updateData{Name: "alice_updated", Age: 26})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateData{Name: "alice_updated", Age: 26})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	names := queryStrings(t, db, "SELECT name FROM users WHERE id = 1")
-	if len(names) != 1 || names[0] != "alice_updated" {
-		t.Errorf("expected alice_updated, got %v", names)
+	type verifyRow struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
 	}
-	ages := queryInts(t, db, "SELECT age FROM users WHERE id = 1")
-	if len(ages) != 1 || ages[0] != 26 {
-		t.Errorf("expected age=26, got %v", ages)
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age").Where("id", "=", 1).Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Name != "alice_updated" || rows[0].Age != 26 {
+		t.Errorf("expected alice_updated/26, got %v", rows)
+	}
+}
+
+// TestMySQLInteg_WhereLike 验证 LIKE 模糊匹配。
+func TestMySQLInteg_WhereLike(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereLike("name", "%ali%").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" {
+		t.Errorf("expected [alice], got %v", rows)
+	}
+}
+
+// TestMySQLInteg_WhereNotLike 验证 NOT LIKE 排除匹配。
+func TestMySQLInteg_WhereNotLike(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNotLike("name", "%ali%").OrderBy("id", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestMySQLInteg_UpdatePartial 验证指针字段部分更新：nil 指针字段不参与 SET。
+func TestMySQLInteg_UpdatePartial(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type updateData struct {
+		Name   *string `db:"name"`
+		Age    *int    `db:"age"`
+		Status *string `db:"status"`
+	}
+	newName := "alice_partial"
+	// Age=nil, Status=nil 为零值指针，应被跳过，仅更新 Name
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateData{Name: &newName})
+	if err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+
+	type verifyRow struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age").Where("id", "=", 1).Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Name != "alice_partial" || rows[0].Age != 25 {
+		t.Errorf("expected alice_partial/25, got %v", rows)
 	}
 }
 
@@ -840,27 +1161,29 @@ func TestMySQLInteg_UpdatePtrPartial(t *testing.T) {
 		Status *string `db:"status"`
 	}
 	newName := "alice_ptr"
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToUpdate(updatePtrData{Name: &newName})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updatePtrData{Name: &newName})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	names := queryStrings(t, db, "SELECT name FROM users WHERE id = 1")
-	if names[0] != "alice_ptr" {
-		t.Errorf("expected alice_ptr, got %s", names[0])
+	type verifyRow struct {
+		Name   string `db:"name"`
+		Age    int    `db:"age"`
+		Status string `db:"status"`
 	}
-	ages := queryInts(t, db, "SELECT age FROM users WHERE id = 1")
-	if ages[0] != 25 {
-		t.Errorf("expected age still 25, got %d", ages[0])
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age", "status").Where("id", "=", 1).Find(context.Background(), &rows)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
-	statuses := queryStrings(t, db, "SELECT status FROM users WHERE id = 1")
-	if statuses[0] != "active" {
-		t.Errorf("expected status still active, got %s", statuses[0])
+	if rows[0].Name != "alice_ptr" {
+		t.Errorf("expected alice_ptr, got %s", rows[0].Name)
+	}
+	if rows[0].Age != 25 {
+		t.Errorf("expected age still 25, got %d", rows[0].Age)
+	}
+	if rows[0].Status != "active" {
+		t.Errorf("expected status still active, got %s", rows[0].Status)
 	}
 }
 
@@ -872,42 +1195,75 @@ func TestMySQLInteg_UpdateWithRaw(t *testing.T) {
 	type updateRaw struct {
 		Age any `db:"age"`
 	}
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToUpdate(updateRaw{Age: Raw("`age` + 10")})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateRaw{Age: Raw("`age` + 10")})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	ages := queryInts(t, db, "SELECT age FROM users WHERE id = 1")
-	if len(ages) != 1 || ages[0] != 35 {
-		t.Errorf("expected age=35, got %v", ages)
+	var age int
+	_ = db.Builder().Table("users").Select("age").Where("id", "=", 1).Value(context.Background(), &age)
+	if age != 35 {
+		t.Errorf("expected age=35, got %d", age)
 	}
 }
 
 // ==================== Group 8: DELETE ====================
+
+// TestMySQLInteg_UpdatePtrAllNil 验证全 nil 指针更新：所有指针字段均为 nil 时返回 ErrNoFields 错误。
+func TestMySQLInteg_UpdatePtrAllNil(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type updatePtrData struct {
+		Name   *string `db:"name"`
+		Age    *int    `db:"age"`
+		Status *string `db:"status"`
+	}
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updatePtrData{})
+	if err == nil {
+		t.Fatalf("expected error for all-nil update, got nil")
+	}
+}
 
 // TestMySQLInteg_DeleteWithWhere 验证带条件删除。
 func TestMySQLInteg_DeleteWithWhere(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToDelete()
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Delete(context.Background())
 	if err != nil {
-		t.Fatalf("ToDelete error: %v", err)
+		t.Fatalf("Delete error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 4 {
 		t.Errorf("expected 4 remaining users, got %d", count)
+	}
+}
+
+// TestMySQLInteg_DeleteWithMultipleConditions 验证多条件 DELETE + ORDER BY + LIMIT。
+func TestMySQLInteg_DeleteWithMultipleConditions(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").
+		Where("status", "=", "inactive").
+		OrderBy("id", "ASC").
+		Limit(1).
+		Delete(context.Background())
+	if err != nil {
+		t.Fatalf("Delete error: %v", err)
+	}
+
+	// inactive: charlie(id=3), eve(id=5); LIMIT 1 → only charlie deleted
+	count, _ := db.Builder().Table("users").Count(context.Background())
+	if count != 4 {
+		t.Errorf("expected 4 remaining users, got %d", count)
+	}
+	// charlie should be gone
+	count, _ = db.Builder().Table("users").Where("name", "=", "charlie").Count(context.Background())
+	if count != 0 {
+		t.Errorf("expected charlie deleted, got %d", count)
 	}
 }
 
@@ -916,16 +1272,12 @@ func TestMySQLInteg_DeleteAll(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		ToDelete()
+	_, err := db.Builder().Table("users").Delete(context.Background())
 	if err != nil {
-		t.Fatalf("ToDelete error: %v", err)
+		t.Fatalf("Delete error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 users after delete all, got %d", count)
 	}
@@ -945,43 +1297,75 @@ func TestMySQLInteg_Upsert(t *testing.T) {
 	}
 
 	// 插入新行
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		ToUpsert(
-			upsertData{Name: "frank", Age: 40, Email: "frank@test.com"},
-			[]string{"email"},
-			[]string{"name", "age"},
-		)
+	_, err := db.Builder().Table("users").Upsert(context.Background(),
+		upsertData{Name: "frank", Age: 40, Email: "frank@test.com"},
+		[]string{"email"},
+		[]string{"name", "age"},
+	)
 	if err != nil {
-		t.Fatalf("ToUpsert error: %v", err)
+		t.Fatalf("Upsert error: %v", err)
 	}
-	mustExec(t, db, sqlStr, args...)
 
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name = 'frank'")
+	count, _ := db.Builder().Table("users").Where("name", "=", "frank").Count(context.Background())
 	if count != 1 {
 		t.Errorf("expected frank inserted, got count=%d", count)
 	}
 
 	// 冲突更新
-	sqlStr, args, err = newMySQLBuilder().
-		Table("users").
-		ToUpsert(
-			upsertData{Name: "alice_upserted", Age: 99, Email: "alice@test.com"},
-			[]string{"email"},
-			[]string{"name", "age"},
-		)
+	_, err = db.Builder().Table("users").Upsert(context.Background(),
+		upsertData{Name: "alice_upserted", Age: 99, Email: "alice@test.com"},
+		[]string{"email"},
+		[]string{"name", "age"},
+	)
 	if err != nil {
-		t.Fatalf("ToUpsert error: %v", err)
+		t.Fatalf("Upsert error: %v", err)
 	}
-	mustExec(t, db, sqlStr, args...)
 
-	names := queryStrings(t, db, "SELECT name FROM users WHERE email = 'alice@test.com'")
-	if len(names) != 1 || names[0] != "alice_upserted" {
-		t.Errorf("expected alice_upserted, got %v", names)
+	type verifyRow struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
 	}
-	ages := queryInts(t, db, "SELECT age FROM users WHERE email = 'alice@test.com'")
-	if len(ages) != 1 || ages[0] != 99 {
-		t.Errorf("expected age=99, got %v", ages)
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age").Where("email", "=", "alice@test.com").Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Name != "alice_upserted" || rows[0].Age != 99 {
+		t.Errorf("expected alice_upserted/99, got %v", rows)
+	}
+}
+
+// TestMySQLInteg_UpsertBatch 验证批量 Upsert。
+func TestMySQLInteg_UpsertBatch(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type upsertData struct {
+		Name  string `db:"name"`
+		Age   int    `db:"age"`
+		Email string `db:"email"`
+	}
+	data := []upsertData{
+		{Name: "frank", Age: 40, Email: "frank@test.com"},
+		{Name: "alice_upserted", Age: 99, Email: "alice@test.com"},
+	}
+	_, err := db.Builder().Table("users").Upsert(context.Background(), data,
+		[]string{"email"}, []string{"name", "age"})
+	if err != nil {
+		t.Fatalf("Upsert error: %v", err)
+	}
+
+	// frank 新增
+	count, _ := db.Builder().Table("users").Where("name", "=", "frank").Count(context.Background())
+	if count != 1 {
+		t.Errorf("expected frank inserted, got count=%d", count)
+	}
+	// alice 冲突更新
+	type verifyRow struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age").Where("email", "=", "alice@test.com").Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Name != "alice_upserted" || rows[0].Age != 99 {
+		t.Errorf("expected alice_upserted/99, got %v", rows)
 	}
 }
 
@@ -996,7 +1380,7 @@ func TestMySQLInteg_InsertUsing(t *testing.T) {
 		age  INT
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 
-	sqlStr, args, err := newMySQLBuilder().
+	sqlStr, args, err := db.Builder().
 		Table("users_archive").
 		ToInsertUsing([]string{"name", "age"}, func(sub *Builder) {
 			sub.Table("users").Select("name", "age").Where("status", "=", "active")
@@ -1004,10 +1388,9 @@ func TestMySQLInteg_InsertUsing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToInsertUsing error: %v", err)
 	}
-
 	mustExec(t, db, sqlStr, args...)
 
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users_archive")
+	count, _ := db.Builder().Table("users_archive").Count(context.Background())
 	if count != 3 {
 		t.Errorf("expected 3 archived users, got %d", count)
 	}
@@ -1018,17 +1401,19 @@ func TestMySQLInteg_Union(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	q1 := newMySQLBuilder().Table("users").Select("name").Where("status", "=", "active")
-	q2 := newMySQLBuilder().Table("users").Select("name").Where("age", ">", 30)
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 30)
 
-	sqlStr, args, err := q1.Union(q2).ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 4 {
-		t.Errorf("expected 4 union results, got %d: %v", len(results), results)
+	var rows []row
+	err := q1.Union(q2).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 union result, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -1037,17 +1422,19 @@ func TestMySQLInteg_UnionAll(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	q1 := newMySQLBuilder().Table("users").Select("name").Where("status", "=", "active")
-	q2 := newMySQLBuilder().Table("users").Select("name").Where("age", ">", 25)
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 25)
 
-	sqlStr, args, err := q1.UnionAll(q2).ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 6 {
-		t.Errorf("expected 6 union all results, got %d: %v", len(results), results)
+	var rows []row
+	err := q1.UnionAll(q2).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 6 {
+		t.Errorf("expected 6 union all result, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -1056,18 +1443,44 @@ func TestMySQLInteg_Truncate(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	sqlStr, err := newMySQLBuilder().
-		Table("users").
-		ToTruncate()
+	err := db.Builder().Table("users").Truncate(context.Background())
 	if err != nil {
-		t.Fatalf("ToTruncate error: %v", err)
+		t.Fatalf("Truncate error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 users after truncate, got %d", count)
+	}
+}
+
+// TestMySQLInteg_Clone 验证 Builder 克隆后独立查询。
+func TestMySQLInteg_Clone(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	base := db.Builder().Table("users").Where("status", "=", "active")
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows1, rows2 []row
+	err := base.Clone().Where("age", ">", 25).Select("name").OrderBy("age", "ASC").Find(context.Background(), &rows1)
+	if err != nil {
+		t.Fatalf("clone1 error: %v", err)
+	}
+	err = base.Clone().Where("age", "<", 28).Select("name").OrderBy("age", "ASC").Find(context.Background(), &rows2)
+	if err != nil {
+		t.Fatalf("clone2 error: %v", err)
+	}
+
+	// clone1: active and age>25 → bob(30), diana(28) = 2
+	if len(rows1) != 2 {
+		t.Errorf("expected 2 rows for clone1, got %d: %v", len(rows1), rows1)
+	}
+	// clone2: active and age<28 → alice(25), diana(28... no, 28 is not < 28) → alice(25) = 1
+	if len(rows2) != 1 {
+		t.Errorf("expected 1 row for clone2, got %d: %v", len(rows2), rows2)
 	}
 }
 
@@ -1083,19 +1496,16 @@ func TestMySQLInteg_UpdateJoin(t *testing.T) {
 	type updateData struct {
 		Status string `db:"status"`
 	}
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
+	_, err := db.Builder().Table("users").
 		Join("orders", "users.id", "=", "orders.user_id").
 		Where("orders.amount", ">", 100).
-		ToUpdate(updateData{Status: "vip"})
+		Update(context.Background(), updateData{Status: "vip"})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
 	// alice(Laptop=120), bob(TV=200), diana(Camera=150) → 3 users updated to 'vip'
-	count := queryCount(t, db, "SELECT COUNT(DISTINCT id) FROM users WHERE status = 'vip'")
+	count, _ := db.Builder().Table("users").Where("status", "=", "vip").Count(context.Background())
 	if count != 3 {
 		t.Errorf("expected 3 vip users, got %d", count)
 	}
@@ -1110,26 +1520,27 @@ func TestMySQLInteg_UpdateOrderByLimit(t *testing.T) {
 	type updateData struct {
 		Status string `db:"status"`
 	}
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
+	_, err := db.Builder().Table("users").
 		WhereNotNull("age").
 		OrderBy("age", "DESC").
 		Limit(2).
-		ToUpdate(updateData{Status: "top"})
+		Update(context.Background(), updateData{Status: "top"})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
 	// charlie(35), bob(30) → top
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE status = 'top'")
+	count, _ := db.Builder().Table("users").Where("status", "=", "top").Count(context.Background())
 	if count != 2 {
 		t.Errorf("expected 2 top users, got %d", count)
 	}
-	names := queryStrings(t, db, "SELECT name FROM users WHERE status = 'top' ORDER BY age DESC")
-	if len(names) != 2 || names[0] != "charlie" || names[1] != "bob" {
-		t.Errorf("expected [charlie, bob], got %v", names)
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	_ = db.Builder().Table("users").Select("name").Where("status", "=", "top").OrderBy("age", "DESC").Find(context.Background(), &rows)
+	if len(rows) != 2 || rows[0].Name != "charlie" || rows[1].Name != "bob" {
+		t.Errorf("expected [charlie, bob], got %v", rows)
 	}
 }
 
@@ -1138,28 +1549,22 @@ func TestMySQLInteg_LockForUpdate(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	tx, err := db.Begin()
+	err := db.Transaction(context.Background(), func(ctx context.Context) error {
+		type row struct {
+			Name string `db:"name"`
+		}
+		var rows []row
+		err := db.Builder().Table("users").Select("name").Where("id", "=", 1).LockForUpdate().Find(ctx, &rows)
+		if err != nil {
+			return err
+		}
+		if len(rows) != 1 || rows[0].Name != "alice" {
+			return fmt.Errorf("expected alice, got %v", rows)
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("begin tx error: %v", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		Where("id", "=", 1).
-		LockForUpdate().
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
-	}
-
-	var name string
-	if err := tx.QueryRow(sqlStr, args...).Scan(&name); err != nil {
-		t.Fatalf("query error: %v", err)
-	}
-	if name != "alice" {
-		t.Errorf("expected alice, got %s", name)
+		t.Fatalf("TestMySQLInteg_LockForUpdate error: %v", err)
 	}
 }
 
@@ -1168,27 +1573,22 @@ func TestMySQLInteg_SharedLock(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	tx, err := db.Begin()
-	if err != nil {
-		t.Fatalf("begin tx error: %v", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	err := db.Transaction(context.Background(), func(ctx context.Context) error {
+		type row struct {
+			Name string `db:"name"`
+		}
+		var rows []row
+		err := db.Builder().Table("users").Select("name").Where("id", "=", 1).SharedLock().Find(ctx, &rows)
+		if err != nil {
+			return err
+		}
+		if len(rows) != 1 || rows[0].Name != "alice" {
+			return fmt.Errorf("expected alice, got %v", rows)
+		}
+		return nil
+	})
 
-	sqlStr, args, err := newMySQLBuilder().
-		Table("users").
-		Select("name").
-		Where("id", "=", 1).
-		SharedLock().
-		ToSelect()
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
-	}
-
-	var name string
-	if err := tx.QueryRow(sqlStr, args...).Scan(&name); err != nil {
-		t.Fatalf("query error: %v", err)
-	}
-	if name != "alice" {
-		t.Errorf("expected alice, got %s", name)
+		t.Fatalf("TestMySQLInteg_SharedLock error: %v", err)
 	}
 }

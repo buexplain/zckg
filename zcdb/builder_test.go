@@ -73,7 +73,7 @@ func TestSnakeCase(t *testing.T) {
 
 func TestSelectWithSnakeCaseColumns(t *testing.T) {
 	g := NewMySQLGrammar()
-	sql, _, err := NewBuilder(g).
+	sql, _, err := NewBuilder(g, nil).
 		Table("order_items").
 		Select("item_name", "unit_price").
 		ToSelect()
@@ -95,7 +95,7 @@ func TestInsertWithSnakeCaseStruct(t *testing.T) {
 		ItemName:  "Widget",
 		UnitPrice: 999,
 	}
-	sql, args, err := NewBuilder(g).Table("order_items").ToInsert(data)
+	sql, args, err := NewBuilder(g, nil).Table("order_items").ToInsert(data)
 	assertNoError(t, err)
 	assertSQL(t, "INSERT INTO `order_items` (`item_name`, `unit_price`) VALUES (?, ?)", sql)
 	assertArgs(t, []any{"Widget", 999}, args)
@@ -108,7 +108,7 @@ func TestInsertBatchWithSnakeCaseStruct(t *testing.T) {
 		{OrderID: 1, ItemName: "Apple", UnitPrice: 300},
 		{OrderID: 2, ItemName: "Banana", UnitPrice: 150},
 	}
-	sql, args, err := NewBuilder(g).Table("order_items").ToInsert(data)
+	sql, args, err := NewBuilder(g, nil).Table("order_items").ToInsert(data)
 	assertNoError(t, err)
 	assertSQL(t, "INSERT INTO `order_items` (`item_name`, `unit_price`) VALUES (?, ?), (?, ?)", sql)
 	assertArgs(t, []any{"Apple", 300, "Banana", 150}, args)
@@ -122,7 +122,7 @@ func TestUpdateWithSnakeCaseStruct(t *testing.T) {
 		ItemName:  "Gadget",
 		UnitPrice: 1999,
 	}
-	sql, args, err := NewBuilder(g).Table("order_items").Where("order_id", "=", 100).ToUpdate(data)
+	sql, args, err := NewBuilder(g, nil).Table("order_items").Where("order_id", "=", 100).ToUpdate(data)
 	assertNoError(t, err)
 	assertSQL(t, "UPDATE `order_items` SET `item_name` = ?, `unit_price` = ? WHERE `order_id` = ?", sql)
 	assertArgs(t, []any{"Gadget", 1999, 100}, args)
@@ -139,7 +139,7 @@ func TestInsertWithConcreteTypeStruct(t *testing.T) {
 		Age:   25,
 		Email: "alice@test.com",
 	}
-	sql, args, err := NewBuilder(g).Table("users").ToInsert(data)
+	sql, args, err := NewBuilder(g, nil).Table("users").ToInsert(data)
 	assertNoError(t, err)
 	assertSQL(t, "INSERT INTO `users` (`id`, `name`, `age`, `email`) VALUES (?, ?, ?, ?)", sql)
 	assertArgs(t, []any{1, "alice", 25, "alice@test.com"}, args)
@@ -154,7 +154,7 @@ func TestUpdateWithConcreteTypeStruct(t *testing.T) {
 		Age:   0,
 		Email: "",
 	}
-	sql, args, err := NewBuilder(g).Table("users").Where("id", "=", 1).ToUpdate(data)
+	sql, args, err := NewBuilder(g, nil).Table("users").Where("id", "=", 1).ToUpdate(data)
 	assertNoError(t, err)
 	assertSQL(t, "UPDATE `users` SET `id` = ?, `name` = ?, `age` = ?, `email` = ? WHERE `id` = ?", sql)
 	assertArgs(t, []any{0, "bob", 0, "", 1}, args)
@@ -164,7 +164,7 @@ func TestUpdateWithConcreteTypeStruct(t *testing.T) {
 
 func TestErrorEmptyTable(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g).ToSelect()
+	_, _, err := NewBuilder(g, nil).ToSelect()
 	if !errors.Is(err, ErrEmptyTable) {
 		t.Errorf("expected ErrEmptyTable, got %v", err)
 	}
@@ -172,7 +172,7 @@ func TestErrorEmptyTable(t *testing.T) {
 
 func TestErrorInvalidInsertData(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g).Table("users").ToInsert("not a struct")
+	_, _, err := NewBuilder(g, nil).Table("users").ToInsert("not a struct")
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}

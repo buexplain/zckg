@@ -1,7 +1,7 @@
 package zcdb
 
 import (
-	"database/sql"
+	"context"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -10,80 +10,34 @@ import (
 // ==================== 基础设施 ====================
 
 // openSQLiteTestDB 打开一个内存 SQLite 数据库，测试结束后自动关闭。
-func openSQLiteTestDB(t *testing.T) *sql.DB {
+func openSQLiteTestDB(t *testing.T) *DBDao {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
+	pool, err := NewPool(PoolConfig{
+		DriverName: "sqlite",
+		DSN:        ":memory:",
+	})
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	dao, err := NewDBDao(pool, "sqlite", nil)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.Close() })
+	return dao
 }
 
 // mustExec 执行 SQL，失败则 Fatal。
-func mustExec(t *testing.T, db *sql.DB, query string, args ...any) sql.Result {
+func mustExec(t *testing.T, db *DBDao, query string, args ...any) {
 	t.Helper()
-	res, err := db.Exec(query, args...)
+	_, err := db.Exec(context.Background(), query, args...)
 	if err != nil {
 		t.Fatalf("exec failed: %s\nerror: %v", query, err)
 	}
-	return res
-}
-
-// queryCount 执行 SELECT COUNT(*) 返回计数。
-func queryCount(t *testing.T, db *sql.DB, query string, args ...any) int {
-	t.Helper()
-	var count int
-	if err := db.QueryRow(query, args...).Scan(&count); err != nil {
-		t.Fatalf("queryCount failed: %s\nerror: %v", query, err)
-	}
-	return count
-}
-
-// queryStrings 执行查询返回某一列的所有字符串值。
-func queryStrings(t *testing.T, db *sql.DB, query string, args ...any) []string {
-	t.Helper()
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		t.Fatalf("queryStrings failed: %s\nerror: %v", query, err)
-	}
-	defer func(rows *sql.Rows) {
-		_ = rows.Close()
-	}(rows)
-	var results []string
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			t.Fatalf("scan failed: %v", err)
-		}
-		results = append(results, s)
-	}
-	return results
-}
-
-// queryInts 执行查询返回某一列的所有 int 值。
-func queryInts(t *testing.T, db *sql.DB, query string, args ...any) []int {
-	t.Helper()
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		t.Fatalf("queryInts failed: %s\nerror: %v", query, err)
-	}
-	defer func(rows *sql.Rows) {
-		_ = rows.Close()
-	}(rows)
-	var results []int
-	for rows.Next() {
-		var n int
-		if err := rows.Scan(&n); err != nil {
-			t.Fatalf("scan failed: %v", err)
-		}
-		results = append(results, n)
-	}
-	return results
 }
 
 // setupSQLiteUsersTable 创建 users 表并预填 5 条数据。
-func setupSQLiteUsersTable(t *testing.T, db *sql.DB) {
+func setupSQLiteUsersTable(t *testing.T, db *DBDao) {
 	t.Helper()
 	mustExec(t, db, `CREATE TABLE users (
 		id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,8 +54,23 @@ func setupSQLiteUsersTable(t *testing.T, db *sql.DB) {
 		('eve', NULL, 'eve@test.com', 'inactive')`)
 }
 
+// setupSQLiteProfilesTable 创建 profiles 表并预填数据。
+func setupSQLiteProfilesTable(t *testing.T, db *DBDao) {
+	t.Helper()
+	mustExec(t, db, `CREATE TABLE profiles (
+		id      INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		bio     TEXT,
+		active  INTEGER DEFAULT 1
+	)`)
+	mustExec(t, db, `INSERT INTO profiles (user_id, bio, active) VALUES
+		(1, 'Alice bio', 99),
+		(2, 'Bob bio', 99),
+		(3, 'Charlie bio', 99)`)
+}
+
 // setupSQLiteOrdersTable 创建 orders 表并预填数据。
-func setupSQLiteOrdersTable(t *testing.T, db *sql.DB) {
+func setupSQLiteOrdersTable(t *testing.T, db *DBDao) {
 	t.Helper()
 	mustExec(t, db, `CREATE TABLE orders (
 		id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,11 +87,6 @@ func setupSQLiteOrdersTable(t *testing.T, db *sql.DB) {
 		(4, 150.0, 'Camera')`)
 }
 
-// newSQLiteBuilder 创建使用 SQLiteGrammar 的 Builder。
-func newSQLiteBuilder() *Builder {
-	return NewBuilder(NewSQLiteGrammar())
-}
-
 // ==================== Group 1: INSERT ====================
 
 // TestSQLiteInteg_InsertSingle 验证单条结构体插入：传入单个结构体，生成并执行 INSERT，确认数据正确写入。
@@ -130,24 +94,16 @@ func TestSQLiteInteg_InsertSingle(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	// 构造 INSERT SQL
 	type insertData struct {
 		Name  string `db:"name"`
 		Age   int    `db:"age"`
 		Email string `db:"email"`
 	}
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		ToInsert(insertData{Name: "frank", Age: 40, Email: "frank@test.com"})
+	_, err := db.Builder().Table("users").Insert(context.Background(), insertData{Name: "frank", Age: 40, Email: "frank@test.com"})
 	if err != nil {
-		t.Fatalf("ToInsert error: %v", err)
+		t.Fatalf("Insert error: %v", err)
 	}
-
-	// 执行
-	mustExec(t, db, sqlStr, args...)
-
-	// 验证
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name = 'frank'")
+	count, _ := db.Builder().Table("users").Where("name", "=", "frank").Count(context.Background())
 	if count != 1 {
 		t.Errorf("expected 1 row for frank, got %d", count)
 	}
@@ -167,16 +123,12 @@ func TestSQLiteInteg_InsertBatch(t *testing.T) {
 		{Name: "frank", Age: 40, Email: "frank@test.com"},
 		{Name: "grace", Age: 22, Email: "grace@test.com"},
 	}
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		ToInsert(data)
+	_, err := db.Builder().Table("users").Insert(context.Background(), data)
 	if err != nil {
-		t.Fatalf("ToInsert error: %v", err)
+		t.Fatalf("Insert error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name IN ('frank', 'grace')")
+	count, _ := db.Builder().Table("users").WhereIn("name", []any{"frank", "grace"}).Count(context.Background())
 	if count != 2 {
 		t.Errorf("expected 2 rows, got %d", count)
 	}
@@ -194,23 +146,68 @@ func TestSQLiteInteg_InsertPtrPartial(t *testing.T) {
 	}
 	name := "frank"
 	email := "frank@test.com"
-	// Age 为 nil → 不参与 INSERT
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		ToInsert(insertPtrData{Name: &name, Email: &email})
+	_, err := db.Builder().Table("users").Insert(context.Background(), insertPtrData{Name: &name, Email: &email})
 	if err != nil {
-		t.Fatalf("ToInsert error: %v", err)
+		t.Fatalf("Insert error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	// 验证 age 为 NULL
-	var age sql.NullInt64
-	if err := db.QueryRow("SELECT age FROM users WHERE name = 'frank'").Scan(&age); err != nil {
+	var age *int
+	err = db.Builder().Table("users").Select("age").Where("name", "=", "frank").Value(context.Background(), &age)
+	if err != nil {
 		t.Fatalf("query error: %v", err)
 	}
-	if age.Valid {
-		t.Errorf("expected NULL age, got %d", age.Int64)
+	if age != nil {
+		t.Errorf("expected NULL age, got %d", *age)
+	}
+}
+
+// TestSQLiteInteg_InsertPtrAllNil 验证全 nil 指针插入：所有指针字段均为 nil 时返回错误。
+func TestSQLiteInteg_InsertPtrAllNil(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type insertPtrData struct {
+		Name  *string `db:"name"`
+		Age   *int    `db:"age"`
+		Email *string `db:"email"`
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), insertPtrData{})
+	if err == nil {
+		t.Fatalf("expected error for all-nil insert, got nil")
+	}
+}
+
+// TestSQLiteInteg_InsertBatchPtr 验证批量指针插入：部分行含 nil 指针字段，对应列应为 NULL。
+func TestSQLiteInteg_InsertBatchPtr(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type insertPtrData struct {
+		Name  *string `db:"name"`
+		Age   *int    `db:"age"`
+		Email *string `db:"email"`
+	}
+	n1, e1 := "frank", "frank@test.com"
+	a1 := 40
+	n2 := "grace"
+	a2 := 22
+	data := []insertPtrData{
+		{Name: &n1, Age: &a1, Email: &e1},
+		{Name: &n2, Age: &a2},
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), data)
+	if err != nil {
+		t.Fatalf("Insert error: %v", err)
+	}
+
+	// grace 的 email 应为 NULL
+	var email *string
+	err = db.Builder().Table("users").Select("email").Where("name", "=", "grace").Value(context.Background(), &email)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if email != nil {
+		t.Errorf("expected NULL email for grace, got %s", *email)
 	}
 }
 
@@ -219,28 +216,21 @@ func TestSQLiteInteg_InsertOrIgnore(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	// 尝试插入重复 email（email 有 UNIQUE 约束）
 	type insertData struct {
 		Name  string `db:"name"`
 		Age   int    `db:"age"`
 		Email string `db:"email"`
 	}
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		ToInsertOrIgnore(insertData{Name: "alice_dup", Age: 99, Email: "alice@test.com"})
+	_, err := db.Builder().Table("users").InsertOrIgnore(context.Background(), insertData{Name: "alice_dup", Age: 99, Email: "alice@test.com"})
 	if err != nil {
-		t.Fatalf("ToInsertOrIgnore error: %v", err)
+		t.Fatalf("InsertOrIgnore error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	// 验证：不应有 alice_dup
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name = 'alice_dup'")
+	count, _ := db.Builder().Table("users").Where("name", "=", "alice_dup").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 rows for alice_dup (ignored), got %d", count)
 	}
-	// 总数仍为 5
-	total := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	total, _ := db.Builder().Table("users").Count(context.Background())
 	if total != 5 {
 		t.Errorf("expected 5 total users, got %d", total)
 	}
@@ -253,27 +243,16 @@ func TestSQLiteInteg_SelectAll(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Id int `db:"id"`
 	}
-
-	rows, err := db.Query(sqlStr, args...)
+	var rows []row
+	err := db.Builder().Table("users").Find(context.Background(), &rows)
 	if err != nil {
 		t.Fatalf("query error: %v", err)
 	}
-	defer func(rows *sql.Rows) {
-		_ = rows.Close()
-	}(rows)
-
-	count := 0
-	for rows.Next() {
-		count++
-	}
-	if count != 5 {
-		t.Errorf("expected 5 rows, got %d", count)
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows))
 	}
 }
 
@@ -282,22 +261,17 @@ func TestSQLiteInteg_SelectColumns(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name", "age").
-		Where("id", "=", 1).
-		ToSelect()
+	type row struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name", "age").Where("id", "=", 1).Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	var name string
-	var age int
-	if err := db.QueryRow(sqlStr, args...).Scan(&name, &age); err != nil {
-		t.Fatalf("scan error: %v", err)
-	}
-	if name != "alice" || age != 25 {
-		t.Errorf("expected alice/25, got %s/%d", name, age)
+	if len(rows) != 1 || rows[0].Name != "alice" || rows[0].Age != 25 {
+		t.Errorf("expected alice/25, got %v", rows)
 	}
 }
 
@@ -306,18 +280,16 @@ func TestSQLiteInteg_SelectDistinct(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("status").
-		Distinct().
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Status string `db:"status"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 {
-		t.Errorf("expected 2 distinct statuses, got %d: %v", len(results), results)
+	var rows []row
+	err := db.Builder().Table("users").Select("status").Distinct().Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("expected 2 distinct statuses, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -326,18 +298,39 @@ func TestSQLiteInteg_SelectWhereBasic(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		Where("age", "=", 25).
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").Where("age", "=", 25).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" {
+		t.Errorf("expected [alice], got %v", rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 1 || results[0] != "alice" {
-		t.Errorf("expected [alice], got %v", results)
+// TestSQLiteInteg_SelectWithWhere 验证多条件 AND WHERE 组合。
+func TestSQLiteInteg_SelectWithWhere(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		Where("age", ">", 20).
+		Where("status", "=", "active").
+		OrderBy("age", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// alice(25,active), bob(30,active), diana(28,active) → 3 rows
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -346,20 +339,20 @@ func TestSQLiteInteg_SelectWhereOr(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		Where("age", "=", 25).
 		OrWhere("age", "=", 30).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 || results[0] != "alice" || results[1] != "bob" {
-		t.Errorf("expected [alice, bob], got %v", results)
+	if len(rows) != 2 || rows[0].Name != "alice" || rows[1].Name != "bob" {
+		t.Errorf("expected [alice, bob], got %v", rows)
 	}
 }
 
@@ -368,19 +361,19 @@ func TestSQLiteInteg_SelectWhereIn(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereIn("id", []any{1, 3, 5}).
 		OrderBy("id", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 rows, got %d: %v", len(results), results)
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -389,19 +382,19 @@ func TestSQLiteInteg_SelectWhereNotIn(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereNotIn("id", []any{1, 2}).
 		OrderBy("id", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 rows, got %d: %v", len(results), results)
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -412,18 +405,16 @@ func TestSQLiteInteg_SelectWhereNull(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		WhereNull("age").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 1 || results[0] != "eve" {
-		t.Errorf("expected [eve], got %v", results)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNull("age").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "eve" {
+		t.Errorf("expected [eve], got %v", rows)
 	}
 }
 
@@ -432,19 +423,16 @@ func TestSQLiteInteg_SelectWhereNotNull(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		WhereNotNull("age").
-		OrderBy("id", "ASC").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 4 {
-		t.Errorf("expected 4 rows, got %d", len(results))
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNotNull("age").OrderBy("id", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d", len(rows))
 	}
 }
 
@@ -453,20 +441,16 @@ func TestSQLiteInteg_SelectWhereBetween(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		WhereBetween("age", 25, 30).
-		OrderBy("age", "ASC").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	// alice(25), diana(28), bob(30)
-	if len(results) != 3 {
-		t.Errorf("expected 3 rows, got %d: %v", len(results), results)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereBetween("age", 25, 30).OrderBy("age", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -475,19 +459,16 @@ func TestSQLiteInteg_SelectWhereNotBetween(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		WhereNotBetween("age", 25, 30).
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	// charlie(35)，eve 的 age 为 NULL 不满足 NOT BETWEEN
-	if len(results) != 1 || results[0] != "charlie" {
-		t.Errorf("expected [charlie], got %v", results)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNotBetween("age", 25, 30).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "charlie" {
+		t.Errorf("expected [charlie], got %v", rows)
 	}
 }
 
@@ -496,25 +477,24 @@ func TestSQLiteInteg_SelectWhereNested(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	// (age > 25 AND status = 'active') → bob(30), diana(28)
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereNested(func(b *Builder) {
 			b.Where("age", ">", 25).Where("status", "=", "active")
 		}).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 {
-		t.Errorf("expected 2 rows, got %d: %v", len(results), results)
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rows, got %d: %v", len(rows), rows)
 	}
-	if results[0] != "diana" || results[1] != "bob" {
-		t.Errorf("expected [diana, bob], got %v", results)
+	if len(rows) >= 2 && (rows[0].Name != "diana" || rows[1].Name != "bob") {
+		t.Errorf("expected [diana, bob], got %v", rows)
 	}
 }
 
@@ -523,18 +503,52 @@ func TestSQLiteInteg_SelectWhereRaw(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		WhereRaw("age > ? AND name LIKE ?", 28, "b%").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereRaw("age > ? AND name LIKE ?", 28, "b%").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "bob" {
+		t.Errorf("expected [bob], got %v", rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 1 || results[0] != "bob" {
-		t.Errorf("expected [bob], got %v", results)
+// TestSQLiteInteg_WhereLike 验证 LIKE 模糊匹配。
+func TestSQLiteInteg_WhereLike(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereLike("name", "%ali%").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" {
+		t.Errorf("expected [alice], got %v", rows)
+	}
+}
+
+// TestSQLiteInteg_WhereNotLike 验证 NOT LIKE 排除匹配。
+func TestSQLiteInteg_WhereNotLike(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNotLike("name", "%ali%").OrderBy("id", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -546,21 +560,20 @@ func TestSQLiteInteg_InnerJoin(t *testing.T) {
 	setupSQLiteUsersTable(t, db)
 	setupSQLiteOrdersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("users.name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name").
 		Join("orders", "users.id", "=", "orders.user_id").
 		Distinct().
 		OrderBy("users.name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	// alice(2 orders), bob(2 orders), charlie(1 order), diana(1 order) → 4 distinct users
-	if len(results) != 4 {
-		t.Errorf("expected 4 users with orders, got %d: %v", len(results), results)
+	if len(rows) != 4 {
+		t.Errorf("expected 4 users with orders, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -570,21 +583,20 @@ func TestSQLiteInteg_LeftJoin(t *testing.T) {
 	setupSQLiteUsersTable(t, db)
 	setupSQLiteOrdersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("users.name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name").
 		LeftJoin("orders", "users.id", "=", "orders.user_id").
 		Distinct().
 		OrderBy("users.name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	// LEFT JOIN → all 5 users (eve has no orders but still appears)
-	if len(results) != 5 {
-		t.Errorf("expected 5 users with left join, got %d: %v", len(results), results)
+	if len(rows) != 5 {
+		t.Errorf("expected 5 users with left join, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -594,17 +606,10 @@ func TestSQLiteInteg_CrossJoin(t *testing.T) {
 	setupSQLiteUsersTable(t, db)
 	setupSQLiteOrdersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		SelectRaw("COUNT(*) as cnt").
-		CrossJoin("orders").
-		ToSelect()
+	count, err := db.Builder().Table("users").SelectRaw("COUNT(*) as cnt").CrossJoin("orders").Count(context.Background())
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	count := queryCount(t, db, sqlStr, args...)
-	// 5 users × 6 orders = 30
 	if count != 30 {
 		t.Errorf("expected 30 cross join rows, got %d", count)
 	}
@@ -616,35 +621,77 @@ func TestSQLiteInteg_JoinOn(t *testing.T) {
 	setupSQLiteUsersTable(t, db)
 	setupSQLiteOrdersTable(t, db)
 
-	// JOIN orders ON users.id = orders.user_id AND orders.amount > 100
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("users.name", "orders.product").
+	type row struct {
+		Name    string `db:"name"`
+		Product string `db:"product"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "orders.product").
 		JoinOn("orders", func(j *JoinBuilder) {
 			j.On("users.id", "=", "orders.user_id").
 				Where("orders.amount", ">", 100)
 		}).
 		OrderBy("users.name", "ASC").
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
-	}
-
-	rows, err := db.Query(sqlStr, args...)
+		Find(context.Background(), &rows)
 	if err != nil {
 		t.Fatalf("query error: %v", err)
 	}
-	defer func(rows *sql.Rows) {
-		_ = rows.Close()
-	}(rows)
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows with amount > 100, got %d", len(rows))
+	}
+}
 
-	count := 0
-	for rows.Next() {
-		count++
+// TestSQLiteInteg_JoinOnMultiple 验证 JoinOn 多 ON 条件（AND 连接）。
+func TestSQLiteInteg_JoinOnMultiple(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+
+	type row struct {
+		Name    string `db:"name"`
+		Product string `db:"product"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "orders.product").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id").
+				Where("orders.amount", ">", 100)
+		}).
+		OrderBy("users.name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
 	}
 	// alice(Laptop=120), bob(TV=200), diana(Camera=150) → 3 rows
-	if count != 3 {
-		t.Errorf("expected 3 rows with amount > 100, got %d", count)
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestSQLiteInteg_LeftJoinOnOrOn 验证 LEFT JOIN ON + OR ON 条件。
+func TestSQLiteInteg_LeftJoinOnOrOn(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteProfilesTable(t, db)
+
+	type row struct {
+		Name string  `db:"name"`
+		Bio  *string `db:"bio"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "profiles.bio").
+		LeftJoinOn("profiles", func(j *JoinBuilder) {
+			j.On("users.id", "=", "profiles.user_id").
+				OrOn("profiles.active", "=", "users.id")
+		}).
+		OrderBy("users.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// 所有 5 个用户都应保留（LEFT JOIN）
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -656,22 +703,44 @@ func TestSQLiteInteg_GroupByHaving(t *testing.T) {
 	setupSQLiteUsersTable(t, db)
 	setupSQLiteOrdersTable(t, db)
 
-	// 每个用户的订单总额，HAVING SUM(amount) > 100
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("orders").
-		Select("user_id").
+	type row struct {
+		UserId int `db:"user_id"`
+	}
+	var rows []row
+	err := db.Builder().Table("orders").Select("user_id").
 		GroupBy("user_id").
 		HavingRaw("SUM(amount) > ?", 100).
 		OrderBy("user_id", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 groups with total > 100, got %d: %v", len(rows), rows)
+	}
+}
 
-	results := queryInts(t, db, sqlStr, args...)
-	// alice: 50+120=170, bob: 80+200=280, diana: 150 → user_id 1, 2, 4
-	if len(results) != 3 {
-		t.Errorf("expected 3 groups with total > 100, got %d: %v", len(results), results)
+// TestSQLiteInteg_HavingBetween 验证 HAVING BETWEEN 聚合过滤。
+func TestSQLiteInteg_HavingBetween(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+
+	type row struct {
+		UserId int `db:"user_id"`
+	}
+	var rows []row
+	err := db.Builder().Table("orders").Select("user_id").
+		GroupBy("user_id").
+		HavingBetween("SUM(amount)", 100, 200).
+		OrderBy("user_id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// user1=170, user2=280, user3=30, user4=150 → user1(170) and user4(150) in [100,200]
+	if len(rows) != 2 {
+		t.Errorf("expected 2 groups, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -680,23 +749,21 @@ func TestSQLiteInteg_OrderByLimitOffset(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereNotNull("age").
 		OrderBy("age", "DESC").
 		Limit(2).
 		Offset(1).
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	// age DESC with NotNull: charlie(35), bob(30), diana(28), alice(25)
-	// offset 1, limit 2 → bob, diana
-	if len(results) != 2 || results[0] != "bob" || results[1] != "diana" {
-		t.Errorf("expected [bob, diana], got %v", results)
+	if len(rows) != 2 || rows[0].Name != "bob" || rows[1].Name != "diana" {
+		t.Errorf("expected [bob, diana], got %v", rows)
 	}
 }
 
@@ -705,22 +772,34 @@ func TestSQLiteInteg_ForPage(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	// page=2, perPage=2 → offset 2, limit 2
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		OrderBy("id", "ASC").
-		ForPage(2, 2).
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(2, 2).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Name != "charlie" || rows[1].Name != "diana" {
+		t.Errorf("expected [charlie, diana], got %v", rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	// id ASC: alice(1), bob(2), charlie(3), diana(4), eve(5)
-	// page 2, perPage 2 → charlie, diana
-	if len(results) != 2 || results[0] != "charlie" || results[1] != "diana" {
-		t.Errorf("expected [charlie, diana], got %v", results)
+// TestSQLiteInteg_ForPageFirst 验证第一页分页：第 1 页不生成 OFFSET。
+func TestSQLiteInteg_ForPageFirst(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(1, 3).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 || rows[0].Name != "alice" || rows[2].Name != "charlie" {
+		t.Errorf("expected [alice, bob, charlie], got %v", rows)
 	}
 }
 
@@ -729,19 +808,16 @@ func TestSQLiteInteg_InRandomOrder(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
-		InRandomOrder().
-		ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	// 不能断言顺序，只断言行数
-	if len(results) != 5 {
-		t.Errorf("expected 5 rows, got %d", len(results))
+	var rows []row
+	err := db.Builder().Table("users").Select("name").InRandomOrder().Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows))
 	}
 }
 
@@ -750,15 +826,10 @@ func TestSQLiteInteg_SelectRaw(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		SelectRaw("COUNT(*) as cnt").
-		ToSelect()
+	count, err := db.Builder().Table("users").SelectRaw("COUNT(*) as cnt").Count(context.Background())
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	count := queryCount(t, db, sqlStr, args...)
 	if count != 5 {
 		t.Errorf("expected 5, got %d", count)
 	}
@@ -771,23 +842,21 @@ func TestSQLiteInteg_WhereSub(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	// age > (SELECT AVG(age) FROM users WHERE age IS NOT NULL)
-	// AVG(25,30,35,28) = 29.5 → charlie(35), bob(30)
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereSub("age", ">", func(sub *Builder) {
 			sub.Table("users").SelectRaw("AVG(age)").WhereNotNull("age")
 		}).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 2 || results[0] != "bob" || results[1] != "charlie" {
-		t.Errorf("expected [bob, charlie], got %v", results)
+	if len(rows) != 2 || rows[0].Name != "bob" || rows[1].Name != "charlie" {
+		t.Errorf("expected [bob, charlie], got %v", rows)
 	}
 }
 
@@ -797,23 +866,46 @@ func TestSQLiteInteg_WhereInSub(t *testing.T) {
 	setupSQLiteUsersTable(t, db)
 	setupSQLiteOrdersTable(t, db)
 
-	// id IN (SELECT user_id FROM orders WHERE amount > 100)
-	// orders with amount > 100: user_id 1(120), 2(200), 4(150) → alice, bob, diana
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereInSub("id", func(sub *Builder) {
 			sub.Table("orders").Select("user_id").Where("amount", ">", 100)
 		}).
 		OrderBy("name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 users, got %d: %v", len(rows), rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	if len(results) != 3 {
-		t.Errorf("expected 3 users, got %d: %v", len(results), results)
+// TestSQLiteInteg_WhereNotInSub 验证 WHERE NOT IN 子查询。
+func TestSQLiteInteg_WhereNotInSub(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereNotInSub("id", func(sub *Builder) {
+			sub.Table("orders").Select("user_id")
+		}).
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// eve(id=5) has no orders
+	if len(rows) != 1 || rows[0].Name != "eve" {
+		t.Errorf("expected [eve], got %v", rows)
 	}
 }
 
@@ -823,25 +915,50 @@ func TestSQLiteInteg_WhereExists(t *testing.T) {
 	setupSQLiteUsersTable(t, db)
 	setupSQLiteOrdersTable(t, db)
 
-	// 存在订单的用户
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Select("name").
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
 		WhereExists(func(sub *Builder) {
 			sub.Table("orders").
 				SelectRaw("1").
 				WhereColumn("orders.user_id", "=", "users.id")
 		}).
 		OrderBy("name", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 users with orders, got %d: %v", len(rows), rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	// alice, bob, charlie, diana have orders; eve doesn't
-	if len(results) != 4 {
-		t.Errorf("expected 4 users with orders, got %d: %v", len(results), results)
+// TestSQLiteInteg_WhereNotExists 验证 WHERE NOT EXISTS 子查询：只保留在 orders 表中不存在关联记录的用户。
+func TestSQLiteInteg_WhereNotExists(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereNotExists(func(sub *Builder) {
+			sub.Table("orders").
+				Select("orders.id").
+				WhereColumn("orders.user_id", "=", "users.id")
+		}).
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// eve(id=5) has no orders
+	if len(rows) != 1 || rows[0].Name != "eve" {
+		t.Errorf("expected [eve], got %v", rows)
 	}
 }
 
@@ -850,22 +967,47 @@ func TestSQLiteInteg_FromSub(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	// FROM (SELECT name, age FROM users WHERE age IS NOT NULL) sub WHERE sub.age > 28
-	sub := newSQLiteBuilder().Table("users").Select("name", "age").WhereNotNull("age")
-	sqlStr, args, err := newSQLiteBuilder().
+	sub := db.Builder().Table("users").Select("name", "age").WhereNotNull("age")
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().
 		FromSub(sub, "sub").
 		Select("name").
 		Where("age", ">", 28).
 		OrderBy("age", "ASC").
-		ToSelect()
+		Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
 	}
+	if len(rows) != 2 || rows[0].Name != "bob" || rows[1].Name != "charlie" {
+		t.Errorf("expected [bob, charlie], got %v", rows)
+	}
+}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	// bob(30), charlie(35)
-	if len(results) != 2 || results[0] != "bob" || results[1] != "charlie" {
-		t.Errorf("expected [bob, charlie], got %v", results)
+// TestSQLiteInteg_SelectSubquery 验证 SELECT 子句中的子查询。
+func TestSQLiteInteg_SelectSubquery(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+
+	sub := db.Builder().Table("orders").SelectRaw("COUNT(*)").WhereRaw(`"orders"."user_id" = "users"."id"`)
+	type row struct {
+		Name        string `db:"name"`
+		OrdersCount int    `db:"orders_count"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("name").
+		SelectSubquery(sub, "orders_count").
+		Where("id", "=", 1).
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" || rows[0].OrdersCount != 2 {
+		t.Errorf("expected alice with 2 orders, got %v", rows)
 	}
 }
 
@@ -880,24 +1022,19 @@ func TestSQLiteInteg_UpdateBasic(t *testing.T) {
 		Name string `db:"name"`
 		Age  int    `db:"age"`
 	}
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToUpdate(updateData{Name: "alice_updated", Age: 26})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateData{Name: "alice_updated", Age: 26})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	// 验证
-	names := queryStrings(t, db, "SELECT name FROM users WHERE id = 1")
-	if len(names) != 1 || names[0] != "alice_updated" {
-		t.Errorf("expected alice_updated, got %v", names)
+	type verifyRow struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
 	}
-	ages := queryInts(t, db, "SELECT age FROM users WHERE id = 1")
-	if len(ages) != 1 || ages[0] != 26 {
-		t.Errorf("expected age=26, got %v", ages)
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age").Where("id", "=", 1).Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Name != "alice_updated" || rows[0].Age != 26 {
+		t.Errorf("expected alice_updated/26, got %v", rows)
 	}
 }
 
@@ -912,29 +1049,29 @@ func TestSQLiteInteg_UpdatePtrPartial(t *testing.T) {
 		Status *string `db:"status"`
 	}
 	newName := "alice_ptr"
-	// Age 和 Status 为 nil → 不参与 UPDATE
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToUpdate(updatePtrData{Name: &newName})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updatePtrData{Name: &newName})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	// 验证 name 变了，age 和 status 没变
-	names := queryStrings(t, db, "SELECT name FROM users WHERE id = 1")
-	if names[0] != "alice_ptr" {
-		t.Errorf("expected alice_ptr, got %s", names[0])
+	type verifyRow struct {
+		Name   string `db:"name"`
+		Age    int    `db:"age"`
+		Status string `db:"status"`
 	}
-	ages := queryInts(t, db, "SELECT age FROM users WHERE id = 1")
-	if ages[0] != 25 {
-		t.Errorf("expected age still 25, got %d", ages[0])
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age", "status").Where("id", "=", 1).Find(context.Background(), &rows)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
-	statuses := queryStrings(t, db, "SELECT status FROM users WHERE id = 1")
-	if statuses[0] != "active" {
-		t.Errorf("expected status still active, got %s", statuses[0])
+	if rows[0].Name != "alice_ptr" {
+		t.Errorf("expected alice_ptr, got %s", rows[0].Name)
+	}
+	if rows[0].Age != 25 {
+		t.Errorf("expected age still 25, got %d", rows[0].Age)
+	}
+	if rows[0].Status != "active" {
+		t.Errorf("expected status still active, got %s", rows[0].Status)
 	}
 }
 
@@ -946,41 +1083,72 @@ func TestSQLiteInteg_UpdateWithRaw(t *testing.T) {
 	type updateRaw struct {
 		Age any `db:"age"`
 	}
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToUpdate(updateRaw{Age: Raw("\"age\" + 10")})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateRaw{Age: Raw("\"age\" + 10")})
 	if err != nil {
-		t.Fatalf("ToUpdate error: %v", err)
+		t.Fatalf("Update error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	// alice 原 age=25，加 10 应为 35
-	ages := queryInts(t, db, "SELECT age FROM users WHERE id = 1")
-	if len(ages) != 1 || ages[0] != 35 {
-		t.Errorf("expected age=35, got %v", ages)
+	var age int
+	_ = db.Builder().Table("users").Select("age").Where("id", "=", 1).Value(context.Background(), &age)
+	if age != 35 {
+		t.Errorf("expected age=35, got %d", age)
 	}
 }
 
 // ==================== Group 8: DELETE ====================
+
+// TestSQLiteInteg_UpdatePtrAllNil 验证全 nil 指针更新：所有指针字段均为 nil 时返回错误。
+func TestSQLiteInteg_UpdatePtrAllNil(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type updatePtrData struct {
+		Name   *string `db:"name"`
+		Age    *int    `db:"age"`
+		Status *string `db:"status"`
+	}
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updatePtrData{})
+	if err == nil {
+		t.Fatalf("expected error for all-nil update, got nil")
+	}
+}
+
+// TestSQLiteInteg_UpdateWithJoin 验证 SQLite 多表更新：使用 FROM 子句实现 JOIN 更新。
+func TestSQLiteInteg_UpdateWithJoin(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+
+	type updateData struct {
+		Status string `db:"status"`
+	}
+	// 将有订单金额 > 100 的用户状态改为 'vip'
+	_, err := db.Builder().Table("users").
+		Join("orders", "users.id", "=", "orders.user_id").
+		Where("orders.amount", ">", 100).
+		Update(context.Background(), updateData{Status: "vip"})
+	if err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+
+	// alice(Laptop=120), bob(TV=200), diana(Camera=150) → 3 users updated to 'vip'
+	count, _ := db.Builder().Table("users").Where("status", "=", "vip").Count(context.Background())
+	if count != 3 {
+		t.Errorf("expected 3 vip users, got %d", count)
+	}
+}
 
 // TestSQLiteInteg_DeleteWithWhere 验证带条件删除：WHERE id=1 只删除一行，其余行不受影响。
 func TestSQLiteInteg_DeleteWithWhere(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		Where("id", "=", 1).
-		ToDelete()
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Delete(context.Background())
 	if err != nil {
-		t.Fatalf("ToDelete error: %v", err)
+		t.Fatalf("Delete error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 4 {
 		t.Errorf("expected 4 remaining users, got %d", count)
 	}
@@ -991,16 +1159,12 @@ func TestSQLiteInteg_DeleteAll(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		ToDelete()
+	_, err := db.Builder().Table("users").Delete(context.Background())
 	if err != nil {
-		t.Fatalf("ToDelete error: %v", err)
+		t.Fatalf("Delete error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr, args...)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 users after delete all, got %d", count)
 	}
@@ -1020,44 +1184,75 @@ func TestSQLiteInteg_Upsert(t *testing.T) {
 	}
 
 	// 插入新行
-	sqlStr, args, err := newSQLiteBuilder().
-		Table("users").
-		ToUpsert(
-			upsertData{Name: "frank", Age: 40, Email: "frank@test.com"},
-			[]string{"email"},
-			[]string{"name", "age"},
-		)
+	_, err := db.Builder().Table("users").Upsert(context.Background(),
+		upsertData{Name: "frank", Age: 40, Email: "frank@test.com"},
+		[]string{"email"},
+		[]string{"name", "age"},
+	)
 	if err != nil {
-		t.Fatalf("ToUpsert error: %v", err)
+		t.Fatalf("Upsert error: %v", err)
 	}
-	mustExec(t, db, sqlStr, args...)
 
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users WHERE name = 'frank'")
+	count, _ := db.Builder().Table("users").Where("name", "=", "frank").Count(context.Background())
 	if count != 1 {
 		t.Errorf("expected frank inserted, got count=%d", count)
 	}
 
 	// 冲突更新（email 已存在）
-	sqlStr, args, err = newSQLiteBuilder().
-		Table("users").
-		ToUpsert(
-			upsertData{Name: "alice_upserted", Age: 99, Email: "alice@test.com"},
-			[]string{"email"},
-			[]string{"name", "age"},
-		)
+	_, err = db.Builder().Table("users").Upsert(context.Background(),
+		upsertData{Name: "alice_upserted", Age: 99, Email: "alice@test.com"},
+		[]string{"email"},
+		[]string{"name", "age"},
+	)
 	if err != nil {
-		t.Fatalf("ToUpsert error: %v", err)
+		t.Fatalf("Upsert error: %v", err)
 	}
-	mustExec(t, db, sqlStr, args...)
 
-	// alice 的 name 和 age 应该被更新
-	names := queryStrings(t, db, "SELECT name FROM users WHERE email = 'alice@test.com'")
-	if len(names) != 1 || names[0] != "alice_upserted" {
-		t.Errorf("expected alice_upserted, got %v", names)
+	type verifyRow struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
 	}
-	ages := queryInts(t, db, "SELECT age FROM users WHERE email = 'alice@test.com'")
-	if len(ages) != 1 || ages[0] != 99 {
-		t.Errorf("expected age=99, got %v", ages)
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age").Where("email", "=", "alice@test.com").Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Name != "alice_upserted" || rows[0].Age != 99 {
+		t.Errorf("expected alice_upserted/99, got %v", rows)
+	}
+}
+
+// TestSQLiteInteg_UpsertBatch 验证批量 UPSERT：切片中新增行与冲突行同时处理。
+func TestSQLiteInteg_UpsertBatch(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type upsertData struct {
+		Name  string `db:"name"`
+		Age   int    `db:"age"`
+		Email string `db:"email"`
+	}
+	data := []upsertData{
+		{Name: "frank", Age: 40, Email: "frank@test.com"},
+		{Name: "alice_upserted", Age: 99, Email: "alice@test.com"},
+	}
+	_, err := db.Builder().Table("users").Upsert(context.Background(), data,
+		[]string{"email"}, []string{"name", "age"})
+	if err != nil {
+		t.Fatalf("Upsert error: %v", err)
+	}
+
+	// frank 新增
+	count, _ := db.Builder().Table("users").Where("name", "=", "frank").Count(context.Background())
+	if count != 1 {
+		t.Errorf("expected frank inserted, got count=%d", count)
+	}
+	// alice 冲突更新
+	type verifyRow struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var rows []verifyRow
+	_ = db.Builder().Table("users").Select("name", "age").Where("email", "=", "alice@test.com").Find(context.Background(), &rows)
+	if len(rows) != 1 || rows[0].Name != "alice_upserted" || rows[0].Age != 99 {
+		t.Errorf("expected alice_upserted/99, got %v", rows)
 	}
 }
 
@@ -1074,7 +1269,7 @@ func TestSQLiteInteg_InsertUsing(t *testing.T) {
 	)`)
 
 	// INSERT INTO users_archive (name, age) SELECT name, age FROM users WHERE status = 'active'
-	sqlStr, args, err := newSQLiteBuilder().
+	sqlStr, args, err := db.Builder().
 		Table("users_archive").
 		ToInsertUsing([]string{"name", "age"}, func(sub *Builder) {
 			sub.Table("users").Select("name", "age").Where("status", "=", "active")
@@ -1085,8 +1280,7 @@ func TestSQLiteInteg_InsertUsing(t *testing.T) {
 
 	mustExec(t, db, sqlStr, args...)
 
-	// active users: alice, bob, diana → 3 rows
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users_archive")
+	count, _ := db.Builder().Table("users_archive").Count(context.Background())
 	if count != 3 {
 		t.Errorf("expected 3 archived users, got %d", count)
 	}
@@ -1097,19 +1291,19 @@ func TestSQLiteInteg_Union(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	// UNION 去重
-	q1 := newSQLiteBuilder().Table("users").Select("name").Where("status", "=", "active")
-	q2 := newSQLiteBuilder().Table("users").Select("name").Where("age", ">", 30)
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 30)
 
-	sqlStr, args, err := q1.Union(q2).ToSelect()
-	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+	type row struct {
+		Name string `db:"name"`
 	}
-
-	results := queryStrings(t, db, sqlStr, args...)
-	// active: alice, bob, diana; age>30: charlie(35); UNION 去重 → 4 names
-	if len(results) != 4 {
-		t.Errorf("expected 4 union results, got %d: %v", len(results), results)
+	var rows []row
+	err := q1.Union(q2).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 union results, got %d: %v", len(rows), rows)
 	}
 }
 
@@ -1118,18 +1312,49 @@ func TestSQLiteInteg_UnionAll(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	q1 := newSQLiteBuilder().Table("users").Select("name").Where("status", "=", "active")
-	q2 := newSQLiteBuilder().Table("users").Select("name").Where("age", ">", 25)
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 25)
 
-	sqlStr, args, err := q1.UnionAll(q2).ToSelect()
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := q1.UnionAll(q2).Find(context.Background(), &rows)
 	if err != nil {
-		t.Fatalf("ToSelect error: %v", err)
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 6 {
+		t.Errorf("expected 6 union all results, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestSQLiteInteg_Clone 验证 Builder 克隆后独立查询。
+func TestSQLiteInteg_Clone(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	base := db.Builder().Table("users").Where("status", "=", "active")
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows1, rows2 []row
+	err := base.Clone().Where("age", ">", 25).Select("name").OrderBy("age", "ASC").Find(context.Background(), &rows1)
+	if err != nil {
+		t.Fatalf("clone1 error: %v", err)
+	}
+	err = base.Clone().Where("age", "<", 28).Select("name").OrderBy("age", "ASC").Find(context.Background(), &rows2)
+	if err != nil {
+		t.Fatalf("clone2 error: %v", err)
 	}
 
-	results := queryStrings(t, db, sqlStr, args...)
-	// active: alice, bob, diana (3); age>25: bob, charlie, diana (3); UNION ALL → 6
-	if len(results) != 6 {
-		t.Errorf("expected 6 union all results, got %d: %v", len(results), results)
+	// clone1: active and age>25 → bob(30), diana(28) = 2
+	if len(rows1) != 2 {
+		t.Errorf("expected 2 rows for clone1, got %d: %v", len(rows1), rows1)
+	}
+	// clone2: active and age<28 → alice(25) = 1
+	if len(rows2) != 1 {
+		t.Errorf("expected 1 row for clone2, got %d: %v", len(rows2), rows2)
 	}
 }
 
@@ -1138,16 +1363,12 @@ func TestSQLiteInteg_Truncate(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	sqlStr, err := newSQLiteBuilder().
-		Table("users").
-		ToTruncate()
+	err := db.Builder().Table("users").Truncate(context.Background())
 	if err != nil {
-		t.Fatalf("ToTruncate error: %v", err)
+		t.Fatalf("Truncate error: %v", err)
 	}
 
-	mustExec(t, db, sqlStr)
-
-	count := queryCount(t, db, "SELECT COUNT(*) FROM users")
+	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 users after truncate, got %d", count)
 	}

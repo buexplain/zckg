@@ -4,6 +4,7 @@ package zcdb
 // 遵循 Laravel 的设计：Builder 积累状态，Grammar 负责编译 SQL。
 type Builder struct {
 	grammar Grammar
+	dao     *DBDao // 持有 DBDao 引用，用于终端方法执行 SQL
 
 	// 查询状态
 	table      string
@@ -23,16 +24,18 @@ type Builder struct {
 	lockClause string
 }
 
-// NewBuilder 创建一个新的查询构造器。
-func NewBuilder(grammar Grammar) *Builder {
-	return &Builder{grammar: grammar}
+// NewBuilder 创建一个新的sql构造器。
+func NewBuilder(grammar Grammar, dao *DBDao) *Builder {
+	return &Builder{
+		grammar: grammar,
+		dao:     dao,
+	}
 }
 
 // ==================== 表和列 ====================
 
-// Table 设置查询目标表名。
-func (b *Builder) Table(table string) *Builder {
-	b.table = table
+func (b *Builder) Table(tableName string) *Builder {
+	b.table = tableName
 	return b
 }
 
@@ -196,7 +199,7 @@ func (b *Builder) WhereColumn(first string, op string, second string) *Builder {
 // WhereNested 添加一个嵌套的 WHERE 子句组。
 // callback 接收一个新的 Builder，用于构建嵌套条件。
 func (b *Builder) WhereNested(callback func(*Builder)) *Builder {
-	nested := NewBuilder(b.grammar)
+	nested := NewBuilder(b.grammar, b.dao)
 	nested.table = b.table
 	callback(nested)
 	if len(nested.wheres) > 0 {
@@ -211,7 +214,7 @@ func (b *Builder) WhereNested(callback func(*Builder)) *Builder {
 
 // OrWhereNested 添加一个嵌套的 OR WHERE 子句组。
 func (b *Builder) OrWhereNested(callback func(*Builder)) *Builder {
-	nested := NewBuilder(b.grammar)
+	nested := NewBuilder(b.grammar, b.dao)
 	nested.table = b.table
 	callback(nested)
 	if len(nested.wheres) > 0 {
@@ -226,7 +229,7 @@ func (b *Builder) OrWhereNested(callback func(*Builder)) *Builder {
 
 // WhereExists 添加一个 WHERE EXISTS (subquery) 条件。
 func (b *Builder) WhereExists(callback func(*Builder)) *Builder {
-	sub := NewBuilder(b.grammar)
+	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeExists,
@@ -238,7 +241,7 @@ func (b *Builder) WhereExists(callback func(*Builder)) *Builder {
 
 // WhereNotExists 添加一个 WHERE NOT EXISTS (subquery) 条件。
 func (b *Builder) WhereNotExists(callback func(*Builder)) *Builder {
-	sub := NewBuilder(b.grammar)
+	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeNotExists,
@@ -250,7 +253,7 @@ func (b *Builder) WhereNotExists(callback func(*Builder)) *Builder {
 
 // WhereSub 添加一个子查询 WHERE 条件: WHERE column op (SELECT ...)
 func (b *Builder) WhereSub(column string, op string, callback func(*Builder)) *Builder {
-	sub := NewBuilder(b.grammar)
+	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
 		Type:     WhereTypeSub,
@@ -264,7 +267,7 @@ func (b *Builder) WhereSub(column string, op string, callback func(*Builder)) *B
 
 // OrWhereSub 添加一个子查询 OR WHERE 条件。
 func (b *Builder) OrWhereSub(column string, op string, callback func(*Builder)) *Builder {
-	sub := NewBuilder(b.grammar)
+	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
 		Type:     WhereTypeSub,
@@ -278,7 +281,7 @@ func (b *Builder) OrWhereSub(column string, op string, callback func(*Builder)) 
 
 // WhereInSub 添加一个 WHERE column IN (SELECT ...) 条件。
 func (b *Builder) WhereInSub(column string, callback func(*Builder)) *Builder {
-	sub := NewBuilder(b.grammar)
+	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeInSub,
@@ -291,7 +294,7 @@ func (b *Builder) WhereInSub(column string, callback func(*Builder)) *Builder {
 
 // WhereNotInSub 添加一个 WHERE column NOT IN (SELECT ...) 条件。
 func (b *Builder) WhereNotInSub(column string, callback func(*Builder)) *Builder {
-	sub := NewBuilder(b.grammar)
+	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeNotInSub,
@@ -781,7 +784,7 @@ func (b *Builder) ToInsertUsing(columns []string, callback func(*Builder)) (stri
 		return "", nil, ErrEmptyTable
 	}
 
-	sub := NewBuilder(b.grammar)
+	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 
 	sql := b.grammar.CompileInsertUsing(b, columns, sub)
@@ -992,6 +995,7 @@ func (b *Builder) collectWhereBindings() []any {
 func (b *Builder) Clone() *Builder {
 	clone := &Builder{
 		grammar:    b.grammar,
+		dao:        b.dao,
 		table:      b.table,
 		distinct:   b.distinct,
 		limit:      b.limit,
