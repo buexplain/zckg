@@ -6,8 +6,8 @@ type Expression struct {
 	value string
 }
 
-// Raw 创建一个原始 SQL 表达式。
-func Raw(value string) Expression {
+// NewExpression 创建一个原始 SQL 表达式。
+func NewExpression(value string) Expression {
 	return Expression{value: value}
 }
 

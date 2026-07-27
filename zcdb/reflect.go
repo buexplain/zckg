@@ -90,7 +90,13 @@ func parseStruct(t reflect.Type) *structInfo {
 //
 // 返回 (列名列表, 值的二维切片, error)
 func extractInsertData(data any) (columns []string, rows [][]any, err error) {
+	if data == nil {
+		return nil, nil, ErrInvalidStruct
+	}
 	v := reflect.ValueOf(data)
+	if !v.IsValid() {
+		return nil, nil, ErrInvalidStruct
+	}
 	t := v.Type()
 
 	// 处理切片类型
@@ -214,7 +220,13 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 //
 // 返回 (列名列表, 值列表, error)
 func extractUpdateData(data any) (columns []string, values []any, err error) {
+	if data == nil {
+		return nil, nil, ErrInvalidStruct
+	}
 	v := reflect.ValueOf(data)
+	if !v.IsValid() {
+		return nil, nil, ErrInvalidStruct
+	}
 	t := v.Type()
 
 	if t.Kind() == reflect.Ptr {

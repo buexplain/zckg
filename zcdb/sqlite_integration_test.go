@@ -2,7 +2,12 @@ package zcdb
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -19,7 +24,9 @@ func openSQLiteTestDB(t *testing.T) *DBDao {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	dao, err := NewDBDao(pool, "sqlite", nil)
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		log.Default().Println(sqlStr, args)
+	})
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
@@ -1075,7 +1082,7 @@ func TestSQLiteInteg_UpdatePtrPartial(t *testing.T) {
 	}
 }
 
-// TestSQLiteInteg_UpdateWithRaw 验证 Raw 表达式更新：字段值为 Raw("age" + 10) 时生成原始 SQL 而非占位符。
+// TestSQLiteInteg_UpdateWithRaw 验证 NewExpression 表达式更新：字段值为 NewExpression("age" + 10) 时生成原始 SQL 而非占位符。
 func TestSQLiteInteg_UpdateWithRaw(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
@@ -1083,7 +1090,7 @@ func TestSQLiteInteg_UpdateWithRaw(t *testing.T) {
 	type updateRaw struct {
 		Age any `db:"age"`
 	}
-	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateRaw{Age: Raw("\"age\" + 10")})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateRaw{Age: NewExpression("\"age\" + 10")})
 	if err != nil {
 		t.Fatalf("Update error: %v", err)
 	}
@@ -1358,6 +1365,149 @@ func TestSQLiteInteg_Clone(t *testing.T) {
 	}
 }
 
+// ==================== Group 10: builder_exec 终端方法 ====================
+
+// TestSQLiteInteg_First 验证 First 查询第一条记录：有数据时填充结构体并返回 nil。
+func TestSQLiteInteg_First(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name", "age").OrderBy("id", "ASC").First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice" || r.Age != 25 {
+		t.Errorf("expected alice/25, got %s/%d", r.Name, r.Age)
+	}
+}
+
+// TestSQLiteInteg_FirstNotFound 验证 First 无数据时返回 sql.ErrNoRows。
+func TestSQLiteInteg_FirstNotFound(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name").Where("id", "=", 999).First(context.Background(), &r)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+// TestSQLiteInteg_FirstLimit 验证 First 自动限制为 1 条：即使有多行匹配也只返回第一条。
+func TestSQLiteInteg_FirstLimit(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name").Where("status", "=", "active").OrderBy("id", "ASC").First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice" {
+		t.Errorf("expected alice, got %s", r.Name)
+	}
+}
+
+// TestSQLiteInteg_Exists 验证 Exists 有数据时返回 true。
+func TestSQLiteInteg_Exists(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	exists, err := db.Builder().Table("users").Where("status", "=", "active").Exists(context.Background())
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if !exists {
+		t.Errorf("expected exists=true, got false")
+	}
+}
+
+// TestSQLiteInteg_ExistsFalse 验证 Exists 无匹配数据时返回 false。
+func TestSQLiteInteg_ExistsFalse(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	exists, err := db.Builder().Table("users").Where("id", "=", 999).Exists(context.Background())
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if exists {
+		t.Errorf("expected exists=false, got true")
+	}
+}
+
+// TestSQLiteInteg_InsertGetId 验证 InsertGetId 插入并返回自增 ID。
+func TestSQLiteInteg_InsertGetId(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type insertData struct {
+		Name  string `db:"name"`
+		Age   int    `db:"age"`
+		Email string `db:"email"`
+	}
+	id, err := db.Builder().Table("users").InsertGetId(context.Background(), insertData{Name: "frank", Age: 40, Email: "frank@test.com"})
+	if err != nil {
+		t.Fatalf("InsertGetId error: %v", err)
+	}
+	if id != 6 {
+		t.Errorf("expected id=6, got %d", id)
+	}
+}
+
+// TestSQLiteInteg_Paginate 验证 Paginate 分页查询：第二页返回正确数据。
+func TestSQLiteInteg_Paginate(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	b := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(2, 2)
+	_, err := b.Paginate(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("Paginate error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(rows))
+	}
+	if len(rows) >= 2 && (rows[0].Name != "charlie" || rows[1].Name != "diana") {
+		t.Errorf("expected [charlie, diana], got %v", rows)
+	}
+}
+
+// TestSQLiteInteg_PaginateDefault 验证 Paginate 未设置分页参数时使用默认值（第 1 页，每页 20 条）。
+func TestSQLiteInteg_PaginateDefault(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	b := db.Builder().Table("users").Select("name").OrderBy("id", "ASC")
+	_, err := b.Paginate(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("Paginate error: %v", err)
+	}
+	// 默认 ForPage(1, 20)，5 条数据全部返回
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows))
+	}
+}
+
 // TestSQLiteInteg_Truncate 验证 TRUNCATE 清空表：执行后表中行数归零。
 func TestSQLiteInteg_Truncate(t *testing.T) {
 	db := openSQLiteTestDB(t)
@@ -1371,5 +1521,347 @@ func TestSQLiteInteg_Truncate(t *testing.T) {
 	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 users after truncate, got %d", count)
+	}
+}
+
+// ==================== Group 11: Lock ====================
+
+// TestSQLiteInteg_LockForUpdate 验证 SQLite 忽略 FOR UPDATE：查询仍可执行，锁子句被忽略。
+func TestSQLiteInteg_LockForUpdate(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").Where("id", "=", 1).LockForUpdate().Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("LockForUpdate error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" {
+		t.Errorf("expected alice, got %v", rows)
+	}
+}
+
+// TestSQLiteInteg_SharedLock 验证 SQLite 忽略 LOCK IN SHARE MODE：查询仍可执行，锁子句被忽略。
+func TestSQLiteInteg_SharedLock(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").Where("id", "=", 1).SharedLock().Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("SharedLock error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "alice" {
+		t.Errorf("expected alice, got %v", rows)
+	}
+}
+
+// ==================== Group 12: Transaction ====================
+
+// TestSQLiteInteg_TransactionCommit 验证事务提交：回调返回 nil 时，修改持久化。
+func TestSQLiteInteg_TransactionCommit(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	err := db.Transaction(context.Background(), func(ctx context.Context) error {
+		type updateData struct {
+			Name string `db:"name"`
+		}
+		_, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, updateData{Name: "alice_tx"})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Transaction error: %v", err)
+	}
+
+	// 提交后数据应持久化
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice_tx" {
+		t.Errorf("expected alice_tx after commit, got %s", r.Name)
+	}
+}
+
+// TestSQLiteInteg_TransactionRollback 验证事务回滚：回调返回 error 时，修改被撤销。
+func TestSQLiteInteg_TransactionRollback(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	err := db.Transaction(context.Background(), func(ctx context.Context) error {
+		type updateData struct {
+			Name string `db:"name"`
+		}
+		_, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, updateData{Name: "alice_rolled_back"})
+		if err != nil {
+			return err
+		}
+		// 主动返回错误触发回滚
+		return fmt.Errorf("intentional error")
+	})
+	if err == nil {
+		t.Fatalf("expected error from Transaction, got nil")
+	}
+
+	// 回滚后数据应保持不变
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice" {
+		t.Errorf("expected alice after rollback, got %s", r.Name)
+	}
+}
+
+// TestSQLiteInteg_TransactionNested 验证嵌套事务传播：内层事务复用外层事务，提交后整体生效。
+func TestSQLiteInteg_TransactionNested(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	err := db.Transaction(context.Background(), func(outerCtx context.Context) error {
+		type updateData struct {
+			Name string `db:"name"`
+		}
+		_, err := db.Builder().Table("users").Where("id", "=", 1).Update(outerCtx, updateData{Name: "alice_nested"})
+		if err != nil {
+			return err
+		}
+		// 嵌套调用：应复用外层事务
+		return db.Transaction(outerCtx, func(innerCtx context.Context) error {
+			_, err := db.Builder().Table("users").Where("id", "=", 2).Update(innerCtx, updateData{Name: "bob_nested"})
+			return err
+		})
+	})
+	if err != nil {
+		t.Fatalf("Transaction error: %v", err)
+	}
+
+	// 两次修改都应生效
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r1, r2 row
+	_ = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r1)
+	if r1.Name != "alice_nested" {
+		t.Errorf("expected alice_nested, got %s", r1.Name)
+	}
+	_ = db.Builder().Table("users").Select("name").Where("id", "=", 2).First(context.Background(), &r2)
+	if r2.Name != "bob_nested" {
+		t.Errorf("expected bob_nested, got %s", r2.Name)
+	}
+}
+
+// ==================== Group 13: any 入参约束验证 ====================
+
+// TestSQLiteInteg_FirstInvalidDest 验证 First 传入非指针类型时返回错误。
+func TestSQLiteInteg_FirstInvalidDest(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name").First(context.Background(), r)
+	if err == nil {
+		t.Fatalf("expected error for non-pointer dest, got nil")
+	}
+}
+
+// TestSQLiteInteg_FirstNilDest 验证 First 传入 nil 时返回错误。
+func TestSQLiteInteg_FirstNilDest(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	err := db.Builder().Table("users").Select("name").First(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("expected error for nil dest, got nil")
+	}
+}
+
+// TestSQLiteInteg_FirstIntPtrDest 验证 First 传入非结构体指针（*int）时返回错误。
+func TestSQLiteInteg_FirstIntPtrDest(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	var n int
+	err := db.Builder().Table("users").Select("name").First(context.Background(), &n)
+	if err == nil {
+		t.Fatalf("expected error for *int dest, got nil")
+	}
+}
+
+// TestSQLiteInteg_FindInvalidDest 验证 Find 传入 *int（非结构体切片指针）时返回错误。
+func TestSQLiteInteg_FindInvalidDest(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	var n int
+	err := db.Builder().Table("users").Select("name").Find(context.Background(), &n)
+	if err == nil {
+		t.Fatalf("expected error for *int dest in Find, got nil")
+	}
+}
+
+// TestSQLiteInteg_FindNonPointerDest 验证 Find 传入非指针（[]struct）时返回错误。
+func TestSQLiteInteg_FindNonPointerDest(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").Find(context.Background(), rows)
+	if err == nil {
+		t.Fatalf("expected error for non-pointer slice dest, got nil")
+	}
+}
+
+// TestSQLiteInteg_FindIntPtrDest 验证 Find 传入 *[]int（非结构体切片指针）时返回错误。
+func TestSQLiteInteg_FindIntPtrDest(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	var nums []int
+	err := db.Builder().Table("users").Select("name").Find(context.Background(), &nums)
+	if err == nil {
+		t.Fatalf("expected error for *[]int dest in Find, got nil")
+	}
+}
+
+// TestSQLiteInteg_PaginateInvalidDest 验证 Paginate 传入 *int（非结构体切片指针）时返回错误。
+func TestSQLiteInteg_PaginateInvalidDest(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	var n int
+	_, err := db.Builder().Table("users").Select("name").Paginate(context.Background(), &n)
+	if err == nil {
+		t.Fatalf("expected error for *int dest in Paginate, got nil")
+	}
+}
+
+// TestSQLiteInteg_ValueNoRows 验证 Value 无匹配数据时返回 sql.ErrNoRows。
+func TestSQLiteInteg_ValueNoRows(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	var name string
+	err := db.Builder().Table("users").Select("name").Where("id", "=", 999).Value(context.Background(), &name)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+// TestSQLiteInteg_InsertInvalidData 验证 Insert 传入非法类型（int、string、nil）时返回错误。
+func TestSQLiteInteg_InsertInvalidData(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").Insert(context.Background(), 123)
+	if err == nil {
+		t.Errorf("expected error for int data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Insert(context.Background(), "hello")
+	if err == nil {
+		t.Errorf("expected error for string data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Insert(context.Background(), nil)
+	if err == nil {
+		t.Errorf("expected error for nil data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Insert(context.Background(), map[string]any{"name": "test"})
+	if err == nil {
+		t.Errorf("expected error for map data, got nil")
+	}
+}
+
+// TestSQLiteInteg_InsertEmptySlice 验证 Insert 传入空切片时返回错误。
+func TestSQLiteInteg_InsertEmptySlice(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type insertData struct {
+		Name string `db:"name"`
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), []insertData{})
+	if err == nil {
+		t.Fatalf("expected error for empty slice, got nil")
+	}
+}
+
+// TestSQLiteInteg_InsertOrIgnoreInvalidData 验证 InsertOrIgnore 传入非法类型时返回错误。
+func TestSQLiteInteg_InsertOrIgnoreInvalidData(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").InsertOrIgnore(context.Background(), 123)
+	if err == nil {
+		t.Errorf("expected error for int data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").InsertOrIgnore(context.Background(), nil)
+	if err == nil {
+		t.Errorf("expected error for nil data, got nil")
+	}
+}
+
+// TestSQLiteInteg_UpsertInvalidData 验证 Upsert 传入非法类型时返回错误。
+func TestSQLiteInteg_UpsertInvalidData(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").Upsert(context.Background(), 123, []string{"email"}, []string{"name"})
+	if err == nil {
+		t.Errorf("expected error for int data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Upsert(context.Background(), nil, []string{"email"}, []string{"name"})
+	if err == nil {
+		t.Errorf("expected error for nil data, got nil")
+	}
+}
+
+// TestSQLiteInteg_UpdateInvalidData 验证 Update 传入非法类型（切片、int、nil）时返回错误。
+func TestSQLiteInteg_UpdateInvalidData(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type updateData struct {
+		Name string `db:"name"`
+	}
+
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), []updateData{{Name: "test"}})
+	if err == nil {
+		t.Errorf("expected error for slice data in Update, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), 123)
+	if err == nil {
+		t.Errorf("expected error for int data in Update, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), nil)
+	if err == nil {
+		t.Errorf("expected error for nil data in Update, got nil")
 	}
 }

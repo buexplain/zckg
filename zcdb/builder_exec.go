@@ -3,37 +3,37 @@ package zcdb
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
 )
 
-// First 查询第一条记录，扫描到 dest（*struct 指针）。返回是否有数据。
-func (b *Builder) First(ctx context.Context, dest any) (bool, error) {
+// First 查询第一条记录，扫描到 dest。
+// dest 必须是结构体指针（*struct），未找到记录时返回 sql.ErrNoRows。
+//
+//	err := db.Builder().Table("users").Where("id", "=", 1).First(ctx, &user)
+func (b *Builder) First(ctx context.Context, dest any) error {
 	// 克隆并设置 LIMIT 1，避免修改原 Builder
-	clone := b.Clone()
-	clone.limit = 1
+	var clone *Builder
+	if b.limit == 1 {
+		clone = b
+	} else {
+		clone = b.Clone()
+		clone.limit = 1
+	}
 
 	sqlStr, args, err := clone.ToSelect()
 	if err != nil {
-		return false, err
+		return err
 	}
-
 	rows, err := b.dao.Query(ctx, sqlStr, args...)
 	if err != nil {
-		return false, err
+		return err
 	}
-
-	err = Scan(rows, dest)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	return ScanStruct(rows, dest)
 }
 
-// Find 查询多条记录，扫描到 dest（*[]struct 或 *[]*struct 指针）。
+// Find 查询多条记录，扫描到 dest。
+// dest 必须是结构体切片指针（*[]struct）或结构体指针切片指针（*[]*struct）。
+//
+//	err := db.Builder().Table("users").Where("status", "=", "active").Find(ctx, &users)
 func (b *Builder) Find(ctx context.Context, dest any) error {
 	sqlStr, args, err := b.ToSelect()
 	if err != nil {
@@ -45,40 +45,28 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 		return err
 	}
 
-	return Scan(rows, dest)
+	return ScanStruct(rows, dest)
 }
 
 // Paginate 分页查询，自动计算总数。
-// dest 为 *[]struct 或 *[]*struct 指针
+// dest 必须是结构体切片指针（*[]struct）或结构体指针切片指针（*[]*struct）。
+//
+//	total, err := db.Builder().Table("users").ForPage(1, 20).Paginate(ctx, &users)
 func (b *Builder) Paginate(ctx context.Context, dest any) (totalCount int, err error) {
-	// 先查总数：克隆 Builder，移除排序和分页，编译 COUNT
-	countBuilder := b.Clone()
-	countBuilder.orders = nil
-	countBuilder.limit = 0
-	countBuilder.offset = 0
-	countBuilder.columns = nil
-
-	countSQL, countArgs, err := countBuilder.ToCount()
-	if err != nil {
-		return 0, err
-	}
-
 	// 执行 COUNT 查询
-	countRows, err := b.dao.Query(ctx, countSQL, countArgs...)
+	c := b.Clone()
+	c.orders = nil
+	c.limit = 0
+	c.offset = 0
+	c.columns = nil
+	total, err := c.Count(ctx)
 	if err != nil {
 		return 0, err
 	}
-	var total int
-	if err = scanScalar(countRows, &total); err != nil {
-		return 0, err
-	}
+
 	// 如果总数为 0，直接返回
 	if total == 0 {
 		return 0, nil
-	}
-
-	if b.limit < 1 || b.offset < 1 {
-		b.ForPage(1, 20)
 	}
 
 	dataSQL, dataArgs, err := b.ToSelect()
@@ -91,55 +79,58 @@ func (b *Builder) Paginate(ctx context.Context, dest any) (totalCount int, err e
 		return 0, err
 	}
 
-	return 0, Scan(rows, dest)
+	return 0, ScanStruct(rows, dest)
 }
 
 // Count 查询记录总数。
+//
+//	count, err := db.Builder().Table("users").Where("status", "=", "active").Count(ctx)
 func (b *Builder) Count(ctx context.Context) (int, error) {
 	sqlStr, args, err := b.ToCount()
 	if err != nil {
 		return 0, err
 	}
 
+	var count int
 	rows, err := b.dao.Query(ctx, sqlStr, args...)
 	if err != nil {
 		return 0, err
 	}
-
-	var count int
-	if err := scanScalar(rows, &count); err != nil {
-		return 0, fmt.Errorf("zcdb: count query failed: %w", err)
+	defer func(rows *sql.Rows) {
+		_ = rows.Close()
+	}(rows)
+	if rows.Next() {
+		if err := rows.Scan(&count); err != nil {
+			return 0, err
+		}
 	}
-	return count, nil
+	return count, rows.Err()
 }
 
 // Exists 判断是否有记录。
+//
+//	exists, err := db.Builder().Table("users").Where("id", "=", 1).Exists(ctx)
 func (b *Builder) Exists(ctx context.Context) (bool, error) {
-	clone := b.Clone()
-	clone.limit = 1
-	clone.columns = nil
-
-	sqlStr, args, err := clone.ToSelect()
+	count, err := b.Count(ctx)
 	if err != nil {
 		return false, err
 	}
-
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-
-	return rows.Next(), rows.Err()
+	return count > 0, nil
 }
 
-// Value 查询单个标量值，扫描到 dest 指针中。
+// Value 查询单个标量值，扫描到 dest。
+// dest 必须是基本类型指针（如 *string、*int、*int64）或 nil 指针（如 **string 用于区分 NULL）。
+// 未找到记录时返回 sql.ErrNoRows。
+//
+//	err := db.Builder().Table("users").Where("id", "=", 1).Value(ctx, &name)
 func (b *Builder) Value(ctx context.Context, dest any) error {
-	clone := b.Clone()
-	clone.limit = 1
-
+	var clone *Builder
+	if b.limit == 1 {
+		clone = b
+	} else {
+		clone = b.Clone()
+		clone.limit = 1
+	}
 	sqlStr, args, err := clone.ToSelect()
 	if err != nil {
 		return err
@@ -149,12 +140,30 @@ func (b *Builder) Value(ctx context.Context, dest any) error {
 	if err != nil {
 		return err
 	}
-
-	return scanScalar(rows, dest)
+	defer func(rows *sql.Rows) {
+		_ = rows.Close()
+	}(rows)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	return rows.Scan(dest)
 }
 
 // Insert 插入数据，返回受影响行数。
-// data 可以是结构体、结构体指针、结构体切片或结构体指针切片。
+// data 支持以下类型：
+//
+//   - 单个结构体：struct{}
+//
+//   - 结构体指针：*struct{}
+//
+//   - 结构体切片：[]struct{}
+//
+//   - 结构体指针切片：[]*struct{}
+//
+//     affected, err := db.Builder().Table("users").Insert(ctx, &user)
 func (b *Builder) Insert(ctx context.Context, data any) (int64, error) {
 	sqlStr, args, err := b.ToInsert(data)
 	if err != nil {
@@ -170,7 +179,9 @@ func (b *Builder) Insert(ctx context.Context, data any) (int64, error) {
 }
 
 // InsertGetId 插入数据并返回自增 ID。
-// data 必须是单个结构体或结构体指针。
+// data 必须是单个结构体（struct{}）或结构体指针（*struct{}），不支持切片。
+//
+//	id, err := db.Builder().Table("users").InsertGetId(ctx, &user)
 func (b *Builder) InsertGetId(ctx context.Context, data any) (int64, error) {
 	sqlStr, args, err := b.ToInsert(data)
 	if err != nil {
@@ -186,6 +197,9 @@ func (b *Builder) InsertGetId(ctx context.Context, data any) (int64, error) {
 }
 
 // InsertOrIgnore 插入数据（忽略冲突），返回受影响行数。
+// data 支持类型同 Insert：struct{}、*struct{}、[]struct{}、[]*struct{}。
+//
+//	affected, err := db.Builder().Table("users").InsertOrIgnore(ctx, &user)
 func (b *Builder) InsertOrIgnore(ctx context.Context, data any) (int64, error) {
 	sqlStr, args, err := b.ToInsertOrIgnore(data)
 	if err != nil {
@@ -201,7 +215,10 @@ func (b *Builder) InsertOrIgnore(ctx context.Context, data any) (int64, error) {
 }
 
 // Upsert 插入或更新数据。
+// data 支持类型同 Insert：struct{}、*struct{}、[]struct{}、[]*struct{}。
 // uniqueBy 为唯一索引列名，updateColumns 为冲突时要更新的列名。
+//
+//	affected, err := db.Builder().Table("users").Upsert(ctx, &user, []string{"email"}, []string{"name", "age"})
 func (b *Builder) Upsert(ctx context.Context, data any, uniqueBy []string, updateColumns []string) (int64, error) {
 	sqlStr, args, err := b.ToUpsert(data, uniqueBy, updateColumns)
 	if err != nil {
@@ -217,6 +234,9 @@ func (b *Builder) Upsert(ctx context.Context, data any, uniqueBy []string, updat
 }
 
 // Update 更新数据，返回受影响行数。
+// data 必须是单个结构体（struct{}）或结构体指针（*struct{}），不支持切片。
+//
+//	affected, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, &user)
 func (b *Builder) Update(ctx context.Context, data any) (int64, error) {
 	sqlStr, args, err := b.ToUpdate(data)
 	if err != nil {
@@ -232,6 +252,8 @@ func (b *Builder) Update(ctx context.Context, data any) (int64, error) {
 }
 
 // Delete 删除数据，返回受影响行数。
+//
+//	affected, err := db.Builder().Table("users").Where("id", "=", 1).Delete(ctx)
 func (b *Builder) Delete(ctx context.Context) (int64, error) {
 	sqlStr, args, err := b.ToDelete()
 	if err != nil {
@@ -247,6 +269,8 @@ func (b *Builder) Delete(ctx context.Context) (int64, error) {
 }
 
 // Truncate 清空表。
+//
+//	err := db.Builder().Table("users").Truncate(ctx)
 func (b *Builder) Truncate(ctx context.Context) error {
 	sqlStr, err := b.ToTruncate()
 	if err != nil {
@@ -255,50 +279,4 @@ func (b *Builder) Truncate(ctx context.Context) error {
 
 	_, err = b.dao.Exec(ctx, sqlStr)
 	return err
-}
-
-// ==================== 内部辅助方法 ====================
-
-// ToCount 编译 COUNT 查询（内部使用）。
-// 通过复用 CompileSelect 生成 SELECT COUNT(*) FROM ... 语句。
-func (b *Builder) ToCount() (string, []any, error) {
-	if b.table == "" && b.fromSub == nil {
-		return "", nil, ErrEmptyTable
-	}
-
-	// 保存原始列并设置为 COUNT(*)，清除 SELECT 子查询
-	origColumns := b.columns
-	origSelectSubs := b.selectSubs
-	b.columns = []string{"COUNT(*)"}
-	b.selectSubs = nil
-
-	sqlStr := b.grammar.CompileSelect(b, b.columns)
-	// collectSelectBindings 会收集 FROM_SUB → JOIN → WHERE → HAVING → UNION 的绑定参数
-	// 由于 selectSubs 已清空，不会包含 SELECT 子查询的参数
-	args := b.collectSelectBindings()
-
-	b.columns = origColumns
-	b.selectSubs = origSelectSubs
-
-	return sqlStr, args, nil
-}
-
-// scanScalar 从 *sql.Rows 中扫描单个标量值。
-func scanScalar(rows *sql.Rows, dest any) error {
-	defer func() {
-		_ = rows.Close()
-	}()
-
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		return sql.ErrNoRows
-	}
-
-	if err := rows.Scan(dest); err != nil {
-		return err
-	}
-
-	return rows.Err()
 }

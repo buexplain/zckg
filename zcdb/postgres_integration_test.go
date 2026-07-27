@@ -2,6 +2,8 @@ package zcdb
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"testing"
@@ -34,8 +36,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 		t.Fatalf("failed to ping postgres: %v", err)
 	}
 	// 创建测试数据库（若不存在）
-	var exists bool
-	err = dao.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'zckg_test_integ')").Scan(&exists)
+	exists, err := dao.Builder().Table("pg_database").Where("datname", "=", "zckg_test_integ").Exists(context.Background())
 	if err != nil {
 		t.Fatalf("failed to check database existence: %v", err)
 	}
@@ -55,7 +56,9 @@ func openPgTestDB(t *testing.T) *DBDao {
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
-	dao, err = NewDBDao(pool, "postgres", nil)
+	dao, err = NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		log.Default().Println(sqlStr, args)
+	})
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
@@ -1106,7 +1109,7 @@ func TestPgInteg_UpdatePtrPartial(t *testing.T) {
 	}
 }
 
-// TestPgInteg_UpdateWithRaw 验证 Raw 表达式更新：字段值为 Raw("age" + 10)。
+// TestPgInteg_UpdateWithRaw 验证 NewExpression 表达式更新：字段值为 NewExpression("age" + 10)。
 func TestPgInteg_UpdateWithRaw(t *testing.T) {
 	db := openPgTestDB(t)
 	setupPgUsersTable(t, db)
@@ -1114,7 +1117,7 @@ func TestPgInteg_UpdateWithRaw(t *testing.T) {
 	type updateRaw struct {
 		Age any `db:"age"`
 	}
-	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateRaw{Age: Raw("\"age\" + 10")})
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updateRaw{Age: NewExpression("\"age\" + 10")})
 	if err != nil {
 		t.Fatalf("Update error: %v", err)
 	}
@@ -1387,7 +1390,147 @@ func TestPgInteg_Truncate(t *testing.T) {
 	}
 }
 
-// ==================== Group 10: PostgreSQL 专属能力 ====================
+// ==================== Group 10: builder_exec 终端方法 ====================
+
+// TestPgInteg_First 验证 First 查询第一条记录：有数据时填充结构体并返回 nil。
+func TestPgInteg_First(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name", "age").OrderBy("id", "ASC").First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice" || r.Age != 25 {
+		t.Errorf("expected alice/25, got %s/%d", r.Name, r.Age)
+	}
+}
+
+// TestPgInteg_FirstNotFound 验证 First 无数据时返回 sql.ErrNoRows。
+func TestPgInteg_FirstNotFound(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name").Where("id", "=", 999).First(context.Background(), &r)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+// TestPgInteg_FirstLimit 验证 First 自动限制为 1 条：即使有多行匹配也只返回第一条。
+func TestPgInteg_FirstLimit(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name").Where("status", "=", "active").OrderBy("id", "ASC").First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice" {
+		t.Errorf("expected alice, got %s", r.Name)
+	}
+}
+
+// TestPgInteg_Exists 验证 Exists 有数据时返回 true。
+func TestPgInteg_Exists(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	exists, err := db.Builder().Table("users").Where("status", "=", "active").Exists(context.Background())
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if !exists {
+		t.Errorf("expected exists=true, got false")
+	}
+}
+
+// TestPgInteg_ExistsFalse 验证 Exists 无匹配数据时返回 false。
+func TestPgInteg_ExistsFalse(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	exists, err := db.Builder().Table("users").Where("id", "=", 999).Exists(context.Background())
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if exists {
+		t.Errorf("expected exists=false, got true")
+	}
+}
+
+// TestPgInteg_InsertGetId 验证 InsertGetId 在 PostgreSQL 中不支持 LastInsertId，应返回错误。
+func TestPgInteg_InsertGetId(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type insertData struct {
+		Name  string `db:"name"`
+		Age   int    `db:"age"`
+		Email string `db:"email"`
+	}
+	_, err := db.Builder().Table("users").InsertGetId(context.Background(), insertData{Name: "frank", Age: 40, Email: "frank@test.com"})
+	if err == nil {
+		t.Fatalf("expected error for InsertGetId on postgres (no LastInsertId support), got nil")
+	}
+}
+
+// TestPgInteg_Paginate 验证 Paginate 分页查询：第二页返回正确数据。
+func TestPgInteg_Paginate(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	b := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(2, 2)
+	_, err := b.Paginate(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("Paginate error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(rows))
+	}
+	if len(rows) >= 2 && (rows[0].Name != "charlie" || rows[1].Name != "diana") {
+		t.Errorf("expected [charlie, diana], got %v", rows)
+	}
+}
+
+// TestPgInteg_PaginateDefault 验证 Paginate 未设置分页参数时使用默认值（第 1 页，每页 20 条）。
+func TestPgInteg_PaginateDefault(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	b := db.Builder().Table("users").Select("name").OrderBy("id", "ASC")
+	_, err := b.Paginate(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("Paginate error: %v", err)
+	}
+	// 默认 ForPage(1, 20)，5 条数据全部返回
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows))
+	}
+}
+
+// ==================== Group 11: PostgreSQL 专属能力 ====================
 
 // TestPgInteg_UpdateFromJoin 验证 UPDATE ... FROM（PostgreSQL 专属多表更新语法）。
 func TestPgInteg_UpdateFromJoin(t *testing.T) {
@@ -1457,5 +1600,309 @@ func TestPgInteg_SharedLock(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("TestPgInteg_SharedLock error: %v", err)
+	}
+}
+
+// ==================== Group 12: Transaction ====================
+
+// TestPgInteg_TransactionCommit 验证事务提交：回调返回 nil 时，修改持久化。
+func TestPgInteg_TransactionCommit(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	err := db.Transaction(context.Background(), func(ctx context.Context) error {
+		type updateData struct {
+			Name string `db:"name"`
+		}
+		_, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, updateData{Name: "alice_tx"})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Transaction error: %v", err)
+	}
+
+	// 提交后数据应持久化
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice_tx" {
+		t.Errorf("expected alice_tx after commit, got %s", r.Name)
+	}
+}
+
+// TestPgInteg_TransactionRollback 验证事务回滚：回调返回 error 时，修改被撤销。
+func TestPgInteg_TransactionRollback(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	err := db.Transaction(context.Background(), func(ctx context.Context) error {
+		type updateData struct {
+			Name string `db:"name"`
+		}
+		_, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, updateData{Name: "alice_rolled_back"})
+		if err != nil {
+			return err
+		}
+		// 主动返回错误触发回滚
+		return fmt.Errorf("intentional error")
+	})
+	if err == nil {
+		t.Fatalf("expected error from Transaction, got nil")
+	}
+
+	// 回滚后数据应保持不变
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if r.Name != "alice" {
+		t.Errorf("expected alice after rollback, got %s", r.Name)
+	}
+}
+
+// TestPgInteg_TransactionNested 验证嵌套事务传播：内层事务复用外层事务，提交后整体生效。
+func TestPgInteg_TransactionNested(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	err := db.Transaction(context.Background(), func(outerCtx context.Context) error {
+		type updateData struct {
+			Name string `db:"name"`
+		}
+		_, err := db.Builder().Table("users").Where("id", "=", 1).Update(outerCtx, updateData{Name: "alice_nested"})
+		if err != nil {
+			return err
+		}
+		// 嵌套调用：应复用外层事务
+		return db.Transaction(outerCtx, func(innerCtx context.Context) error {
+			_, err := db.Builder().Table("users").Where("id", "=", 2).Update(innerCtx, updateData{Name: "bob_nested"})
+			return err
+		})
+	})
+	if err != nil {
+		t.Fatalf("Transaction error: %v", err)
+	}
+
+	// 两次修改都应生效
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r1, r2 row
+	_ = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r1)
+	if r1.Name != "alice_nested" {
+		t.Errorf("expected alice_nested, got %s", r1.Name)
+	}
+	_ = db.Builder().Table("users").Select("name").Where("id", "=", 2).First(context.Background(), &r2)
+	if r2.Name != "bob_nested" {
+		t.Errorf("expected bob_nested, got %s", r2.Name)
+	}
+}
+
+// ==================== Group 13: any 入参约束验证 ====================
+
+// TestPgInteg_FirstInvalidDest 验证 First 传入非指针类型时返回错误。
+func TestPgInteg_FirstInvalidDest(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	err := db.Builder().Table("users").Select("name").First(context.Background(), r)
+	if err == nil {
+		t.Fatalf("expected error for non-pointer dest, got nil")
+	}
+}
+
+// TestPgInteg_FirstNilDest 验证 First 传入 nil 时返回错误。
+func TestPgInteg_FirstNilDest(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	err := db.Builder().Table("users").Select("name").First(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("expected error for nil dest, got nil")
+	}
+}
+
+// TestPgInteg_FirstIntPtrDest 验证 First 传入非结构体指针（*int）时返回错误。
+func TestPgInteg_FirstIntPtrDest(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	var n int
+	err := db.Builder().Table("users").Select("name").First(context.Background(), &n)
+	if err == nil {
+		t.Fatalf("expected error for *int dest, got nil")
+	}
+}
+
+// TestPgInteg_FindInvalidDest 验证 Find 传入 *int（非结构体切片指针）时返回错误。
+func TestPgInteg_FindInvalidDest(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	var n int
+	err := db.Builder().Table("users").Select("name").Find(context.Background(), &n)
+	if err == nil {
+		t.Fatalf("expected error for *int dest in Find, got nil")
+	}
+}
+
+// TestPgInteg_FindNonPointerDest 验证 Find 传入非指针（[]struct）时返回错误。
+func TestPgInteg_FindNonPointerDest(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").Find(context.Background(), rows)
+	if err == nil {
+		t.Fatalf("expected error for non-pointer slice dest, got nil")
+	}
+}
+
+// TestPgInteg_FindIntPtrDest 验证 Find 传入 *[]int（非结构体切片指针）时返回错误。
+func TestPgInteg_FindIntPtrDest(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	var nums []int
+	err := db.Builder().Table("users").Select("name").Find(context.Background(), &nums)
+	if err == nil {
+		t.Fatalf("expected error for *[]int dest in Find, got nil")
+	}
+}
+
+// TestPgInteg_PaginateInvalidDest 验证 Paginate 传入 *int（非结构体切片指针）时返回错误。
+func TestPgInteg_PaginateInvalidDest(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	var n int
+	_, err := db.Builder().Table("users").Select("name").Paginate(context.Background(), &n)
+	if err == nil {
+		t.Fatalf("expected error for *int dest in Paginate, got nil")
+	}
+}
+
+// TestPgInteg_ValueNoRows 验证 Value 无匹配数据时返回 sql.ErrNoRows。
+func TestPgInteg_ValueNoRows(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	var name string
+	err := db.Builder().Table("users").Select("name").Where("id", "=", 999).Value(context.Background(), &name)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+// TestPgInteg_InsertInvalidData 验证 Insert 传入非法类型（int、string、nil）时返回错误。
+func TestPgInteg_InsertInvalidData(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").Insert(context.Background(), 123)
+	if err == nil {
+		t.Errorf("expected error for int data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Insert(context.Background(), "hello")
+	if err == nil {
+		t.Errorf("expected error for string data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Insert(context.Background(), nil)
+	if err == nil {
+		t.Errorf("expected error for nil data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Insert(context.Background(), map[string]any{"name": "test"})
+	if err == nil {
+		t.Errorf("expected error for map data, got nil")
+	}
+}
+
+// TestPgInteg_InsertEmptySlice 验证 Insert 传入空切片时返回错误。
+func TestPgInteg_InsertEmptySlice(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type insertData struct {
+		Name string `db:"name"`
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), []insertData{})
+	if err == nil {
+		t.Fatalf("expected error for empty slice, got nil")
+	}
+}
+
+// TestPgInteg_InsertOrIgnoreInvalidData 验证 InsertOrIgnore 传入非法类型时返回错误。
+func TestPgInteg_InsertOrIgnoreInvalidData(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").InsertOrIgnore(context.Background(), 123)
+	if err == nil {
+		t.Errorf("expected error for int data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").InsertOrIgnore(context.Background(), nil)
+	if err == nil {
+		t.Errorf("expected error for nil data, got nil")
+	}
+}
+
+// TestPgInteg_UpsertInvalidData 验证 Upsert 传入非法类型时返回错误。
+func TestPgInteg_UpsertInvalidData(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").Upsert(context.Background(), 123, []string{"email"}, []string{"name"})
+	if err == nil {
+		t.Errorf("expected error for int data, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Upsert(context.Background(), nil, []string{"email"}, []string{"name"})
+	if err == nil {
+		t.Errorf("expected error for nil data, got nil")
+	}
+}
+
+// TestPgInteg_UpdateInvalidData 验证 Update 传入非法类型（切片、int、nil）时返回错误。
+func TestPgInteg_UpdateInvalidData(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type updateData struct {
+		Name string `db:"name"`
+	}
+
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), []updateData{{Name: "test"}})
+	if err == nil {
+		t.Errorf("expected error for slice data in Update, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), 123)
+	if err == nil {
+		t.Errorf("expected error for int data in Update, got nil")
+	}
+
+	_, err = db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), nil)
+	if err == nil {
+		t.Errorf("expected error for nil data in Update, got nil")
 	}
 }

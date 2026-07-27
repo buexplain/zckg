@@ -48,21 +48,24 @@ func getScanFieldInfo(t reflect.Type) *scanFieldInfo {
 	return info
 }
 
-// Scan 将 *sql.Rows 扫描到 dest 中。
+// ScanStruct 将 *sql.Rows 扫描到 dest 中。
 // dest 可以是：
-//   - *struct 指针：扫描第一行到结构体
+//   - *struct 指针：扫描第一行到结构体，未找到返回 sql.ErrNoRows
 //   - *[]struct 指针：扫描所有行到结构体切片
 //   - *[]*struct 指针：扫描所有行到结构体指针切片
 //
 // 根据 db 标签或 snake_case 自动匹配列名到字段。
-func Scan(rows *sql.Rows, dest any) error {
+//
+//	err := zcdb.ScanStruct(rows, &user)
+//	err := zcdb.ScanStruct(rows, &users)
+func ScanStruct(rows *sql.Rows, dest any) error {
 	defer func() {
 		_ = rows.Close()
 	}()
 
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr {
-		return fmt.Errorf("zcdb: Scan dest must be a pointer, got %T", dest)
+		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer, got %T", dest)
 	}
 	destValue = destValue.Elem()
 
@@ -72,17 +75,17 @@ func Scan(rows *sql.Rows, dest any) error {
 	}
 
 	switch destValue.Kind() {
-	case reflect.Slice:
-		return scanSlice(rows, columns, destValue)
 	case reflect.Struct:
-		return scanStruct(rows, columns, destValue)
+		return scanOneRow(rows, columns, destValue)
+	case reflect.Slice:
+		return scanAllRows(rows, columns, destValue)
 	default:
-		return fmt.Errorf("zcdb: Scan dest must be a pointer to struct or slice, got *%s", destValue.Kind())
+		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer to struct or slice, got *%s", destValue.Kind())
 	}
 }
 
-// scanStruct 扫描第一行到结构体。
-func scanStruct(rows *sql.Rows, columns []string, dest reflect.Value) error {
+// scanOneRow 扫描第一行到结构体，未找到返回 sql.ErrNoRows。
+func scanOneRow(rows *sql.Rows, columns []string, dest reflect.Value) error {
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
 			return err
@@ -98,8 +101,8 @@ func scanStruct(rows *sql.Rows, columns []string, dest reflect.Value) error {
 	return rows.Err()
 }
 
-// scanSlice 扫描所有行到结构体切片。
-func scanSlice(rows *sql.Rows, columns []string, dest reflect.Value) error {
+// scanAllRows 扫描所有行到结构体切片。
+func scanAllRows(rows *sql.Rows, columns []string, dest reflect.Value) error {
 	elemType := dest.Type().Elem()
 	isPtr := elemType.Kind() == reflect.Ptr
 	if isPtr {

@@ -120,28 +120,6 @@ func (d *DBDao) Query(ctx context.Context, sqlStr string, args ...any) (*sql.Row
 	return rows, err
 }
 
-// QueryRow 执行原始查询，返回 *sql.Row
-func (d *DBDao) QueryRow(ctx context.Context, sqlStr string, args ...any) *sql.Row {
-	start := time.Now()
-
-	var row *sql.Row
-
-	// 事务检测：有事务走事务连接，否则走读库
-	if tx := txFromCtx(ctx); tx != nil {
-		row = tx.QueryRowContext(ctx, sqlStr, args...)
-	} else {
-		db := d.pool.PickReadDB()
-		row = db.QueryRowContext(ctx, sqlStr, args...)
-	}
-
-	// 慢 SQL 检测
-	if d.onSQL != nil {
-		d.onSQL(ctx, time.Since(start), sqlStr, args)
-	}
-
-	return row
-}
-
 // Transaction 开启事务，通过 context 传播。
 // 回调返回 nil → Commit；返回 error → Rollback。
 // 嵌套调用时检测到 ctx 中已有事务，直接传播（不再开新事务）。

@@ -33,8 +33,8 @@ type WhereClause struct {
 	Min      any    // Between
 	Max      any    // Between
 	Boolean  string // "AND" / "OR"
-	SQL      string // Raw
-	Bindings []any  // Raw 的绑定参数
+	SQL      string // NewExpression
+	Bindings []any  // NewExpression 的绑定参数
 	Second   string // Column 类型的第二列
 	Nested   *Builder
 	Sub      *Builder // 子查询 (WhereSub / WhereInSub)
@@ -122,7 +122,7 @@ func (j *JoinBuilder) OrWhere(column, op string, value any) *JoinBuilder {
 	return j
 }
 
-// Raw 添加一个原始 SQL ON 条件
+// NewExpression 添加一个原始 SQL ON 条件
 func (j *JoinBuilder) Raw(sql string, bindings ...any) *JoinBuilder {
 	j.Conditions = append(j.Conditions, JoinCondition{
 		Type:     "raw",

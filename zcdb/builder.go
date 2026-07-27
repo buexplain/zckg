@@ -896,6 +896,30 @@ func (b *Builder) ToTruncate() (string, error) {
 	return b.grammar.CompileTruncate(b), nil
 }
 
+// ToCount 编译 COUNT 查询。
+// 通过复用 CompileSelect 生成 SELECT COUNT(*) FROM ... 语句。
+func (b *Builder) ToCount() (string, []any, error) {
+	if b.table == "" && b.fromSub == nil {
+		return "", nil, ErrEmptyTable
+	}
+
+	// 保存原始列并设置为 COUNT(*)，清除 SELECT 子查询
+	origColumns := b.columns
+	origSelectSubs := b.selectSubs
+	b.columns = []string{"COUNT(*)"}
+	b.selectSubs = nil
+
+	sqlStr := b.grammar.CompileSelect(b, b.columns)
+	// collectSelectBindings 会收集 FROM_SUB → JOIN → WHERE → HAVING → UNION 的绑定参数
+	// 由于 selectSubs 已清空，不会包含 SELECT 子查询的参数
+	args := b.collectSelectBindings()
+
+	b.columns = origColumns
+	b.selectSubs = origSelectSubs
+
+	return sqlStr, args, nil
+}
+
 // ==================== 内部方法：收集绑定参数 ====================
 
 // collectSelectBindings 收集 SELECT 查询的所有绑定参数。
