@@ -70,6 +70,11 @@ func (d *DBDao) Builder() *Builder {
 	return NewBuilder(d.grammar, d)
 }
 
+// Schema 创建数据库元数据查询器，用于查询表列表、字段信息等。
+func (d *DBDao) Schema() (SchemaInspector, error) {
+	return NewSchemaInspector(d)
+}
+
 func (d *DBDao) Pool() *Pool {
 	return d.pool
 }

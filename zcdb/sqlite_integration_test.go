@@ -2624,3 +2624,94 @@ func TestSQLiteInteg_Complex_MultiSubqueryCombination(t *testing.T) {
 		t.Errorf("expected diana/Camera/150, got %v", rows[0])
 	}
 }
+
+// ==================== SchemaInspector 集成测试 ====================
+
+// TestSQLiteInteg_SchemaInspector_Tables 验证 Tables 返回表名（注释始终为空）。
+func TestSQLiteInteg_SchemaInspector_Tables(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	tables, err := inspector.Tables(context.Background())
+	if err != nil {
+		t.Fatalf("Tables() error: %v", err)
+	}
+
+	// 应包含 users 和 orders 表
+	found := map[string]string{}
+	for _, tbl := range tables {
+		found[tbl.Name] = tbl.Comment
+	}
+	if _, ok := found["users"]; !ok {
+		t.Errorf("expected 'users' table, not found: %v", tables)
+	}
+	if _, ok := found["orders"]; !ok {
+		t.Errorf("expected 'orders' table, not found: %v", tables)
+	}
+	// SQLite 不支持表注释，Comment 应为空
+	if found["users"] != "" {
+		t.Errorf("users: expected empty comment, got %q", found["users"])
+	}
+}
+
+// TestSQLiteInteg_SchemaInspector_Columns 验证 Columns 返回字段名、类型（注释始终为空）。
+func TestSQLiteInteg_SchemaInspector_Columns(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	mustExec(t, db, `CREATE TABLE test_columns (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		age INTEGER,
+		email TEXT DEFAULT 'none'
+	)`)
+	defer mustExec(t, db, `DROP TABLE IF EXISTS test_columns`)
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	columns, err := inspector.Columns(context.Background(), "test_columns")
+	if err != nil {
+		t.Fatalf("Columns() error: %v", err)
+	}
+	if len(columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(columns))
+	}
+
+	checks := []struct {
+		name     string
+		typ      string
+		nullable bool
+		hasDef   bool
+	}{
+		// SQLite 的 INTEGER PRIMARY KEY 是 rowid 别名，PRAGMA 中 notnull=0
+		{"id", "INTEGER", true, false},
+		{"name", "TEXT", false, false},
+		{"age", "INTEGER", true, false},
+		{"email", "TEXT", true, true},
+	}
+	for i, c := range checks {
+		if columns[i].Name != c.name {
+			t.Errorf("col[%d]: expected name %q, got %q", i, c.name, columns[i].Name)
+		}
+		if columns[i].Type != c.typ {
+			t.Errorf("col[%d] %s: expected type %q, got %q", i, c.name, c.typ, columns[i].Type)
+		}
+		if columns[i].Comment != "" {
+			t.Errorf("col[%d] %s: expected empty comment, got %q", i, c.name, columns[i].Comment)
+		}
+		if columns[i].Nullable != c.nullable {
+			t.Errorf("col[%d] %s: expected nullable=%v, got %v", i, c.name, c.nullable, columns[i].Nullable)
+		}
+		if c.hasDef && columns[i].Default == nil {
+			t.Errorf("col[%d] %s: expected default, got nil", i, c.name)
+		}
+		if !c.hasDef && columns[i].Default != nil {
+			t.Errorf("col[%d] %s: expected no default, got %q", i, c.name, *columns[i].Default)
+		}
+	}
+}

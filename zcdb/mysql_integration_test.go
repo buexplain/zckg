@@ -3411,3 +3411,108 @@ func TestMySQLInteg_Complex_NestedSubqueryLockForUpdate(t *testing.T) {
 		t.Errorf("row[1]: expected bob, got %s", rows[1].Name)
 	}
 }
+
+// ==================== SchemaInspector 集成测试 ====================
+
+// TestMySQLInteg_SchemaInspector_Tables 验证 Tables 返回表名和注释。
+func TestMySQLInteg_SchemaInspector_Tables(t *testing.T) {
+	db := openMySQLTestDB(t)
+	// 创建带注释的表
+	mustExec(t, db, "CREATE TABLE `test_schema_a` (`id` INT NOT NULL PRIMARY KEY) ENGINE=InnoDB COMMENT='表A注释'")
+	mustExec(t, db, "CREATE TABLE `test_schema_b` (`id` INT NOT NULL PRIMARY KEY) ENGINE=InnoDB COMMENT='表B注释'")
+	defer func() {
+		mustExec(t, db, "DROP TABLE IF EXISTS `test_schema_a`")
+		mustExec(t, db, "DROP TABLE IF EXISTS `test_schema_b`")
+	}()
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	tables, err := inspector.Tables(context.Background())
+	if err != nil {
+		t.Fatalf("Tables() error: %v", err)
+	}
+
+	// 找到我们创建的表
+	found := map[string]string{}
+	for _, tbl := range tables {
+		if tbl.Name == "test_schema_a" || tbl.Name == "test_schema_b" {
+			found[tbl.Name] = tbl.Comment
+		}
+	}
+	if len(found) != 2 {
+		t.Fatalf("expected 2 test tables, got %d: %v", len(found), tables)
+	}
+	if found["test_schema_a"] != "表A注释" {
+		t.Errorf("test_schema_a: expected '表A注释', got %q", found["test_schema_a"])
+	}
+	if found["test_schema_b"] != "表B注释" {
+		t.Errorf("test_schema_b: expected '表B注释', got %q", found["test_schema_b"])
+	}
+}
+
+// TestMySQLInteg_SchemaInspector_Columns 验证 Columns 返回字段名、类型、注释、Nullable、Default。
+func TestMySQLInteg_SchemaInspector_Columns(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, `CREATE TABLE `+"`test_columns`"+` (
+		`+"`id`"+` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		`+"`name`"+` VARCHAR(64) NOT NULL COMMENT '用户名',
+		`+"`age`"+` INT NULL COMMENT '年龄',
+		`+"`status`"+` VARCHAR(16) NOT NULL DEFAULT 'active' COMMENT '状态'
+	) ENGINE=InnoDB COMMENT='测试字段表'`)
+	defer func() {
+		mustExec(t, db, "DROP TABLE IF EXISTS `test_columns`")
+	}()
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	columns, err := inspector.Columns(context.Background(), "test_columns")
+	if err != nil {
+		t.Fatalf("Columns() error: %v", err)
+	}
+	if len(columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(columns))
+	}
+
+	// 验证每个字段
+	checks := []struct {
+		name     string
+		typ      string
+		comment  string
+		nullable bool
+		hasDef   bool
+		defVal   string
+	}{
+		{"id", "bigint unsigned", "", false, false, ""},
+		{"name", "varchar(64)", "用户名", false, false, ""},
+		{"age", "int", "年龄", true, false, ""},
+		{"status", "varchar(16)", "状态", false, true, "active"},
+	}
+	for i, c := range checks {
+		if columns[i].Name != c.name {
+			t.Errorf("col[%d]: expected name %q, got %q", i, c.name, columns[i].Name)
+		}
+		if columns[i].Type != c.typ {
+			t.Errorf("col[%d] %s: expected type %q, got %q", i, c.name, c.typ, columns[i].Type)
+		}
+		if columns[i].Comment != c.comment {
+			t.Errorf("col[%d] %s: expected comment %q, got %q", i, c.name, c.comment, columns[i].Comment)
+		}
+		if columns[i].Nullable != c.nullable {
+			t.Errorf("col[%d] %s: expected nullable=%v, got %v", i, c.name, c.nullable, columns[i].Nullable)
+		}
+		if c.hasDef {
+			if columns[i].Default == nil {
+				t.Errorf("col[%d] %s: expected default %q, got nil", i, c.name, c.defVal)
+			} else if *columns[i].Default != c.defVal {
+				t.Errorf("col[%d] %s: expected default %q, got %q", i, c.name, c.defVal, *columns[i].Default)
+			}
+		} else if columns[i].Default != nil && c.name != "id" {
+			// id 有默认值 '' (空字符串)，跳过检查
+			t.Errorf("col[%d] %s: expected no default, got %q", i, c.name, *columns[i].Default)
+		}
+	}
+}
