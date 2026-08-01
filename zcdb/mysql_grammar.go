@@ -65,7 +65,7 @@ func (g *MySQLGrammar) wrapValue(value string) string {
 }
 
 // CompileSelect 编译 SELECT 查询
-func (g *MySQLGrammar) CompileSelect(b *Builder, columns []string) string {
+func (g *MySQLGrammar) CompileSelect(b *Builder, columns []SelectColumn) string {
 	var sql strings.Builder
 
 	// SELECT [DISTINCT]
@@ -83,7 +83,11 @@ func (g *MySQLGrammar) CompileSelect(b *Builder, columns []string) string {
 			if !first {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.WrapColumn(col))
+			if col.Raw {
+				sql.WriteString(col.Value)
+			} else {
+				sql.WriteString(g.WrapColumn(col.Value))
+			}
 			first = false
 		}
 		for _, ss := range b.selectSubs {

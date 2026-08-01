@@ -1,5 +1,12 @@
 package zcdb
 
+// SelectColumn 表示 SELECT 中的一个列。
+// Raw 为 true 时，Value 直接嵌入 SQL，不经过 WrapColumn 引用。
+type SelectColumn struct {
+	Value string
+	Raw   bool
+}
+
 // Builder 是查询构造器的核心，负责收集用户的查询意图和数据。
 // 遵循 Laravel 的设计：Builder 积累状态，Grammar 负责编译 SQL。
 type Builder struct {
@@ -8,7 +15,7 @@ type Builder struct {
 
 	// 查询状态
 	table      string
-	columns    []string // 用于 SELECT 的列
+	columns    []SelectColumn // 用于 SELECT 的列
 	selectSubs []SelectSub
 	distinct   bool
 	fromSub    *Builder // FROM 子查询
@@ -72,13 +79,16 @@ func (b *Builder) Table(tableName string) *Builder {
 
 // Select 显式指定 SELECT 的列名。
 func (b *Builder) Select(columns ...string) *Builder {
-	b.columns = columns
+	b.columns = make([]SelectColumn, len(columns))
+	for i, col := range columns {
+		b.columns[i] = SelectColumn{Value: col, Raw: false}
+	}
 	return b
 }
 
-// SelectRaw 添加原始 SQL 表达式作为列。
+// SelectRaw 添加原始 SQL 表达式作为列，不经过 WrapColumn 引用。
 func (b *Builder) SelectRaw(expression string) *Builder {
-	b.columns = append(b.columns, expression)
+	b.columns = append(b.columns, SelectColumn{Value: expression, Raw: true})
 	return b
 }
 
@@ -1074,7 +1084,7 @@ func (b *Builder) ToCount() (string, []any, error) {
 		b.columns = origColumns
 		b.selectSubs = origSelectSubs
 	}()
-	b.columns = []string{"COUNT(*)"}
+	b.columns = []SelectColumn{{Value: "COUNT(*)", Raw: true}}
 	b.selectSubs = nil
 
 	sqlStr := b.grammar.CompileSelect(b, b.columns)
@@ -1215,7 +1225,7 @@ func (b *Builder) Clone() *Builder {
 		clone.fromSub = b.fromSub.Clone()
 	}
 	if b.columns != nil {
-		clone.columns = make([]string, len(b.columns))
+		clone.columns = make([]SelectColumn, len(b.columns))
 		copy(clone.columns, b.columns)
 	}
 	if b.selectSubs != nil {

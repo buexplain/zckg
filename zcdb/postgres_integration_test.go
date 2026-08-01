@@ -2540,3 +2540,242 @@ func TestPgInteg_JoinOnRaw(t *testing.T) {
 		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }
+
+// ==================== 复杂SQL能力验证 ====================
+
+// TestPgInteg_Complex_FromSubJoinGroupHaving 验证 FROM子查询 + JOIN + GROUP BY + HAVING 组合。
+// 预期：bob(2单,280), alice(2单,170)
+func TestPgInteg_Complex_FromSubJoinGroupHaving(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	sub := db.Builder().Table("orders").
+		Select("user_id").
+		SelectRaw("COUNT(*) AS order_count").
+		SelectRaw("SUM(amount) AS total_amount").
+		GroupBy("user_id").
+		Having("COUNT(*)", ">=", 2)
+
+	type row struct {
+		Name       string  `db:"name"`
+		OrderCount int     `db:"order_count"`
+		TotalAmt   float64 `db:"total_amount"`
+	}
+	var rows []row
+	err := db.Builder().
+		Select("users.name", "t.order_count", "t.total_amount").
+		FromSub(sub, "t").
+		JoinOn("users", func(j *JoinBuilder) {
+			j.On("t.user_id", "=", "users.id")
+		}).
+		OrderBy("t.total_amount", "DESC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].Name != "bob" || rows[0].OrderCount != 2 || rows[0].TotalAmt != 280 {
+		t.Errorf("row[0]: expected bob/2/280, got %v", rows[0])
+	}
+	if rows[1].Name != "alice" || rows[1].OrderCount != 2 || rows[1].TotalAmt != 170 {
+		t.Errorf("row[1]: expected alice/2/170, got %v", rows[1])
+	}
+}
+
+// TestPgInteg_Complex_SelectSubWhereInSubNestedWhere 验证 SELECT子查询列 + WHERE IN子查询 + 嵌套WHERE。
+// 预期：bob(30,2), diana(28,1), alice(25,2)
+func TestPgInteg_Complex_SelectSubWhereInSubNestedWhere(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	countSub := db.Builder().Table("orders").
+		SelectRaw("COUNT(*)").
+		WhereRaw("orders.user_id = users.id")
+
+	type row struct {
+		Name       string `db:"name"`
+		Age        int    `db:"age"`
+		OrderCount int    `db:"order_count"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("name", "age").
+		SelectSubquery(countSub, "order_count").
+		WhereInSub("id", func(sub *Builder) {
+			sub.Table("orders").Select("user_id").Where("amount", ">", 100)
+		}).
+		WhereNested(func(b *Builder) {
+			b.Where("age", ">", 25).OrWhere("status", "=", "active")
+		}).
+		OrderBy("age", "DESC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].Name != "bob" || rows[0].Age != 30 || rows[0].OrderCount != 2 {
+		t.Errorf("row[0]: expected bob/30/2, got %v", rows[0])
+	}
+	if rows[1].Name != "diana" || rows[1].Age != 28 || rows[1].OrderCount != 1 {
+		t.Errorf("row[1]: expected diana/28/1, got %v", rows[1])
+	}
+	if rows[2].Name != "alice" || rows[2].Age != 25 || rows[2].OrderCount != 2 {
+		t.Errorf("row[2]: expected alice/25/2, got %v", rows[2])
+	}
+}
+
+// TestPgInteg_Complex_WhereExistsMultiJoinGroupBy 验证 WHERE EXISTS关联子查询 + 多表JOIN + GROUP BY。
+// 预期：alice(2), bob(2)
+func TestPgInteg_Complex_WhereExistsMultiJoinGroupBy(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+	setupPgProfilesTable(t, db)
+
+	type row struct {
+		Name       string `db:"name"`
+		OrderCount int    `db:"order_count"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("users.name").
+		SelectRaw("COUNT(orders.id) AS order_count").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id")
+		}).
+		LeftJoinOn("profiles", func(j *JoinBuilder) {
+			j.On("users.id", "=", "profiles.user_id")
+		}).
+		WhereExists(func(sub *Builder) {
+			sub.Table("orders").
+				SelectRaw("COUNT(*)").
+				WhereRaw("orders.user_id = users.id").
+				Having("COUNT(*)", ">=", 2)
+		}).
+		GroupBy("users.id", "users.name").
+		OrderBy("users.name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].Name != "alice" || rows[0].OrderCount != 2 {
+		t.Errorf("row[0]: expected alice/2, got %v", rows[0])
+	}
+	if rows[1].Name != "bob" || rows[1].OrderCount != 2 {
+		t.Errorf("row[1]: expected bob/2, got %v", rows[1])
+	}
+}
+
+// TestPgInteg_Complex_UnionAllJoinOrderBy 验证 UNION ALL + JOIN 组合。
+// 预期合并后 4 行。
+func TestPgInteg_Complex_UnionAllJoinOrderBy(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	bigSpender := db.Builder().Table("users").
+		Select("users.name", "users.age").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id")
+		}).
+		Where("orders.amount", ">", 150)
+
+	type row struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("name", "age").
+		Where("status", "=", "active").
+		UnionAll(bigSpender).
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestPgInteg_Complex_InsertUsingJoinGroupHaving 验证 INSERT USING 复杂 SELECT（JOIN + WHERE + GROUP BY + HAVING）。
+// 预期归档：alice(25), bob(30)
+func TestPgInteg_Complex_InsertUsingJoinGroupHaving(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	mustExec(t, db, `CREATE TABLE users_archive (
+		id   BIGSERIAL PRIMARY KEY,
+		name VARCHAR(64),
+		age  INT
+	)`)
+
+	sqlStr, args, err := db.Builder().
+		Table("users_archive").
+		ToInsertUsing([]string{"name", "age"}, func(sub *Builder) {
+			sub.Table("users").
+				Select("users.name", "users.age").
+				JoinOn("orders", func(j *JoinBuilder) {
+					j.On("users.id", "=", "orders.user_id")
+				}).
+				Where("orders.amount", ">", 30).
+				GroupBy("users.id", "users.name", "users.age").
+				Having("COUNT(*)", ">=", 2)
+		})
+	if err != nil {
+		t.Fatalf("ToInsertUsing error: %v", err)
+	}
+	mustExec(t, db, sqlStr, args...)
+
+	count, _ := db.Builder().Table("users_archive").Count(context.Background())
+	if count != 2 {
+		t.Errorf("expected 2 archived users, got %d", count)
+	}
+}
+
+// TestPgInteg_Complex_NestedSubqueryLockForUpdate 验证多层嵌套子查询 + LOCK FOR UPDATE。
+// 预期：alice, bob
+func TestPgInteg_Complex_NestedSubqueryLockForUpdate(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("name").
+		WhereInSub("id", func(sub *Builder) {
+			sub.Table("orders").
+				Select("user_id").
+				GroupBy("user_id").
+				HavingRaw("AVG(amount) > $1", 75).
+				HavingRaw("COUNT(*) >= $2", 2)
+		}).
+		OrderBy("name", "ASC").
+		LockForUpdate().
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].Name != "alice" {
+		t.Errorf("row[0]: expected alice, got %s", rows[0].Name)
+	}
+	if rows[1].Name != "bob" {
+		t.Errorf("row[1]: expected bob, got %s", rows[1].Name)
+	}
+}

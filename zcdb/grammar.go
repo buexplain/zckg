@@ -4,7 +4,7 @@ package zcdb
 // 不同数据库方言实现此接口以生成对应语法的 SQL。
 type Grammar interface {
 	// CompileSelect 编译 SELECT 查询
-	CompileSelect(b *Builder, columns []string) string
+	CompileSelect(b *Builder, columns []SelectColumn) string
 	// CompileInsert 编译 INSERT 语句
 	CompileInsert(b *Builder, columns []string, rows [][]any) string
 	// CompileInsertOrIgnore 编译 INSERT OR IGNORE 语句

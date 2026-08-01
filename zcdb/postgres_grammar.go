@@ -100,12 +100,12 @@ func (g *PostgresGrammar) wrapValue(value string) string {
 }
 
 // CompileSelect 编译 SELECT 查询
-func (g *PostgresGrammar) CompileSelect(b *Builder, columns []string) string {
+func (g *PostgresGrammar) CompileSelect(b *Builder, columns []SelectColumn) string {
 	g = g.cloneForCompile()
 	return g.compileSelectInner(b, columns)
 }
 
-func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []string) string {
+func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn) string {
 	var sql strings.Builder
 
 	// SELECT [DISTINCT]
@@ -123,7 +123,11 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []string) strin
 			if !first {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.WrapColumn(col))
+			if col.Raw {
+				sql.WriteString(col.Value)
+			} else {
+				sql.WriteString(g.WrapColumn(col.Value))
+			}
 			first = false
 		}
 		for _, ss := range b.selectSubs {

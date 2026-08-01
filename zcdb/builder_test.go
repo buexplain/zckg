@@ -651,7 +651,7 @@ func TestBug_ToCountPanicSafety(t *testing.T) {
 	if b.limit != 10 {
 		t.Errorf("ToCount panic 后 limit 未恢复: expected 10, got %d", b.limit)
 	}
-	if len(b.columns) != 2 || b.columns[0] != "name" || b.columns[1] != "age" {
+	if len(b.columns) != 2 || b.columns[0].Value != "name" || b.columns[1].Value != "age" {
 		t.Errorf("ToCount panic 后 columns 未恢复: expected [name age], got %v", b.columns)
 	}
 }
@@ -1276,5 +1276,107 @@ func TestExtractUpdateData_NonStruct_Builder(t *testing.T) {
 	_, _, err := extractUpdateData("not a struct")
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
+	}
+}
+
+// ==================== SelectRaw 原始列测试 ====================
+
+// TestSelectRaw_BypassWrapColumn 验证 SelectRaw 的表达式不经过 WrapColumn 引用，直接嵌入 SQL。
+func TestSelectRaw_BypassWrapColumn(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		builder  *Builder
+		expected string
+	}{
+		{
+			name:     "MySQL_SelectRaw_数字字面量",
+			grammar:  &MySQLGrammar{},
+			builder:  NewBuilder(&MySQLGrammar{}, nil).Table("users").SelectRaw("1"),
+			expected: "SELECT 1 FROM `users`",
+		},
+		{
+			name:     "MySQL_SelectRaw_算术表达式",
+			grammar:  &MySQLGrammar{},
+			builder:  NewBuilder(&MySQLGrammar{}, nil).Table("users").SelectRaw("age + 1 AS age_plus"),
+			expected: "SELECT age + 1 AS age_plus FROM `users`",
+		},
+		{
+			name:     "MySQL_SelectRaw_混合普通列",
+			grammar:  &MySQLGrammar{},
+			builder:  NewBuilder(&MySQLGrammar{}, nil).Table("users").Select("name", "age").SelectRaw("1"),
+			expected: "SELECT `name`, `age`, 1 FROM `users`",
+		},
+		{
+			name:     "PostgreSQL_SelectRaw_数字字面量",
+			grammar:  &PostgresGrammar{},
+			builder:  NewBuilder(&PostgresGrammar{}, nil).Table("users").SelectRaw("1"),
+			expected: `SELECT 1 FROM "users"`,
+		},
+		{
+			name:     "PostgreSQL_SelectRaw_混合普通列",
+			grammar:  &PostgresGrammar{},
+			builder:  NewBuilder(&PostgresGrammar{}, nil).Table("users").Select("name").SelectRaw("1"),
+			expected: `SELECT "name", 1 FROM "users"`,
+		},
+		{
+			name:     "SQLite_SelectRaw_数字字面量",
+			grammar:  &SQLiteGrammar{},
+			builder:  NewBuilder(&SQLiteGrammar{}, nil).Table("users").SelectRaw("1"),
+			expected: `SELECT 1 FROM "users"`,
+		},
+		{
+			name:     "SQLite_SelectRaw_混合普通列",
+			grammar:  &SQLiteGrammar{},
+			builder:  NewBuilder(&SQLiteGrammar{}, nil).Table("users").Select("name").SelectRaw("1"),
+			expected: `SELECT "name", 1 FROM "users"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sqlStr := tt.grammar.CompileSelect(tt.builder, tt.builder.columns)
+			if sqlStr != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, sqlStr)
+			}
+		})
+	}
+}
+
+// TestSelectRaw_ColumnOrder 验证 Select 和 SelectRaw 混合调用时列顺序保持正确。
+func TestSelectRaw_ColumnOrder(t *testing.T) {
+	g := &MySQLGrammar{}
+	b := NewBuilder(g, nil).Table("users").
+		Select("name", "age").
+		SelectRaw("COUNT(*) AS cnt").
+		SelectRaw("1")
+
+	sqlStr := g.CompileSelect(b, b.columns)
+	expected := "SELECT `name`, `age`, COUNT(*) AS cnt, 1 FROM `users`"
+	if sqlStr != expected {
+		t.Errorf("expected %q, got %q", expected, sqlStr)
+	}
+}
+
+// TestSelectRaw_ClonePreservesRawFlag 验证 Clone 后 SelectColumn 的 Raw 标志被正确复制。
+func TestSelectRaw_ClonePreservesRawFlag(t *testing.T) {
+	g := &MySQLGrammar{}
+	b := NewBuilder(g, nil).Table("users").Select("name").SelectRaw("1")
+	clone := b.Clone()
+
+	if len(clone.columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(clone.columns))
+	}
+	if clone.columns[0].Raw {
+		t.Error("first column should not be raw")
+	}
+	if !clone.columns[1].Raw {
+		t.Error("second column should be raw")
+	}
+
+	// 修改克隆体不影响原始
+	clone.columns[1] = SelectColumn{Value: "2", Raw: true}
+	if b.columns[1].Value != "1" {
+		t.Error("original should not be affected by clone modification")
 	}
 }
