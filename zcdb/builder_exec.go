@@ -27,7 +27,7 @@ func (b *Builder) First(ctx context.Context, dest any) error {
 	if err != nil {
 		return err
 	}
-	return ScanStruct(rows, dest)
+	return ScanStructClose(rows, dest)
 }
 
 // Find 查询多条记录，扫描到 dest。
@@ -45,7 +45,7 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 		return err
 	}
 
-	return ScanStruct(rows, dest)
+	return ScanStructClose(rows, dest)
 }
 
 // Paginate 分页查询，自动计算总数。
@@ -79,7 +79,7 @@ func (b *Builder) Paginate(ctx context.Context, dest any) (totalCount int, err e
 		return 0, err
 	}
 
-	return total, ScanStruct(rows, dest)
+	return total, ScanStructClose(rows, dest)
 }
 
 // Count 查询记录总数。

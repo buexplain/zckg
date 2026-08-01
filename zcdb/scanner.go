@@ -72,21 +72,20 @@ func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int) {
 	}
 }
 
-// ScanStruct 将 *sql.Rows 扫描到 dest 中。
+// ScanStruct 将 *sql.Rows 扫描到 dest 中，不关闭 rows。
 // dest 可以是：
 //   - *struct 指针：扫描第一行到结构体，未找到返回 sql.ErrNoRows
 //   - *[]struct 指针：扫描所有行到结构体切片
 //   - *[]*struct 指针：扫描所有行到结构体指针切片
 //
 // 根据 db 标签或 snake_case 自动匹配列名到字段。
+// 调用方负责关闭 rows。
 //
-//	err := zcdb.ScanStruct(rows, &user)
+//	rows, err := db.Query(ctx, sqlStr, args...)
+//	if err != nil { ... }
+//	defer rows.Close()
 //	err := zcdb.ScanStruct(rows, &users)
 func ScanStruct(rows *sql.Rows, dest any) error {
-	defer func() {
-		_ = rows.Close()
-	}()
-
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr {
 		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer, got %T", dest)
@@ -106,6 +105,15 @@ func ScanStruct(rows *sql.Rows, dest any) error {
 	default:
 		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer to struct or slice, got *%s", destValue.Kind())
 	}
+}
+
+// ScanStructClose 将 *sql.Rows 扫描到 dest 中，完成后自动关闭 rows。
+// 是 ScanStruct 的便捷封装，适用于不需要流式读取的场景。
+func ScanStructClose(rows *sql.Rows, dest any) error {
+	defer func(rows *sql.Rows) {
+		_ = rows.Close()
+	}(rows)
+	return ScanStruct(rows, dest)
 }
 
 // scanOneRow 扫描第一行到结构体，未找到返回 sql.ErrNoRows。
@@ -174,6 +182,6 @@ func makeScanValues(columns []string, info *scanFieldInfo, structValue reflect.V
 // discard 实现 sql.Scanner，用于忽略不需要的列。
 type discard struct{}
 
-func (d *discard) Scan(src any) error {
+func (d *discard) Scan(_ any) error {
 	return nil
 }

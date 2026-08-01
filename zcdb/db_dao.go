@@ -18,6 +18,9 @@ func txFromCtx(ctx context.Context) *sql.Tx {
 
 // dialectGrammar 根据方言名称推导对应的 Grammar 编译器
 func dialectGrammar(dialect string) (Grammar, error) {
+	if dialect == "" {
+		return nil, ErrDialectRequired
+	}
 	switch dialect {
 	case "mysql":
 		return &MySQLGrammar{}, nil
@@ -57,6 +60,9 @@ func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapse
 	grammar, err := dialectGrammar(dialect)
 	if err != nil {
 		return nil, err
+	}
+	if pool == nil {
+		return nil, ErrPoolRequired
 	}
 	return &DBDao{
 		pool:    pool,

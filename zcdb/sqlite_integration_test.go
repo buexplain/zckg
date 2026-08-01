@@ -2715,3 +2715,139 @@ func TestSQLiteInteg_SchemaInspector_Columns(t *testing.T) {
 		}
 	}
 }
+
+// ==================== Cursor 迭代器集成测试 ====================
+
+// TestSQLiteInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行扫描，break 时自动释放连接。
+func TestSQLiteInteg_Cursor_Stream(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+		Age  *int   `db:"age"`
+	}
+	var user row
+	var names []string
+	for err := range db.Builder().Table("users").Select("name", "age").OrderBy("id", "ASC").Cursor(context.Background(), &user) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		names = append(names, user.Name)
+	}
+	if len(names) != 5 {
+		t.Errorf("expected 5 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "alice" {
+		t.Errorf("expected first name alice, got %s", names[0])
+	}
+}
+
+// TestSQLiteInteg_Cursor_Break 验证 Cursor 迭代中 break 能正常释放资源。
+func TestSQLiteInteg_Cursor_Break(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var user row
+	count := 0
+	for err := range db.Builder().Table("users").Select("name").OrderBy("id", "ASC").Cursor(context.Background(), &user) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		count++
+		if count == 2 {
+			break // 只取前 2 条
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected 2 iterations, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_CursorBy_Keyset 验证 CursorBy 游标分页迭代：分批获取全部数据。
+func TestSQLiteInteg_CursorBy_Keyset(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var names []string
+	var lastID int
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 2, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, user.Name)
+		lastID = user.ID
+	}
+	if len(names) != 5 {
+		t.Errorf("expected 5 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "alice" || names[4] != "eve" {
+		t.Errorf("expected alice...eve, got %v", names)
+	}
+	if lastID != 5 {
+		t.Errorf("expected last id=5, got %d", lastID)
+	}
+}
+
+// TestSQLiteInteg_CursorBy_Break 验证 CursorBy 迭代中 break 能正常停止。
+func TestSQLiteInteg_CursorBy_Break(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	count := 0
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 2, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		count++
+		if count == 3 {
+			break
+		}
+	}
+	if count != 3 {
+		t.Errorf("expected 3 iterations, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_CursorBy_IgnoresOrderBy 验证 CursorBy 会忽略已设置的 ORDER BY。
+func TestSQLiteInteg_CursorBy_IgnoresOrderBy(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var ids []int
+	// 用户先设置了 ORDER BY name DESC，但 CursorBy 应该忽略它，强制按 id ASC
+	for err := range db.Builder().Table("users").Select("id", "name").OrderBy("name", "DESC").CursorBy(context.Background(), &user, 10, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		ids = append(ids, user.ID)
+	}
+	// 验证结果是按 id 升序，而非 name 降序
+	expected := []int{1, 2, 3, 4, 5}
+	if len(ids) != len(expected) {
+		t.Errorf("expected %d ids, got %d: %v", len(expected), len(ids), ids)
+	}
+	for i, id := range ids {
+		if id != expected[i] {
+			t.Errorf("ids[%d]: expected %d, got %d", i, expected[i], id)
+		}
+	}
+}
