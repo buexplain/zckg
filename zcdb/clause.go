@@ -72,10 +72,15 @@ type JoinClause struct {
 // JoinBuilder 用于构建复杂的 JOIN ON 条件
 type JoinBuilder struct {
 	Conditions []JoinCondition
+	err        error // 累积错误（如无效运算符）
 }
 
 // On 添加一个 AND ON 列比较条件
 func (j *JoinBuilder) On(first, op, second string) *JoinBuilder {
+	if err := validateOperator(op); err != nil {
+		j.err = err
+		return j
+	}
 	j.Conditions = append(j.Conditions, JoinCondition{
 		Type:     "column",
 		First:    first,
@@ -88,6 +93,10 @@ func (j *JoinBuilder) On(first, op, second string) *JoinBuilder {
 
 // OrOn 添加一个 OR ON 列比较条件
 func (j *JoinBuilder) OrOn(first, op, second string) *JoinBuilder {
+	if err := validateOperator(op); err != nil {
+		j.err = err
+		return j
+	}
 	j.Conditions = append(j.Conditions, JoinCondition{
 		Type:     "column",
 		First:    first,
@@ -100,6 +109,10 @@ func (j *JoinBuilder) OrOn(first, op, second string) *JoinBuilder {
 
 // Where 添加一个 AND ON 值比较条件 (ON ... AND column op ?)
 func (j *JoinBuilder) Where(column, op string, value any) *JoinBuilder {
+	if err := validateOperator(op); err != nil {
+		j.err = err
+		return j
+	}
 	j.Conditions = append(j.Conditions, JoinCondition{
 		Type:     "value",
 		First:    column,
@@ -112,6 +125,10 @@ func (j *JoinBuilder) Where(column, op string, value any) *JoinBuilder {
 
 // OrWhere 添加一个 OR ON 值比较条件
 func (j *JoinBuilder) OrWhere(column, op string, value any) *JoinBuilder {
+	if err := validateOperator(op); err != nil {
+		j.err = err
+		return j
+	}
 	j.Conditions = append(j.Conditions, JoinCondition{
 		Type:     "value",
 		First:    column,

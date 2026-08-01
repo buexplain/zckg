@@ -17,18 +17,28 @@ package zcconfig
 //			Password: zcconfig.Env("DB_PASSWORD", "root"),
 //			Database: zcconfig.Env("DB_DATABASE", "test_db"),
 //			Charset:  zcconfig.Env("DB_CHARSET", "utf8mb4"),
+//			Slaves:   nil,
 //		}
 //		return config
 //	})
 //
 // testDB := zcconfig.Config("database.test_db", zcconfig.DBConfig{})
 type DBConfig struct {
-	Driver   string // 数据库方言（"mysql"、"postgres"、"sqlite"）
-	Dialect  string // 驱动名（"mysql"、"postgres"、"sqlite"）
+	Driver   string          // 数据库方言（"mysql"、"postgres"、"sqlite"）
+	Dialect  string          // 驱动名（"mysql"、"postgres"、"sqlite"）
+	Host     string          // 数据库服务器地址，如 "127.0.0.1" 或 "db.example.com"
+	Port     int             // 数据库服务器端口，如 MySQL 默认 3306、PostgreSQL 默认 5432
+	Username string          // 数据库登录用户名
+	Password string          // 数据库登录密码
+	Database string          // 目标数据库名称
+	Charset  string          // 连接字符集，如 "utf8mb4"（MySQL）或 "UTF8"（PostgreSQL）
+	Slaves   []DBSlaveConfig // 从库配置列表
+}
+
+// DBSlaveConfig 从库配置结构体，用于承载从库连接所需的各项参数。
+type DBSlaveConfig struct {
 	Host     string // 数据库服务器地址，如 "127.0.0.1" 或 "db.example.com"
 	Port     int    // 数据库服务器端口，如 MySQL 默认 3306、PostgreSQL 默认 5432
 	Username string // 数据库登录用户名
 	Password string // 数据库登录密码
-	Database string // 目标数据库名称
-	Charset  string // 连接字符集，如 "utf8mb4"（MySQL）或 "UTF8"（PostgreSQL）
 }

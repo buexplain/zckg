@@ -12,5 +12,11 @@ var (
 	ErrDialectRequired = errors.New("zcdb: dialect is required")
 	ErrUnknownDialect  = errors.New("zcdb: unknown dialect")
 	ErrPoolRequired    = errors.New("zcdb: pool is required")
-	ErrNoRows          = errors.New("zcdb: no rows in result set")
+
+	// ErrLockNotSupported 锁子句不支持错误
+	ErrPgUnionLockNotSupported = errors.New("zcdb: PostgreSQL does not support LOCK with UNION queries")
+	ErrSQLiteLockNotSupported  = errors.New("zcdb: SQLite does not support LOCK clauses")
+
+	// ErrInvalidOperator 运算符不在白名单内
+	ErrInvalidOperator = errors.New("zcdb: invalid operator")
 )

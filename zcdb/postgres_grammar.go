@@ -12,25 +12,32 @@ import (
 //   - DELETE/UPDATE 不支持 ORDER BY 和 LIMIT
 //   - INSERT 支持 RETURNING 子句
 type PostgresGrammar struct {
-	tablePrefix string
-	paramCount  int // 编译期间的参数计数器
+	paramCount int // 编译期间的参数计数器（每次编译入口重置）
+}
+
+// cloneForCompile 克隆当前 Grammar 用于单次编译，保证并发安全。
+// paramCount 从 0 开始，各 goroutine 互不干扰。
+func (g *PostgresGrammar) cloneForCompile() *PostgresGrammar {
+	return &PostgresGrammar{}
+}
+
+// convertRawPlaceholders 将原始 SQL 中的 ? 依次替换为 $N 占位符。
+func (g *PostgresGrammar) convertRawPlaceholders(sql string) string {
+	var buf strings.Builder
+	buf.Grow(len(sql) + 8)
+	for i := 0; i < len(sql); i++ {
+		if sql[i] == '?' {
+			buf.WriteString(g.nextParam())
+		} else {
+			buf.WriteByte(sql[i])
+		}
+	}
+	return buf.String()
 }
 
 // NewPostgresGrammar 创建一个 PostgreSQL 语法编译器
 func NewPostgresGrammar() *PostgresGrammar {
 	return &PostgresGrammar{}
-}
-
-// SetTablePrefix 设置表名前缀
-func (g *PostgresGrammar) SetTablePrefix(prefix string) *PostgresGrammar {
-	g.tablePrefix = prefix
-	return g
-}
-
-// Placeholder PostgreSQL 使用 $N 作为参数占位符
-func (g *PostgresGrammar) Placeholder(_ int) string {
-	g.paramCount++
-	return "$" + intToStr(g.paramCount)
 }
 
 // nextParam 生成下一个占位符并返回
@@ -42,6 +49,11 @@ func (g *PostgresGrammar) nextParam() string {
 // CompileRandom 返回 PostgreSQL 随机排序表达式
 func (g *PostgresGrammar) CompileRandom() string {
 	return "RANDOM()"
+}
+
+// UpdateSetBeforeJoin PostgreSQL 的 UPDATE ... SET ... FROM ... WHERE ... 中 SET 在 JOIN 条件之前。
+func (g *PostgresGrammar) UpdateSetBeforeJoin() bool {
+	return true
 }
 
 // WrapColumn 使用双引号引用列名。
@@ -74,9 +86,9 @@ func (g *PostgresGrammar) WrapTable(table string) string {
 		idx := strings.Index(strings.ToLower(table), " as ")
 		name := table[:idx]
 		alias := table[idx+4:]
-		return g.wrapValue(g.tablePrefix+strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
+		return g.wrapValue(strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
 	}
-	return g.wrapValue(g.tablePrefix + table)
+	return g.wrapValue(table)
 }
 
 // wrapValue PostgreSQL 使用双引号引用标识符
@@ -89,7 +101,7 @@ func (g *PostgresGrammar) wrapValue(value string) string {
 
 // CompileSelect 编译 SELECT 查询
 func (g *PostgresGrammar) CompileSelect(b *Builder, columns []string) string {
-	g.paramCount = 0
+	g = g.cloneForCompile()
 	return g.compileSelectInner(b, columns)
 }
 
@@ -193,6 +205,15 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []string) strin
 		sql.WriteString(intToStr(b.offset))
 	}
 
+	// LOCK (PostgreSQL 使用 FOR SHARE 代替 LOCK IN SHARE MODE)
+	var lockSQL string
+	if b.lockClause != "" {
+		lockSQL = b.lockClause
+		if lockSQL == "LOCK IN SHARE MODE" {
+			lockSQL = "FOR SHARE"
+		}
+	}
+
 	// UNION
 	if len(b.unions) > 0 {
 		result := "(" + sql.String() + ")"
@@ -205,17 +226,15 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []string) strin
 			unionSQL := g.compileSelectInner(union.Query, union.Query.columns)
 			result += "(" + unionSQL + ")"
 		}
+		if lockSQL != "" {
+			result += " " + lockSQL
+		}
 		return result
 	}
 
-	// LOCK (PostgreSQL 使用 FOR SHARE 代替 LOCK IN SHARE MODE)
-	if b.lockClause != "" {
-		lock := b.lockClause
-		if lock == "LOCK IN SHARE MODE" {
-			lock = "FOR SHARE"
-		}
+	if lockSQL != "" {
 		sql.WriteString(" ")
-		sql.WriteString(lock)
+		sql.WriteString(lockSQL)
 	}
 
 	return sql.String()
@@ -223,7 +242,7 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []string) strin
 
 // CompileInsert 编译 INSERT 语句
 func (g *PostgresGrammar) CompileInsert(b *Builder, columns []string, rows [][]any) string {
-	g.paramCount = 0
+	g = g.cloneForCompile()
 
 	var sql strings.Builder
 
@@ -262,10 +281,9 @@ func (g *PostgresGrammar) CompileInsertOrIgnore(b *Builder, columns []string, ro
 
 // CompileUpsert 编译 PostgreSQL 的 INSERT ... ON CONFLICT DO UPDATE 语句
 func (g *PostgresGrammar) CompileUpsert(b *Builder, columns []string, rows [][]any, uniqueBy []string, updateColumns []string, _ []any) string {
-	var sql strings.Builder
+	g = g.cloneForCompile()
 
-	// INSERT 部分（复用 CompileInsert 逻辑但不重置 paramCount）
-	g.paramCount = 0
+	var sql strings.Builder
 
 	sql.WriteString("INSERT INTO ")
 	sql.WriteString(g.WrapTable(b.table))
@@ -317,7 +335,7 @@ func (g *PostgresGrammar) CompileUpsert(b *Builder, columns []string, rows [][]a
 
 // CompileInsertUsing 编译 INSERT INTO ... SELECT 语句
 func (g *PostgresGrammar) CompileInsertUsing(b *Builder, columns []string, sub *Builder) string {
-	g.paramCount = 0
+	g = g.cloneForCompile()
 
 	var sql strings.Builder
 
@@ -339,7 +357,7 @@ func (g *PostgresGrammar) CompileInsertUsing(b *Builder, columns []string, sub *
 // CompileUpdate 编译 UPDATE 语句。
 // 注意: PostgreSQL 的 UPDATE 不支持 ORDER BY 和 LIMIT。
 func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []any) string {
-	g.paramCount = 0
+	g = g.cloneForCompile()
 
 	var sql strings.Builder
 
@@ -374,26 +392,42 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 	}
 
 	// WHERE
-	whereSQL := g.compileWheres(b)
-
-	// 如果有 JOIN，将 ON 条件合并到 WHERE 中
+	// 有 JOIN 时先将 ON 条件并入 WHERE 前部。
+	// 注意：必须在 compileWheres 之前编译 JOIN 条件，
+	// 以保证 $N 占位符顺序（JOIN 条件 → WHERE 条件）与 collectJoinBindings → collectWhereBindings 的绑定顺序一致。
+	var joinWhere string
 	if len(b.joins) > 0 {
 		var joinConditions []string
 		for _, join := range b.joins {
-			for _, cond := range join.Conditions {
-				if cond.Type == "column" {
-					jc := g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+			for i, cond := range join.Conditions {
+				var jc string
+				switch cond.Type {
+				case "column":
+					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+				case "value":
+					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.nextParam()
+				case "raw":
+					jc = g.convertRawPlaceholders(cond.SQL)
+				}
+				if jc == "" {
+					continue
+				}
+				if i == 0 {
 					joinConditions = append(joinConditions, jc)
+				} else {
+					joinConditions = append(joinConditions, cond.Boolean+" "+jc)
 				}
 			}
 		}
-		if len(joinConditions) > 0 {
-			joinWhere := strings.Join(joinConditions, " AND ")
-			if whereSQL != "" {
-				whereSQL = joinWhere + " AND " + whereSQL
-			} else {
-				whereSQL = joinWhere
-			}
+		joinWhere = strings.Join(joinConditions, " ")
+	}
+
+	whereSQL := g.compileWheres(b)
+	if joinWhere != "" {
+		if whereSQL != "" {
+			whereSQL = joinWhere + " AND " + whereSQL
+		} else {
+			whereSQL = joinWhere
 		}
 	}
 
@@ -408,7 +442,7 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 // CompileDelete 编译 DELETE 语句。
 // 注意: PostgreSQL 的 DELETE 不支持 ORDER BY 和 LIMIT。
 func (g *PostgresGrammar) CompileDelete(b *Builder) string {
-	g.paramCount = 0
+	g = g.cloneForCompile()
 
 	var sql strings.Builder
 
@@ -454,7 +488,7 @@ func (g *PostgresGrammar) compileWheres(b *Builder) string {
 		case WhereTypeNotBetween:
 			clause = g.WrapColumn(w.Column) + " NOT BETWEEN " + g.nextParam() + " AND " + g.nextParam()
 		case WhereTypeRaw:
-			clause = w.SQL
+			clause = g.convertRawPlaceholders(w.SQL)
 		case WhereTypeNested:
 			if w.Nested != nil {
 				nested := g.compileWheres(w.Nested)
@@ -565,7 +599,7 @@ func (g *PostgresGrammar) compileJoin(join JoinClause) string {
 			case "value":
 				result += g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.nextParam()
 			case "raw":
-				result += cond.SQL
+				result += g.convertRawPlaceholders(cond.SQL)
 			}
 		}
 	}
@@ -581,7 +615,7 @@ func (g *PostgresGrammar) compileHavings(b *Builder) string {
 		case "basic":
 			clause = g.WrapColumn(h.Column) + " " + h.Operator + " " + g.nextParam()
 		case "raw":
-			clause = h.SQL
+			clause = g.convertRawPlaceholders(h.SQL)
 		case "between":
 			if h.Not {
 				clause = g.WrapColumn(h.Column) + " NOT BETWEEN " + g.nextParam() + " AND " + g.nextParam()

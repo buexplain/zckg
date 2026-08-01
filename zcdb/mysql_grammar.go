@@ -5,29 +5,21 @@ import (
 )
 
 // MySQLGrammar MySQL 方言编译器
-type MySQLGrammar struct {
-	tablePrefix string
-}
+type MySQLGrammar struct{}
 
 // NewMySQLGrammar 创建一个 MySQL 语法编译器
 func NewMySQLGrammar() *MySQLGrammar {
 	return &MySQLGrammar{}
 }
 
-// SetTablePrefix 设置表名前缀
-func (g *MySQLGrammar) SetTablePrefix(prefix string) *MySQLGrammar {
-	g.tablePrefix = prefix
-	return g
-}
-
-// Placeholder MySQL 使用 ? 作为参数占位符
-func (g *MySQLGrammar) Placeholder(_ int) string {
-	return "?"
-}
-
 // CompileRandom 返回 MySQL 随机排序表达式
 func (g *MySQLGrammar) CompileRandom() string {
 	return "RAND()"
+}
+
+// UpdateSetBeforeJoin MySQL 的 UPDATE ... JOIN ... SET ... 中 JOIN 条件在 SET 之前。
+func (g *MySQLGrammar) UpdateSetBeforeJoin() bool {
+	return false
 }
 
 // WrapColumn 使用反引号引用列名。
@@ -60,9 +52,9 @@ func (g *MySQLGrammar) WrapTable(table string) string {
 		idx := strings.Index(strings.ToLower(table), " as ")
 		name := table[:idx]
 		alias := table[idx+4:]
-		return g.wrapValue(g.tablePrefix+strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
+		return g.wrapValue(strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
 	}
-	return g.wrapValue(g.tablePrefix + table)
+	return g.wrapValue(table)
 }
 
 func (g *MySQLGrammar) wrapValue(value string) string {
@@ -184,6 +176,9 @@ func (g *MySQLGrammar) CompileSelect(b *Builder, columns []string) string {
 			}
 			unionSQL := union.Query.grammar.CompileSelect(union.Query, union.Query.columns)
 			result += "(" + unionSQL + ")"
+		}
+		if b.lockClause != "" {
+			result += " " + b.lockClause
 		}
 		return result
 	}

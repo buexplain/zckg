@@ -10,7 +10,7 @@ import (
 // structField 表示一个解析后的结构体字段信息
 type structField struct {
 	Column string // 数据库列名
-	Index  int    // 在结构体中的字段索引
+	Index  []int  // 字段索引路径（支持嵌入结构体，如 [0, 1] 表示第一个嵌入字段的第二个字段）
 }
 
 // structInfo 缓存解析后的结构体元信息
@@ -24,6 +24,7 @@ var structCache sync.Map // map[reflect.Type]*structInfo
 // parseStruct 解析结构体类型，提取字段列名和索引。
 // 使用 `db` 标签获取列名，无标签时自动将字段名转为 snake_case。
 // `db:"-"` 的字段会被跳过。
+// 支持嵌入结构体（匿名字段），其内部字段会被递归展开。
 func parseStruct(t reflect.Type) *structInfo {
 	// 确保是结构体类型
 	if t.Kind() == reflect.Ptr {
@@ -39,12 +40,38 @@ func parseStruct(t reflect.Type) *structInfo {
 	}
 
 	info := &structInfo{}
+	parseStructFields(t, info, nil)
+
+	structCache.Store(t, info)
+	return info
+}
+
+// parseStructFields 递归解析结构体字段，支持嵌入结构体。
+// indexPrefix 是当前嵌入路径的前缀。
+func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int) {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 
 		// 跳过未导出字段
 		if !field.IsExported() {
 			continue
+		}
+
+		// 构建当前字段的完整索引路径
+		index := make([]int, len(indexPrefix)+1)
+		copy(index, indexPrefix)
+		index[len(indexPrefix)] = i
+
+		// 处理嵌入结构体（匿名字段）
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			embeddedType := field.Type
+			if embeddedType.Kind() == reflect.Ptr {
+				embeddedType = embeddedType.Elem()
+			}
+			if embeddedType.Kind() == reflect.Struct {
+				parseStructFields(embeddedType, info, index)
+				continue
+			}
 		}
 
 		// 解析 db 标签
@@ -61,12 +88,9 @@ func parseStruct(t reflect.Type) *structInfo {
 
 		info.Fields = append(info.Fields, structField{
 			Column: column,
-			Index:  i,
+			Index:  index,
 		})
 	}
-
-	structCache.Store(t, info)
-	return info
 }
 
 // extractInsertData 从 INSERT 数据中提取列名和值。
@@ -121,12 +145,15 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 		// 收集所有非 nil 字段的列名（基于第一行）
 		first := v.Index(0)
 		if first.Kind() == reflect.Ptr {
+			if first.IsNil() {
+				return nil, nil, ErrInvalidStruct
+			}
 			first = first.Elem()
 		}
 
-		var colIndices []int
+		var colIndices [][]int
 		for _, f := range info.Fields {
-			fv := first.Field(f.Index)
+			fv := first.FieldByIndex(f.Index)
 			// interface/指针类型：nil 则跳过；其它类型永远纳入
 			if (fv.Kind() == reflect.Interface || fv.Kind() == reflect.Ptr) && fv.IsNil() {
 				continue
@@ -142,11 +169,14 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 		for i := 0; i < v.Len(); i++ {
 			elem := v.Index(i)
 			if elem.Kind() == reflect.Ptr {
+				if elem.IsNil() {
+					return nil, nil, ErrInvalidStruct
+				}
 				elem = elem.Elem()
 			}
 			row := make([]any, 0, len(colIndices))
 			for _, idx := range colIndices {
-				fv := elem.Field(idx)
+				fv := elem.FieldByIndex(idx)
 				switch fv.Kind() {
 				case reflect.Interface, reflect.Ptr:
 					if fv.IsNil() {
@@ -179,7 +209,7 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 
 	var values []any
 	for _, f := range info.Fields {
-		fv := v.Field(f.Index)
+		fv := v.FieldByIndex(f.Index)
 		switch fv.Kind() {
 		case reflect.Interface:
 			// any 字段为 nil 则跳过，否则取实际值
@@ -243,7 +273,7 @@ func extractUpdateData(data any) (columns []string, values []any, err error) {
 	}
 
 	for _, f := range info.Fields {
-		fv := v.Field(f.Index)
+		fv := v.FieldByIndex(f.Index)
 		switch fv.Kind() {
 		case reflect.Interface:
 			// any 字段为 nil 则跳过，否则取实际值

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,7 +53,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 	// 重新连接到测试数据库
 	pool, err = NewPool(PoolConfig{
 		DriverName: "postgres",
-		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable",
+		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=zckg_test_integ",
 	})
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
@@ -75,7 +77,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 // dropPgTables 清除所有测试用表
 func dropPgTables(t *testing.T, db *DBDao) {
 	t.Helper()
-	tables := []string{"users_archive", "orders", "users"}
+	tables := []string{"users_archive", "orders", "profiles", "users"}
 	for _, table := range tables {
 		_, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS "+table+" CASCADE")
 	}
@@ -97,6 +99,21 @@ func setupPgUsersTable(t *testing.T, db *DBDao) {
 		('charlie', 35, 'charlie@test.com', 'inactive'),
 		('diana', 28, 'diana@test.com', 'active'),
 		('eve', NULL, 'eve@test.com', 'inactive')`)
+}
+
+// setupPgProfilesTable 创建 PostgreSQL 版 profiles 表并预填数据。
+func setupPgProfilesTable(t *testing.T, db *DBDao) {
+	t.Helper()
+	mustExec(t, db, `CREATE TABLE profiles (
+		id      BIGSERIAL PRIMARY KEY,
+		user_id BIGINT NOT NULL,
+		bio     VARCHAR(255) NULL,
+		active  BIGINT DEFAULT 1
+	)`)
+	mustExec(t, db, `INSERT INTO profiles (user_id, bio, active) VALUES
+		(1, 'Alice bio', 99),
+		(2, 'Bob bio', 99),
+		(3, 'Charlie bio', 99)`)
 }
 
 // setupPgOrdersTable 创建 PostgreSQL 版 orders 表并预填数据。
@@ -1498,9 +1515,12 @@ func TestPgInteg_Paginate(t *testing.T) {
 	}
 	var rows []row
 	b := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(2, 2)
-	_, err := b.Paginate(context.Background(), &rows)
+	total, err := b.Paginate(context.Background(), &rows)
 	if err != nil {
 		t.Fatalf("Paginate error: %v", err)
+	}
+	if total != 5 {
+		t.Errorf("expected total 5, got %d", total)
 	}
 	if len(rows) != 2 {
 		t.Errorf("expected 2 rows, got %d", len(rows))
@@ -1520,9 +1540,12 @@ func TestPgInteg_PaginateDefault(t *testing.T) {
 	}
 	var rows []row
 	b := db.Builder().Table("users").Select("name").OrderBy("id", "ASC")
-	_, err := b.Paginate(context.Background(), &rows)
+	total, err := b.Paginate(context.Background(), &rows)
 	if err != nil {
 		t.Fatalf("Paginate error: %v", err)
+	}
+	if total != 5 {
+		t.Errorf("expected total 5, got %d", total)
 	}
 	// 默认 ForPage(1, 20)，5 条数据全部返回
 	if len(rows) != 5 {
@@ -1600,6 +1623,83 @@ func TestPgInteg_SharedLock(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("TestPgInteg_SharedLock error: %v", err)
+	}
+}
+
+// TestPgInteg_UnionLockNotSupported 验证 PostgreSQL UNION + LOCK 返回错误（PostgreSQL 不支持此组合）。
+func TestPgInteg_UnionLockNotSupported(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 30)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := q1.Union(q2).LockForUpdate().Find(context.Background(), &rows)
+	if !errors.Is(err, ErrPgUnionLockNotSupported) {
+		t.Errorf("expected ErrPgUnionLockNotSupported, got %v", err)
+	}
+}
+
+// TestPgInteg_UnionSharedLockNotSupported 验证 PostgreSQL UNION + SharedLock 返回错误。
+func TestPgInteg_UnionSharedLockNotSupported(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 25)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := q1.UnionAll(q2).SharedLock().Find(context.Background(), &rows)
+	if !errors.Is(err, ErrPgUnionLockNotSupported) {
+		t.Errorf("expected ErrPgUnionLockNotSupported, got %v", err)
+	}
+}
+
+// TestPgInteg_ConcurrentCompile 验证多 goroutine 并发执行查询时 $N 占位符编号正确。
+func TestPgInteg_ConcurrentCompile(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	const n = 20
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			type row struct {
+				Name string `db:"name"`
+			}
+			var rows []row
+			// 多条件查询，$N 编号必须从 $1 开始递增
+			err := db.Builder().Table("users").
+				Select("name").
+				Where("status", "=", "active").
+				Where("age", ">", 25).
+				OrderBy("name", "ASC").
+				Find(context.Background(), &rows)
+			if err != nil {
+				errCh <- fmt.Errorf("goroutine[%d]: %v", idx, err)
+				return
+			}
+			// active 且 age>25: bob(30), diana(28) → 2 条
+			if len(rows) != 2 {
+				errCh <- fmt.Errorf("goroutine[%d]: expected 2 rows, got %d", idx, len(rows))
+				return
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("并发查询失败: %v", err)
 	}
 }
 
@@ -1704,6 +1804,34 @@ func TestPgInteg_TransactionNested(t *testing.T) {
 	_ = db.Builder().Table("users").Select("name").Where("id", "=", 2).First(context.Background(), &r2)
 	if r2.Name != "bob_nested" {
 		t.Errorf("expected bob_nested, got %s", r2.Name)
+	}
+}
+
+// TestPgInteg_TransactionPanicRollback 验证事务回调 panic 时，事务应自动回滚。
+func TestPgInteg_TransactionPanicRollback(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	// 回调中 panic，事务应自动回滚
+	func() {
+		defer func() { recover() }()
+		_ = db.Transaction(context.Background(), func(ctx context.Context) error {
+			type updateData struct {
+				Name string `db:"name"`
+			}
+			_, _ = db.Builder().Table("users").Where("id", "=", 1).Update(ctx, updateData{Name: "should_rollback"})
+			panic("test panic in transaction")
+		})
+	}()
+
+	// 验证数据未被修改（事务已回滚）
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	_ = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r)
+	if r.Name == "should_rollback" {
+		t.Error("事务 panic 后数据未回滚，修改已持久化")
 	}
 }
 
@@ -1904,5 +2032,511 @@ func TestPgInteg_UpdateInvalidData(t *testing.T) {
 	_, err = db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), nil)
 	if err == nil {
 		t.Errorf("expected error for nil data in Update, got nil")
+	}
+}
+
+// ==================== Group 15: Bug 验证集成测试 ====================
+
+// TestPgInteg_Bug_CountWithUnion 验证 Count() 对 UNION 查询返回正确结果。
+// 数据：active 用户 3 人，age>25 用户 3 人 (eve age 为 NULL 不计入)。
+// UNION ALL 不去重，正确总数应为 6。修复前生成无效 SQL 报错。
+func TestPgInteg_Bug_CountWithUnion(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	union := db.Builder().Table("users").Where("age", ">", 25)
+	b := db.Builder().Table("users").Where("status", "=", "active").UnionAll(union)
+
+	count, err := b.Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 6 {
+		t.Errorf("Count with UNION ALL expected 6, got %d", count)
+	}
+}
+
+// TestPgInteg_Bug_UpdateJoinDropsValueCondition 验证 PostgreSQL UPDATE + JOIN 含 value 条件时
+// 条件不再被静默丢弃，且绑定参数顺序正确：仅更新 profiles.active=99 的用户。
+func TestPgInteg_Bug_UpdateJoinDropsValueCondition(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgProfilesTable(t, db)
+
+	// 先将 user_id=2 的 active 设为 0，这样只有 user_id=1 和 3 的 active=99
+	mustExec(t, db, `UPDATE profiles SET active = 0 WHERE user_id = 2`)
+
+	type updateData struct {
+		Name string `db:"name"`
+	}
+	// 意图：只更新 profiles.active=99 的用户（user 1 和 3）
+	_, err := db.Builder().Table("users").
+		JoinOn("profiles", func(jb *JoinBuilder) {
+			jb.On("users.id", "=", "profiles.user_id")
+			jb.Where("profiles.active", "=", 99)
+		}).
+		Update(context.Background(), updateData{Name: "updated"})
+	if err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+
+	// user 2 (bob) 的 profiles.active=0，不应被更新
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	_ = db.Builder().Table("users").Select("name").Where("id", "=", 2).First(context.Background(), &r)
+	if r.Name == "updated" {
+		t.Errorf("BUG: user 2 (bob) should NOT be updated (profiles.active=0), but was updated due to dropped value condition")
+	}
+	// user 1 应被更新
+	var r1 row
+	_ = db.Builder().Table("users").Select("name").Where("id", "=", 1).First(context.Background(), &r1)
+	if r1.Name != "updated" {
+		t.Errorf("expected user 1 name 'updated', got %q", r1.Name)
+	}
+}
+
+// TestPgInteg_Bug_SelectSubFromSubBindingOrder 验证 SELECT 子查询与 FROM 子查询同时含绑定参数时，
+// 收集顺序与 SQL 占位符顺序一致（SELECT 子查询在前，FROM 子查询在后）。
+func TestPgInteg_Bug_SelectSubFromSubBindingOrder(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	// SELECT 子查询：统计 amount > 100 的订单数（标量，绑定 100），结果为 3 (120,200,150)
+	scalarSub := db.Builder().Table("orders").SelectRaw("COUNT(*)").Where("amount", ">", 100)
+	// FROM 子查询：age > 25 的用户（绑定 25），结果为 3 人 (bob,charlie,diana)
+	fromSub := db.Builder().Table("users").Select("name").Where("age", ">", 25)
+
+	type row struct {
+		Name     string `db:"name"`
+		BigCount int    `db:"big_count"`
+	}
+	var rows []row
+	err := db.Builder().
+		Select("name").
+		SelectSubquery(scalarSub, "big_count").
+		FromSub(fromSub, "t").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+	// 绑定顺序错误时 age>100 会返回 0 行；正确时应为 3 行，每行 big_count=3
+	if len(rows) != 3 {
+		t.Fatalf("BUG: binding order wrong, expected 3 rows, got %d", len(rows))
+	}
+	for _, r := range rows {
+		if r.BigCount != 3 {
+			t.Errorf("expected big_count=3 for %s, got %d", r.Name, r.BigCount)
+		}
+	}
+}
+
+// TestPgInteg_Bug_InsertNilPtrInSlice 验证指针切片含 nil 元素时 Insert 返回错误而非 panic。
+func TestPgInteg_Bug_InsertNilPtrInSlice(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type insertData struct {
+		Name  string `db:"name"`
+		Age   int    `db:"age"`
+		Email string `db:"email"`
+	}
+	data := []*insertData{
+		{Name: "frank", Age: 40, Email: "frank@test.com"},
+		nil,
+		{Name: "grace", Age: 22, Email: "grace@test.com"},
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), data)
+	if err == nil {
+		t.Fatalf("expected error for nil element in pointer slice, got nil")
+	}
+}
+
+// TestPgInteg_Bug_CloneNestedBuilder 验证 Clone 对嵌套 Builder（UNION 子查询）深拷贝：
+// 修改原始嵌套 Builder 后，克隆体不受影响。
+func TestPgInteg_Bug_CloneNestedBuilder(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	// unionSub 作为嵌套 Builder 被 base 引用
+	unionSub := db.Builder().Table("users").Where("status", "=", "active") // 3 人
+	base := db.Builder().Table("users").Where("age", ">", 25).UnionAll(unionSub)
+
+	clone := base.Clone()
+
+	// 修改原始嵌套 Builder：若 Clone 为浅拷贝，clone 会一并受影响
+	unionSub.Where("age", ">", 100) // active 且 age>100 → 0 人
+
+	// clone 应仍为 age>25 (3) UNION ALL active (3) = 6
+	count, err := clone.Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 6 {
+		t.Errorf("BUG: clone affected by nested builder mutation: expected 6, got %d", count)
+	}
+}
+
+// TestPgInteg_Bug_TransactionCommitError 验证 Commit 失败时返回提交错误本身，
+// 而非因再次 Rollback 产生的误导性 ErrTxDone 错误。
+func TestPgInteg_Bug_TransactionCommitError(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	err := db.Transaction(context.Background(), func(ctx context.Context) error {
+		type insertData struct {
+			Name  string `db:"name"`
+			Email string `db:"email"`
+		}
+		// 故意违反唯一约束使事务进入 aborted 状态，但忽略该错误
+		_, _ = db.Builder().Table("users").Insert(ctx, insertData{Name: "dup", Email: "alice@test.com"})
+		// 回调返回 nil，触发 Commit；此时 PG 事务已 aborted，Commit 必然失败
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("expected commit failure, got nil")
+	}
+	// 修复后应返回 commit 错误，而非 "transaction has already been committed or rolled back"
+	if strings.Contains(err.Error(), "already been committed or rolled back") {
+		t.Errorf("BUG: got misleading ErrTxDone error instead of commit error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "commit failed") {
+		t.Errorf("expected error to mention commit failure, got: %v", err)
+	}
+}
+
+// ==================== Group 16: OR 条件 ====================
+
+// TestPgInteg_OrWhereRaw 验证 OrWhereRaw：原始 SQL OR 条件与绑定参数。
+func TestPgInteg_OrWhereRaw(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		Where("status", "=", "active").
+		OrWhereRaw("age IS NOT NULL").
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// active: alice, bob, diana (3); age>30: charlie(35) → 4
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestPgInteg_OrWhereNested 验证 OrWhereNested：OR 连接嵌套条件组。
+func TestPgInteg_OrWhereNested(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		Where("status", "=", "active").
+		OrWhereNested(func(b *Builder) {
+			b.Where("age", ">", 30).Where("name", "=", "charlie")
+		}).
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// active: alice, bob, diana (3); charlie(age=35) → 4
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestPgInteg_OrWhereSub 验证 OrWhereSub：OR 连接子查询比较条件。
+func TestPgInteg_OrWhereSub(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		Where("id", ">", 2).
+		OrWhereSub("age", ">", func(sub *Builder) {
+			sub.Table("users").SelectRaw("AVG(age)").WhereNotNull("age")
+		}).
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// id>2: charlie(3), diana(4), eve(5); AVG(age)=29.5, age>29.5: bob(30), charlie(35)
+	// 合并去重: bob, charlie, diana, eve → 4
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestPgInteg_OrWhereLike 验证 OrWhereLike：OR 连接 LIKE 模糊匹配。
+func TestPgInteg_OrWhereLike(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereLike("name", "a%").
+		OrWhereLike("name", "b%").
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// name LIKE 'a%': alice; name LIKE 'b%': bob → 2
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// ==================== Group 17: RIGHT JOIN ====================
+
+// TestPgInteg_RightJoin 验证 RIGHT JOIN：右表所有行都保留。
+func TestPgInteg_RightJoin(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		Name *string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name").
+		RightJoin("orders", "users.id", "=", "orders.user_id").
+		OrderBy("orders.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// orders 有 6 行，所有 user_id 都有效 → 6 行
+	if len(rows) != 6 {
+		t.Errorf("expected 6 rows, got %d", len(rows))
+	}
+}
+
+// TestPgInteg_RightJoinOn 验证 RightJoinOn 多条件：RIGHT JOIN + 回调式 ON 条件。
+func TestPgInteg_RightJoinOn(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		Name *string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name").
+		RightJoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id").
+				Where("orders.amount", ">", 100)
+		}).
+		OrderBy("orders.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// ON users.id=orders.user_id OR orders.amount>100 → 6 rows
+	if len(rows) != 6 {
+		t.Errorf("expected 6 rows, got %d", len(rows))
+	}
+}
+
+// ==================== Group 18: HAVING 子句 ====================
+
+// TestPgInteg_HavingBasic 验证 Having 基本用法：HAVING SUM(amount) > 100。
+func TestPgInteg_HavingBasic(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		UserId int `db:"user_id"`
+	}
+	var rows []row
+	err := db.Builder().Table("orders").Select("user_id").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", 100).
+		OrderBy("user_id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// user1=170, user2=280, user4=150 > 100 → 3 groups
+	if len(rows) != 3 {
+		t.Errorf("expected 3 groups, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestPgInteg_OrHaving 验证 OrHaving：HAVING SUM>200 OR SUM<50。
+func TestPgInteg_OrHaving(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		UserId int `db:"user_id"`
+	}
+	var rows []row
+	err := db.Builder().Table("orders").Select("user_id").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", 200).
+		OrHaving("SUM(amount)", "<", 50).
+		OrderBy("user_id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// user1=170, user2=280, user3=30, user4=150
+	// SUM>200: user2(280); SUM<50: user3(30) → 2
+	if len(rows) != 2 {
+		t.Errorf("expected 2 groups, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestPgInteg_HavingNotBetween 验证 HavingNotBetween：HAVING SUM NOT BETWEEN 100 AND 200。
+func TestPgInteg_HavingNotBetween(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		UserId int `db:"user_id"`
+	}
+	var rows []row
+	err := db.Builder().Table("orders").Select("user_id").
+		GroupBy("user_id").
+		HavingNotBetween("SUM(amount)", 100, 200).
+		OrderBy("user_id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// user1=170 [100,200], user2=280 outside, user3=30 outside, user4=150 [100,200]
+	// NOT BETWEEN → user2, user3 → 2
+	if len(rows) != 2 {
+		t.Errorf("expected 2 groups, got %d: %v", len(rows), rows)
+	}
+}
+
+// ==================== Group 19: 高级 ORDER BY ====================
+
+// TestPgInteg_OrderByDesc 验证 OrderByDesc 降序排序。
+func TestPgInteg_OrderByDesc(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereNotNull("age").
+		OrderByDesc("age").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// age DESC: charlie(35), bob(30), diana(28), alice(25)
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 rows, got %d", len(rows))
+	}
+	if rows[0].Name != "charlie" {
+		t.Errorf("expected first row charlie, got %s", rows[0].Name)
+	}
+}
+
+// TestPgInteg_OrderByRaw 验证 OrderByRaw 原始 SQL 排序。
+func TestPgInteg_OrderByRaw(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereNotNull("age").
+		OrderByRaw("age DESC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 rows, got %d", len(rows))
+	}
+	if rows[0].Name != "charlie" {
+		t.Errorf("expected first row charlie, got %s", rows[0].Name)
+	}
+}
+
+// ==================== Group 20: JoinBuilder 高级方法 ====================
+
+// TestPgInteg_JoinOnOrWhere 验证 JoinBuilder.OrWhere：JOIN ON 中的 OR 值条件。
+func TestPgInteg_JoinOnOrWhere(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		Name    string `db:"name"`
+		Product string `db:"product"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "orders.product").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id").
+				OrWhere("orders.amount", ">", 140)
+		}).
+		OrderBy("orders.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// INNER JOIN ON id=user_id OR amount>140: 6 条匹配 id + 额外 amount>140 交叉匹配 → 14
+	if len(rows) != 14 {
+		t.Errorf("expected 14 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestPgInteg_JoinOnRaw 验证 JoinBuilder.Raw：JOIN ON 中的原始 SQL 条件。
+func TestPgInteg_JoinOnRaw(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+
+	type row struct {
+		Name    string `db:"name"`
+		Product string `db:"product"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "orders.product").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id").
+				Raw("orders.amount > $1", 100)
+		}).
+		OrderBy("orders.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// users.id=orders.user_id AND orders.amount>100 → 3 (Laptop, TV, Camera)
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d: %v", len(rows), rows)
 	}
 }

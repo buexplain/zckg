@@ -18,6 +18,10 @@ type Grammar interface {
 	CompileInsertUsing(b *Builder, columns []string, sub *Builder) string
 	// CompileUpdate 编译 UPDATE 语句
 	CompileUpdate(b *Builder, columns []string, values []any) string
+	// UpdateSetBeforeJoin 报告 UPDATE 语句中 SET 子句的绑定参数是否出现在 JOIN 条件之前。
+	// MySQL 的 UPDATE ... JOIN ... SET ... 中 JOIN 条件在前（返回 false）；
+	// PostgreSQL/SQLite 的 UPDATE ... SET ... FROM ... WHERE ... 中 SET 在前（返回 true）。
+	UpdateSetBeforeJoin() bool
 	// CompileDelete 编译 DELETE 语句
 	CompileDelete(b *Builder) string
 	// CompileTruncate 编译 TRUNCATE 语句
@@ -26,8 +30,6 @@ type Grammar interface {
 	WrapColumn(column string) string
 	// WrapTable 引用表标识符
 	WrapTable(table string) string
-	// Placeholder 返回参数占位符
-	Placeholder(index int) string
 	// CompileRandom 返回随机排序的 SQL 表达式
 	CompileRandom() string
 }

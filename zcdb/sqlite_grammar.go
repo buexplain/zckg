@@ -11,33 +11,25 @@ import (
 //   - INSERT OR IGNORE INTO ...（有别于 MySQL 的 INSERT IGNORE 和 PG 的 ON CONFLICT DO NOTHING）
 //   - UPSERT 使用 ON CONFLICT (col) DO UPDATE SET col = excluded.col（SQLite 3.24+，语法同 PG）
 //   - 没有 TRUNCATE，用 DELETE FROM 代替
-//   - 不支持锁（FOR UPDATE / LOCK IN SHARE MODE 会被忽略）
+//   - 不支持锁（FOR UPDATE / LOCK IN SHARE MODE 返回 ErrSQLiteLockNotSupported）
 //   - UPDATE 不生成 JOIN、ORDER BY、LIMIT（多表更新用 FROM 子句，SQLite 3.33+）
 //   - DELETE 不生成 ORDER BY 和 LIMIT（除非编译时启用）
 //   - 随机排序使用 RANDOM()
-type SQLiteGrammar struct {
-	tablePrefix string
-}
+type SQLiteGrammar struct{}
 
 // NewSQLiteGrammar 创建一个 SQLite 语法编译器
 func NewSQLiteGrammar() *SQLiteGrammar {
 	return &SQLiteGrammar{}
 }
 
-// SetTablePrefix 设置表名前缀
-func (g *SQLiteGrammar) SetTablePrefix(prefix string) *SQLiteGrammar {
-	g.tablePrefix = prefix
-	return g
-}
-
-// Placeholder SQLite 使用 ? 作为参数占位符
-func (g *SQLiteGrammar) Placeholder(_ int) string {
-	return "?"
-}
-
 // CompileRandom 返回 SQLite 随机排序表达式
 func (g *SQLiteGrammar) CompileRandom() string {
 	return "RANDOM()"
+}
+
+// UpdateSetBeforeJoin SQLite 的 UPDATE ... SET ... FROM ... WHERE ... 中 SET 在 JOIN 条件之前。
+func (g *SQLiteGrammar) UpdateSetBeforeJoin() bool {
+	return true
 }
 
 // WrapColumn 使用双引号引用列名。
@@ -70,9 +62,9 @@ func (g *SQLiteGrammar) WrapTable(table string) string {
 		idx := strings.Index(strings.ToLower(table), " as ")
 		name := table[:idx]
 		alias := table[idx+4:]
-		return g.wrapValue(g.tablePrefix+strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
+		return g.wrapValue(strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
 	}
-	return g.wrapValue(g.tablePrefix + table)
+	return g.wrapValue(table)
 }
 
 // wrapValue SQLite 使用双引号引用标识符
@@ -315,9 +307,8 @@ func (g *SQLiteGrammar) CompileUpsert(b *Builder, columns []string, rows [][]any
 		}
 		wrapped := g.WrapColumn(col)
 		sql.WriteString(wrapped)
-		sql.WriteString(" = ")
-		sql.WriteString(`"excluded".`)
-		sql.WriteString(g.wrapValue(col))
+		sql.WriteString(" = EXCLUDED.")
+		sql.WriteString(wrapped)
 	}
 
 	return sql.String()
@@ -379,26 +370,41 @@ func (g *SQLiteGrammar) CompileUpdate(b *Builder, columns []string, values []any
 	}
 
 	// WHERE
-	whereSQL := g.compileWheres(b)
-
-	// 有 JOIN 时把 ON 条件并入 WHERE
+	// 有 JOIN 时先将 ON 条件并入 WHERE 前部，
+	// 保证占位符顺序（JOIN 条件 → WHERE 条件）与 collectJoinBindings → collectWhereBindings 的绑定顺序一致。
+	var joinWhere string
 	if len(b.joins) > 0 {
 		var joinConditions []string
 		for _, join := range b.joins {
-			for _, cond := range join.Conditions {
-				if cond.Type == "column" {
-					jc := g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+			for i, cond := range join.Conditions {
+				var jc string
+				switch cond.Type {
+				case "column":
+					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+				case "value":
+					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
+				case "raw":
+					jc = cond.SQL
+				}
+				if jc == "" {
+					continue
+				}
+				if i == 0 {
 					joinConditions = append(joinConditions, jc)
+				} else {
+					joinConditions = append(joinConditions, cond.Boolean+" "+jc)
 				}
 			}
 		}
-		if len(joinConditions) > 0 {
-			joinWhere := strings.Join(joinConditions, " AND ")
-			if whereSQL != "" {
-				whereSQL = joinWhere + " AND " + whereSQL
-			} else {
-				whereSQL = joinWhere
-			}
+		joinWhere = strings.Join(joinConditions, " ")
+	}
+
+	whereSQL := g.compileWheres(b)
+	if joinWhere != "" {
+		if whereSQL != "" {
+			whereSQL = joinWhere + " AND " + whereSQL
+		} else {
+			whereSQL = joinWhere
 		}
 	}
 

@@ -75,6 +75,7 @@ func (d *DBDao) Pool() *Pool {
 }
 
 // Exec 执行原始 SQL（含慢 SQL 检测 + 读写路由），返回 sql.Result。
+// args 为 SQL 中占位符的绑定值，支持基本类型（int、string、float、bool、time.Time 等）。
 func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Result, error) {
 	start := time.Now()
 
@@ -98,6 +99,7 @@ func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Resul
 }
 
 // Query 执行原始查询，返回 *sql.Rows 调用方负责 Close。
+// args 类型规则同 Exec。
 func (d *DBDao) Query(ctx context.Context, sqlStr string, args ...any) (*sql.Rows, error) {
 	start := time.Now()
 
@@ -122,6 +124,7 @@ func (d *DBDao) Query(ctx context.Context, sqlStr string, args ...any) (*sql.Row
 
 // Transaction 开启事务，通过 context 传播。
 // 回调返回 nil → Commit；返回 error → Rollback。
+// 回调 panic → defer Rollback 兜底，确保事务始终回滚。
 // 嵌套调用时检测到 ctx 中已有事务，直接传播（不再开新事务）。
 func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) error) error {
 	// 嵌套事务检测：ctx 中已有事务则直接传播
@@ -138,22 +141,33 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 	// 将事务绑定到 ctx
 	txCtx := context.WithValue(ctx, ctxTxKey{}, tx)
 
+	// 标记事务是否已提交
+	committed := false
+	// defer Rollback 兜底：如果回调 panic 或 Commit 失败，确保事务回滚
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
 	// 执行回调
 	if err := fn(txCtx); err != nil {
 		// 回滚
 		if rbErr := tx.Rollback(); rbErr != nil {
 			return fmt.Errorf("zcdb: rollback failed: %v, original error: %w", rbErr, err)
 		}
+		committed = true // 已回滚，defer 不再重复执行
 		return err
 	}
 
 	// 提交
 	if err := tx.Commit(); err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			return fmt.Errorf("zcdb: commit failed: %v, rollback failed: %w", err, rbErr)
-		}
+		// Commit 失败后事务已结束，database/sql 会自动回滚，
+		// 再调用 Rollback 只会返回 ErrTxDone 这类误导性错误，故直接返回提交错误。
+		committed = true // 已提交（或自动回滚），defer 不再重复执行
 		return fmt.Errorf("zcdb: commit failed: %w", err)
 	}
+	committed = true
 	return nil
 }
 

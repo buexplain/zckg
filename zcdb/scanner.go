@@ -9,14 +9,15 @@ import (
 
 // scanFieldInfo 缓存的扫描字段信息，用于列名到结构体字段的映射。
 type scanFieldInfo struct {
-	// columnIndex 列名 → 结构体字段索引的映射
-	columnIndex map[string]int
+	// columnIndex 列名 → 结构体字段索引路径的映射（支持嵌入结构体）
+	columnIndex map[string][]int
 }
 
 // scanCache 扫描结果的字段映射缓存，按 reflect.Type 缓存。
 var scanCache sync.Map // map[reflect.Type]*scanFieldInfo
 
 // getScanFieldInfo 获取或构建结构体类型的列名→字段索引映射。
+// 支持嵌入结构体（匿名字段），其内部字段会被递归展开。
 func getScanFieldInfo(t reflect.Type) *scanFieldInfo {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
@@ -26,13 +27,39 @@ func getScanFieldInfo(t reflect.Type) *scanFieldInfo {
 	}
 
 	info := &scanFieldInfo{
-		columnIndex: make(map[string]int),
+		columnIndex: make(map[string][]int),
 	}
+	buildScanFields(t, info, nil)
+
+	scanCache.Store(t, info)
+	return info
+}
+
+// buildScanFields 递归构建扫描字段映射，支持嵌入结构体。
+func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int) {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if !field.IsExported() {
 			continue
 		}
+
+		// 构建当前字段的完整索引路径
+		index := make([]int, len(indexPrefix)+1)
+		copy(index, indexPrefix)
+		index[len(indexPrefix)] = i
+
+		// 处理嵌入结构体（匿名字段）
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			embeddedType := field.Type
+			if embeddedType.Kind() == reflect.Ptr {
+				embeddedType = embeddedType.Elem()
+			}
+			if embeddedType.Kind() == reflect.Struct {
+				buildScanFields(embeddedType, info, index)
+				continue
+			}
+		}
+
 		tag := field.Tag.Get("db")
 		if tag == "-" {
 			continue
@@ -41,11 +68,8 @@ func getScanFieldInfo(t reflect.Type) *scanFieldInfo {
 		if column == "" {
 			column = toSnakeCase(field.Name)
 		}
-		info.columnIndex[column] = i
+		info.columnIndex[column] = index
 	}
-
-	scanCache.Store(t, info)
-	return info
 }
 
 // ScanStruct 将 *sql.Rows 扫描到 dest 中。
@@ -137,7 +161,7 @@ func makeScanValues(columns []string, info *scanFieldInfo, structValue reflect.V
 	values := make([]any, len(columns))
 	for i, col := range columns {
 		if idx, ok := info.columnIndex[col]; ok {
-			field := structValue.Field(idx)
+			field := structValue.FieldByIndex(idx)
 			values[i] = field.Addr().Interface()
 		} else {
 			// 未匹配的列，扫描到 discard 忽略

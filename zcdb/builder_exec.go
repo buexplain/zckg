@@ -79,7 +79,7 @@ func (b *Builder) Paginate(ctx context.Context, dest any) (totalCount int, err e
 		return 0, err
 	}
 
-	return 0, ScanStruct(rows, dest)
+	return total, ScanStruct(rows, dest)
 }
 
 // Count 查询记录总数。

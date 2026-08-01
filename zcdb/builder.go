@@ -22,6 +22,7 @@ type Builder struct {
 	offset     int
 	unions     []UnionClause
 	lockClause string
+	err        error // 累积错误（如无效运算符）
 }
 
 // NewBuilder 创建一个新的sql构造器。
@@ -30,6 +31,36 @@ func NewBuilder(grammar Grammar, dao *DBDao) *Builder {
 		grammar: grammar,
 		dao:     dao,
 	}
+}
+
+// validOperators 运算符白名单，防止 SQL 注入。
+var validOperators = map[string]bool{
+	"=": true, "!=": true, "<>": true,
+	"<": true, ">": true, "<=": true, ">=": true,
+	"LIKE": true, "NOT LIKE": true,
+	"IS": true, "IS NOT": true,
+	"IN": true, "NOT IN": true,
+	"BETWEEN": true, "NOT BETWEEN": true,
+}
+
+// validateOperator 检查运算符是否在白名单内。
+func validateOperator(op string) error {
+	// 尝试大写匹配
+	upper := op
+	if len(upper) > 0 && upper[0] >= 'a' && upper[0] <= 'z' {
+		upper = ""
+		for _, c := range op {
+			if c >= 'a' && c <= 'z' {
+				upper += string(c - 32)
+			} else {
+				upper += string(c)
+			}
+		}
+	}
+	if validOperators[upper] {
+		return nil
+	}
+	return ErrInvalidOperator
 }
 
 // ==================== 表和列 ====================
@@ -73,7 +104,12 @@ func (b *Builder) Distinct() *Builder {
 // ==================== WHERE 条件 ====================
 
 // Where 添加一个 AND WHERE 条件。
+// value 支持基本类型（int、string、float、bool、time.Time 等）和 Expression（直接嵌入 SQL，不作为绑定参数）。
 func (b *Builder) Where(column string, op string, value any) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.wheres = append(b.wheres, WhereClause{
 		Type:     WhereTypeBasic,
 		Column:   column,
@@ -85,7 +121,12 @@ func (b *Builder) Where(column string, op string, value any) *Builder {
 }
 
 // OrWhere 添加一个 OR WHERE 条件。
+// value 类型规则同 Where。
 func (b *Builder) OrWhere(column string, op string, value any) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.wheres = append(b.wheres, WhereClause{
 		Type:     WhereTypeBasic,
 		Column:   column,
@@ -97,6 +138,7 @@ func (b *Builder) OrWhere(column string, op string, value any) *Builder {
 }
 
 // WhereIn 添加一个 WHERE column IN (...) 条件。
+// values 元素支持基本类型（int、string 等）。
 func (b *Builder) WhereIn(column string, values []any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeIn,
@@ -108,6 +150,7 @@ func (b *Builder) WhereIn(column string, values []any) *Builder {
 }
 
 // WhereNotIn 添加一个 WHERE column NOT IN (...) 条件。
+// values 元素类型规则同 WhereIn。
 func (b *Builder) WhereNotIn(column string, values []any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeNotIn,
@@ -139,6 +182,7 @@ func (b *Builder) WhereNotNull(column string) *Builder {
 }
 
 // WhereBetween 添加一个 WHERE column BETWEEN min AND max 条件。
+// min、max 支持基本类型（int、string、time.Time 等）。
 func (b *Builder) WhereBetween(column string, min, max any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeBetween,
@@ -151,6 +195,7 @@ func (b *Builder) WhereBetween(column string, min, max any) *Builder {
 }
 
 // WhereNotBetween 添加一个 WHERE column NOT BETWEEN min AND max 条件。
+// min、max 类型规则同 WhereBetween。
 func (b *Builder) WhereNotBetween(column string, min, max any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeNotBetween,
@@ -163,6 +208,7 @@ func (b *Builder) WhereNotBetween(column string, min, max any) *Builder {
 }
 
 // WhereRaw 添加一个原始 SQL WHERE 条件。
+// bindings 为 SQL 中 ? 占位符的绑定值，支持基本类型和 Expression（直接嵌入 SQL）。
 func (b *Builder) WhereRaw(sql string, bindings ...any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:     WhereTypeRaw,
@@ -174,6 +220,7 @@ func (b *Builder) WhereRaw(sql string, bindings ...any) *Builder {
 }
 
 // OrWhereRaw 添加一个原始 SQL OR WHERE 条件。
+// bindings 类型规则同 WhereRaw。
 func (b *Builder) OrWhereRaw(sql string, bindings ...any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:     WhereTypeRaw,
@@ -186,6 +233,10 @@ func (b *Builder) OrWhereRaw(sql string, bindings ...any) *Builder {
 
 // WhereColumn 添加一个两列比较的 WHERE 条件。
 func (b *Builder) WhereColumn(first string, op string, second string) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.wheres = append(b.wheres, WhereClause{
 		Type:     WhereTypeColumn,
 		Column:   first,
@@ -253,6 +304,10 @@ func (b *Builder) WhereNotExists(callback func(*Builder)) *Builder {
 
 // WhereSub 添加一个子查询 WHERE 条件: WHERE column op (SELECT ...)
 func (b *Builder) WhereSub(column string, op string, callback func(*Builder)) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
@@ -267,6 +322,10 @@ func (b *Builder) WhereSub(column string, op string, callback func(*Builder)) *B
 
 // OrWhereSub 添加一个子查询 OR WHERE 条件。
 func (b *Builder) OrWhereSub(column string, op string, callback func(*Builder)) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
 	b.wheres = append(b.wheres, WhereClause{
@@ -306,6 +365,7 @@ func (b *Builder) WhereNotInSub(column string, callback func(*Builder)) *Builder
 }
 
 // WhereLike 添加一个 WHERE column LIKE value 条件。
+// value 通常为 string 类型（如 "%keyword%"），也支持 Expression。
 func (b *Builder) WhereLike(column string, value any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeLike,
@@ -317,6 +377,7 @@ func (b *Builder) WhereLike(column string, value any) *Builder {
 }
 
 // OrWhereLike 添加一个 OR WHERE column LIKE value 条件。
+// value 类型规则同 WhereLike。
 func (b *Builder) OrWhereLike(column string, value any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeLike,
@@ -328,6 +389,7 @@ func (b *Builder) OrWhereLike(column string, value any) *Builder {
 }
 
 // WhereNotLike 添加一个 WHERE column NOT LIKE value 条件。
+// value 类型规则同 WhereLike。
 func (b *Builder) WhereNotLike(column string, value any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeNotLike,
@@ -401,6 +463,10 @@ func (b *Builder) CrossJoin(table string) *Builder {
 func (b *Builder) JoinOn(table string, callback func(*JoinBuilder)) *Builder {
 	jb := &JoinBuilder{}
 	callback(jb)
+	if jb.err != nil {
+		b.err = jb.err
+		return b
+	}
 	b.joins = append(b.joins, JoinClause{
 		Type:       JoinTypeInner,
 		Table:      table,
@@ -413,6 +479,10 @@ func (b *Builder) JoinOn(table string, callback func(*JoinBuilder)) *Builder {
 func (b *Builder) LeftJoinOn(table string, callback func(*JoinBuilder)) *Builder {
 	jb := &JoinBuilder{}
 	callback(jb)
+	if jb.err != nil {
+		b.err = jb.err
+		return b
+	}
 	b.joins = append(b.joins, JoinClause{
 		Type:       JoinTypeLeft,
 		Table:      table,
@@ -425,6 +495,10 @@ func (b *Builder) LeftJoinOn(table string, callback func(*JoinBuilder)) *Builder
 func (b *Builder) RightJoinOn(table string, callback func(*JoinBuilder)) *Builder {
 	jb := &JoinBuilder{}
 	callback(jb)
+	if jb.err != nil {
+		b.err = jb.err
+		return b
+	}
 	b.joins = append(b.joins, JoinClause{
 		Type:       JoinTypeRight,
 		Table:      table,
@@ -442,7 +516,12 @@ func (b *Builder) GroupBy(columns ...string) *Builder {
 }
 
 // Having 添加一个 HAVING 条件。
+// value 支持基本类型（int、string、float 等）。
 func (b *Builder) Having(column string, op string, value any) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.havings = append(b.havings, HavingClause{
 		Type:     "basic",
 		Column:   column,
@@ -454,7 +533,12 @@ func (b *Builder) Having(column string, op string, value any) *Builder {
 }
 
 // OrHaving 添加一个 OR HAVING 条件。
+// value 类型规则同 Having。
 func (b *Builder) OrHaving(column string, op string, value any) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.havings = append(b.havings, HavingClause{
 		Type:     "basic",
 		Column:   column,
@@ -466,6 +550,7 @@ func (b *Builder) OrHaving(column string, op string, value any) *Builder {
 }
 
 // HavingRaw 添加一个原始 SQL HAVING 条件。
+// bindings 为 SQL 中 ? 占位符的绑定值，支持基本类型和 Expression（直接嵌入 SQL）。
 func (b *Builder) HavingRaw(sql string, bindings ...any) *Builder {
 	b.havings = append(b.havings, HavingClause{
 		Type:     "raw",
@@ -477,6 +562,7 @@ func (b *Builder) HavingRaw(sql string, bindings ...any) *Builder {
 }
 
 // HavingBetween 添加一个 HAVING column BETWEEN min AND max 条件。
+// min、max 支持基本类型（int、float 等）。
 func (b *Builder) HavingBetween(column string, min, max any) *Builder {
 	b.havings = append(b.havings, HavingClause{
 		Type:    "between",
@@ -489,6 +575,7 @@ func (b *Builder) HavingBetween(column string, min, max any) *Builder {
 }
 
 // HavingNotBetween 添加一个 HAVING column NOT BETWEEN min AND max 条件。
+// min、max 类型规则同 HavingBetween。
 func (b *Builder) HavingNotBetween(column string, min, max any) *Builder {
 	b.havings = append(b.havings, HavingClause{
 		Type:    "between",
@@ -589,7 +676,10 @@ func (b *Builder) LockForUpdate() *Builder {
 	return b
 }
 
-// SharedLock 设置共享锁 (LOCK IN SHARE MODE)。
+// SharedLock 设置共享锁，不同方言语法：
+//   - MySQL:      LOCK IN SHARE MODE
+//   - PostgreSQL: FOR SHARE（自动转换）
+//   - SQLite:     不支持，返回 ErrSQLiteLockNotSupported
 func (b *Builder) SharedLock() *Builder {
 	b.lockClause = "LOCK IN SHARE MODE"
 	return b
@@ -602,8 +692,23 @@ func (b *Builder) SharedLock() *Builder {
 //
 // 返回 (SQL, 绑定参数, 错误)
 func (b *Builder) ToSelect() (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
 	if b.table == "" && b.fromSub == nil {
 		return "", nil, ErrEmptyTable
+	}
+
+	// 检查不支持的锁子句场景
+	if b.lockClause != "" {
+		switch b.grammar.(type) {
+		case *PostgresGrammar:
+			if len(b.unions) > 0 {
+				return "", nil, ErrPgUnionLockNotSupported
+			}
+		case *SQLiteGrammar:
+			return "", nil, ErrSQLiteLockNotSupported
+		}
 	}
 
 	sql := b.grammar.CompileSelect(b, b.columns)
@@ -654,6 +759,9 @@ func (b *Builder) ToSelect() (string, []any, error) {
 //
 // 返回 (SQL, 绑定参数, 错误)
 func (b *Builder) ToInsert(data any) (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
@@ -691,6 +799,9 @@ func (b *Builder) ToInsert(data any) (string, []any, error) {
 //
 // 返回 (SQL, 绑定参数, 错误)
 func (b *Builder) ToInsertOrIgnore(data any) (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
@@ -735,6 +846,9 @@ func (b *Builder) ToInsertOrIgnore(data any) (string, []any, error) {
 //
 // 返回 (SQL, 绑定参数, 错误)
 func (b *Builder) ToUpsert(data any, uniqueBy []string, updateColumns []string) (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
@@ -780,6 +894,9 @@ func (b *Builder) ToUpsert(data any, uniqueBy []string, updateColumns []string) 
 //
 // 返回 (SQL, 绑定参数, 错误)
 func (b *Builder) ToInsertUsing(columns []string, callback func(*Builder)) (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
@@ -826,12 +943,15 @@ func (b *Builder) ToInsertUsing(columns []string, callback func(*Builder)) (stri
 //	sql, args, err = NewBuilder(g).
 //	    Table("users").
 //	    Where("id", "=", 1).
-//	    ToUpdate(userUpdate{Age: Raw("`age` + 1")})
+//	    ToUpdate(userUpdate{Age: NewExpression("`age` + 1")})
 //	// SQL:  UPDATE `users` SET `age` = `age` + 1 WHERE `id` = ?
 //	// args: [1]
 //
 // 返回 (SQL, 绑定参数, 错误)
 func (b *Builder) ToUpdate(data any) (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
@@ -843,12 +963,26 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 
 	sql := b.grammar.CompileUpdate(b, columns, values)
 
-	// 绑定参数 = SET 子句的值（排除 Expression）+ WHERE 子句的值
+	// 绑定参数顺序须与 SQL 中占位符出现顺序一致：
+	// MySQL 为 UPDATE ... JOIN(ON) ... SET ... WHERE，JOIN 条件在 SET 之前；
+	// PostgreSQL/SQLite 为 UPDATE ... SET ... FROM ... WHERE(JOIN 条件并入 WHERE 前部)，SET 在 JOIN 之前。
+	// 通过 grammar.UpdateSetBeforeJoin() 区分两种顺序。
 	var args []any
-	for _, v := range values {
-		if _, ok := v.(Expression); !ok {
-			args = append(args, v)
+	setBindings := func() {
+		for _, v := range values {
+			if _, ok := v.(Expression); !ok {
+				args = append(args, v)
+			}
 		}
+	}
+	if b.grammar.UpdateSetBeforeJoin() {
+		// SET → JOIN → WHERE
+		setBindings()
+		args = append(args, b.collectJoinBindings()...)
+	} else {
+		// JOIN → SET → WHERE
+		args = append(args, b.collectJoinBindings()...)
+		setBindings()
 	}
 	args = append(args, b.collectWhereBindings()...)
 
@@ -869,6 +1003,9 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 //
 // 返回 (SQL, 绑定参数, 错误)
 func (b *Builder) ToDelete() (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
@@ -898,24 +1035,52 @@ func (b *Builder) ToTruncate() (string, error) {
 
 // ToCount 编译 COUNT 查询。
 // 通过复用 CompileSelect 生成 SELECT COUNT(*) FROM ... 语句。
+// 当查询包含 UNION 时，将整个 UNION 包裹为子查询再计数，
+// 避免生成 (SELECT COUNT(*) ...) UNION (...) 这类无效 SQL。
 func (b *Builder) ToCount() (string, []any, error) {
-	if b.table == "" && b.fromSub == nil {
+	if b.err != nil {
+		return "", nil, b.err
+	}
+	if b.table == "" && b.fromSub == nil && len(b.unions) == 0 {
 		return "", nil, ErrEmptyTable
+	}
+
+	// UNION 查询：将整个 UNION 作为子查询包裹后计数
+	if len(b.unions) > 0 {
+		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
+		origLimit, origOffset := b.limit, b.offset
+		origOrders := b.orders
+		origLock := b.lockClause
+		b.limit, b.offset = 0, 0
+		b.orders = nil
+		b.lockClause = ""
+
+		unionSQL := b.grammar.CompileSelect(b, b.columns)
+		args := b.collectSelectBindings()
+
+		b.limit, b.offset = origLimit, origOffset
+		b.orders = origOrders
+		b.lockClause = origLock
+
+		countSQL := "SELECT COUNT(*) FROM (" + unionSQL + ") AS " + b.grammar.WrapTable("t")
+		return countSQL, args, nil
 	}
 
 	// 保存原始列并设置为 COUNT(*)，清除 SELECT 子查询
 	origColumns := b.columns
 	origSelectSubs := b.selectSubs
+	// 使用 defer 确保 panic 时也能恢复状态
+	defer func() {
+		b.columns = origColumns
+		b.selectSubs = origSelectSubs
+	}()
 	b.columns = []string{"COUNT(*)"}
 	b.selectSubs = nil
 
 	sqlStr := b.grammar.CompileSelect(b, b.columns)
-	// collectSelectBindings 会收集 FROM_SUB → JOIN → WHERE → HAVING → UNION 的绑定参数
+	// collectSelectBindings 会收集 SELECT_SUB → FROM_SUB → JOIN → WHERE → HAVING → UNION 的绑定参数
 	// 由于 selectSubs 已清空，不会包含 SELECT 子查询的参数
 	args := b.collectSelectBindings()
-
-	b.columns = origColumns
-	b.selectSubs = origSelectSubs
 
 	return sqlStr, args, nil
 }
@@ -923,16 +1088,17 @@ func (b *Builder) ToCount() (string, []any, error) {
 // ==================== 内部方法：收集绑定参数 ====================
 
 // collectSelectBindings 收集 SELECT 查询的所有绑定参数。
-// 顺序: FROM_SUB → JOIN → WHERE → HAVING → UNION
+// 顺序与 CompileSelect 生成占位符的顺序一致：
+// SELECT_SUB → FROM_SUB → JOIN → WHERE → HAVING → UNION
 func (b *Builder) collectSelectBindings() []any {
 	var args []any
+	// SELECT sub 的绑定参数（编译时先于 FROM 出现）
+	for _, ss := range b.selectSubs {
+		args = append(args, ss.Query.collectSelectBindings()...)
+	}
 	// FROM sub 的绑定参数
 	if b.fromSub != nil {
 		args = append(args, b.fromSub.collectSelectBindings()...)
-	}
-	// SELECT sub 的绑定参数
-	for _, ss := range b.selectSubs {
-		args = append(args, ss.Query.collectSelectBindings()...)
 	}
 	// JOIN 绑定参数
 	for _, j := range b.joins {
@@ -961,6 +1127,22 @@ func (b *Builder) collectSelectBindings() []any {
 	// UNION
 	for _, u := range b.unions {
 		args = append(args, u.Query.collectSelectBindings()...)
+	}
+	return args
+}
+
+// collectJoinBindings 收集 JOIN ON 条件中的绑定参数（value 与 raw 类型）。
+func (b *Builder) collectJoinBindings() []any {
+	var args []any
+	for _, j := range b.joins {
+		for _, c := range j.Conditions {
+			switch c.Type {
+			case "value":
+				args = append(args, c.Value)
+			case "raw":
+				args = append(args, c.Bindings...)
+			}
+		}
 	}
 	return args
 }
@@ -1025,8 +1207,12 @@ func (b *Builder) Clone() *Builder {
 		limit:      b.limit,
 		offset:     b.offset,
 		lockClause: b.lockClause,
-		fromSub:    b.fromSub,
 		fromAlias:  b.fromAlias,
+		err:        b.err,
+	}
+	// FROM 子查询深拷贝
+	if b.fromSub != nil {
+		clone.fromSub = b.fromSub.Clone()
 	}
 	if b.columns != nil {
 		clone.columns = make([]string, len(b.columns))
@@ -1035,14 +1221,51 @@ func (b *Builder) Clone() *Builder {
 	if b.selectSubs != nil {
 		clone.selectSubs = make([]SelectSub, len(b.selectSubs))
 		copy(clone.selectSubs, b.selectSubs)
+		for i := range clone.selectSubs {
+			if clone.selectSubs[i].Query != nil {
+				clone.selectSubs[i].Query = clone.selectSubs[i].Query.Clone()
+			}
+		}
 	}
 	if b.joins != nil {
 		clone.joins = make([]JoinClause, len(b.joins))
 		copy(clone.joins, b.joins)
+		for i := range clone.joins {
+			if clone.joins[i].Conditions != nil {
+				conds := make([]JoinCondition, len(clone.joins[i].Conditions))
+				copy(conds, clone.joins[i].Conditions)
+				for j := range conds {
+					if conds[j].Bindings != nil {
+						cp := make([]any, len(conds[j].Bindings))
+						copy(cp, conds[j].Bindings)
+						conds[j].Bindings = cp
+					}
+				}
+				clone.joins[i].Conditions = conds
+			}
+		}
 	}
 	if b.wheres != nil {
 		clone.wheres = make([]WhereClause, len(b.wheres))
 		copy(clone.wheres, b.wheres)
+		for i := range clone.wheres {
+			if clone.wheres[i].Values != nil {
+				cp := make([]any, len(clone.wheres[i].Values))
+				copy(cp, clone.wheres[i].Values)
+				clone.wheres[i].Values = cp
+			}
+			if clone.wheres[i].Bindings != nil {
+				cp := make([]any, len(clone.wheres[i].Bindings))
+				copy(cp, clone.wheres[i].Bindings)
+				clone.wheres[i].Bindings = cp
+			}
+			if clone.wheres[i].Nested != nil {
+				clone.wheres[i].Nested = clone.wheres[i].Nested.Clone()
+			}
+			if clone.wheres[i].Sub != nil {
+				clone.wheres[i].Sub = clone.wheres[i].Sub.Clone()
+			}
+		}
 	}
 	if b.groups != nil {
 		clone.groups = make([]string, len(b.groups))
@@ -1059,6 +1282,11 @@ func (b *Builder) Clone() *Builder {
 	if b.unions != nil {
 		clone.unions = make([]UnionClause, len(b.unions))
 		copy(clone.unions, b.unions)
+		for i := range clone.unions {
+			if clone.unions[i].Query != nil {
+				clone.unions[i].Query = clone.unions[i].Query.Clone()
+			}
+		}
 	}
 	return clone
 }
