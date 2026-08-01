@@ -145,13 +145,10 @@ func TestMakeScanValues_MatchingColumns(t *testing.T) {
 		t.Fatalf("expected 2 values, got %d", len(values))
 	}
 
-	// 验证返回值是指针类型
+	// 验证返回值是 nullSafeField 类型
 	for i, v := range values {
-		if _, ok := v.(*int); i == 0 && !ok {
-			t.Errorf("value[%d] should be *int, got %T", i, v)
-		}
-		if _, ok := v.(*string); i == 1 && !ok {
-			t.Errorf("value[%d] should be *string, got %T", i, v)
+		if _, ok := v.(*nullSafeField); !ok {
+			t.Errorf("value[%d] should be *nullSafeField, got %T", i, v)
 		}
 	}
 }
@@ -176,9 +173,9 @@ func TestMakeScanValues_UnmatchedColumns(t *testing.T) {
 		t.Fatalf("expected 2 values, got %d", len(values))
 	}
 
-	// 第一个值应该是 *int
-	if _, ok := values[0].(*int); !ok {
-		t.Errorf("values[0] should be *int, got %T", values[0])
+	// 第一个值应该是 *nullSafeField
+	if _, ok := values[0].(*nullSafeField); !ok {
+		t.Errorf("values[0] should be *nullSafeField, got %T", values[0])
 	}
 
 	// 第二个值应该是 *discard
@@ -212,12 +209,12 @@ func TestMakeScanValues_EmbeddedStruct(t *testing.T) {
 		t.Fatalf("expected 2 values, got %d", len(values))
 	}
 
-	// 验证嵌入字段的指针正确
-	if _, ok := values[0].(*int); !ok {
-		t.Errorf("values[0] should be *int (embedded), got %T", values[0])
+	// 验证嵌入字段的 nullSafeField 正确
+	if _, ok := values[0].(*nullSafeField); !ok {
+		t.Errorf("values[0] should be *nullSafeField (embedded), got %T", values[0])
 	}
-	if _, ok := values[1].(*string); !ok {
-		t.Errorf("values[1] should be *string, got %T", values[1])
+	if _, ok := values[1].(*nullSafeField); !ok {
+		t.Errorf("values[1] should be *nullSafeField, got %T", values[1])
 	}
 }
 

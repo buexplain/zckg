@@ -2719,27 +2719,34 @@ func TestSQLiteInteg_SchemaInspector_Columns(t *testing.T) {
 // ==================== Cursor 迭代器集成测试 ====================
 
 // TestSQLiteInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行扫描，break 时自动释放连接。
+// 同时验证 NULL 安全扫描：eve 的 age 为 NULL，扫描到 int 类型时保留零值 0。
 func TestSQLiteInteg_Cursor_Stream(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
 	type row struct {
 		Name string `db:"name"`
-		Age  *int   `db:"age"`
+		Age  int    `db:"age"` // 非指针类型，NULL 时保留零值
 	}
 	var user row
 	var names []string
+	var ages []int
 	for err := range db.Builder().Table("users").Select("name", "age").OrderBy("id", "ASC").Cursor(context.Background(), &user) {
 		if err != nil {
 			t.Fatalf("Cursor error: %v", err)
 		}
 		names = append(names, user.Name)
+		ages = append(ages, user.Age)
 	}
 	if len(names) != 5 {
 		t.Errorf("expected 5 names, got %d: %v", len(names), names)
 	}
 	if names[0] != "alice" {
 		t.Errorf("expected first name alice, got %s", names[0])
+	}
+	// eve 的 age 为 NULL，应该是零值 0
+	if ages[4] != 0 {
+		t.Errorf("expected eve's age=0 (NULL), got %d", ages[4])
 	}
 }
 
@@ -2850,4 +2857,468 @@ func TestSQLiteInteg_CursorBy_IgnoresOrderBy(t *testing.T) {
 			t.Errorf("ids[%d]: expected %d, got %d", i, expected[i], id)
 		}
 	}
+}
+
+// ==================== nullSafeField 集成测试 ====================
+
+// TestSQLiteInteg_NullSafeField_AllTypes 验证 nullSafeField 能正确处理各种数据类型的 NULL 和非 NULL 值。
+// 测试覆盖：整数、浮点数、字符串、布尔值、指针类型。
+func TestSQLiteInteg_NullSafeField_AllTypes(t *testing.T) {
+	db := openSQLiteTestDB(t)
+
+	// 创建包含各种类型的表
+	mustExec(t, db, `CREATE TABLE type_test (
+		id       INTEGER PRIMARY KEY AUTOINCREMENT,
+		-- 整数类型
+		i_val    INTEGER,
+		-- 浮点类型
+		f_val    REAL,
+		-- 字符串类型
+		s_val    TEXT,
+		-- 布尔类型（SQLite 用 0/1 存储）
+		b_val    INTEGER
+	)`)
+
+	// 插入两行数据：一行有值，一行全部为 NULL
+	mustExec(t, db, `INSERT INTO type_test (i_val, f_val, s_val, b_val) VALUES (42, 3.14, 'hello', 1)`)
+	mustExec(t, db, `INSERT INTO type_test (i_val, f_val, s_val, b_val) VALUES (NULL, NULL, NULL, NULL)`)
+
+	// 测试非指针类型：NULL 时保留零值
+	t.Run("NonPointer", func(t *testing.T) {
+		type row struct {
+			IVal int     `db:"i_val"`
+			FVal float64 `db:"f_val"`
+			SVal string  `db:"s_val"`
+			BVal bool    `db:"b_val"`
+		}
+
+		var results []row
+		var r row
+		for err := range db.Builder().Table("type_test").Select("i_val", "f_val", "s_val", "b_val").
+			OrderBy("id", "ASC").Cursor(context.Background(), &r) {
+			if err != nil {
+				t.Fatalf("Cursor error: %v", err)
+			}
+			results = append(results, r)
+		}
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 rows, got %d", len(results))
+		}
+
+		// 第一行：有值
+		if results[0].IVal != 42 {
+			t.Errorf("row[0].IVal: expected 42, got %d", results[0].IVal)
+		}
+		if results[0].FVal != 3.14 {
+			t.Errorf("row[0].FVal: expected 3.14, got %f", results[0].FVal)
+		}
+		if results[0].SVal != "hello" {
+			t.Errorf("row[0].SVal: expected 'hello', got %q", results[0].SVal)
+		}
+		if !results[0].BVal {
+			t.Errorf("row[0].BVal: expected true, got false")
+		}
+
+		// 第二行：NULL → 零值
+		if results[1].IVal != 0 {
+			t.Errorf("row[1].IVal: expected 0 (NULL), got %d", results[1].IVal)
+		}
+		if results[1].FVal != 0.0 {
+			t.Errorf("row[1].FVal: expected 0.0 (NULL), got %f", results[1].FVal)
+		}
+		if results[1].SVal != "" {
+			t.Errorf("row[1].SVal: expected '' (NULL), got %q", results[1].SVal)
+		}
+		if results[1].BVal {
+			t.Errorf("row[1].BVal: expected false (NULL), got true")
+		}
+	})
+
+	// 测试指针类型：NULL 时为 nil
+	t.Run("Pointer", func(t *testing.T) {
+		type row struct {
+			IVal *int     `db:"i_val"`
+			FVal *float64 `db:"f_val"`
+			SVal *string  `db:"s_val"`
+			BVal *bool    `db:"b_val"`
+		}
+
+		var results []row
+		var r row
+		for err := range db.Builder().Table("type_test").Select("i_val", "f_val", "s_val", "b_val").
+			OrderBy("id", "ASC").Cursor(context.Background(), &r) {
+			if err != nil {
+				t.Fatalf("Cursor error: %v", err)
+			}
+			results = append(results, r)
+		}
+
+		if len(results) != 2 {
+			t.Fatalf("expected 2 rows, got %d", len(results))
+		}
+
+		// 第一行：有值
+		if results[0].IVal == nil || *results[0].IVal != 42 {
+			t.Errorf("row[0].IVal: expected *42, got %v", results[0].IVal)
+		}
+		if results[0].FVal == nil || *results[0].FVal != 3.14 {
+			t.Errorf("row[0].FVal: expected *3.14, got %v", results[0].FVal)
+		}
+		if results[0].SVal == nil || *results[0].SVal != "hello" {
+			t.Errorf("row[0].SVal: expected *'hello', got %v", results[0].SVal)
+		}
+		if results[0].BVal == nil || !*results[0].BVal {
+			t.Errorf("row[0].BVal: expected *true, got %v", results[0].BVal)
+		}
+
+		// 第二行：NULL → nil
+		if results[1].IVal != nil {
+			t.Errorf("row[1].IVal: expected nil (NULL), got %v", *results[1].IVal)
+		}
+		if results[1].FVal != nil {
+			t.Errorf("row[1].FVal: expected nil (NULL), got %v", *results[1].FVal)
+		}
+		if results[1].SVal != nil {
+			t.Errorf("row[1].SVal: expected nil (NULL), got %v", *results[1].SVal)
+		}
+		if results[1].BVal != nil {
+			t.Errorf("row[1].BVal: expected nil (NULL), got %v", *results[1].BVal)
+		}
+	})
+}
+
+// TestSQLiteInteg_NullSafeField_IntTypes 验证各种整数类型的 NULL 安全扫描。
+func TestSQLiteInteg_NullSafeField_IntTypes(t *testing.T) {
+	db := openSQLiteTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE int_test (
+		id      INTEGER PRIMARY KEY AUTOINCREMENT,
+		i8_val  INTEGER,
+		i16_val INTEGER,
+		i32_val INTEGER,
+		i64_val INTEGER,
+		u8_val  INTEGER,
+		u16_val INTEGER,
+		u32_val INTEGER,
+		u64_val INTEGER
+	)`)
+
+	// 插入有值行和 NULL 行（uint64 最大值超出 SQLite int64 存储范围，改用 int64 最大值）
+	mustExec(t, db, `INSERT INTO int_test (i8_val, i16_val, i32_val, i64_val, u8_val, u16_val, u32_val, u64_val)
+		VALUES (127, 32767, 2147483647, 9223372036854775807, 255, 65535, 4294967295, 9223372036854775807)`)
+	mustExec(t, db, `INSERT INTO int_test (i8_val, i16_val, i32_val, i64_val, u8_val, u16_val, u32_val, u64_val)
+		VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`)
+
+	type row struct {
+		I8  int8   `db:"i8_val"`
+		I16 int16  `db:"i16_val"`
+		I32 int32  `db:"i32_val"`
+		I64 int64  `db:"i64_val"`
+		U8  uint8  `db:"u8_val"`
+		U16 uint16 `db:"u16_val"`
+		U32 uint32 `db:"u32_val"`
+		U64 uint64 `db:"u64_val"`
+	}
+
+	var results []row
+	var r row
+	for err := range db.Builder().Table("int_test").
+		Select("i8_val", "i16_val", "i32_val", "i64_val", "u8_val", "u16_val", "u32_val", "u64_val").
+		OrderBy("id", "ASC").Cursor(context.Background(), &r) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		results = append(results, r)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+
+	// 第一行：验证各种整数类型的最大值
+	if results[0].I8 != 127 {
+		t.Errorf("I8: expected 127, got %d", results[0].I8)
+	}
+	if results[0].I16 != 32767 {
+		t.Errorf("I16: expected 32767, got %d", results[0].I16)
+	}
+	if results[0].I32 != 2147483647 {
+		t.Errorf("I32: expected 2147483647, got %d", results[0].I32)
+	}
+	if results[0].I64 != 9223372036854775807 {
+		t.Errorf("I64: expected 9223372036854775807, got %d", results[0].I64)
+	}
+	if results[0].U8 != 255 {
+		t.Errorf("U8: expected 255, got %d", results[0].U8)
+	}
+	if results[0].U16 != 65535 {
+		t.Errorf("U16: expected 65535, got %d", results[0].U16)
+	}
+	if results[0].U32 != 4294967295 {
+		t.Errorf("U32: expected 4294967295, got %d", results[0].U32)
+	}
+	if results[0].U64 != 9223372036854775807 {
+		t.Errorf("U64: expected 9223372036854775807, got %d", results[0].U64)
+	}
+
+	// 第二行：全部为零值
+	if results[1].I8 != 0 || results[1].I16 != 0 || results[1].I32 != 0 || results[1].I64 != 0 {
+		t.Errorf("row[1] signed ints: expected all 0, got %d %d %d %d",
+			results[1].I8, results[1].I16, results[1].I32, results[1].I64)
+	}
+	if results[1].U8 != 0 || results[1].U16 != 0 || results[1].U32 != 0 || results[1].U64 != 0 {
+		t.Errorf("row[1] unsigned ints: expected all 0, got %d %d %d %d",
+			results[1].U8, results[1].U16, results[1].U32, results[1].U64)
+	}
+}
+
+// TestSQLiteInteg_NullSafeField_FloatTypes 验证 float32/float64 的 NULL 安全扫描。
+func TestSQLiteInteg_NullSafeField_FloatTypes(t *testing.T) {
+	db := openSQLiteTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE float_test (
+		id      INTEGER PRIMARY KEY AUTOINCREMENT,
+		f32_val REAL,
+		f64_val REAL
+	)`)
+
+	mustExec(t, db, `INSERT INTO float_test (f32_val, f64_val) VALUES (1.5, 2.718281828)`)
+	mustExec(t, db, `INSERT INTO float_test (f32_val, f64_val) VALUES (NULL, NULL)`)
+
+	type row struct {
+		F32 float32 `db:"f32_val"`
+		F64 float64 `db:"f64_val"`
+	}
+
+	var results []row
+	var r row
+	for err := range db.Builder().Table("float_test").Select("f32_val", "f64_val").
+		OrderBy("id", "ASC").Cursor(context.Background(), &r) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		results = append(results, r)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+
+	// 第一行
+	if results[0].F32 != 1.5 {
+		t.Errorf("F32: expected 1.5, got %f", results[0].F32)
+	}
+	if results[0].F64 != 2.718281828 {
+		t.Errorf("F64: expected 2.718281828, got %f", results[0].F64)
+	}
+
+	// 第二行：NULL → 0
+	if results[1].F32 != 0 {
+		t.Errorf("F32: expected 0 (NULL), got %f", results[1].F32)
+	}
+	if results[1].F64 != 0 {
+		t.Errorf("F64: expected 0 (NULL), got %f", results[1].F64)
+	}
+}
+
+// TestSQLiteInteg_NullSafeField_BooleanType 验证 BOOLEAN 类型（SQLite 用 INTEGER 0/1 存储）的 NULL 安全扫描。
+// SQLite 没有原生 BOOLEAN 类型，DECLARE BOOLEAN 实际使用 INTEGER 亲和性。
+func TestSQLiteInteg_NullSafeField_BooleanType(t *testing.T) {
+	db := openSQLiteTestDB(t)
+
+	// 创建包含 BOOLEAN 类型字段的表（SQLite 会当作 INTEGER 处理）
+	mustExec(t, db, `CREATE TABLE bool_test (
+		id       INTEGER PRIMARY KEY AUTOINCREMENT,
+		is_active  BOOLEAN,
+		is_deleted BOOLEAN,
+		is_valid   BOOLEAN NOT NULL DEFAULT 1
+	)`)
+
+	// 插入测试数据：TRUE/FALSE/NULL
+	mustExec(t, db, `INSERT INTO bool_test (is_active, is_deleted, is_valid) VALUES (1, 0, 1)`)
+	mustExec(t, db, `INSERT INTO bool_test (is_active, is_deleted, is_valid) VALUES (0, 1, 0)`)
+	mustExec(t, db, `INSERT INTO bool_test (is_active, is_deleted, is_valid) VALUES (NULL, NULL, 1)`)
+
+	// 测试非指针 bool 类型
+	t.Run("NonPointer", func(t *testing.T) {
+		type row struct {
+			IsActive  bool `db:"is_active"`
+			IsDeleted bool `db:"is_deleted"`
+			IsValid   bool `db:"is_valid"`
+		}
+
+		var results []row
+		var r row
+		for err := range db.Builder().Table("bool_test").Select("is_active", "is_deleted", "is_valid").
+			OrderBy("id", "ASC").Cursor(context.Background(), &r) {
+			if err != nil {
+				t.Fatalf("Cursor error: %v", err)
+			}
+			results = append(results, r)
+		}
+
+		if len(results) != 3 {
+			t.Fatalf("expected 3 rows, got %d", len(results))
+		}
+
+		// 第一行：TRUE, FALSE, TRUE
+		if !results[0].IsActive {
+			t.Errorf("row[0].IsActive: expected true, got false")
+		}
+		if results[0].IsDeleted {
+			t.Errorf("row[0].IsDeleted: expected false, got true")
+		}
+		if !results[0].IsValid {
+			t.Errorf("row[0].IsValid: expected true, got false")
+		}
+
+		// 第二行：FALSE, TRUE, FALSE
+		if results[1].IsActive {
+			t.Errorf("row[1].IsActive: expected false, got true")
+		}
+		if !results[1].IsDeleted {
+			t.Errorf("row[1].IsDeleted: expected true, got false")
+		}
+		if results[1].IsValid {
+			t.Errorf("row[1].IsValid: expected false, got true")
+		}
+
+		// 第三行：NULL, NULL, TRUE → false, false, true
+		if results[2].IsActive {
+			t.Errorf("row[2].IsActive: expected false (NULL), got true")
+		}
+		if results[2].IsDeleted {
+			t.Errorf("row[2].IsDeleted: expected false (NULL), got true")
+		}
+		if !results[2].IsValid {
+			t.Errorf("row[2].IsValid: expected true, got false")
+		}
+	})
+
+	// 测试指针 *bool 类型
+	t.Run("Pointer", func(t *testing.T) {
+		type row struct {
+			IsActive  *bool `db:"is_active"`
+			IsDeleted *bool `db:"is_deleted"`
+			IsValid   *bool `db:"is_valid"`
+		}
+
+		var results []row
+		var r row
+		for err := range db.Builder().Table("bool_test").Select("is_active", "is_deleted", "is_valid").
+			OrderBy("id", "ASC").Cursor(context.Background(), &r) {
+			if err != nil {
+				t.Fatalf("Cursor error: %v", err)
+			}
+			results = append(results, r)
+		}
+
+		if len(results) != 3 {
+			t.Fatalf("expected 3 rows, got %d", len(results))
+		}
+
+		// 第一行：TRUE, FALSE, TRUE
+		if results[0].IsActive == nil || !*results[0].IsActive {
+			t.Errorf("row[0].IsActive: expected *true, got %v", results[0].IsActive)
+		}
+		if results[0].IsDeleted == nil || *results[0].IsDeleted {
+			t.Errorf("row[0].IsDeleted: expected *false, got %v", results[0].IsDeleted)
+		}
+		if results[0].IsValid == nil || !*results[0].IsValid {
+			t.Errorf("row[0].IsValid: expected *true, got %v", results[0].IsValid)
+		}
+
+		// 第二行：FALSE, TRUE, FALSE
+		if results[1].IsActive == nil || *results[1].IsActive {
+			t.Errorf("row[1].IsActive: expected *false, got %v", results[1].IsActive)
+		}
+		if results[1].IsDeleted == nil || !*results[1].IsDeleted {
+			t.Errorf("row[1].IsDeleted: expected *true, got %v", results[1].IsDeleted)
+		}
+		if results[1].IsValid == nil || *results[1].IsValid {
+			t.Errorf("row[1].IsValid: expected *false, got %v", results[1].IsValid)
+		}
+
+		// 第三行：NULL, NULL, TRUE → nil, nil, *true
+		if results[2].IsActive != nil {
+			t.Errorf("row[2].IsActive: expected nil (NULL), got %v", *results[2].IsActive)
+		}
+		if results[2].IsDeleted != nil {
+			t.Errorf("row[2].IsDeleted: expected nil (NULL), got %v", *results[2].IsDeleted)
+		}
+		if results[2].IsValid == nil || !*results[2].IsValid {
+			t.Errorf("row[2].IsValid: expected *true, got %v", results[2].IsValid)
+		}
+	})
+}
+
+// TestSQLiteInteg_NullSafeField_BlobType 验证 BLOB 类型的 NULL 安全扫描。
+// BLOB 用于存储二进制数据（如图片、文件），在 Go 中对应 []byte。
+func TestSQLiteInteg_NullSafeField_BlobType(t *testing.T) {
+	db := openSQLiteTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE blob_test (
+		id      INTEGER PRIMARY KEY AUTOINCREMENT,
+		data    BLOB,
+		thumbnail BLOB
+	)`)
+
+	// 插入测试数据：有值和 NULL
+	binaryData := []byte{0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD}
+	thumbnailData := []byte("thumbnail_bytes")
+	mustExec(t, db, `INSERT INTO blob_test (data, thumbnail) VALUES (?, ?)`, binaryData, thumbnailData)
+	mustExec(t, db, `INSERT INTO blob_test (data, thumbnail) VALUES (NULL, NULL)`)
+	mustExec(t, db, `INSERT INTO blob_test (data, thumbnail) VALUES (?, NULL)`, []byte("only_data"))
+
+	// 测试 []byte 类型（非指针）
+	t.Run("ByteSlice", func(t *testing.T) {
+		type row struct {
+			Data      []byte `db:"data"`
+			Thumbnail []byte `db:"thumbnail"`
+		}
+
+		var results []row
+		var r row
+		for err := range db.Builder().Table("blob_test").Select("data", "thumbnail").
+			OrderBy("id", "ASC").Cursor(context.Background(), &r) {
+			if err != nil {
+				t.Fatalf("Cursor error: %v", err)
+			}
+			results = append(results, r)
+		}
+
+		if len(results) != 3 {
+			t.Fatalf("expected 3 rows, got %d", len(results))
+		}
+
+		// 第一行：有值
+		if len(results[0].Data) != len(binaryData) {
+			t.Errorf("row[0].Data: expected %d bytes, got %d", len(binaryData), len(results[0].Data))
+		}
+		for i, b := range results[0].Data {
+			if b != binaryData[i] {
+				t.Errorf("row[0].Data[%d]: expected %x, got %x", i, binaryData[i], b)
+			}
+		}
+		if string(results[0].Thumbnail) != "thumbnail_bytes" {
+			t.Errorf("row[0].Thumbnail: expected 'thumbnail_bytes', got %q", results[0].Thumbnail)
+		}
+
+		// 第二行：NULL → nil 或空切片
+		if results[1].Data != nil && len(results[1].Data) != 0 {
+			t.Errorf("row[1].Data: expected nil or empty (NULL), got %v", results[1].Data)
+		}
+		if results[1].Thumbnail != nil && len(results[1].Thumbnail) != 0 {
+			t.Errorf("row[1].Thumbnail: expected nil or empty (NULL), got %v", results[1].Thumbnail)
+		}
+
+		// 第三行：data 有值，thumbnail 为 NULL
+		if string(results[2].Data) != "only_data" {
+			t.Errorf("row[2].Data: expected 'only_data', got %q", results[2].Data)
+		}
+		if results[2].Thumbnail != nil && len(results[2].Thumbnail) != 0 {
+			t.Errorf("row[2].Thumbnail: expected nil or empty (NULL), got %v", results[2].Thumbnail)
+		}
+	})
 }

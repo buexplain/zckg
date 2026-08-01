@@ -2,9 +2,12 @@ package zcdb
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"sync"
+	"time"
 )
 
 // scanFieldInfo 缓存的扫描字段信息，用于列名到结构体字段的映射。
@@ -165,12 +168,13 @@ func scanAllRows(rows *sql.Rows, columns []string, dest reflect.Value) error {
 
 // makeScanValues 为每一行创建扫描目标值切片。
 // 按列名匹配结构体字段，未匹配的列扫描到 discard（忽略）。
+// 支持 NULL 值：非指针字段遇到 NULL 时保留零值，指针字段遇到 NULL 时设为 nil。
 func makeScanValues(columns []string, info *scanFieldInfo, structValue reflect.Value) []any {
 	values := make([]any, len(columns))
 	for i, col := range columns {
 		if idx, ok := info.columnIndex[col]; ok {
 			field := structValue.FieldByIndex(idx)
-			values[i] = field.Addr().Interface()
+			values[i] = &nullSafeField{field: field}
 		} else {
 			// 未匹配的列，扫描到 discard 忽略
 			values[i] = &discard{}
@@ -184,4 +188,172 @@ type discard struct{}
 
 func (d *discard) Scan(_ any) error {
 	return nil
+}
+
+// nullSafeField 包装结构体字段，实现 sql.Scanner 接口。
+// 遇到 NULL 时保留零值（非指针）或设为 nil（指针），避免扫描报错。
+type nullSafeField struct {
+	field reflect.Value
+}
+
+func (n *nullSafeField) Scan(src any) error {
+	// NULL 值处理：设为零值（指针类型为 nil，非指针类型为零值）
+	if src == nil {
+		n.field.Set(reflect.Zero(n.field.Type()))
+		return nil
+	}
+
+	// 确定实际要设置的目标值（处理指针间接）
+	isPtr := n.field.Kind() == reflect.Ptr
+	targetType := n.field.Type()
+	if isPtr {
+		targetType = targetType.Elem()
+	}
+	targetKind := targetType.Kind()
+
+	// 类型转换
+	val := reflect.ValueOf(src)
+
+	// 辅助函数：将转换后的值设置到字段（处理指针间接）
+	setFinalValue := func(converted reflect.Value) {
+		if isPtr {
+			newVal := reflect.New(targetType).Elem()
+			newVal.Set(converted)
+			n.field.Set(newVal.Addr())
+		} else {
+			n.field.Set(converted)
+		}
+	}
+
+	// 处理 []byte → 目标类型的转换
+	if val.Kind() == reflect.Slice && val.Type().Elem().Kind() == reflect.Uint8 {
+		switch targetKind {
+		case reflect.String:
+			setFinalValue(reflect.ValueOf(string(val.Bytes())))
+			return nil
+		case reflect.Slice:
+			// []byte → []byte 或 []byte → json.RawMessage（底层都是 []byte）
+			dst := reflect.MakeSlice(targetType, len(val.Bytes()), len(val.Bytes()))
+			reflect.Copy(dst, val)
+			setFinalValue(dst)
+			return nil
+		case reflect.Map:
+			// []byte → map[string]any（JSON 反序列化）
+			if targetType.Key().Kind() == reflect.String {
+				m := reflect.New(targetType).Interface()
+				if err := json.Unmarshal(val.Bytes(), m.(any)); err != nil {
+					return fmt.Errorf("zcdb: cannot unmarshal JSON to map: %w", err)
+				}
+				setFinalValue(reflect.ValueOf(m).Elem())
+				return nil
+			}
+		case reflect.Struct:
+			// []byte → 自定义结构体（JSON 反序列化）
+			dst := reflect.New(targetType)
+			if err := json.Unmarshal(val.Bytes(), dst.Interface()); err != nil {
+				return fmt.Errorf("zcdb: cannot unmarshal JSON to struct: %w", err)
+			}
+			setFinalValue(dst.Elem())
+			return nil
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			i, err := strconv.ParseInt(string(val.Bytes()), 10, 64)
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
+			}
+			setFinalValue(reflect.ValueOf(i).Convert(targetType))
+			return nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			u, err := strconv.ParseUint(string(val.Bytes()), 10, 64)
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
+			}
+			setFinalValue(reflect.ValueOf(u).Convert(targetType))
+			return nil
+		case reflect.Float32, reflect.Float64:
+			f, err := strconv.ParseFloat(string(val.Bytes()), 64)
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
+			}
+			setFinalValue(reflect.ValueOf(f).Convert(targetType))
+			return nil
+		case reflect.Bool:
+			b, err := strconv.ParseBool(string(val.Bytes()))
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to bool", string(val.Bytes()))
+			}
+			setFinalValue(reflect.ValueOf(b))
+			return nil
+		default:
+			//无需任何处理，接着往下执行
+		}
+	}
+
+	// 处理 time.Time → string 的转换（MySQL 日期时间类型）
+	if _, ok := src.(time.Time); ok {
+		if targetKind == reflect.String {
+			setFinalValue(reflect.ValueOf(src.(time.Time).Format(time.RFC3339)))
+			return nil
+		}
+	}
+
+	// 处理 string → 目标类型的转换（PostgreSQL TEXT 驱动返回 string）
+	if val.Kind() == reflect.String {
+		switch targetKind {
+		case reflect.Bool:
+			b, err := strconv.ParseBool(val.String())
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to bool", val.String())
+			}
+			setFinalValue(reflect.ValueOf(b))
+			return nil
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			i, err := strconv.ParseInt(val.String(), 10, 64)
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
+			}
+			setFinalValue(reflect.ValueOf(i).Convert(targetType))
+			return nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			u, err := strconv.ParseUint(val.String(), 10, 64)
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
+			}
+			setFinalValue(reflect.ValueOf(u).Convert(targetType))
+			return nil
+		case reflect.Float32, reflect.Float64:
+			f, err := strconv.ParseFloat(val.String(), 64)
+			if err != nil {
+				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
+			}
+			setFinalValue(reflect.ValueOf(f).Convert(targetType))
+			return nil
+		default:
+			//无需任何处理，接着往下执行
+		}
+	}
+
+	// 处理数值 → bool 的转换（SQLite 用 0/1 存储布尔值，驱动返回 int64）
+	if targetKind == reflect.Bool {
+		switch val.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			setFinalValue(reflect.ValueOf(val.Int() != 0))
+			return nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			setFinalValue(reflect.ValueOf(val.Uint() != 0))
+			return nil
+		case reflect.Float32, reflect.Float64:
+			setFinalValue(reflect.ValueOf(val.Float() != 0))
+			return nil
+		default:
+			//无需任何处理，接着往下执行
+		}
+	}
+
+	// 直接类型匹配
+	if val.Type().ConvertibleTo(targetType) {
+		setFinalValue(val.Convert(targetType))
+		return nil
+	}
+
+	return fmt.Errorf("zcdb: cannot convert %T to %s", src, targetType)
 }

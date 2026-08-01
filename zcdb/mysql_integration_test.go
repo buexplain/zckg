@@ -3,6 +3,7 @@ package zcdb
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,7 +54,9 @@ func openMySQLTestDB(t *testing.T) *DBDao {
 // dropMySQLTables 清除所有测试用表
 func dropMySQLTables(t *testing.T, db *DBDao) {
 	t.Helper()
-	tables := []string{"users_archive", "profiles", "orders", "users"}
+	tables := []string{"users_archive", "profiles", "orders", "users",
+		"numeric_test", "datetime_test", "string_test", "binary_test", "bool_test",
+		"json_conv_test"}
 	for _, table := range tables {
 		_, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS `"+table+"`")
 	}
@@ -3515,4 +3518,535 @@ func TestMySQLInteg_SchemaInspector_Columns(t *testing.T) {
 			t.Errorf("col[%d] %s: expected no default, got %q", i, c.name, *columns[i].Default)
 		}
 	}
+}
+
+// ==================== nullSafeField 集成测试 ====================
+
+// TestMySQLInteg_NullSafeField_NumericTypes 验证数值类型的 NULL 安全扫描。
+// 覆盖：TINYINT, SMALLINT, MEDIUMINT, INT, BIGINT, FLOAT, DOUBLE, DECIMAL, BIT
+func TestMySQLInteg_NullSafeField_NumericTypes(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	// 创建包含所有数值类型的表
+	mustExec(t, db, `CREATE TABLE numeric_test (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		-- 整数类型
+		tiny_val TINYINT,
+		small_val SMALLINT,
+		med_val  MEDIUMINT,
+		int_val  INT,
+		big_val  BIGINT,
+		-- 无符号整数
+		utiny_val TINYINT UNSIGNED,
+		ubig_val  BIGINT UNSIGNED,
+		-- 浮点类型
+		float_val FLOAT,
+		double_val DOUBLE,
+		-- 精确小数
+		decimal_val DECIMAL(10,2),
+		-- 位字段
+		bit_val  BIT(8)
+	)`)
+
+	// 插入有值行和 NULL 行
+	mustExec(t, db, `INSERT INTO numeric_test (tiny_val, small_val, med_val, int_val, big_val,
+		utiny_val, ubig_val, float_val, double_val, decimal_val, bit_val)
+		VALUES (127, 32767, 8388607, 2147483647, 9223372036854775807,
+			255, 18446744073709551615, 3.14, 2.718281828, 99999.99, B'10101010')`)
+	mustExec(t, db, `INSERT INTO numeric_test (tiny_val, small_val, med_val, int_val, big_val,
+		utiny_val, ubig_val, float_val, double_val, decimal_val, bit_val)
+		VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`)
+
+	type numericRow struct {
+		ID      int     `db:"id"`
+		Tiny    int8    `db:"tiny_val"`
+		Small   int16   `db:"small_val"`
+		Med     int32   `db:"med_val"`
+		Int     int     `db:"int_val"`
+		Big     int64   `db:"big_val"`
+		UTiny   uint8   `db:"utiny_val"`
+		UBig    uint64  `db:"ubig_val"`
+		Float   float32 `db:"float_val"`
+		Double  float64 `db:"double_val"`
+		Decimal float64 `db:"decimal_val"`
+		Bit     []byte  `db:"bit_val"`
+	}
+
+	var results []numericRow
+	err := db.Builder().Table("numeric_test").
+		Select("id", "tiny_val", "small_val", "med_val", "int_val", "big_val",
+			"utiny_val", "ubig_val", "float_val", "double_val", "decimal_val", "bit_val").
+		OrderBy("id", "ASC").
+		Find(context.Background(), &results)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+
+	// 验证有值行
+	r := results[0]
+	if r.Tiny != 127 {
+		t.Errorf("Tiny: expected 127, got %d", r.Tiny)
+	}
+	if r.Small != 32767 {
+		t.Errorf("Small: expected 32767, got %d", r.Small)
+	}
+	if r.Big != 9223372036854775807 {
+		t.Errorf("Big: expected max int64, got %d", r.Big)
+	}
+	if r.UTiny != 255 {
+		t.Errorf("UTiny: expected 255, got %d", r.UTiny)
+	}
+	if r.Double != 2.718281828 {
+		t.Errorf("Double: expected 2.718281828, got %f", r.Double)
+	}
+	if r.Decimal != 99999.99 {
+		t.Errorf("Decimal: expected 99999.99, got %f", r.Decimal)
+	}
+
+	// 验证 NULL 行（非指针类型应为零值）
+	nullRow := results[1]
+	if nullRow.Tiny != 0 {
+		t.Errorf("NULL Tiny: expected 0, got %d", nullRow.Tiny)
+	}
+	if nullRow.Big != 0 {
+		t.Errorf("NULL Big: expected 0, got %d", nullRow.Big)
+	}
+	if nullRow.Double != 0 {
+		t.Errorf("NULL Double: expected 0, got %f", nullRow.Double)
+	}
+}
+
+// TestMySQLInteg_NullSafeField_DateTimeTypes 验证日期时间类型的 NULL 安全扫描。
+// 覆盖：DATE, TIME, DATETIME, TIMESTAMP, YEAR
+func TestMySQLInteg_NullSafeField_DateTimeTypes(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE datetime_test (
+		id         INT AUTO_INCREMENT PRIMARY KEY,
+		date_val   DATE,
+		time_val   TIME,
+		datetime_val DATETIME,
+		timestamp_val TIMESTAMP NULL DEFAULT NULL,
+		year_val   YEAR
+	)`)
+
+	// 插入有值行和 NULL 行
+	mustExec(t, db, `INSERT INTO datetime_test (date_val, time_val, datetime_val, timestamp_val, year_val)
+		VALUES ('2024-06-15', '14:30:00', '2024-06-15 14:30:00', '2024-06-15 14:30:00', 2024)`)
+	mustExec(t, db, `INSERT INTO datetime_test (date_val, time_val, datetime_val, timestamp_val, year_val)
+		VALUES (NULL, NULL, NULL, NULL, NULL)`)
+
+	type datetimeRow struct {
+		ID        int    `db:"id"`
+		Date      string `db:"date_val"`
+		Time      string `db:"time_val"`
+		DateTime  string `db:"datetime_val"`
+		Timestamp string `db:"timestamp_val"`
+		Year      int    `db:"year_val"`
+	}
+
+	var results []datetimeRow
+	err := db.Builder().Table("datetime_test").
+		Select("id", "date_val", "time_val", "datetime_val", "timestamp_val", "year_val").
+		OrderBy("id", "ASC").
+		Find(context.Background(), &results)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+
+	// 验证有值行
+	r := results[0]
+	if r.Date != "2024-06-15T00:00:00+08:00" {
+		t.Errorf("Date: expected 2024-06-15T00:00:00+08:00, got %s", r.Date)
+	}
+	if r.Time != "14:30:00" {
+		t.Errorf("Time: expected 14:30:00, got %s", r.Time)
+	}
+	if r.Year != 2024 {
+		t.Errorf("Year: expected 2024, got %d", r.Year)
+	}
+
+	// 验证 NULL 行
+	nullRow := results[1]
+	if nullRow.Date != "" {
+		t.Errorf("NULL Date: expected empty, got %s", nullRow.Date)
+	}
+	if nullRow.Year != 0 {
+		t.Errorf("NULL Year: expected 0, got %d", nullRow.Year)
+	}
+}
+
+// TestMySQLInteg_NullSafeField_StringTypes 验证字符串类型的 NULL 安全扫描。
+// 覆盖：CHAR, VARCHAR, TINYTEXT, TEXT, MEDIUMTEXT, LONGTEXT, ENUM, SET, JSON
+func TestMySQLInteg_NullSafeField_StringTypes(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE string_test (
+		id          INT AUTO_INCREMENT PRIMARY KEY,
+		char_val    CHAR(10),
+		varchar_val VARCHAR(100),
+		tinytext_val TINYTEXT,
+		text_val    TEXT,
+		mediumtext_val MEDIUMTEXT,
+		longtext_val LONGTEXT,
+		enum_val    ENUM('small', 'medium', 'large'),
+		set_val     SET('a', 'b', 'c'),
+		json_val    JSON
+	)`)
+
+	// 插入有值行和 NULL 行
+	mustExec(t, db, `INSERT INTO string_test (char_val, varchar_val, tinytext_val, text_val,
+		mediumtext_val, longtext_val, enum_val, set_val, json_val)
+		VALUES ('hello', 'world', 'tiny text', 'normal text', 'medium text', 'long text',
+			'medium', 'a,b', '{"key": "value"}')`)
+	mustExec(t, db, `INSERT INTO string_test (char_val, varchar_val, tinytext_val, text_val,
+		mediumtext_val, longtext_val, enum_val, set_val, json_val)
+		VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`)
+
+	type stringRow struct {
+		ID         int    `db:"id"`
+		Char       string `db:"char_val"`
+		Varchar    string `db:"varchar_val"`
+		TinyText   string `db:"tinytext_val"`
+		Text       string `db:"text_val"`
+		MediumText string `db:"mediumtext_val"`
+		LongText   string `db:"longtext_val"`
+		Enum       string `db:"enum_val"`
+		Set        string `db:"set_val"`
+		JSON       string `db:"json_val"`
+	}
+
+	var results []stringRow
+	err := db.Builder().Table("string_test").
+		Select("id", "char_val", "varchar_val", "tinytext_val", "text_val",
+			"mediumtext_val", "longtext_val", "enum_val", "set_val", "json_val").
+		OrderBy("id", "ASC").
+		Find(context.Background(), &results)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+
+	// 验证有值行
+	r := results[0]
+	if r.Char != "hello" {
+		t.Errorf("Char: expected hello, got %s", r.Char)
+	}
+	if r.Varchar != "world" {
+		t.Errorf("Varchar: expected world, got %s", r.Varchar)
+	}
+	if r.Enum != "medium" {
+		t.Errorf("Enum: expected medium, got %s", r.Enum)
+	}
+	if r.Set != "a,b" {
+		t.Errorf("Set: expected a,b, got %s", r.Set)
+	}
+
+	// 验证 NULL 行
+	nullRow := results[1]
+	if nullRow.Varchar != "" {
+		t.Errorf("NULL Varchar: expected empty, got %s", nullRow.Varchar)
+	}
+	if nullRow.Enum != "" {
+		t.Errorf("NULL Enum: expected empty, got %s", nullRow.Enum)
+	}
+}
+
+// TestMySQLInteg_NullSafeField_BinaryTypes 验证二进制类型的 NULL 安全扫描。
+// 覆盖：BINARY, VARBINARY, TINYBLOB, BLOB, MEDIUMBLOB, LONGBLOB
+func TestMySQLInteg_NullSafeField_BinaryTypes(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE binary_test (
+		id           INT AUTO_INCREMENT PRIMARY KEY,
+		binary_val   BINARY(16),
+		varbinary_val VARBINARY(100),
+		tinyblob_val TINYBLOB,
+		blob_val     BLOB,
+		mediumblob_val MEDIUMBLOB,
+		longblob_val LONGBLOB
+	)`)
+
+	// 插入有值行和 NULL 行
+	binaryData := []byte{0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD}
+	mustExec(t, db, `INSERT INTO binary_test (binary_val, varbinary_val, tinyblob_val, blob_val, mediumblob_val, longblob_val)
+		VALUES (?, ?, ?, ?, ?, ?)`, binaryData, binaryData, binaryData, binaryData, binaryData, binaryData)
+	mustExec(t, db, `INSERT INTO binary_test (binary_val, varbinary_val, tinyblob_val, blob_val, mediumblob_val, longblob_val)
+		VALUES (NULL, NULL, NULL, NULL, NULL, NULL)`)
+
+	type binaryRow struct {
+		ID         int    `db:"id"`
+		Binary     []byte `db:"binary_val"`
+		Varbinary  []byte `db:"varbinary_val"`
+		TinyBlob   []byte `db:"tinyblob_val"`
+		Blob       []byte `db:"blob_val"`
+		MediumBlob []byte `db:"mediumblob_val"`
+		LongBlob   []byte `db:"longblob_val"`
+	}
+
+	var results []binaryRow
+	err := db.Builder().Table("binary_test").
+		Select("id", "binary_val", "varbinary_val", "tinyblob_val", "blob_val", "mediumblob_val", "longblob_val").
+		OrderBy("id", "ASC").
+		Find(context.Background(), &results)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+
+	// 验证有值行
+	r := results[0]
+	if len(r.Blob) != len(binaryData) {
+		t.Errorf("Blob: expected length %d, got %d", len(binaryData), len(r.Blob))
+	}
+
+	// 验证 NULL 行
+	nullRow := results[1]
+	if nullRow.Blob != nil {
+		t.Errorf("NULL Blob: expected nil, got %v", nullRow.Blob)
+	}
+}
+
+// TestMySQLInteg_NullSafeField_BooleanType 验证 BOOLEAN 类型的 NULL 安全扫描。
+// MySQL 的 BOOLEAN 实际是 TINYINT(1) 的别名。
+func TestMySQLInteg_NullSafeField_BooleanType(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE bool_test (
+		id         INT AUTO_INCREMENT PRIMARY KEY,
+		is_active  BOOLEAN,
+		is_deleted BOOLEAN,
+		is_valid   BOOLEAN NOT NULL DEFAULT TRUE
+	)`)
+
+	// 插入 TRUE/FALSE/NULL
+	mustExec(t, db, `INSERT INTO bool_test (is_active, is_deleted, is_valid) VALUES (TRUE, FALSE, TRUE)`)
+	mustExec(t, db, `INSERT INTO bool_test (is_active, is_deleted, is_valid) VALUES (FALSE, TRUE, FALSE)`)
+	mustExec(t, db, `INSERT INTO bool_test (is_active, is_deleted, is_valid) VALUES (NULL, NULL, TRUE)`)
+
+	type boolRow struct {
+		ID        int  `db:"id"`
+		IsActive  bool `db:"is_active"`
+		IsDeleted bool `db:"is_deleted"`
+		IsValid   bool `db:"is_valid"`
+	}
+
+	var results []boolRow
+	err := db.Builder().Table("bool_test").
+		Select("id", "is_active", "is_deleted", "is_valid").
+		OrderBy("id", "ASC").
+		Find(context.Background(), &results)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+
+	if len(results) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(results))
+	}
+
+	// 验证 TRUE 行
+	if !results[0].IsActive {
+		t.Errorf("row[0].IsActive: expected true, got false")
+	}
+	if results[0].IsDeleted {
+		t.Errorf("row[0].IsDeleted: expected false, got true")
+	}
+
+	// 验证 FALSE 行
+	if results[1].IsActive {
+		t.Errorf("row[1].IsActive: expected false, got true")
+	}
+	if !results[1].IsDeleted {
+		t.Errorf("row[1].IsDeleted: expected true, got false")
+	}
+
+	// 验证 NULL 行（非指针应为零值 false）
+	if results[2].IsActive {
+		t.Errorf("row[2].IsActive: expected false (NULL), got true")
+	}
+}
+
+// TestMySQLInteg_NullSafeField_JSONConversions 验证 JSON 类型可以转换到多种 Go 类型。
+// 覆盖：[]byte、json.RawMessage、map[string]any、自定义结构体
+func TestMySQLInteg_NullSafeField_JSONConversions(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE json_conv_test (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		json_val JSON
+	)`)
+
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES ('{"name":"alice","age":25}')`)
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES (NULL)`)
+
+	// 测试 1: JSON → []byte
+	t.Run("JSON_to_[]byte", func(t *testing.T) {
+		type row struct {
+			ID   int    `db:"id"`
+			Data []byte `db:"json_val"`
+		}
+		var results []row
+		err := db.Builder().Table("json_conv_test").Select("id", "json_val").
+			OrderBy("id", "ASC").Find(context.Background(), &results)
+		if err != nil {
+			t.Fatalf("Find error: %v", err)
+		}
+		if len(results[0].Data) == 0 {
+			t.Errorf("expected non-empty []byte, got empty")
+		}
+		if results[1].Data != nil {
+			t.Errorf("NULL: expected nil, got %v", results[1].Data)
+		}
+	})
+
+	// 测试 2: JSON → json.RawMessage
+	t.Run("JSON_to_RawMessage", func(t *testing.T) {
+		type row struct {
+			ID   int             `db:"id"`
+			Data json.RawMessage `db:"json_val"`
+		}
+		var results []row
+		err := db.Builder().Table("json_conv_test").Select("id", "json_val").
+			OrderBy("id", "ASC").Find(context.Background(), &results)
+		if err != nil {
+			t.Fatalf("Find error: %v", err)
+		}
+		if len(results[0].Data) == 0 {
+			t.Errorf("expected non-empty RawMessage, got empty")
+		}
+		if results[1].Data != nil {
+			t.Errorf("NULL: expected nil, got %v", results[1].Data)
+		}
+	})
+
+	// 测试 3: JSON → map[string]any
+	t.Run("JSON_to_map", func(t *testing.T) {
+		type row struct {
+			ID   int            `db:"id"`
+			Data map[string]any `db:"json_val"`
+		}
+		var results []row
+		err := db.Builder().Table("json_conv_test").Select("id", "json_val").
+			OrderBy("id", "ASC").Find(context.Background(), &results)
+		if err != nil {
+			t.Fatalf("Find error: %v", err)
+		}
+		if results[0].Data["name"] != "alice" {
+			t.Errorf("expected name=alice, got %v", results[0].Data["name"])
+		}
+		if results[1].Data != nil {
+			t.Errorf("NULL: expected nil map, got %v", results[1].Data)
+		}
+	})
+
+	// 测试 4: JSON → 自定义结构体
+	t.Run("JSON_to_struct", func(t *testing.T) {
+		type Person struct {
+			Name string `json:"name"`
+			Age  int    `json:"age"`
+		}
+		type row struct {
+			ID   int    `db:"id"`
+			Data Person `db:"json_val"`
+		}
+		var results []row
+		err := db.Builder().Table("json_conv_test").Select("id", "json_val").
+			OrderBy("id", "ASC").Find(context.Background(), &results)
+		if err != nil {
+			t.Fatalf("Find error: %v", err)
+		}
+		if results[0].Data.Name != "alice" {
+			t.Errorf("expected name=alice, got %s", results[0].Data.Name)
+		}
+		if results[0].Data.Age != 25 {
+			t.Errorf("expected age=25, got %d", results[0].Data.Age)
+		}
+		if results[1].Data.Name != "" {
+			t.Errorf("NULL: expected zero struct, got %+v", results[1].Data)
+		}
+	})
+
+	// 测试 5: JSON → *结构体（字段本身是指针）
+	t.Run("JSON_to_ptr_struct", func(t *testing.T) {
+		type Person struct {
+			Name string `json:"name"`
+			Age  int    `json:"age"`
+		}
+		type row struct {
+			ID   int     `db:"id"`
+			Data *Person `db:"json_val"`
+		}
+		var results []row
+		err := db.Builder().Table("json_conv_test").Select("id", "json_val").
+			OrderBy("id", "ASC").Find(context.Background(), &results)
+		if err != nil {
+			t.Fatalf("Find error: %v", err)
+		}
+		if results[0].Data == nil {
+			t.Fatalf("expected non-nil *Person")
+		}
+		if results[0].Data.Name != "alice" {
+			t.Errorf("expected name=alice, got %s", results[0].Data.Name)
+		}
+		if results[0].Data.Age != 25 {
+			t.Errorf("expected age=25, got %d", results[0].Data.Age)
+		}
+		// NULL 行：指针应为 nil
+		if results[1].Data != nil {
+			t.Errorf("NULL: expected nil *Person, got %+v", results[1].Data)
+		}
+	})
+
+	// 测试 6: JSON → 结构体含嵌套指针结构体字段
+	t.Run("JSON_to_nested_ptr_struct", func(t *testing.T) {
+		type Address struct {
+			City string `json:"city"`
+		}
+		type Person struct {
+			Name    string   `json:"name"`
+			Age     int      `json:"age"`
+			Address *Address `json:"address"`
+		}
+		// 插入含嵌套对象的数据
+		mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES ('{"name":"charlie","age":35,"address":{"city":"Shanghai"}}')`)
+		type row struct {
+			ID   int    `db:"id"`
+			Data Person `db:"json_val"`
+		}
+		var results []row
+		err := db.Builder().Table("json_conv_test").Select("id", "json_val").
+			OrderBy("id", "ASC").Find(context.Background(), &results)
+		if err != nil {
+			t.Fatalf("Find error: %v", err)
+		}
+		// 第三行是嵌套数据
+		r := results[2]
+		if r.Data.Name != "charlie" {
+			t.Errorf("expected name=charlie, got %s", r.Data.Name)
+		}
+		if r.Data.Address == nil {
+			t.Fatalf("expected non-nil Address")
+		}
+		if r.Data.Address.City != "Shanghai" {
+			t.Errorf("expected city=Shanghai, got %s", r.Data.Address.City)
+		}
+		// 第一行没有 address 字段，嵌套指针应为 nil
+		if results[0].Data.Address != nil {
+			t.Errorf("expected nil Address for row without address, got %+v", results[0].Data.Address)
+		}
+	})
 }
