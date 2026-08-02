@@ -189,6 +189,44 @@ func TestParseStruct_CacheHit(t *testing.T) {
 	}
 }
 
+// TestParseStruct_EmbeddedPtrStruct 验证嵌入指针结构体（*struct 匿名嵌入）字段展开。
+// 当前行为（BUG）：嵌入条件限制为值类型结构体，*Base 不会被展开，
+// 而是被当作普通字段（列名变为 base）。
+func TestParseStruct_EmbeddedPtrStruct(t *testing.T) {
+	type Base struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	type User struct {
+		*Base
+		Age int `db:"age"`
+	}
+
+	info := parseStruct(reflect.TypeOf(User{}))
+	if info == nil {
+		t.Fatal("parseStruct returned nil")
+	}
+	if len(info.Fields) != 3 {
+		t.Fatalf("expected 3 fields (embedded ptr expanded), got %d: %+v", len(info.Fields), info.Fields)
+	}
+
+	expected := map[string][]int{
+		"id":   {0, 0},
+		"name": {0, 1},
+		"age":  {1},
+	}
+	for _, f := range info.Fields {
+		exp, ok := expected[f.Column]
+		if !ok {
+			t.Errorf("unexpected column %q", f.Column)
+			continue
+		}
+		if !reflect.DeepEqual(f.Index, exp) {
+			t.Errorf("column %q: expected index %v, got %v", f.Column, exp, f.Index)
+		}
+	}
+}
+
 // ==================== extractInsertData 测试 ====================
 
 // TestExtractInsertData_SingleStruct 验证单个结构体。
@@ -384,6 +422,40 @@ func TestExtractInsertData_SliceNilPointerInMiddle(t *testing.T) {
 	}
 }
 
+// TestExtractInsertData_EmbeddedPtrStruct 验证嵌入指针结构体的数据提取：
+// 非 nil 时字段展开取值；nil 时不 panic 且跳过该嵌入字段。
+func TestExtractInsertData_EmbeddedPtrStruct(t *testing.T) {
+	type Base struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	type User struct {
+		*Base
+		Age int `db:"age"`
+	}
+
+	// 非 nil 嵌入指针：id/name/age 全部提取
+	cols, rows, err := extractInsertData(&User{Base: &Base{ID: 1, Name: "alice"}, Age: 25})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cols) != 3 {
+		t.Fatalf("expected 3 columns with non-nil embedded ptr, got %d: %v", len(cols), cols)
+	}
+	if len(rows) != 1 || len(rows[0]) != 3 {
+		t.Fatalf("unexpected rows: %v", rows)
+	}
+
+	// nil 嵌入指针：不 panic，id/name 跳过，只剩 age
+	cols, rows, err = extractInsertData(&User{Age: 30})
+	if err != nil {
+		t.Fatalf("unexpected error with nil embedded ptr: %v", err)
+	}
+	if len(cols) != 1 || cols[0] != "age" {
+		t.Fatalf("expected only age column with nil embedded ptr, got %v", cols)
+	}
+}
+
 // ==================== extractUpdateData 测试 ====================
 
 // TestExtractUpdateData_SingleStruct 验证单个结构体。
@@ -502,6 +574,10 @@ func TestToSnakeCase(t *testing.T) {
 		{"A", "a"},
 		{"AB", "ab"},
 		{"ABCDef", "abc_def"},
+		// Unicode 字段名：中文字符后的大写字母不应误插下划线
+		{"AX中", "ax中"},
+		{"用户Name", "用户_name"},
+		{"中Name", "中_name"},
 	}
 
 	for _, tt := range tests {

@@ -3396,3 +3396,32 @@ func TestSQLiteInteg_CountWithGroupByHaving(t *testing.T) {
 		t.Fatalf("Count with GROUP BY + HAVING: expected 3, got %d", count)
 	}
 }
+
+// TestSQLiteInteg_ExistsWithGroupBy 验证 GROUP BY + HAVING 下的 Exists 真实执行：
+// Exists 基于 Count（分组数量 > 0）判断，语义为“是否存在满足条件的分组”。
+func TestSQLiteInteg_ExistsWithGroupBy(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteOrdersTable(t, db)
+
+	// 3 组满足 SUM(amount) > 100 → true
+	exists, err := db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", 100).
+		Exists(context.Background())
+	assertNoError(t, err)
+	if !exists {
+		t.Error("Exists with GROUP BY + HAVING: expected true, got false")
+	}
+
+	// 无任何组满足 → false
+	exists, err = db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", 99999).
+		Exists(context.Background())
+	assertNoError(t, err)
+	if exists {
+		t.Error("Exists with GROUP BY + HAVING (no match): expected false, got true")
+	}
+}

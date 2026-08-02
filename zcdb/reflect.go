@@ -62,8 +62,8 @@ func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int) {
 		copy(index, indexPrefix)
 		index[len(indexPrefix)] = i
 
-		// 处理嵌入结构体（匿名字段）
-		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+		// 处理嵌入结构体（匿名字段，支持值类型与指针类型）
+		if field.Anonymous {
 			embeddedType := field.Type
 			if embeddedType.Kind() == reflect.Ptr {
 				embeddedType = embeddedType.Elem()
@@ -153,7 +153,11 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 
 		var colIndices [][]int
 		for _, f := range info.Fields {
-			fv := first.FieldByIndex(f.Index)
+			fv, ok := fieldByIndexSafe(first, f.Index)
+			if !ok {
+				// nil 嵌入指针：字段不可用，跳过
+				continue
+			}
 			// interface/指针类型：nil 则跳过；其它类型永远纳入
 			if (fv.Kind() == reflect.Interface || fv.Kind() == reflect.Ptr) && fv.IsNil() {
 				continue
@@ -176,7 +180,12 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 			}
 			row := make([]any, 0, len(colIndices))
 			for _, idx := range colIndices {
-				fv := elem.FieldByIndex(idx)
+				fv, ok := fieldByIndexSafe(elem, idx)
+				if !ok {
+					// nil 嵌入指针：该列取不到值，按 NULL 处理
+					row = append(row, nil)
+					continue
+				}
 				switch fv.Kind() {
 				case reflect.Interface, reflect.Ptr:
 					if fv.IsNil() {
@@ -209,7 +218,11 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 
 	var values []any
 	for _, f := range info.Fields {
-		fv := v.FieldByIndex(f.Index)
+		fv, ok := fieldByIndexSafe(v, f.Index)
+		if !ok {
+			// nil 嵌入指针：字段不可用，跳过
+			continue
+		}
 		switch fv.Kind() {
 		case reflect.Interface:
 			// any 字段为 nil 则跳过，否则取实际值
@@ -273,7 +286,11 @@ func extractUpdateData(data any) (columns []string, values []any, err error) {
 	}
 
 	for _, f := range info.Fields {
-		fv := v.FieldByIndex(f.Index)
+		fv, ok := fieldByIndexSafe(v, f.Index)
+		if !ok {
+			// nil 嵌入指针：字段不可用，跳过
+			continue
+		}
 		switch fv.Kind() {
 		case reflect.Interface:
 			// any 字段为 nil 则跳过，否则取实际值
@@ -301,15 +318,17 @@ func extractUpdateData(data any) (columns []string, values []any, err error) {
 }
 
 // toSnakeCase 将 PascalCase/camelCase 转换为 snake_case。
+// 使用 rune 索引处理，支持中文等多字节字符字段名。
 func toSnakeCase(s string) string {
+	runes := []rune(s)
 	var buf strings.Builder
 	buf.Grow(len(s) + 4)
 
-	for i, r := range s {
+	for i, r := range runes {
 		if unicode.IsUpper(r) {
 			if i > 0 {
-				prev := rune(s[i-1])
-				if unicode.IsLower(prev) || (i+1 < len(s) && unicode.IsLower(rune(s[i+1]))) {
+				prev := runes[i-1]
+				if unicode.IsLower(prev) || (i+1 < len(runes) && unicode.IsLower(runes[i+1])) {
 					buf.WriteByte('_')
 				}
 			}
@@ -319,4 +338,19 @@ func toSnakeCase(s string) string {
 		}
 	}
 	return buf.String()
+}
+
+// fieldByIndexSafe 沿索引路径安全取值：遇到 nil 中间指针（如未初始化的嵌入指针结构体）
+// 返回零值并标记不可用，避免 FieldByIndex 直接 panic。
+func fieldByIndexSafe(v reflect.Value, index []int) (reflect.Value, bool) {
+	for _, i := range index {
+		if v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				return reflect.Value{}, false
+			}
+			v = v.Elem()
+		}
+		v = v.Field(i)
+	}
+	return v, true
 }

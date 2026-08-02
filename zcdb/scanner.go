@@ -51,8 +51,8 @@ func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int) {
 		copy(index, indexPrefix)
 		index[len(indexPrefix)] = i
 
-		// 处理嵌入结构体（匿名字段）
-		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+		// 处理嵌入结构体（匿名字段，支持值类型与指针类型）
+		if field.Anonymous {
 			embeddedType := field.Type
 			if embeddedType.Kind() == reflect.Ptr {
 				embeddedType = embeddedType.Elem()
@@ -173,8 +173,13 @@ func makeScanValues(columns []string, info *scanFieldInfo, structValue reflect.V
 	values := make([]any, len(columns))
 	for i, col := range columns {
 		if idx, ok := info.columnIndex[col]; ok {
-			field := structValue.FieldByIndex(idx)
-			values[i] = &nullSafeField{field: field}
+			field, ok := fieldByIndexSafe(structValue, idx)
+			if !ok {
+				// nil 嵌入指针：该列无法填充，忽略
+				values[i] = &discard{}
+			} else {
+				values[i] = &nullSafeField{field: field}
+			}
 		} else {
 			// 未匹配的列，扫描到 discard 忽略
 			values[i] = &discard{}
