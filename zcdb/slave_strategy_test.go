@@ -70,6 +70,35 @@ func TestRandomStrategy_Distribution(t *testing.T) {
 	}
 }
 
+// TestRandomStrategy_Concurrent 验证随机策略的并发安全性：
+// 全局 rand 顶层函数在 Go 1.20+ 自带锁保护，并发调用不应 panic 或返回非法值。
+// 用 go test -race 运行可验证无数据竞争。
+func TestRandomStrategy_Concurrent(t *testing.T) {
+	s := &RandomStrategy{}
+	db1 := &sql.DB{}
+	db2 := &sql.DB{}
+	db3 := &sql.DB{}
+	slaves := []*sql.DB{db1, db2, db3}
+
+	const goroutines = 20
+	const iterations = 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				got := s.Pick(slaves)
+				if got != db1 && got != db2 && got != db3 {
+					t.Errorf("unexpected db: %v", got)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // ==================== RoundRobinStrategy 测试 ====================
 
 // TestRoundRobinStrategy_EmptySlaves 验证空从库列表返回 nil。

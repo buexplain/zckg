@@ -237,10 +237,20 @@ func (n *nullSafeField) Scan(src any) error {
 			setFinalValue(reflect.ValueOf(string(val.Bytes())))
 			return nil
 		case reflect.Slice:
-			// []byte → []byte 或 []byte → json.RawMessage（底层都是 []byte）
-			dst := reflect.MakeSlice(targetType, len(val.Bytes()), len(val.Bytes()))
-			reflect.Copy(dst, val)
-			setFinalValue(dst)
+			if targetType.Elem().Kind() == reflect.Uint8 {
+				// []byte → []byte 或 []byte → json.RawMessage（底层都是 []byte）
+				dst := reflect.MakeSlice(targetType, len(val.Bytes()), len(val.Bytes()))
+				reflect.Copy(dst, val)
+				setFinalValue(dst)
+				return nil
+			}
+			// 其它切片类型（如 []int、[]string）：数据库通常以 JSON 文本存储，
+			// 直接 reflect.Copy 会因元素类型不匹配而 panic，故走 JSON 反序列化
+			dst := reflect.New(targetType)
+			if err := json.Unmarshal(val.Bytes(), dst.Interface()); err != nil {
+				return fmt.Errorf("zcdb: cannot unmarshal JSON to %v: %w", targetType, err)
+			}
+			setFinalValue(dst.Elem())
 			return nil
 		case reflect.Map:
 			// []byte → map[string]any（JSON 反序列化）
@@ -301,9 +311,41 @@ func (n *nullSafeField) Scan(src any) error {
 		}
 	}
 
+	// 处理数值 → string 的转换（SQLite/PostgreSQL 驱动对数值列返回 int64/float64，
+	// 目标是 string 字段时若走 ConvertibleTo 会把数值当成 rune 码转成字符，
+	// 如 123 → "{"，必须显式格式化为数字字符串）
+	if targetKind == reflect.String {
+		switch val.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			setFinalValue(reflect.ValueOf(strconv.FormatInt(val.Int(), 10)))
+			return nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			setFinalValue(reflect.ValueOf(strconv.FormatUint(val.Uint(), 10)))
+			return nil
+		case reflect.Float32, reflect.Float64:
+			setFinalValue(reflect.ValueOf(strconv.FormatFloat(val.Float(), 'g', -1, 64)))
+			return nil
+		default:
+			// 无需任何处理，接着往下执行
+		}
+	}
+
 	// 处理 string → 目标类型的转换（PostgreSQL TEXT 驱动返回 string）
 	if val.Kind() == reflect.String {
 		switch targetKind {
+		case reflect.Slice:
+			if targetType.Elem().Kind() == reflect.Uint8 {
+				// string → []byte（或 []byte 别名）：直接转换，拷贝字节
+				setFinalValue(val.Convert(targetType))
+				return nil
+			}
+			// string → 其它切片类型（如 []int、[]string）：数据库通常以 JSON 文本存储
+			dst := reflect.New(targetType)
+			if err := json.Unmarshal([]byte(val.String()), dst.Interface()); err != nil {
+				return fmt.Errorf("zcdb: cannot unmarshal JSON to %v: %w", targetType, err)
+			}
+			setFinalValue(dst.Elem())
+			return nil
 		case reflect.Bool:
 			b, err := strconv.ParseBool(val.String())
 			if err != nil {

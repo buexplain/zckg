@@ -175,10 +175,24 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 					yield(fmt.Errorf("zcdb: cursor scan failed: %w", err))
 					return
 				}
-				count++
 
-				// 提取游标列值
-				lastCursorValue = destElem.FieldByIndex(cursorIdx).Interface()
+				// 提取游标列值：使用安全取值，避免 nil 嵌入指针 panic
+				cursorField, ok := fieldByIndexSafe(destElem, cursorIdx)
+				if !ok {
+					_ = rows.Close()
+					yield(ErrCursorFieldUnavailable)
+					return
+				}
+				cursorValue := cursorField.Interface()
+				if isNilValue(cursorValue) {
+					// 游标列值为 NULL：无法继续分页（条件 cursorColumn > NULL 恒为假），
+					// 且若不终止会无限重复返回同一批数据，故直接报错终止
+					_ = rows.Close()
+					yield(ErrCursorColumnNull)
+					return
+				}
+				count++
+				lastCursorValue = cursorValue
 
 				if !yield(nil) {
 					_ = rows.Close()
@@ -193,4 +207,19 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 			}
 		}
 	}
+}
+
+// isNilValue 判断 interface 包裹的值是否为 nil（指针、接口、map、slice、func、chan）。
+// 用于识别游标列值为 NULL 的情况：如 *int 字段扫描出 nil 指针后，
+// Interface() 返回的类型化 nil 接口，直接与 nil 比较会失真。
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	}
+	return false
 }

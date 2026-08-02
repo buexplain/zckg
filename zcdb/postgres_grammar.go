@@ -21,12 +21,22 @@ func (g *PostgresGrammar) cloneForCompile() *PostgresGrammar {
 	return &PostgresGrammar{}
 }
 
-// convertRawPlaceholders 将原始 SQL 中的 ? 依次替换为 $N 占位符。
-func (g *PostgresGrammar) convertRawPlaceholders(sql string) string {
+// convertRawPlaceholders 将原始 SQL 中的 ? 依次替换为 $N 占位符，
+// bindings 中的 Expression 直接内嵌为 SQL 文本且不占用占位符编号。
+func (g *PostgresGrammar) convertRawPlaceholders(sql string, bindings []any) string {
 	var buf strings.Builder
 	buf.Grow(len(sql) + 8)
+	bi := 0
 	for i := 0; i < len(sql); i++ {
 		if sql[i] == '?' {
+			if bi < len(bindings) {
+				if expr, ok := bindings[bi].(Expression); ok {
+					buf.WriteString(expr.Value())
+					bi++
+					continue
+				}
+				bi++
+			}
 			buf.WriteString(g.nextParam())
 		} else {
 			buf.WriteByte(sql[i])
@@ -410,7 +420,7 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 				case "value":
 					jc = gClone.WrapColumn(cond.First) + " " + cond.Operator + " " + gClone.nextParam()
 				case "raw":
-					jc = gClone.convertRawPlaceholders(cond.SQL)
+					jc = gClone.convertRawPlaceholders(cond.SQL, cond.Bindings)
 				}
 				if jc == "" {
 					continue
@@ -491,7 +501,7 @@ func (g *PostgresGrammar) compileWheres(b *Builder) string {
 		case WhereTypeNotBetween:
 			clause = g.WrapColumn(w.Column) + " NOT BETWEEN " + g.nextParam() + " AND " + g.nextParam()
 		case WhereTypeRaw:
-			clause = g.convertRawPlaceholders(w.SQL)
+			clause = g.convertRawPlaceholders(w.SQL, w.Bindings)
 		case WhereTypeNested:
 			if w.Nested != nil {
 				nested := g.compileWheres(w.Nested)
@@ -610,7 +620,7 @@ func (g *PostgresGrammar) compileJoin(join JoinClause) string {
 			case "value":
 				result += g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.nextParam()
 			case "raw":
-				result += g.convertRawPlaceholders(cond.SQL)
+				result += g.convertRawPlaceholders(cond.SQL, cond.Bindings)
 			}
 		}
 	}
@@ -624,9 +634,13 @@ func (g *PostgresGrammar) compileHavings(b *Builder) string {
 		var clause string
 		switch h.Type {
 		case "basic":
-			clause = g.WrapColumn(h.Column) + " " + h.Operator + " " + g.nextParam()
+			if expr, ok := h.Value.(Expression); ok {
+				clause = g.WrapColumn(h.Column) + " " + h.Operator + " " + expr.Value()
+			} else {
+				clause = g.WrapColumn(h.Column) + " " + h.Operator + " " + g.nextParam()
+			}
 		case "raw":
-			clause = g.convertRawPlaceholders(h.SQL)
+			clause = g.convertRawPlaceholders(h.SQL, h.Bindings)
 		case "between":
 			if h.Not {
 				clause = g.WrapColumn(h.Column) + " NOT BETWEEN " + g.nextParam() + " AND " + g.nextParam()

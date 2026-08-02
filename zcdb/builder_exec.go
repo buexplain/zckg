@@ -108,14 +108,26 @@ func (b *Builder) Count(ctx context.Context) (int, error) {
 }
 
 // Exists 判断是否有记录。
+// 走 SELECT 1 ... LIMIT 1，找到第一条记录即返回，避免 COUNT(*) 全表计数。
 //
 //	exists, err := db.Builder().Table("users").Where("id", "=", 1).Exists(ctx)
 func (b *Builder) Exists(ctx context.Context) (bool, error) {
-	count, err := b.Count(ctx)
+	sqlStr, args, err := b.ToExists()
 	if err != nil {
 		return false, err
 	}
-	return count > 0, nil
+
+	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	if err != nil {
+		return false, err
+	}
+	defer func(rows *sql.Rows) {
+		_ = rows.Close()
+	}(rows)
+
+	// 有行即存在
+	exists := rows.Next()
+	return exists, rows.Err()
 }
 
 // Value 查询单个标量值，扫描到 dest。
@@ -235,9 +247,16 @@ func (b *Builder) Upsert(ctx context.Context, data any, uniqueBy []string, updat
 
 // Update 更新数据，返回受影响行数。
 // data 必须是单个结构体（struct{}）或结构体指针（*struct{}），不支持切片。
+// 无 WHERE 条件时默认拒绝执行（防误操作全表更新），
+// 确需全表更新请显式调用 Force()。
 //
 //	affected, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, &user)
 func (b *Builder) Update(ctx context.Context, data any) (int64, error) {
+	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 Where("1=1")
+	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
+		return 0, ErrUpdateWithoutWhere
+	}
+
 	sqlStr, args, err := b.ToUpdate(data)
 	if err != nil {
 		return 0, err
@@ -252,9 +271,16 @@ func (b *Builder) Update(ctx context.Context, data any) (int64, error) {
 }
 
 // Delete 删除数据，返回受影响行数。
+// 无 WHERE 条件时默认拒绝执行（防误操作全表删除），
+// 确需全表删除请显式调用 Force()。
 //
 //	affected, err := db.Builder().Table("users").Where("id", "=", 1).Delete(ctx)
 func (b *Builder) Delete(ctx context.Context) (int64, error) {
+	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 Where("1=1")
+	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
+		return 0, ErrDeleteWithoutWhere
+	}
+
 	sqlStr, args, err := b.ToDelete()
 	if err != nil {
 		return 0, err
@@ -266,6 +292,35 @@ func (b *Builder) Delete(ctx context.Context) (int64, error) {
 	}
 
 	return result.RowsAffected()
+}
+
+// hasEffectiveWhere 判断是否存在实际生效的 WHERE 条件。
+// 排除空嵌套（如 WhereNested 传入空回调）等编译后为空的伪条件，
+// 防止空嵌套绕过无 WHERE 保护导致全表删除/更新。
+func (b *Builder) hasEffectiveWhere() bool {
+	for _, w := range b.wheres {
+		switch w.Type {
+		case WhereTypeNested, WhereTypeExists, WhereTypeNotExists:
+			if w.Nested != nil && w.Nested.hasEffectiveWhere() {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// hasEffectiveJoin 判断是否存在带条件的 JOIN。
+// UPDATE/DELETE 中 JOIN 的 ON/Where 条件同样限定操作范围，
+// 视为有效限定条件；无条件 JOIN 会产生笛卡尔积，不视为限定。
+func (b *Builder) hasEffectiveJoin() bool {
+	for _, j := range b.joins {
+		if len(j.Conditions) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Truncate 清空表。

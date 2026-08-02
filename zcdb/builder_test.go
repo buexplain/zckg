@@ -3,6 +3,7 @@ package zcdb
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -1111,6 +1112,368 @@ func TestBuilder_WhereNotInEmpty(t *testing.T) {
 	assertNoError(t, err)
 	assertSQL(t, "SELECT * FROM `users` WHERE 1 = 1", sql)
 	assertArgs(t, []any{}, args)
+}
+
+// ==================== BUG 验证测试 ====================
+
+// TestBug_HavingWithExpression 验证 Having/OrHaving 传入 Expression 时直接内嵌 SQL。
+// 当前行为（BUG）：compileHavings 的 basic 分支固定生成占位符，
+// Expression 被当作绑定参数传入驱动导致执行失败。
+func TestBug_HavingWithExpression(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "SELECT * FROM `users` GROUP BY `user_id` HAVING SUM(amount) > 100"},
+		{"postgres", NewPostgresGrammar(), "SELECT * FROM \"users\" GROUP BY \"user_id\" HAVING SUM(amount) > 100"},
+		{"sqlite", NewSQLiteGrammar(), "SELECT * FROM \"users\" GROUP BY \"user_id\" HAVING SUM(amount) > 100"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args, err := NewBuilder(tt.grammar, nil).
+				Table("users").
+				GroupBy("user_id").
+				Having("SUM(amount)", ">", NewExpression("100")).
+				ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+			assertArgs(t, []any{}, args)
+		})
+	}
+}
+
+// TestBug_RawWithExpressionBindings 验证 WhereRaw/HavingRaw/Join.Raw 的绑定参数中含 Expression 时直接内嵌。
+// 当前行为（BUG）：raw SQL 原样输出（含 ?），Expression 被当作绑定参数传入驱动导致执行失败。
+func TestBug_RawWithExpressionBindings(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		build    func(b *Builder) *Builder
+		expected string
+	}{
+		{
+			"whereRaw", NewMySQLGrammar(),
+			func(b *Builder) *Builder {
+				return b.WhereRaw("amount > ?", NewExpression("100"))
+			},
+			"SELECT * FROM `users` WHERE amount > 100",
+		},
+		{
+			"havingRaw", NewMySQLGrammar(),
+			func(b *Builder) *Builder {
+				return b.GroupBy("user_id").HavingRaw("SUM(amount) > ?", NewExpression("100"))
+			},
+			"SELECT * FROM `users` GROUP BY `user_id` HAVING SUM(amount) > 100",
+		},
+		{
+			"joinRaw", NewMySQLGrammar(),
+			func(b *Builder) *Builder {
+				return b.JoinOn("orders", func(jb *JoinBuilder) {
+					jb.Raw("orders.amount > ?", NewExpression("users.min_amount"))
+				})
+			},
+			"SELECT * FROM `users` INNER JOIN `orders` ON orders.amount > users.min_amount",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args, err := tt.build(NewBuilder(tt.grammar, nil).Table("users")).ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+			assertArgs(t, []any{}, args)
+		})
+	}
+}
+
+// TestBug_ToCountWithDistinct 验证 Distinct + Count 的去重计数。
+// 当前行为（BUG）：生成 SELECT DISTINCT COUNT(*)，DISTINCT 对聚合结果无效，返回总行数。
+func TestBug_ToCountWithDistinct(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "SELECT COUNT(*) FROM (SELECT DISTINCT `name` FROM `users`) AS `t`"},
+		{"postgres", NewPostgresGrammar(), "SELECT COUNT(*) FROM (SELECT DISTINCT \"name\" FROM \"users\") AS \"t\""},
+		{"sqlite", NewSQLiteGrammar(), "SELECT COUNT(*) FROM (SELECT DISTINCT \"name\" FROM \"users\") AS \"t\""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args, err := NewBuilder(tt.grammar, nil).
+				Table("users").
+				Select("name").
+				Distinct().
+				ToCount()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+			assertArgs(t, []any{}, args)
+		})
+	}
+}
+
+// TestBug_OffsetWithoutLimit 验证仅 Offset 无 Limit 时各方言生成合法 SQL。
+// 当前行为（BUG）：MySQL/SQLite 直接输出 OFFSET n（无 LIMIT），数据库报语法错误。
+func TestBug_OffsetWithoutLimit(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "SELECT * FROM `users` LIMIT 18446744073709551615 OFFSET 5"},
+		{"postgres", NewPostgresGrammar(), "SELECT * FROM \"users\" OFFSET 5"},
+		{"sqlite", NewSQLiteGrammar(), "SELECT * FROM \"users\" LIMIT -1 OFFSET 5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, _, err := NewBuilder(tt.grammar, nil).
+				Table("users").
+				Offset(5).
+				ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+		})
+	}
+}
+
+// TestBug_CloneHavingsBindings 验证 Clone 后 havings 的 Bindings 相互独立。
+// 当前行为（BUG）：Clone 只复制 havings 切片，Bindings 数组仍共享，
+// 修改克隆会影响原 Builder（并发复用不安全）。
+func TestBug_CloneHavingsBindings(t *testing.T) {
+	b := NewBuilder(NewMySQLGrammar(), nil).
+		Table("users").
+		HavingRaw("SUM(amount) > ?", 100)
+	c := b.Clone()
+
+	// 修改克隆的绑定参数
+	c.havings[0].Bindings[0] = 999
+	if b.havings[0].Bindings[0] != 100 {
+		t.Errorf("Clone should deep-copy havings bindings: original changed to %v", b.havings[0].Bindings[0])
+	}
+}
+
+// TestBug_InsertUpdateNilPointer 验证 Insert/Update 传入 nil 结构体指针时
+// 返回 ErrInvalidStruct 而非 panic。
+// 当前行为（BUG）：extractInsertData/extractUpdateData 对 nil 指针执行
+// v.Elem() 后 v.Type() 直接 panic（reflect: call of Type on zero Value）。
+func TestBug_InsertUpdateNilPointer(t *testing.T) {
+	type User struct {
+		Name string `db:"name"`
+	}
+	var u *User
+
+	// 防 panic：应返回 ErrInvalidStruct
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("extractInsertData panicked on nil pointer: %v", r)
+			}
+		}()
+		_, _, err := extractInsertData(u)
+		if !errors.Is(err, ErrInvalidStruct) {
+			t.Errorf("extractInsertData: expected ErrInvalidStruct, got %v", err)
+		}
+	}()
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("extractUpdateData panicked on nil pointer: %v", r)
+			}
+		}()
+		_, _, err := extractUpdateData(u)
+		if !errors.Is(err, ErrInvalidStruct) {
+			t.Errorf("extractUpdateData: expected ErrInvalidStruct, got %v", err)
+		}
+	}()
+}
+
+// TestBug_ScanNumericToString 验证数值扫描到 string 字段时转换为数字字符串。
+// 当前行为（BUG）：int64 123 经 ConvertibleTo 分支 Convert 为 string，
+// 得到字符码 "{" 而不是 "123"。
+func TestBug_ScanNumericToString(t *testing.T) {
+	var s string
+	n := nullSafeField{field: reflect.ValueOf(&s).Elem()}
+	if err := n.Scan(int64(123)); err != nil {
+		t.Fatalf("Scan error: %v", err)
+	}
+	if s != "123" {
+		t.Errorf("expected \"123\", got %q", s)
+	}
+}
+
+// TestBug_ScanByteSliceToIntSlice 验证 []byte 扫描到非字节切片目标（如 []int）时不 panic。
+// 当前行为（BUG）：reflect.Copy 元素类型不匹配直接 panic。
+func TestBug_ScanByteSliceToIntSlice(t *testing.T) {
+	var arr []int
+	n := nullSafeField{field: reflect.ValueOf(&arr).Elem()}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Scan panicked on []byte → []int: %v", r)
+		}
+	}()
+	if err := n.Scan([]byte("[1,2,3]")); err != nil {
+		t.Fatalf("Scan error: %v", err)
+	}
+	if len(arr) != 3 || arr[0] != 1 || arr[2] != 3 {
+		t.Errorf("expected [1 2 3], got %v", arr)
+	}
+}
+
+// TestBug_ForceDeleteUpdateProtection 验证 Force 标记、Clone 传播，
+// 以及编译层 ToDelete/ToUpdate 不受执行层保护影响。
+func TestBug_ForceDeleteUpdateProtection(t *testing.T) {
+	// Force 标记 + Clone 传播
+	b := NewBuilder(NewMySQLGrammar(), nil).Table("users").Force()
+	if !b.force {
+		t.Error("Force should set force flag")
+	}
+	c := b.Clone()
+	if !c.force {
+		t.Error("Clone should propagate force flag")
+	}
+
+	// 编译层不受保护影响：无 WHERE 仍能生成 DELETE/UPDATE SQL（执行层才校验）
+	sqlStr, _, err := b.ToDelete()
+	assertNoError(t, err)
+	assertSQL(t, "DELETE FROM `users`", sqlStr)
+
+	type updateData struct {
+		Name string `db:"name"`
+	}
+	sqlStr, _, err = b.ToUpdate(updateData{Name: "x"})
+	assertNoError(t, err)
+	assertSQL(t, "UPDATE `users` SET `name` = ?", sqlStr)
+}
+
+// TestBug_HasEffectiveWhere 验证 hasEffectiveWhere 对空嵌套的识别：
+// WhereNested 空回调编译后无 WHERE，不能作为有效条件绕过无 WHERE 保护。
+func TestBug_HasEffectiveWhere(t *testing.T) {
+	// 无任何条件
+	b := NewBuilder(NewMySQLGrammar(), nil)
+	if b.hasEffectiveWhere() {
+		t.Error("empty wheres should not have effective where")
+	}
+
+	// 普通条件
+	b = NewBuilder(NewMySQLGrammar(), nil).Where("id", "=", 1)
+	if !b.hasEffectiveWhere() {
+		t.Error("basic where should be effective")
+	}
+
+	// 空嵌套：应视为无有效条件
+	b = NewBuilder(NewMySQLGrammar(), nil).WhereNested(func(q *Builder) {})
+	if b.hasEffectiveWhere() {
+		t.Error("empty nested where should not be effective")
+	}
+
+	// 嵌套含有效条件：应视为有效
+	b = NewBuilder(NewMySQLGrammar(), nil).WhereNested(func(q *Builder) {
+		q.Where("id", ">", 10)
+	})
+	if !b.hasEffectiveWhere() {
+		t.Error("nested with conditions should be effective")
+	}
+
+	// 空 JOIN（无 ON/Where 条件）：不应视为有效限定
+	b = NewBuilder(NewMySQLGrammar(), nil).JoinOn("profiles", func(jb *JoinBuilder) {})
+	if b.hasEffectiveJoin() {
+		t.Error("empty join should not be effective")
+	}
+	if b.hasEffectiveWhere() || b.hasEffectiveJoin() {
+		t.Error("empty join should not bypass protection")
+	}
+
+	// 带 ON 条件的 JOIN：应视为有效限定（UPDATE/DELETE JOIN 场景）
+	b = NewBuilder(NewMySQLGrammar(), nil).JoinOn("profiles", func(jb *JoinBuilder) {
+		jb.On("users.id", "=", "profiles.user_id")
+	})
+	if !b.hasEffectiveJoin() {
+		t.Error("join with on condition should be effective")
+	}
+}
+
+// TestBug_ToExistsSQL 验证 ToExists 生成 SELECT 1 ... LIMIT 1
+// （而非 COUNT(*) 全表计数），且不破坏原 Builder 状态。
+func TestBug_ToExistsSQL(t *testing.T) {
+	// MySQL
+	b := NewBuilder(NewMySQLGrammar(), nil).Table("users").Where("id", "=", 1)
+	sqlStr, args, err := b.ToExists()
+	assertNoError(t, err)
+	assertSQL(t, "SELECT 1 FROM `users` WHERE `id` = ? LIMIT 1", sqlStr)
+	if len(args) != 1 || args[0] != 1 {
+		t.Errorf("expected args [1], got %v", args)
+	}
+
+	// SQLite
+	b = NewBuilder(NewSQLiteGrammar(), nil).Table("users").Where("id", "=", 1)
+	sqlStr, _, err = b.ToExists()
+	assertNoError(t, err)
+	assertSQL(t, `SELECT 1 FROM "users" WHERE "id" = ? LIMIT 1`, sqlStr)
+
+	// PostgreSQL
+	b = NewBuilder(NewPostgresGrammar(), nil).Table("users").Where("id", "=", 1)
+	sqlStr, args, err = b.ToExists()
+	assertNoError(t, err)
+	assertSQL(t, `SELECT 1 FROM "users" WHERE "id" = $1 LIMIT 1`, sqlStr)
+	if len(args) != 1 {
+		t.Errorf("expected 1 arg, got %v", args)
+	}
+
+	// UNION：整个 UNION 包裹为子查询后附加 LIMIT 1
+	g := NewMySQLGrammar()
+	union := NewBuilder(g, nil).Table("admins").Where("id", ">", 2)
+	b = NewBuilder(g, nil).Table("users").Where("id", ">", 1).Union(union)
+	sqlStr, _, err = b.ToExists()
+	assertNoError(t, err)
+	if !strings.Contains(sqlStr, "SELECT 1 FROM (") || !strings.Contains(sqlStr, "LIMIT 1") {
+		t.Errorf("expected subquery wrapped union with LIMIT 1, got: %s", sqlStr)
+	}
+
+	// 状态恢复：ToExists 不应破坏原 Builder 的分页/列/锁状态
+	b = NewBuilder(NewMySQLGrammar(), nil).Table("users").
+		Select("name").Where("id", ">", 1).ForPage(2, 10).OrderByDesc("id").LockForUpdate()
+	_, _, err = b.ToExists()
+	assertNoError(t, err)
+	if b.limit != 10 || b.offset != 10 {
+		t.Errorf("limit/offset should be restored, got %d/%d", b.limit, b.offset)
+	}
+	if len(b.columns) != 1 || b.columns[0].Value != "name" {
+		t.Errorf("columns should be restored, got %v", b.columns)
+	}
+	if len(b.orders) != 1 || b.lockClause == "" {
+		t.Errorf("orders/lockClause should be restored, got orders=%v lock=%q", b.orders, b.lockClause)
+	}
+}
+
+// TestBug_SelectStarNotWrapped 验证星号不被标识符包裹：
+// Select("*") 走 WrapColumn 的星号分支；Select("users.*") 的列名部分经 wrapValue，
+// 星号同样不能加引号（否则生成 `"users"."*"` 导致 SQL 语法错误）。
+func TestBug_SelectStarNotWrapped(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		column   string
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "*", "SELECT * FROM `users`"},
+		{"postgres", NewPostgresGrammar(), "*", `SELECT * FROM "users"`},
+		{"sqlite", NewSQLiteGrammar(), "*", `SELECT * FROM "users"`},
+		{"mysql-qualified", NewMySQLGrammar(), "users.*", "SELECT `users`.* FROM `users`"},
+		{"postgres-qualified", NewPostgresGrammar(), "users.*", `SELECT "users".* FROM "users"`},
+		{"sqlite-qualified", NewSQLiteGrammar(), "users.*", `SELECT "users".* FROM "users"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sqlStr, _, err := NewBuilder(tt.grammar, nil).Table("users").Select(tt.column).ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sqlStr)
+		})
+	}
 }
 
 // ==================== 测试辅助函数 ====================

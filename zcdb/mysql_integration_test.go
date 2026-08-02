@@ -1185,12 +1185,12 @@ func TestMySQLInteg_DeleteWithMultipleConditions(t *testing.T) {
 	}
 }
 
-// TestMySQLInteg_DeleteAll 验证无条件全表删除。
+// TestMySQLInteg_DeleteAll 验证 Force() 允许无条件全表删除。
 func TestMySQLInteg_DeleteAll(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	_, err := db.Builder().Table("users").Delete(context.Background())
+	_, err := db.Builder().Table("users").Force().Delete(context.Background())
 	if err != nil {
 		t.Fatalf("Delete error: %v", err)
 	}
@@ -1198,6 +1198,43 @@ func TestMySQLInteg_DeleteAll(t *testing.T) {
 	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 users after delete all, got %d", count)
+	}
+}
+
+// TestMySQLInteg_DeleteWithoutWhere 验证无 WHERE 条件的 Delete 被拒绝（防误操作全表删除）。
+func TestMySQLInteg_DeleteWithoutWhere(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").Delete(context.Background())
+	if !errors.Is(err, ErrDeleteWithoutWhere) {
+		t.Fatalf("expected ErrDeleteWithoutWhere, got %v", err)
+	}
+
+	// 数据应原封不动
+	count, _ := db.Builder().Table("users").Count(context.Background())
+	if count != 5 {
+		t.Errorf("expected 5 users (delete rejected), got %d", count)
+	}
+}
+
+// TestMySQLInteg_UpdateWithoutWhere 验证无 WHERE 条件的 Update 被拒绝（防误操作全表更新）。
+func TestMySQLInteg_UpdateWithoutWhere(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type updateData struct {
+		Status string `db:"status"`
+	}
+	_, err := db.Builder().Table("users").Update(context.Background(), updateData{Status: "vip"})
+	if !errors.Is(err, ErrUpdateWithoutWhere) {
+		t.Fatalf("expected ErrUpdateWithoutWhere, got %v", err)
+	}
+
+	// 数据应原封不动
+	count, _ := db.Builder().Table("users").Where("status", "=", "vip").Count(context.Background())
+	if count != 0 {
+		t.Errorf("expected 0 vip users (update rejected), got %d", count)
 	}
 }
 
@@ -4338,5 +4375,81 @@ func TestMySQLInteg_CountWithGroupByHaving(t *testing.T) {
 	assertNoError(t, err)
 	if count != 3 {
 		t.Fatalf("Count with GROUP BY + HAVING: expected 3, got %d", count)
+	}
+}
+
+// TestMySQLInteg_HavingExpression 验证 HAVING 值传 Expression 时真实执行（直接内嵌 SQL）。
+func TestMySQLInteg_HavingExpression(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLOrdersTable(t, db)
+
+	// 各组 SUM(amount)：170/280/30/150 → >100 的有 3 组
+	count, err := db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", NewExpression("100")).
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("Having with Expression: expected 3 groups, got %d", count)
+	}
+}
+
+// TestMySQLInteg_WhereRawExpression 验证 WhereRaw 绑定参数含 Expression 时真实执行。
+func TestMySQLInteg_WhereRawExpression(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLOrdersTable(t, db)
+
+	// amount > 100：120/200/150 共 3 行
+	count, err := db.Builder().
+		Table("orders").
+		WhereRaw("amount > ?", NewExpression("100")).
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("WhereRaw with Expression: expected 3 rows, got %d", count)
+	}
+}
+
+// TestMySQLInteg_OffsetWithoutLimit 验证仅 Offset 无 Limit 时真实执行。
+// 注意：MySQL 的 OFFSET 必须配合 LIMIT，修复前生成 SELECT ... OFFSET 5 会直接语法错误。
+func TestMySQLInteg_OffsetWithoutLimit(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	var users []struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	err := db.Builder().
+		Table("users").
+		OrderBy("id", "ASC").
+		Offset(2).
+		Find(context.Background(), &users)
+	assertNoError(t, err)
+	if len(users) != 3 {
+		t.Fatalf("Offset(2) without Limit: expected 3 rows, got %d", len(users))
+	}
+	if users[0].Name != "charlie" {
+		t.Errorf("Offset(2) without Limit: expected first row charlie, got %s", users[0].Name)
+	}
+}
+
+// TestMySQLInteg_CountWithDistinct 验证 Distinct + Count 去重计数真实执行。
+func TestMySQLInteg_CountWithDistinct(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS `tags`")
+	mustExec(t, db, `CREATE TABLE tags (name VARCHAR(16) NOT NULL)`)
+	mustExec(t, db, `INSERT INTO tags (name) VALUES ('a'), ('a'), ('b'), ('c')`)
+
+	// 4 行 3 个去重值；修复前生成 SELECT DISTINCT COUNT(*) 会错误返回 4
+	count, err := db.Builder().
+		Table("tags").
+		Select("name").
+		Distinct().
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("Distinct Count: expected 3 distinct values, got %d", count)
 	}
 }

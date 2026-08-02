@@ -29,6 +29,7 @@ type Builder struct {
 	offset     int
 	unions     []UnionClause
 	lockClause string
+	force      bool  // 允许执行无 WHERE 条件的 Delete/Update（全表操作）
 	err        error // 累积错误（如无效运算符）
 }
 
@@ -1079,8 +1080,7 @@ func (b *Builder) ToCount() (string, []any, error) {
 	// GROUP BY 查询：COUNT(*) 与分组列组合时返回每组一行，
 	// 执行端只取第一行会得到错误结果，因此将查询包裹为子查询再计数，
 	// 返回分组数量。
-	if len(b.groups) > 0 {
-		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
+	if len(b.groups) > 0 { // 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
 		origLimit, origOffset := b.limit, b.offset
 		origOrders := b.orders
 		origLock := b.lockClause
@@ -1107,6 +1107,28 @@ func (b *Builder) ToCount() (string, []any, error) {
 		return countSQL, args, nil
 	}
 
+	// DISTINCT 查询：SELECT DISTINCT COUNT(*) 中 DISTINCT 对聚合结果无效，
+	// 会丢失去重语义返回总行数，因此将查询包裹为子查询再计数。
+	if b.distinct {
+		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
+		origLimit, origOffset := b.limit, b.offset
+		origOrders := b.orders
+		origLock := b.lockClause
+		b.limit, b.offset = 0, 0
+		b.orders = nil
+		b.lockClause = ""
+
+		subSQL := b.grammar.CompileSelect(b, b.columns)
+		args := b.collectSelectBindings()
+
+		b.limit, b.offset = origLimit, origOffset
+		b.orders = origOrders
+		b.lockClause = origLock
+
+		countSQL := "SELECT COUNT(*) FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t")
+		return countSQL, args, nil
+	}
+
 	// 保存原始列并设置为 COUNT(*)，清除 SELECT 子查询
 	origColumns := b.columns
 	origSelectSubs := b.selectSubs
@@ -1124,6 +1146,50 @@ func (b *Builder) ToCount() (string, []any, error) {
 	args := b.collectSelectBindings()
 
 	return sqlStr, args, nil
+}
+
+// ToExists 编译存在性查询：SELECT 1 ... LIMIT 1。
+// 数据库找到第一条匹配记录即返回，避免 ToCount 的 COUNT(*) 扫描所有匹配行，
+// 大表场景下存在性检查显著更快。
+// UNION 查询与 ToCount 相同：整个 UNION 包裹为子查询再附加 LIMIT 1；
+// GROUP BY/DISTINCT 场景直接编译（SELECT 1 与这些子句无冲突）。
+func (b *Builder) ToExists() (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
+	if b.table == "" && b.fromSub == nil && len(b.unions) == 0 {
+		return "", nil, ErrEmptyTable
+	}
+
+	// 保存并清除分页/排序/锁/列：存在性检查只关心是否有匹配行
+	origLimit, origOffset := b.limit, b.offset
+	origOrders := b.orders
+	origLock := b.lockClause
+	origColumns := b.columns
+	origSelectSubs := b.selectSubs
+	b.limit, b.offset = 0, 0
+	b.orders = nil
+	b.lockClause = ""
+	b.columns = []SelectColumn{{Value: "1", Raw: true}}
+	b.selectSubs = nil
+
+	// 使用 defer 确保 panic 时也能恢复状态
+	defer func() {
+		b.limit, b.offset = origLimit, origOffset
+		b.orders = origOrders
+		b.lockClause = origLock
+		b.columns = origColumns
+		b.selectSubs = origSelectSubs
+	}()
+
+	subSQL := b.grammar.CompileSelect(b, b.columns)
+	args := b.collectSelectBindings()
+
+	// UNION 查询：整个 UNION 作为子查询后附加 LIMIT 1
+	if len(b.unions) > 0 {
+		return "SELECT 1 FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t") + " LIMIT 1", args, nil
+	}
+	return subSQL + " LIMIT 1", args, nil
 }
 
 // ==================== 内部方法：收集绑定参数 ====================
@@ -1148,7 +1214,11 @@ func (b *Builder) collectSelectBindings() []any {
 			case "value":
 				args = append(args, c.Value)
 			case "raw":
-				args = append(args, c.Bindings...)
+				for _, v := range c.Bindings {
+					if _, ok := v.(Expression); !ok {
+						args = append(args, v)
+					}
+				}
 			}
 		}
 	}
@@ -1158,9 +1228,16 @@ func (b *Builder) collectSelectBindings() []any {
 	for _, h := range b.havings {
 		switch h.Type {
 		case "basic":
-			args = append(args, h.Value)
+			// Expression 已直接内嵌到 SQL，不作为绑定参数
+			if _, ok := h.Value.(Expression); !ok {
+				args = append(args, h.Value)
+			}
 		case "raw":
-			args = append(args, h.Bindings...)
+			for _, v := range h.Bindings {
+				if _, ok := v.(Expression); !ok {
+					args = append(args, v)
+				}
+			}
 		case "between":
 			args = append(args, h.Min, h.Max)
 		}
@@ -1181,7 +1258,11 @@ func (b *Builder) collectJoinBindings() []any {
 			case "value":
 				args = append(args, c.Value)
 			case "raw":
-				args = append(args, c.Bindings...)
+				for _, v := range c.Bindings {
+					if _, ok := v.(Expression); !ok {
+						args = append(args, v)
+					}
+				}
 			}
 		}
 	}
@@ -1204,7 +1285,11 @@ func (b *Builder) collectWhereBindings() []any {
 		case WhereTypeBetween, WhereTypeNotBetween:
 			args = append(args, w.Min, w.Max)
 		case WhereTypeRaw:
-			args = append(args, w.Bindings...)
+			for _, v := range w.Bindings {
+				if _, ok := v.(Expression); !ok {
+					args = append(args, v)
+				}
+			}
 		case WhereTypeNested:
 			if w.Nested != nil {
 				args = append(args, w.Nested.collectWhereBindings()...)
@@ -1241,6 +1326,16 @@ func (b *Builder) collectWhereBindings() []any {
 
 // ==================== 辅助方法 ====================
 
+// Force 标记允许执行无 WHERE 条件的 Delete/Update（全表操作）。
+// Delete/Update 默认拒绝无 WHERE 条件，防止误操作清空/更新整张表；
+// 确需全表操作时显式调用 Force 表示已知意图，或使用 Where("1=1") 作为逃生口。
+//
+//	affected, err := db.Builder().Table("users").Force().Delete(ctx)
+func (b *Builder) Force() *Builder {
+	b.force = true
+	return b
+}
+
 // Clone 克隆当前 Builder，返回一个独立副本。
 func (b *Builder) Clone() *Builder {
 	clone := &Builder{
@@ -1252,6 +1347,7 @@ func (b *Builder) Clone() *Builder {
 		offset:     b.offset,
 		lockClause: b.lockClause,
 		fromAlias:  b.fromAlias,
+		force:      b.force,
 		err:        b.err,
 	}
 	// FROM 子查询深拷贝
@@ -1318,6 +1414,13 @@ func (b *Builder) Clone() *Builder {
 	if b.havings != nil {
 		clone.havings = make([]HavingClause, len(b.havings))
 		copy(clone.havings, b.havings)
+		for i := range clone.havings {
+			if clone.havings[i].Bindings != nil {
+				cp := make([]any, len(clone.havings[i].Bindings))
+				copy(cp, clone.havings[i].Bindings)
+				clone.havings[i].Bindings = cp
+			}
+		}
 	}
 	if b.orders != nil {
 		clone.orders = make([]OrderClause, len(b.orders))

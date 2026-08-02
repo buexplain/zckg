@@ -1,5 +1,7 @@
 package zcdb
 
+import "strings"
+
 // Grammar 定义了 SQL 编译器接口。
 // 不同数据库方言实现此接口以生成对应语法的 SQL。
 type Grammar interface {
@@ -56,4 +58,29 @@ func intToStr(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// replaceRawExpression 将原始 SQL 中的 ? 与 bindings 按位置对应：
+// Expression 直接内嵌为 SQL 文本，其余值保留 ? 占位符。
+// 用于 MySQL/SQLite 方言（? 占位符风格）。
+func replaceRawExpression(sql string, bindings []any) string {
+	if len(bindings) == 0 {
+		return sql
+	}
+	var buf strings.Builder
+	buf.Grow(len(sql) + 8)
+	bi := 0
+	for i := 0; i < len(sql); i++ {
+		if sql[i] == '?' && bi < len(bindings) {
+			if expr, ok := bindings[bi].(Expression); ok {
+				buf.WriteString(expr.Value())
+			} else {
+				buf.WriteByte('?')
+			}
+			bi++
+		} else {
+			buf.WriteByte(sql[i])
+		}
+	}
+	return buf.String()
 }

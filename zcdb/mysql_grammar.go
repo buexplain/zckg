@@ -165,6 +165,10 @@ func (g *MySQLGrammar) CompileSelect(b *Builder, columns []SelectColumn) string 
 
 	// OFFSET
 	if b.offset > 0 {
+		// MySQL 的 OFFSET 必须配合 LIMIT，无 LIMIT 时使用最大行数
+		if b.limit == 0 {
+			sql.WriteString(" LIMIT 18446744073709551615")
+		}
 		sql.WriteString(" OFFSET ")
 		sql.WriteString(intToStr(b.offset))
 	}
@@ -457,7 +461,7 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 		case WhereTypeNotBetween:
 			clause = g.WrapColumn(w.Column) + " NOT BETWEEN ? AND ?"
 		case WhereTypeRaw:
-			clause = w.SQL
+			clause = replaceRawExpression(w.SQL, w.Bindings)
 		case WhereTypeNested:
 			if w.Nested != nil {
 				nested := g.compileWheres(w.Nested)
@@ -576,7 +580,7 @@ func (g *MySQLGrammar) compileJoin(join JoinClause) string {
 			case "value":
 				result += g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
 			case "raw":
-				result += cond.SQL
+				result += replaceRawExpression(cond.SQL, cond.Bindings)
 			}
 		}
 	}
@@ -590,9 +594,13 @@ func (g *MySQLGrammar) compileHavings(b *Builder) string {
 		var clause string
 		switch h.Type {
 		case "basic":
-			clause = g.WrapColumn(h.Column) + " " + h.Operator + " ?"
+			if expr, ok := h.Value.(Expression); ok {
+				clause = g.WrapColumn(h.Column) + " " + h.Operator + " " + expr.Value()
+			} else {
+				clause = g.WrapColumn(h.Column) + " " + h.Operator + " ?"
+			}
 		case "raw":
-			clause = h.SQL
+			clause = replaceRawExpression(h.SQL, h.Bindings)
 		case "between":
 			if h.Not {
 				clause = g.WrapColumn(h.Column) + " NOT BETWEEN ? AND ?"

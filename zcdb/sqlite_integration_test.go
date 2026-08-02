@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1134,12 +1136,12 @@ func TestSQLiteInteg_DeleteWithWhere(t *testing.T) {
 	}
 }
 
-// TestSQLiteInteg_DeleteAll 验证无条件全表删除：不设 WHERE 时 DELETE 清空整张表。
+// TestSQLiteInteg_DeleteAll 验证 Force() 允许无条件全表删除。
 func TestSQLiteInteg_DeleteAll(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	_, err := db.Builder().Table("users").Delete(context.Background())
+	_, err := db.Builder().Table("users").Force().Delete(context.Background())
 	if err != nil {
 		t.Fatalf("Delete error: %v", err)
 	}
@@ -1147,6 +1149,43 @@ func TestSQLiteInteg_DeleteAll(t *testing.T) {
 	count, _ := db.Builder().Table("users").Count(context.Background())
 	if count != 0 {
 		t.Errorf("expected 0 users after delete all, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_DeleteWithoutWhere 验证无 WHERE 条件的 Delete 被拒绝（防误操作全表删除）。
+func TestSQLiteInteg_DeleteWithoutWhere(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	_, err := db.Builder().Table("users").Delete(context.Background())
+	if !errors.Is(err, ErrDeleteWithoutWhere) {
+		t.Fatalf("expected ErrDeleteWithoutWhere, got %v", err)
+	}
+
+	// 数据应原封不动
+	count, _ := db.Builder().Table("users").Count(context.Background())
+	if count != 5 {
+		t.Errorf("expected 5 users (delete rejected), got %d", count)
+	}
+}
+
+// TestSQLiteInteg_UpdateWithoutWhere 验证无 WHERE 条件的 Update 被拒绝（防误操作全表更新）。
+func TestSQLiteInteg_UpdateWithoutWhere(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type updateData struct {
+		Status string `db:"status"`
+	}
+	_, err := db.Builder().Table("users").Update(context.Background(), updateData{Status: "vip"})
+	if !errors.Is(err, ErrUpdateWithoutWhere) {
+		t.Fatalf("expected ErrUpdateWithoutWhere, got %v", err)
+	}
+
+	// 数据应原封不动
+	count, _ := db.Builder().Table("users").Where("status", "=", "vip").Count(context.Background())
+	if count != 0 {
+		t.Errorf("expected 0 vip users (update rejected), got %d", count)
 	}
 }
 
@@ -1453,6 +1492,52 @@ func TestSQLiteInteg_ExistsFalse(t *testing.T) {
 	}
 	if exists {
 		t.Errorf("expected exists=false, got true")
+	}
+}
+
+// TestSQLiteInteg_ExistsUsesLimit1 验证 Exists 走 SELECT 1 ... LIMIT 1 而非 COUNT(*)：
+// 通过 onSQL 回调捕获实际执行 SQL 断言。
+func TestSQLiteInteg_ExistsUsesLimit1(t *testing.T) {
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	var captured []string
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		captured = append(captured, sqlStr)
+	})
+	if err != nil {
+		t.Fatalf("failed to create dao: %v", err)
+	}
+	defer dao.Close()
+
+	setupSQLiteUsersTable(t, dao)
+
+	exists, err := dao.Builder().Table("users").Where("status", "=", "active").Exists(context.Background())
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if !exists {
+		t.Errorf("expected exists=true, got false")
+	}
+
+	// 捕获的 SQL 必须是 LIMIT 1 形式，不能是 COUNT(*)
+	var sqlStr string
+	for _, s := range captured {
+		if strings.Contains(s, "SELECT 1") {
+			sqlStr = s
+			break
+		}
+	}
+	if sqlStr == "" {
+		t.Fatalf("no EXISTS SQL captured, got: %v", captured)
+	}
+	if strings.Contains(sqlStr, "COUNT(*)") {
+		t.Errorf("Exists should not use COUNT(*), got: %s", sqlStr)
+	}
+	if !strings.Contains(sqlStr, "LIMIT 1") {
+		t.Errorf("Exists should use SELECT 1 ... LIMIT 1, got: %s", sqlStr)
 	}
 }
 
@@ -2716,6 +2801,51 @@ func TestSQLiteInteg_SchemaInspector_Columns(t *testing.T) {
 	}
 }
 
+// TestSQLiteInteg_SchemaInspector_ColumnsNumericDefault 验证 Columns 能处理数值默认值：
+// PRAGMA table_info 的 dflt_value 对 DEFAULT 0/1.5 返回 INTEGER/REAL（int64/float64），
+// 而非 TEXT，扫描到 *string 必须显式转换。
+func TestSQLiteInteg_SchemaInspector_ColumnsNumericDefault(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	mustExec(t, db, `CREATE TABLE test_num_default (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			status INTEGER DEFAULT 0,
+			score REAL DEFAULT 1.5,
+			flag TEXT DEFAULT 'x'
+		)`)
+	defer mustExec(t, db, `DROP TABLE IF EXISTS test_num_default`)
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	columns, err := inspector.Columns(context.Background(), "test_num_default")
+	if err != nil {
+		t.Fatalf("Columns() error: %v", err)
+	}
+	if len(columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(columns))
+	}
+
+	checks := []struct {
+		name     string
+		hasDef   bool
+		defValue string
+	}{
+		{"id", false, ""},
+		{"status", true, "0"},
+		{"score", true, "1.5"},
+		{"flag", true, "'x'"},
+	}
+	for i, c := range checks {
+		if c.hasDef && (columns[i].Default == nil || *columns[i].Default != c.defValue) {
+			t.Errorf("col[%d] %s: expected default %q, got %v", i, c.name, c.defValue, columns[i].Default)
+		}
+		if !c.hasDef && columns[i].Default != nil {
+			t.Errorf("col[%d] %s: expected no default, got %q", i, c.name, *columns[i].Default)
+		}
+	}
+}
+
 // ==================== Cursor 迭代器集成测试 ====================
 
 // TestSQLiteInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行扫描，break 时自动释放连接。
@@ -2859,6 +2989,222 @@ func TestSQLiteInteg_CursorBy_IgnoresOrderBy(t *testing.T) {
 	}
 }
 
+// TestSQLiteInteg_CursorBy_NullCursorValue 验证游标列值为 NULL 时迭代器报错终止，
+// 而不是无限循环重复返回同一批数据。
+func TestSQLiteInteg_CursorBy_NullCursorValue(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// age 用指针类型，eve 的 age 为 NULL
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+		Age  *int   `db:"age"`
+	}
+	var user row
+	gotErr := false
+	count := 0
+	for err := range db.Builder().Table("users").Select("id", "name", "age").CursorBy(context.Background(), &user, 2, "age") {
+		if err != nil {
+			gotErr = true
+			break
+		}
+		count++
+		if count > 100 {
+			t.Fatalf("CursorBy 未终止，疑似死循环（已迭代 %d 次）", count)
+		}
+	}
+	if !gotErr {
+		t.Errorf("expected error for NULL cursor value, got nil (iterated %d times)", count)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 iterations before error, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_CursorBy_NilEmbeddedPtr 验证 dest 的嵌入指针结构体为 nil 时，
+// CursorBy 返回错误而非 panic。
+func TestSQLiteInteg_CursorBy_NilEmbeddedPtr(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// 嵌入类型名必须大写导出，才会被字段展开
+	type Base struct {
+		ID int `db:"id"`
+	}
+	// 嵌入指针未初始化，为 nil
+	type user struct {
+		*Base
+		Name string `db:"name"`
+	}
+	var u user
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CursorBy panicked: %v", r)
+		}
+	}()
+	gotErr := false
+	count := 0
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &u, 2, "id") {
+		if err != nil {
+			gotErr = true
+			break
+		}
+		count++
+		if count > 10 {
+			t.Fatalf("CursorBy 未终止，疑似死循环")
+		}
+	}
+	if !gotErr {
+		t.Errorf("expected error for unavailable cursor field, got nil (iterated %d times)", count)
+	}
+}
+
+// TestSQLiteInteg_Cursor_ErrorPaths 验证 Cursor 对非法 dest 返回错误：
+// 非指针与非结构体指针均应在迭代首轮 yield 错误。
+func TestSQLiteInteg_Cursor_ErrorPaths(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// 非指针 dest（结构体值）
+	gotErr := false
+	for err := range db.Builder().Table("users").Cursor(context.Background(), struct {
+		Name string `db:"name"`
+	}{}) {
+		gotErr = errors.Is(err, ErrNotPointer)
+		break
+	}
+	if !gotErr {
+		t.Error("expected ErrNotPointer for non-pointer dest, got nil")
+	}
+
+	// 非结构体指针 dest（*int）
+	gotErr = false
+	var num int
+	for err := range db.Builder().Table("users").Cursor(context.Background(), &num) {
+		gotErr = errors.Is(err, ErrNotStruct)
+		break
+	}
+	if !gotErr {
+		t.Error("expected ErrNotStruct for *int dest, got nil")
+	}
+}
+
+// TestSQLiteInteg_CursorBy_ErrorPaths 验证 CursorBy 对非法 dest 与缺失游标字段返回错误。
+func TestSQLiteInteg_CursorBy_ErrorPaths(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// 非指针 dest
+	gotErr := false
+	for err := range db.Builder().Table("users").CursorBy(context.Background(), struct {
+		Name string `db:"name"`
+	}{}, 2, "id") {
+		gotErr = errors.Is(err, ErrNotPointer)
+		break
+	}
+	if !gotErr {
+		t.Error("expected ErrNotPointer for non-pointer dest, got nil")
+	}
+
+	// 非结构体指针 dest（*int）
+	gotErr = false
+	var num int
+	for err := range db.Builder().Table("users").CursorBy(context.Background(), &num, 2, "id") {
+		gotErr = errors.Is(err, ErrNotStruct)
+		break
+	}
+	if !gotErr {
+		t.Error("expected ErrNotStruct for *int dest, got nil")
+	}
+
+	// 缺失游标字段：结构体不含 cursorColumn 对应字段
+	gotErr = false
+	var noCursor struct {
+		Name string `db:"name"`
+	}
+	for err := range db.Builder().Table("users").CursorBy(context.Background(), &noCursor, 2, "id") {
+		gotErr = errors.Is(err, ErrCursorFieldNotFound)
+		break
+	}
+	if !gotErr {
+		t.Error("expected ErrCursorFieldNotFound for missing cursor field, got nil")
+	}
+}
+
+// TestSQLiteInteg_CursorBy_DefaultChunkSize 验证 chunkSize<=0 时使用默认值 100：
+// 数据量小于默认分块大小时应完整迭代。
+func TestSQLiteInteg_CursorBy_DefaultChunkSize(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var names []string
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 0, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, user.Name)
+	}
+	if len(names) != 5 {
+		t.Errorf("expected 5 names, got %d", len(names))
+	}
+}
+
+// TestSQLiteInteg_ScanStruct_ErrorPaths 验证 ScanStruct/ScanStructClose 对非法 dest 返回错误：
+// 非指针、非结构体指针、切片元素非结构体。
+func TestSQLiteInteg_ScanStruct_ErrorPaths(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	ctx := context.Background()
+
+	// 非指针 dest（结构体值）
+	rows, err := db.Query(ctx, "SELECT id, name FROM users")
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if err := ScanStruct(rows, struct {
+		Name string `db:"name"`
+	}{}); err == nil {
+		t.Error("expected error for non-pointer dest, got nil")
+	}
+	rows.Close()
+
+	// 非结构体指针 dest（*int）
+	rows, err = db.Query(ctx, "SELECT id FROM users")
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if err := ScanStruct(rows, new(int)); err == nil {
+		t.Error("expected error for *int dest, got nil")
+	}
+	rows.Close()
+
+	// 切片元素非结构体（*[]int）
+	rows, err = db.Query(ctx, "SELECT id FROM users")
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	var ints []int
+	if err := ScanStruct(rows, &ints); err == nil {
+		t.Error("expected error for *[]int dest, got nil")
+	}
+	rows.Close()
+
+	// ScanStructClose 对非法 dest 返回错误，且自动关闭 rows
+	rows, err = db.Query(ctx, "SELECT id FROM users")
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if err := ScanStructClose(rows, new(int)); err == nil {
+		t.Error("expected error for *int dest via ScanStructClose, got nil")
+	}
+}
+
 // ==================== nullSafeField 集成测试 ====================
 
 // TestSQLiteInteg_NullSafeField_AllTypes 验证 nullSafeField 能正确处理各种数据类型的 NULL 和非 NULL 值。
@@ -2986,6 +3332,56 @@ func TestSQLiteInteg_NullSafeField_AllTypes(t *testing.T) {
 			t.Errorf("row[1].BVal: expected nil (NULL), got %v", *results[1].BVal)
 		}
 	})
+}
+
+// TestSQLiteInteg_PoolConcurrentAddSlavePick 验证 AddSlave 与 PickReadDB 的并发安全性：
+// 多个 goroutine 并发 PickReadDB，同时主 goroutine 反复 AddSlave，
+// 不应 panic 或返回 nil；添加从库后 PickReadDB 应返回从库之一。
+// 用 go test -race 运行可验证无数据竞争。
+func TestSQLiteInteg_PoolConcurrentAddSlavePick(t *testing.T) {
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatalf("failed to open pool: %v", err)
+	}
+	defer pool.Close()
+
+	master := pool.PickWriteDB()
+
+	const pickers = 8
+	var wg sync.WaitGroup
+	wg.Add(pickers)
+	stop := make(chan struct{})
+	for g := 0; g < pickers; g++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if db := pool.PickReadDB(); db == nil {
+						t.Errorf("PickReadDB returned nil")
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// 主 goroutine 反复添加从库（SQLite :memory: 每个连接独立，仅验证路由行为）
+	for i := 0; i < 5; i++ {
+		if err := pool.AddSlave(":memory:"); err != nil {
+			t.Fatalf("AddSlave error: %v", err)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+
+	// 添加从库后 PickReadDB 应返回从库之一（随机策略）
+	if readDB := pool.PickReadDB(); readDB == master {
+		t.Errorf("expected PickReadDB to return a slave after AddSlave, got master")
+	}
 }
 
 // TestSQLiteInteg_NullSafeField_IntTypes 验证各种整数类型的 NULL 安全扫描。
@@ -3423,5 +3819,148 @@ func TestSQLiteInteg_ExistsWithGroupBy(t *testing.T) {
 	assertNoError(t, err)
 	if exists {
 		t.Error("Exists with GROUP BY + HAVING (no match): expected false, got true")
+	}
+}
+
+// TestSQLiteInteg_HavingExpression 验证 HAVING 值传 Expression 时真实执行（直接内嵌 SQL）。
+func TestSQLiteInteg_HavingExpression(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteOrdersTable(t, db)
+
+	// 各组 SUM(amount)：170/280/30/150 → >100 的有 3 组
+	count, err := db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", NewExpression("100")).
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("Having with Expression: expected 3 groups, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_WhereRawExpression 验证 WhereRaw 绑定参数含 Expression 时真实执行。
+func TestSQLiteInteg_WhereRawExpression(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteOrdersTable(t, db)
+
+	// amount > 100：120/200/150 共 3 行
+	count, err := db.Builder().
+		Table("orders").
+		WhereRaw("amount > ?", NewExpression("100")).
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("WhereRaw with Expression: expected 3 rows, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_OffsetWithoutLimit 验证仅 Offset 无 Limit 时真实执行。
+func TestSQLiteInteg_OffsetWithoutLimit(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	var users []struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	err := db.Builder().
+		Table("users").
+		OrderBy("id", "ASC").
+		Offset(2).
+		Find(context.Background(), &users)
+	assertNoError(t, err)
+	if len(users) != 3 {
+		t.Fatalf("Offset(2) without Limit: expected 3 rows, got %d", len(users))
+	}
+	if users[0].Name != "charlie" {
+		t.Errorf("Offset(2) without Limit: expected first row charlie, got %s", users[0].Name)
+	}
+}
+
+// TestSQLiteInteg_CountWithDistinct 验证 Distinct + Count 去重计数真实执行。
+func TestSQLiteInteg_CountWithDistinct(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	mustExec(t, db, `CREATE TABLE tags (name TEXT NOT NULL)`)
+	mustExec(t, db, `INSERT INTO tags (name) VALUES ('a'), ('a'), ('b'), ('c')`)
+
+	// 4 行 3 个去重值；修复前生成 SELECT DISTINCT COUNT(*) 会错误返回 4
+	count, err := db.Builder().
+		Table("tags").
+		Select("name").
+		Distinct().
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("Distinct Count: expected 3 distinct values, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_InsertNilPointer 验证 Insert 传入 nil 结构体指针返回 ErrInvalidStruct 而非 panic。
+func TestSQLiteInteg_InsertNilPointer(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type user struct {
+		Name string `db:"name"`
+	}
+	var u *user
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Insert panicked on nil pointer: %v", r)
+		}
+	}()
+	_, err := db.Builder().Table("users").Insert(context.Background(), u)
+	if !errors.Is(err, ErrInvalidStruct) {
+		t.Fatalf("expected ErrInvalidStruct, got %v", err)
+	}
+}
+
+// TestSQLiteInteg_ScanNumericToString 验证 SQLite 数值列（驱动返回 int64）
+// 扫描到 string 字段时得到数字字符串而非字符码。
+func TestSQLiteInteg_ScanNumericToString(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	mustExec(t, db, `CREATE TABLE num_str_test (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)`)
+	mustExec(t, db, `INSERT INTO num_str_test (v) VALUES (123)`)
+
+	var r struct {
+		V string `db:"v"`
+	}
+	err := db.Builder().
+		Table("num_str_test").
+		Select("v").
+		First(context.Background(), &r)
+	assertNoError(t, err)
+	if r.V != "123" {
+		t.Errorf("expected \"123\", got %q", r.V)
+	}
+}
+
+// TestSQLiteInteg_ScanJsonToIntSlice 验证 JSON 列扫描到 []int 字段：
+// BLOB 列（驱动返回 []byte）与 TEXT 列（驱动返回 string）都应正确反序列化。
+func TestSQLiteInteg_ScanJsonToIntSlice(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	mustExec(t, db, `CREATE TABLE json_arr_test (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		arr_blob BLOB,
+		arr_text TEXT
+	)`)
+	// [1,2,3] 的十六进制：5B 31 2C 32 2C 33 5D
+	mustExec(t, db, `INSERT INTO json_arr_test (arr_blob, arr_text) VALUES (X'5B312C322C335D', '[1,2,3]')`)
+
+	var r struct {
+		ArrBlob []int `db:"arr_blob"`
+		ArrText []int `db:"arr_text"`
+	}
+	err := db.Builder().
+		Table("json_arr_test").
+		Select("arr_blob", "arr_text").
+		First(context.Background(), &r)
+	assertNoError(t, err)
+	if len(r.ArrBlob) != 3 || r.ArrBlob[0] != 1 || r.ArrBlob[2] != 3 {
+		t.Errorf("arr_blob: expected [1 2 3], got %v", r.ArrBlob)
+	}
+	if len(r.ArrText) != 3 || r.ArrText[0] != 1 || r.ArrText[2] != 3 {
+		t.Errorf("arr_text: expected [1 2 3], got %v", r.ArrText)
 	}
 }

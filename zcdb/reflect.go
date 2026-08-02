@@ -204,6 +204,9 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 
 	// 处理单个结构体
 	if t.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return nil, nil, ErrInvalidStruct
+		}
 		v = v.Elem()
 		t = v.Type()
 	}
@@ -273,6 +276,9 @@ func extractUpdateData(data any) (columns []string, values []any, err error) {
 	t := v.Type()
 
 	if t.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return nil, nil, ErrInvalidStruct
+		}
 		v = v.Elem()
 		t = v.Type()
 	}

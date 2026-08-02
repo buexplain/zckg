@@ -88,7 +88,11 @@ func (d *DBDao) Pool() *Pool {
 // Exec 执行原始 SQL（含慢 SQL 检测 + 读写路由），返回 sql.Result。
 // args 为 SQL 中占位符的绑定值，支持基本类型（int、string、float、bool、time.Time 等）。
 func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Result, error) {
-	start := time.Now()
+	// 慢 SQL 检测：仅在配置回调时计时，避免热路径上无谓的 time.Now 开销
+	var start time.Time
+	if d.onSQL != nil {
+		start = time.Now()
+	}
 
 	var result sql.Result
 	var err error
@@ -112,7 +116,11 @@ func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Resul
 // Query 执行原始查询，返回 *sql.Rows 调用方负责 Close。
 // args 类型规则同 Exec。
 func (d *DBDao) Query(ctx context.Context, sqlStr string, args ...any) (*sql.Rows, error) {
-	start := time.Now()
+	// 慢 SQL 检测：仅在配置回调时计时，避免热路径上无谓的 time.Now 开销
+	var start time.Time
+	if d.onSQL != nil {
+		start = time.Now()
+	}
 
 	var rows *sql.Rows
 	var err error
