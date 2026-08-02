@@ -101,8 +101,7 @@ func (g *PostgresGrammar) wrapValue(value string) string {
 
 // CompileSelect 编译 SELECT 查询
 func (g *PostgresGrammar) CompileSelect(b *Builder, columns []SelectColumn) string {
-	g = g.cloneForCompile()
-	return g.compileSelectInner(b, columns)
+	return g.cloneForCompile().compileSelectInner(b, columns)
 }
 
 func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn) string {
@@ -246,18 +245,18 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn)
 
 // CompileInsert 编译 INSERT 语句
 func (g *PostgresGrammar) CompileInsert(b *Builder, columns []string, rows [][]any) string {
-	g = g.cloneForCompile()
+	gClone := g.cloneForCompile()
 
 	var sql strings.Builder
 
 	sql.WriteString("INSERT INTO ")
-	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(gClone.WrapTable(b.table))
 	sql.WriteString(" (")
 	for i, col := range columns {
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		sql.WriteString(g.WrapColumn(col))
+		sql.WriteString(gClone.WrapColumn(col))
 	}
 	sql.WriteString(") VALUES ")
 
@@ -270,7 +269,7 @@ func (g *PostgresGrammar) CompileInsert(b *Builder, columns []string, rows [][]a
 			if j > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.nextParam())
+			sql.WriteString(gClone.nextParam())
 		}
 		sql.WriteString(")")
 	}
@@ -285,18 +284,18 @@ func (g *PostgresGrammar) CompileInsertOrIgnore(b *Builder, columns []string, ro
 
 // CompileUpsert 编译 PostgreSQL 的 INSERT ... ON CONFLICT DO UPDATE 语句
 func (g *PostgresGrammar) CompileUpsert(b *Builder, columns []string, rows [][]any, uniqueBy []string, updateColumns []string, _ []any) string {
-	g = g.cloneForCompile()
+	gClone := g.cloneForCompile()
 
 	var sql strings.Builder
 
 	sql.WriteString("INSERT INTO ")
-	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(gClone.WrapTable(b.table))
 	sql.WriteString(" (")
 	for i, col := range columns {
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		sql.WriteString(g.WrapColumn(col))
+		sql.WriteString(gClone.WrapColumn(col))
 	}
 	sql.WriteString(") VALUES ")
 
@@ -309,7 +308,7 @@ func (g *PostgresGrammar) CompileUpsert(b *Builder, columns []string, rows [][]a
 			if j > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.nextParam())
+			sql.WriteString(gClone.nextParam())
 		}
 		sql.WriteString(")")
 	}
@@ -320,7 +319,7 @@ func (g *PostgresGrammar) CompileUpsert(b *Builder, columns []string, rows [][]a
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		sql.WriteString(g.WrapColumn(col))
+		sql.WriteString(gClone.WrapColumn(col))
 	}
 	sql.WriteString(") DO UPDATE SET ")
 
@@ -328,7 +327,7 @@ func (g *PostgresGrammar) CompileUpsert(b *Builder, columns []string, rows [][]a
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		wrapped := g.WrapColumn(col)
+		wrapped := gClone.WrapColumn(col)
 		sql.WriteString(wrapped)
 		sql.WriteString(" = EXCLUDED.")
 		sql.WriteString(wrapped)
@@ -339,21 +338,21 @@ func (g *PostgresGrammar) CompileUpsert(b *Builder, columns []string, rows [][]a
 
 // CompileInsertUsing 编译 INSERT INTO ... SELECT 语句
 func (g *PostgresGrammar) CompileInsertUsing(b *Builder, columns []string, sub *Builder) string {
-	g = g.cloneForCompile()
+	gClone := g.cloneForCompile()
 
 	var sql strings.Builder
 
 	sql.WriteString("INSERT INTO ")
-	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(gClone.WrapTable(b.table))
 	sql.WriteString(" (")
 	for i, col := range columns {
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		sql.WriteString(g.WrapColumn(col))
+		sql.WriteString(gClone.WrapColumn(col))
 	}
 	sql.WriteString(") ")
-	sql.WriteString(g.compileSelectInner(sub, sub.columns))
+	sql.WriteString(gClone.compileSelectInner(sub, sub.columns))
 
 	return sql.String()
 }
@@ -361,12 +360,12 @@ func (g *PostgresGrammar) CompileInsertUsing(b *Builder, columns []string, sub *
 // CompileUpdate 编译 UPDATE 语句。
 // 注意: PostgreSQL 的 UPDATE 不支持 ORDER BY 和 LIMIT。
 func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []any) string {
-	g = g.cloneForCompile()
+	gClone := g.cloneForCompile()
 
 	var sql strings.Builder
 
 	sql.WriteString("UPDATE ")
-	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(gClone.WrapTable(b.table))
 
 	// SET
 	sql.WriteString(" SET ")
@@ -374,13 +373,13 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		sql.WriteString(g.WrapColumn(col))
+		sql.WriteString(gClone.WrapColumn(col))
 		sql.WriteString(" = ")
 		// 检查值是否为 Expression
 		if expr, ok := values[i].(Expression); ok {
 			sql.WriteString(expr.Value())
 		} else {
-			sql.WriteString(g.nextParam())
+			sql.WriteString(gClone.nextParam())
 		}
 	}
 
@@ -391,7 +390,7 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 			if i > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.WrapTable(join.Table))
+			sql.WriteString(gClone.WrapTable(join.Table))
 		}
 	}
 
@@ -407,11 +406,11 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 				var jc string
 				switch cond.Type {
 				case "column":
-					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+					jc = gClone.WrapColumn(cond.First) + " " + cond.Operator + " " + gClone.WrapColumn(cond.Second)
 				case "value":
-					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.nextParam()
+					jc = gClone.WrapColumn(cond.First) + " " + cond.Operator + " " + gClone.nextParam()
 				case "raw":
-					jc = g.convertRawPlaceholders(cond.SQL)
+					jc = gClone.convertRawPlaceholders(cond.SQL)
 				}
 				if jc == "" {
 					continue
@@ -426,7 +425,7 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 		joinWhere = strings.Join(joinConditions, " ")
 	}
 
-	whereSQL := g.compileWheres(b)
+	whereSQL := gClone.compileWheres(b)
 	if joinWhere != "" {
 		if whereSQL != "" {
 			whereSQL = joinWhere + " AND " + whereSQL
@@ -446,15 +445,15 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 // CompileDelete 编译 DELETE 语句。
 // 注意: PostgreSQL 的 DELETE 不支持 ORDER BY 和 LIMIT。
 func (g *PostgresGrammar) CompileDelete(b *Builder) string {
-	g = g.cloneForCompile()
+	gClone := g.cloneForCompile()
 
 	var sql strings.Builder
 
 	sql.WriteString("DELETE FROM ")
-	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(gClone.WrapTable(b.table))
 
 	// WHERE
-	if whereSQL := g.compileWheres(b); whereSQL != "" {
+	if whereSQL := gClone.compileWheres(b); whereSQL != "" {
 		sql.WriteString(" WHERE ")
 		sql.WriteString(whereSQL)
 	}

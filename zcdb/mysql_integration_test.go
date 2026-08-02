@@ -4050,3 +4050,223 @@ func TestMySQLInteg_NullSafeField_JSONConversions(t *testing.T) {
 		}
 	})
 }
+
+// ==================== Cursor 集成测试 ====================
+
+// TestMySQLInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行读取所有数据。
+func TestMySQLInteg_Cursor_Stream(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"` // 非指针类型，NULL 时保留零值
+	}
+	var user row
+	var names []string
+	var ages []int
+	for err := range db.Builder().Table("users").Select("name", "age").OrderBy("id", "ASC").Cursor(context.Background(), &user) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		names = append(names, user.Name)
+		ages = append(ages, user.Age)
+	}
+	if len(names) != 5 {
+		t.Errorf("expected 5 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "alice" {
+		t.Errorf("expected first name alice, got %s", names[0])
+	}
+	// eve 的 age 为 NULL，应该是零值 0
+	if ages[4] != 0 {
+		t.Errorf("expected eve's age=0 (NULL), got %d", ages[4])
+	}
+}
+
+// TestMySQLInteg_Cursor_Break 验证 Cursor 迭代中 break 能正常释放资源。
+func TestMySQLInteg_Cursor_Break(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var user row
+	count := 0
+	for err := range db.Builder().Table("users").Select("name").OrderBy("id", "ASC").Cursor(context.Background(), &user) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		count++
+		if count == 2 {
+			break // 只取前 2 条
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected 2 iterations, got %d", count)
+	}
+}
+
+// TestMySQLInteg_CursorBy_Keyset 验证 CursorBy 游标分页迭代：分批获取全部数据。
+func TestMySQLInteg_CursorBy_Keyset(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var names []string
+	var lastID int
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 2, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, user.Name)
+		lastID = user.ID
+	}
+	if len(names) != 5 {
+		t.Errorf("expected 5 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "alice" || names[4] != "eve" {
+		t.Errorf("expected alice...eve, got %v", names)
+	}
+	if lastID != 5 {
+		t.Errorf("expected last id=5, got %d", lastID)
+	}
+}
+
+// TestMySQLInteg_CursorBy_Break 验证 CursorBy 迭代中 break 能正常停止。
+func TestMySQLInteg_CursorBy_Break(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	count := 0
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 2, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		count++
+		if count == 3 {
+			break
+		}
+	}
+	if count != 3 {
+		t.Errorf("expected 3 iterations, got %d", count)
+	}
+}
+
+// TestMySQLInteg_CursorBy_IgnoresOrderBy 验证 CursorBy 会忽略已设置的 ORDER BY。
+func TestMySQLInteg_CursorBy_IgnoresOrderBy(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var ids []int
+	// 用户先设置了 ORDER BY name DESC，但 CursorBy 应该忽略它，强制按 id ASC
+	for err := range db.Builder().Table("users").Select("id", "name").OrderBy("name", "DESC").CursorBy(context.Background(), &user, 10, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		ids = append(ids, user.ID)
+	}
+	// 验证结果是按 id 升序，而非 name 降序
+	expected := []int{1, 2, 3, 4, 5}
+	if len(ids) != len(expected) {
+		t.Errorf("expected %d ids, got %d: %v", len(expected), len(ids), ids)
+	}
+	for i, id := range ids {
+		if id != expected[i] {
+			t.Errorf("ids[%d]: expected %d, got %d", i, expected[i], id)
+		}
+	}
+}
+
+// ==================== 复杂查询补充 ====================
+
+// TestMySQLInteg_Complex_MultiSubqueryCombination 验证多种子查询类型组合：
+// WHERE NOT IN子查询 + WHERE EXISTS + JOIN + ORDER BY。
+// 找出「没有个人档案但有订单」的用户，且至少有一笔订单金额 > 100。
+// 预期：diana(有 Camera 150，无 profile)
+func TestMySQLInteg_Complex_MultiSubqueryCombination(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+	setupMySQLProfilesTable(t, db)
+
+	// NOT IN 子查询：排除有 profile 的用户
+	type row struct {
+		Name    string  `db:"name"`
+		Product string  `db:"product"`
+		Amount  float64 `db:"amount"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("users.name", "orders.product", "orders.amount").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id")
+		}).
+		WhereNotInSub("users.id", func(sub *Builder) {
+			sub.Table("profiles").Select("user_id")
+		}).
+		WhereExists(func(sub *Builder) {
+			sub.Table("orders").
+				SelectRaw("COUNT(*)").
+				WhereRaw("orders.user_id = users.id").
+				Where("orders.amount", ">", 100)
+		}).
+		OrderBy("users.name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// 没有 profile 的用户: diana(4), eve(5)
+	// 其中有订单的: diana(Camera, 150)
+	// 且有金额 > 100 的订单: diana ✓
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %v", len(rows), rows)
+	}
+	if rows[0].Name != "diana" || rows[0].Product != "Camera" || rows[0].Amount != 150 {
+		t.Errorf("expected diana/Camera/150, got %v", rows[0])
+	}
+}
+
+// ==================== JOIN 补充 ====================
+
+// TestMySQLInteg_LeftJoinOnOrOn 验证 LeftJoinOn + OrOn：LEFT JOIN 带 OR 条件的 ON 子句。
+func TestMySQLInteg_LeftJoinOnOrOn(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLProfilesTable(t, db)
+
+	type row struct {
+		Name string  `db:"name"`
+		Bio  *string `db:"bio"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "profiles.bio").
+		LeftJoinOn("profiles", func(j *JoinBuilder) {
+			j.On("users.id", "=", "profiles.user_id").
+				OrOn("profiles.active", "=", "users.id")
+		}).
+		OrderBy("users.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// 所有 5 个用户都应保留（LEFT JOIN）
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d: %v", len(rows), rows)
+	}
+}

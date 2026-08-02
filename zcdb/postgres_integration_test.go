@@ -3851,3 +3851,320 @@ func TestPgInteg_NullSafeField_JSONError(t *testing.T) {
 		t.Errorf("error should contain 'zcdb': %v", err)
 	}
 }
+
+// ==================== Cursor 集成测试 ====================
+
+// TestPgInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行读取所有数据。
+func TestPgInteg_Cursor_Stream(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+		Age  int    `db:"age"` // 非指针类型，NULL 时保留零值
+	}
+	var user row
+	var names []string
+	var ages []int
+	for err := range db.Builder().Table("users").Select("name", "age").OrderBy("id", "ASC").Cursor(context.Background(), &user) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		names = append(names, user.Name)
+		ages = append(ages, user.Age)
+	}
+	if len(names) != 5 {
+		t.Errorf("expected 5 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "alice" {
+		t.Errorf("expected first name alice, got %s", names[0])
+	}
+	// eve 的 age 为 NULL，应该是零值 0
+	if ages[4] != 0 {
+		t.Errorf("expected eve's age=0 (NULL), got %d", ages[4])
+	}
+}
+
+// TestPgInteg_Cursor_Break 验证 Cursor 迭代中 break 能正常释放资源。
+func TestPgInteg_Cursor_Break(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var user row
+	count := 0
+	for err := range db.Builder().Table("users").Select("name").OrderBy("id", "ASC").Cursor(context.Background(), &user) {
+		if err != nil {
+			t.Fatalf("Cursor error: %v", err)
+		}
+		count++
+		if count == 2 {
+			break // 只取前 2 条
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected 2 iterations, got %d", count)
+	}
+}
+
+// TestPgInteg_CursorBy_Keyset 验证 CursorBy 游标分页迭代：分批获取全部数据。
+func TestPgInteg_CursorBy_Keyset(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var names []string
+	var lastID int
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 2, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, user.Name)
+		lastID = user.ID
+	}
+	if len(names) != 5 {
+		t.Errorf("expected 5 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "alice" || names[4] != "eve" {
+		t.Errorf("expected alice...eve, got %v", names)
+	}
+	if lastID != 5 {
+		t.Errorf("expected last id=5, got %d", lastID)
+	}
+}
+
+// TestPgInteg_CursorBy_Break 验证 CursorBy 迭代中 break 能正常停止。
+func TestPgInteg_CursorBy_Break(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	count := 0
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 2, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		count++
+		if count == 3 {
+			break
+		}
+	}
+	if count != 3 {
+		t.Errorf("expected 3 iterations, got %d", count)
+	}
+}
+
+// TestPgInteg_CursorBy_IgnoresOrderBy 验证 CursorBy 会忽略已设置的 ORDER BY。
+func TestPgInteg_CursorBy_IgnoresOrderBy(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var ids []int
+	// 用户先设置了 ORDER BY name DESC，但 CursorBy 应该忽略它，强制按 id ASC
+	for err := range db.Builder().Table("users").Select("id", "name").OrderBy("name", "DESC").CursorBy(context.Background(), &user, 10, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		ids = append(ids, user.ID)
+	}
+	// 验证结果是按 id 升序，而非 name 降序
+	expected := []int{1, 2, 3, 4, 5}
+	if len(ids) != len(expected) {
+		t.Errorf("expected %d ids, got %d: %v", len(expected), len(ids), ids)
+	}
+	for i, id := range ids {
+		if id != expected[i] {
+			t.Errorf("ids[%d]: expected %d, got %d", i, expected[i], id)
+		}
+	}
+}
+
+// ==================== 复杂查询补充 ====================
+
+// TestPgInteg_Complex_MultiSubqueryCombination 验证多种子查询类型组合：
+// WHERE NOT IN子查询 + WHERE EXISTS + JOIN + ORDER BY。
+// 找出「没有个人档案但有订单」的用户，且至少有一笔订单金额 > 100。
+// 预期：diana(有 Camera 150，无 profile)
+func TestPgInteg_Complex_MultiSubqueryCombination(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgOrdersTable(t, db)
+	setupPgProfilesTable(t, db)
+
+	// NOT IN 子查询：排除有 profile 的用户
+	type row struct {
+		Name    string  `db:"name"`
+		Product string  `db:"product"`
+		Amount  float64 `db:"amount"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		Select("users.name", "orders.product", "orders.amount").
+		JoinOn("orders", func(j *JoinBuilder) {
+			j.On("users.id", "=", "orders.user_id")
+		}).
+		WhereNotInSub("users.id", func(sub *Builder) {
+			sub.Table("profiles").Select("user_id")
+		}).
+		WhereExists(func(sub *Builder) {
+			sub.Table("orders").
+				SelectRaw("COUNT(*)").
+				WhereRaw("orders.user_id = users.id").
+				Where("orders.amount", ">", 100)
+		}).
+		OrderBy("users.name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// 没有 profile 的用户: diana(4), eve(5)
+	// 其中有订单的: diana(Camera, 150)
+	// 且有金额 > 100 的订单: diana ✓
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %v", len(rows), rows)
+	}
+	if rows[0].Name != "diana" || rows[0].Product != "Camera" || rows[0].Amount != 150 {
+		t.Errorf("expected diana/Camera/150, got %v", rows[0])
+	}
+}
+
+// ==================== 分页补充 ====================
+
+// TestPgInteg_ForPageFirst 验证第一页分页：第 1 页不生成 OFFSET。
+func TestPgInteg_ForPageFirst(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").ForPage(1, 3).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(rows))
+	}
+	if rows[0].Name != "alice" {
+		t.Errorf("expected first row alice, got %s", rows[0].Name)
+	}
+}
+
+// ==================== JOIN 补充 ====================
+
+// TestPgInteg_LeftJoinOnOrOn 验证 LeftJoinOn + OrOn：LEFT JOIN 带 OR 条件的 ON 子句。
+func TestPgInteg_LeftJoinOnOrOn(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+	setupPgProfilesTable(t, db)
+
+	type row struct {
+		Name string  `db:"name"`
+		Bio  *string `db:"bio"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("users.name", "profiles.bio").
+		LeftJoinOn("profiles", func(j *JoinBuilder) {
+			j.On("users.id", "=", "profiles.user_id").
+				OrOn("profiles.active", "=", "users.id")
+		}).
+		OrderBy("users.id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	// 所有 5 个用户都应保留（LEFT JOIN）
+	if len(rows) != 5 {
+		t.Errorf("expected 5 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// ==================== UPDATE 补充 ====================
+
+// TestPgInteg_UpdatePtrAllNil 验证全指针字段均为 nil 时更新应返回错误。
+func TestPgInteg_UpdatePtrAllNil(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type updatePtrData struct {
+		Name   *string `db:"name"`
+		Age    *int    `db:"age"`
+		Status *string `db:"status"`
+	}
+	_, err := db.Builder().Table("users").Where("id", "=", 1).Update(context.Background(), updatePtrData{})
+	if err == nil {
+		t.Fatalf("expected error for all-nil update, got nil")
+	}
+}
+
+// ==================== WHERE 补充 ====================
+
+// TestPgInteg_WhereNotLike 验证 WHERE NOT LIKE：排除匹配模式的行。
+func TestPgInteg_WhereNotLike(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereNotLike("name", "%ali%").OrderBy("id", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// ==================== INSERT 补充 ====================
+
+// TestPgInteg_InsertBatchPtr 验证批量插入指针字段：部分指针为 nil 时写入 NULL。
+func TestPgInteg_InsertBatchPtr(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	type insertPtrData struct {
+		Name  *string `db:"name"`
+		Age   *int    `db:"age"`
+		Email *string `db:"email"`
+	}
+	n1, e1 := "frank", "frank@test.com"
+	a1 := 40
+	n2 := "grace"
+	a2 := 22
+	data := []insertPtrData{
+		{Name: &n1, Age: &a1, Email: &e1},
+		{Name: &n2, Age: &a2},
+	}
+	_, err := db.Builder().Table("users").Insert(context.Background(), data)
+	if err != nil {
+		t.Fatalf("Insert error: %v", err)
+	}
+
+	// grace 的 email 应为 NULL
+	var email *string
+	err = db.Builder().Table("users").Select("email").Where("name", "=", "grace").Value(context.Background(), &email)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if email != nil {
+		t.Errorf("expected NULL email for grace, got %s", *email)
+	}
+}

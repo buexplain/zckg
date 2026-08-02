@@ -139,7 +139,7 @@ func (j *JoinBuilder) OrWhere(column, op string, value any) *JoinBuilder {
 	return j
 }
 
-// NewExpression 添加一个原始 SQL ON 条件
+// Raw 添加一个原始 SQL ON 条件
 func (j *JoinBuilder) Raw(sql string, bindings ...any) *JoinBuilder {
 	j.Conditions = append(j.Conditions, JoinCondition{
 		Type:     "raw",
