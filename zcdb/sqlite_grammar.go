@@ -503,9 +503,17 @@ func (g *SQLiteGrammar) compileWheres(b *Builder) string {
 				clause = g.WrapColumn(w.Column) + " NOT IN (" + subSQL + ")"
 			}
 		case WhereTypeLike:
-			clause = g.WrapColumn(w.Column) + " LIKE ?"
+			if expr, ok := w.Value.(Expression); ok {
+				clause = g.WrapColumn(w.Column) + " LIKE " + expr.Value()
+			} else {
+				clause = g.WrapColumn(w.Column) + " LIKE ?"
+			}
 		case WhereTypeNotLike:
-			clause = g.WrapColumn(w.Column) + " NOT LIKE ?"
+			if expr, ok := w.Value.(Expression); ok {
+				clause = g.WrapColumn(w.Column) + " NOT LIKE " + expr.Value()
+			} else {
+				clause = g.WrapColumn(w.Column) + " NOT LIKE ?"
+			}
 		}
 
 		if clause == "" {

@@ -3322,3 +3322,77 @@ func TestSQLiteInteg_NullSafeField_BlobType(t *testing.T) {
 		}
 	})
 }
+
+// ==================== BUG 验证 ====================
+
+// TestSQLiteInteg_CountWithGroupBy 验证 GROUP BY 下的 Count 行为。
+// 当前行为（BUG）：生成 SELECT COUNT(*) FROM orders GROUP BY user_id，
+// 返回每组一行的计数，Count 只取第一行（user_id=1 的 2），与"记录总数"语义不符。
+// 期望行为：返回分组数量（4）。
+func TestSQLiteInteg_CountWithGroupBy(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteOrdersTable(t, db)
+
+	// orders 共 6 条：user_id 1×2、2×2、3×1、4×1 → 4 个分组
+	count, err := db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count failed: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("Count with GROUP BY: expected 4 (number of groups), got %d", count)
+	}
+}
+
+// TestSQLiteInteg_WhereLikeExpression 验证 WhereLike 传入 Expression 的真实执行：
+// Expression 直接内嵌为原始 SQL（无占位符、无绑定参数），SQL 语法正确且结果正确。
+func TestSQLiteInteg_WhereLikeExpression(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// 编译层面：Expression 内嵌，无占位符、无绑定参数
+	sql, args, err := db.Builder().Table("users").WhereLike("name", NewExpression("'%a%'")).ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, `SELECT * FROM "users" WHERE "name" LIKE '%a%'`, sql)
+	assertArgs(t, nil, args)
+
+	// 执行层面：alice/charlie/diana 名字含 a → 3 行
+	count, err := db.Builder().Table("users").WhereLike("name", NewExpression("'%a%'")).Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("LIKE '%%a%%' count: expected 3, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_WhereNotLikeExpression 验证 WhereNotLike 传入 Expression 的真实执行。
+func TestSQLiteInteg_WhereNotLikeExpression(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// 执行层面：bob/eve 名字不含 a → 2 行
+	count, err := db.Builder().Table("users").WhereNotLike("name", NewExpression("'%a%'")).Count(context.Background())
+	assertNoError(t, err)
+	if count != 2 {
+		t.Fatalf("NOT LIKE '%%a%%' count: expected 2, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_CountWithGroupByHaving 验证 GROUP BY + HAVING 的 Count 真实执行：
+// 返回满足 HAVING 条件的分组数量（非第一组行数）。
+func TestSQLiteInteg_CountWithGroupByHaving(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteOrdersTable(t, db)
+
+	// 各组 SUM(amount)：user1=170、user2=280、user3=30、user4=150 → >100 的有 3 组
+	count, err := db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", 100).
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("Count with GROUP BY + HAVING: expected 3, got %d", count)
+	}
+}

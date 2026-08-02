@@ -4168,3 +4168,73 @@ func TestPgInteg_InsertBatchPtr(t *testing.T) {
 		t.Errorf("expected NULL email for grace, got %s", *email)
 	}
 }
+
+// ==================== BUG 修复验证（真实数据库执行） ====================
+
+// TestPgInteg_WhereLikeExpression 验证 PostgreSQL 上 WhereLike 传入 Expression 的真实执行：
+// Expression 直接内嵌为原始 SQL（无占位符、无绑定参数），SQL 语法正确且结果正确。
+// 注意：PG 的 LIKE 大小写敏感，测试数据全小写，'%a%' 命中 alice/charlie/diana。
+func TestPgInteg_WhereLikeExpression(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	// 编译层面：Expression 内嵌，无占位符、无绑定参数
+	sql, args, err := db.Builder().Table("users").WhereLike("name", NewExpression("'%a%'")).ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, `SELECT * FROM "users" WHERE "name" LIKE '%a%'`, sql)
+	assertArgs(t, nil, args)
+
+	// 执行层面：alice/charlie/diana 名字含 a → 3 行
+	count, err := db.Builder().Table("users").WhereLike("name", NewExpression("'%a%'")).Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("LIKE '%%a%%' count: expected 3, got %d", count)
+	}
+}
+
+// TestPgInteg_WhereNotLikeExpression 验证 PostgreSQL 上 WhereNotLike 传入 Expression 的真实执行。
+func TestPgInteg_WhereNotLikeExpression(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	// 执行层面：bob/eve 名字不含 a → 2 行
+	count, err := db.Builder().Table("users").WhereNotLike("name", NewExpression("'%a%'")).Count(context.Background())
+	assertNoError(t, err)
+	if count != 2 {
+		t.Fatalf("NOT LIKE '%%a%%' count: expected 2, got %d", count)
+	}
+}
+
+// TestPgInteg_CountWithGroupBy 验证 PostgreSQL 上 GROUP BY 的 Count 真实执行：
+// 返回分组数量（非第一组行数）。
+func TestPgInteg_CountWithGroupBy(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgOrdersTable(t, db)
+
+	// orders 共 6 条：user_id 1×2、2×2、3×1、4×1 → 4 个分组
+	count, err := db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 4 {
+		t.Fatalf("Count with GROUP BY: expected 4 (number of groups), got %d", count)
+	}
+}
+
+// TestPgInteg_CountWithGroupByHaving 验证 PostgreSQL 上 GROUP BY + HAVING 的 Count 真实执行。
+func TestPgInteg_CountWithGroupByHaving(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgOrdersTable(t, db)
+
+	// 各组 SUM(amount)：user1=170、user2=280、user3=30、user4=150 → >100 的有 3 组
+	count, err := db.Builder().
+		Table("orders").
+		GroupBy("user_id").
+		Having("SUM(amount)", ">", 100).
+		Count(context.Background())
+	assertNoError(t, err)
+	if count != 3 {
+		t.Fatalf("Count with GROUP BY + HAVING: expected 3, got %d", count)
+	}
+}

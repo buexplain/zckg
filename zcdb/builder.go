@@ -1076,6 +1076,37 @@ func (b *Builder) ToCount() (string, []any, error) {
 		return countSQL, args, nil
 	}
 
+	// GROUP BY 查询：COUNT(*) 与分组列组合时返回每组一行，
+	// 执行端只取第一行会得到错误结果，因此将查询包裹为子查询再计数，
+	// 返回分组数量。
+	if len(b.groups) > 0 {
+		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
+		origLimit, origOffset := b.limit, b.offset
+		origOrders := b.orders
+		origLock := b.lockClause
+		b.limit, b.offset = 0, 0
+		b.orders = nil
+		b.lockClause = ""
+
+		// 将列替换为常量，避免 SELECT * 与 GROUP BY 在严格模式下冲突
+		origColumns := b.columns
+		origSelectSubs := b.selectSubs
+		b.columns = []SelectColumn{{Value: "1", Raw: true}}
+		b.selectSubs = nil
+
+		subSQL := b.grammar.CompileSelect(b, b.columns)
+		args := b.collectSelectBindings()
+
+		b.limit, b.offset = origLimit, origOffset
+		b.orders = origOrders
+		b.lockClause = origLock
+		b.columns = origColumns
+		b.selectSubs = origSelectSubs
+
+		countSQL := "SELECT COUNT(*) FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t")
+		return countSQL, args, nil
+	}
+
 	// 保存原始列并设置为 COUNT(*)，清除 SELECT 子查询
 	origColumns := b.columns
 	origSelectSubs := b.selectSubs
@@ -1195,7 +1226,10 @@ func (b *Builder) collectWhereBindings() []any {
 				args = append(args, w.Sub.collectSelectBindings()...)
 			}
 		case WhereTypeLike, WhereTypeNotLike:
-			args = append(args, w.Value)
+			// Expression 已直接内嵌到 SQL，不作为绑定参数
+			if _, ok := w.Value.(Expression); !ok {
+				args = append(args, w.Value)
+			}
 		case WhereTypeNull, WhereTypeNotNull, WhereTypeColumn:
 			// 无绑定参数
 		default:
