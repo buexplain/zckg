@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // Generate 根据表信息和列定义生成 Entity 结构体、DO 结构体及两者的互转方法（ToDO/ToEntity），
@@ -44,6 +45,10 @@ func Generate(input Input) error {
 				c.StructFieldInfo.Type = "string"
 			}
 		}
+		// 类型为 time.Time 时自动引入 time 包（调用者未显式指定 Import 时）
+		if c.StructFieldInfo.Type == "time.Time" && c.StructFieldInfo.Import == "" {
+			c.StructFieldInfo.Import = "time"
+		}
 	}
 
 	// 生成 Entity 和 DO 结构体及互转方法
@@ -77,8 +82,26 @@ func Generate(input Input) error {
 	}
 
 	filePath := filepath.Join(input.OutputDir, input.TableName+".go")
-	if err := writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode); err != nil {
+	if err := writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode, neededImportsOf(input.Columns)); err != nil {
 		return fmt.Errorf("生成结构体失败: %v", err)
 	}
 	return nil
+}
+
+// neededImportsOf 收集生成代码需要的 import 路径：
+// 遍历列的 StructFieldInfo.Import（调用者显式指定或 Generate 自动填充），去重并按字典序排序。
+// Import 为空（内置类型或无需引入包的类型）时不收集。
+func neededImportsOf(columns []*Column) []string {
+	seen := make(map[string]bool)
+	var imports []string
+	for _, c := range columns {
+		path := c.StructFieldInfo.Import
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		imports = append(imports, path)
+	}
+	sort.Strings(imports)
+	return imports
 }

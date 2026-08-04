@@ -51,6 +51,7 @@ type Input struct {
 type StructFieldInfo struct {
 	Name         string // 表字段转成结构体字段的名字
 	Type         string // 表字段类型转成结构体字段的类型
+	Import       string // Type 对应的 import 路径（如 time.Time 需要 "time"），空值不引入任何包
 	JsonTagValue string //表字段转成结构体字段的json tag的值
 }
 
