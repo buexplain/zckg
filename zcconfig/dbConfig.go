@@ -24,8 +24,8 @@ package zcconfig
 //
 // testDB := zcconfig.Config("database.test_db", zcconfig.DBConfig{})
 type DBConfig struct {
-	Driver   string          // 数据库方言（"mysql"、"postgres"、"sqlite"）
-	Dialect  string          // 驱动名（"mysql"、"postgres"、"sqlite"）
+	Driver   string          // 驱动名（"mysql"、"postgres"、"sqlite"）
+	Dialect  string          // 数据库方言（"mysql"、"postgres"、"sqlite"）
 	Host     string          // 数据库服务器地址，如 "127.0.0.1" 或 "db.example.com"
 	Port     int             // 数据库服务器端口，如 MySQL 默认 3306、PostgreSQL 默认 5432
 	Username string          // 数据库登录用户名
