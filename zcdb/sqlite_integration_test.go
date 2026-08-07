@@ -1305,6 +1305,37 @@ func TestSQLiteInteg_InsertUsing(t *testing.T) {
 	}
 }
 
+// TestSQLiteInteg_InsertUsingExec 验证 InsertUsing 执行封装：INSERT ... SELECT 并返回受影响行数。
+func TestSQLiteInteg_InsertUsingExec(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// 创建归档表
+	mustExec(t, db, `CREATE TABLE users_archive (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT,
+		age INTEGER
+	)`)
+
+	// INSERT INTO users_archive (name, age) SELECT name, age FROM users WHERE status = 'active'
+	affected, err := db.Builder().
+		Table("users_archive").
+		InsertUsing(context.Background(), []string{"name", "age"}, func(sub *Builder) {
+			sub.Table("users").Select("name", "age").Where("status", "=", "active")
+		})
+	if err != nil {
+		t.Fatalf("InsertUsing error: %v", err)
+	}
+	if affected != 3 {
+		t.Errorf("expected 3 affected rows, got %d", affected)
+	}
+
+	count, _ := db.Builder().Table("users_archive").Count(context.Background())
+	if count != 3 {
+		t.Errorf("expected 3 archived users, got %d", count)
+	}
+}
+
 // TestSQLiteInteg_Union 验证 UNION 去重合并：两个查询的结果合并后自动去除重复行。
 func TestSQLiteInteg_Union(t *testing.T) {
 	db := openSQLiteTestDB(t)

@@ -377,6 +377,27 @@ func (b *Builder) InsertGetId(ctx context.Context, data any) (int64, error) {
 	return result.LastInsertId()
 }
 
+// InsertUsing 将 SELECT 子查询的结果插入目标表，返回受影响行数。
+// columns 为目标表的列名列表，callback 用于构建 SELECT 子查询。
+//
+//	affected, err := db.Builder().Table("users_archive").
+//	    InsertUsing(ctx, []string{"name", "age"}, func(sub *Builder) {
+//	        sub.Table("users").Select("name", "age").Where("status", "=", "active")
+//	    })
+func (b *Builder) InsertUsing(ctx context.Context, columns []string, callback func(*Builder)) (int64, error) {
+	sqlStr, args, err := b.ToInsertUsing(columns, callback)
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := b.dao.Exec(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected()
+}
+
 // InsertOrIgnore 插入数据（忽略冲突），返回受影响行数。
 // data 支持类型同 Insert：struct{}、*struct{}、[]struct{}、[]*struct{}。
 //

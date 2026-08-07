@@ -1362,6 +1362,35 @@ func TestPgInteg_InsertUsing(t *testing.T) {
 	}
 }
 
+// TestPgInteg_InsertUsingExec 验证 InsertUsing 执行封装：INSERT INTO ... SELECT 并返回受影响行数。
+func TestPgInteg_InsertUsingExec(t *testing.T) {
+	db := openPgTestDB(t)
+	setupPgUsersTable(t, db)
+
+	mustExec(t, db, `CREATE TABLE users_archive (
+		id   BIGSERIAL PRIMARY KEY,
+		name VARCHAR(64),
+		age  INT
+	)`)
+
+	affected, err := db.Builder().
+		Table("users_archive").
+		InsertUsing(context.Background(), []string{"name", "age"}, func(sub *Builder) {
+			sub.Table("users").Select("name", "age").Where("status", "=", "active")
+		})
+	if err != nil {
+		t.Fatalf("InsertUsing error: %v", err)
+	}
+	if affected != 3 {
+		t.Errorf("expected 3 affected rows, got %d", affected)
+	}
+
+	count, _ := db.Builder().Table("users_archive").Count(context.Background())
+	if count != 3 {
+		t.Errorf("expected 3 archived users, got %d", count)
+	}
+}
+
 // TestPgInteg_Union 验证 UNION 去重合并。
 func TestPgInteg_Union(t *testing.T) {
 	db := openPgTestDB(t)
