@@ -3,6 +3,9 @@ package zcdb
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"reflect"
+	"strings"
 )
 
 // First 查询第一条记录，扫描到 dest。
@@ -46,6 +49,172 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 	}
 
 	return ScanStructClose(rows, dest)
+}
+
+// Pluck 提取查询结果中的列值到目标容器。
+// dest 为切片指针时提取单列（第一列）：
+//
+//	var names []string
+//	err := db.Builder().Table("users").OrderBy("id", "ASC").Pluck(ctx, &names, "name")
+//
+// dest 为 map 指针时提取键值对（第一列为值、第二列为键）：
+//
+//	var m map[int64]string
+//	err := db.Builder().Table("users").Pluck(ctx, &m, "name", "id") // id => name
+//
+// map 值为结构体/结构体指针时进入键列模式（keyBy）：唯一列参数作为键列，整行数据按 db tag 扫描进结构体：
+//
+//	var m map[int64]User // id => User 整行
+//	err := db.Builder().Table("users").Pluck(ctx, &m, "id")
+//
+// NULL 值扫描为零值（与 Find 一致）；map 模式重复键后者覆盖前者，键列为 NULL 时使用零值键。
+// Pluck 会覆盖 Builder 当前的 SELECT 列（与 Laravel pluck 语义一致）。
+func (b *Builder) Pluck(ctx context.Context, dest any, columns ...string) error {
+	destValue := reflect.ValueOf(dest)
+	if destValue.Kind() != reflect.Ptr || destValue.IsNil() {
+		return ErrPluckDest
+	}
+	destValue = destValue.Elem()
+
+	switch destValue.Kind() {
+	case reflect.Slice:
+		if len(columns) != 1 {
+			return ErrPluckColumns
+		}
+	case reflect.Map:
+		// nil map 初始化，避免 SetMapIndex panic
+		if destValue.IsNil() {
+			destValue.Set(reflect.MakeMap(destValue.Type()))
+		}
+		// map 值类型为结构体/结构体指针时进入键列模式（keyBy）：
+		// 唯一列参数作为键列，整行数据按 db tag 扫描进结构体
+		valType := destValue.Type().Elem()
+		if valType.Kind() == reflect.Ptr {
+			valType = valType.Elem()
+		}
+		if valType.Kind() == reflect.Struct {
+			if len(columns) != 1 {
+				return ErrPluckColumns
+			}
+			return b.pluckKeyBy(ctx, destValue, columns[0])
+		}
+		if len(columns) != 2 {
+			return ErrPluckColumns
+		}
+	default:
+		return ErrPluckDest
+	}
+
+	// 只查询需要的列（覆盖既有 SELECT）
+	b.Select(columns...)
+	sqlStr, args, err := b.ToSelect()
+	if err != nil {
+		return err
+	}
+
+	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		if destValue.Kind() == reflect.Slice {
+			elem := reflect.New(destValue.Type().Elem()).Elem()
+			if err := rows.Scan(&nullSafeField{field: elem}); err != nil {
+				return fmt.Errorf("zcdb: pluck scan row failed: %w", err)
+			}
+			destValue.Set(reflect.Append(destValue, elem))
+			continue
+		}
+		// map 模式：第一列为值、第二列为键
+		val := reflect.New(destValue.Type().Elem()).Elem()
+		key := reflect.New(destValue.Type().Key()).Elem()
+		if err := rows.Scan(&nullSafeField{field: val}, &nullSafeField{field: key}); err != nil {
+			return fmt.Errorf("zcdb: pluck scan row failed: %w", err)
+		}
+		destValue.SetMapIndex(key, val)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// pluckKeyBy 键列模式（keyBy）：map 值为结构体/结构体指针时，columns 唯一元素作为键列，
+// 整行数据按 db tag 扫描进结构体后以键列值作为 map 键。
+// 键列若已在结构体字段中则不重复 SELECT，直接复用字段扫描值；否则追加为 SELECT 最后一列。
+func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColumn string) error {
+	valType := destMap.Type().Elem()
+	isPtr := valType.Kind() == reflect.Ptr
+	elemType := valType
+	if isPtr {
+		elemType = elemType.Elem()
+	}
+
+	info := parseStruct(elemType)
+	if info == nil || len(info.Fields) == 0 {
+		return ErrNoFields
+	}
+
+	// SELECT 列 = 结构体字段列（按字段顺序）+ 键列（若不在字段列中，追加到末尾）
+	columns := make([]string, 0, len(info.Fields)+1)
+	keyIndex := -1 // 键列在 SELECT 列中的位置
+	for i, f := range info.Fields {
+		columns = append(columns, f.Column)
+		if f.Column == keyColumn {
+			keyIndex = i
+		}
+	}
+	if keyIndex < 0 {
+		keyIndex = len(columns)
+		columns = append(columns, keyColumn)
+	}
+
+	b.Select(columns...)
+	sqlStr, args, err := b.ToSelect()
+	if err != nil {
+		return err
+	}
+
+	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	fieldInfo := getScanFieldInfo(elemType)
+	for rows.Next() {
+		elem := reflect.New(elemType).Elem()
+		values := makeScanValues(columns, fieldInfo, elem)
+		// 键列不在结构体字段中时，将其扫描目标替换为 key（在字段中时扫描后从字段取值）
+		key := reflect.New(destMap.Type().Key()).Elem()
+		keyInFields := keyIndex < len(info.Fields)
+		if !keyInFields {
+			values[keyIndex] = &nullSafeField{field: key}
+		}
+		if err := rows.Scan(values...); err != nil {
+			return fmt.Errorf("zcdb: pluck scan row failed: %w", err)
+		}
+		// 键列在结构体字段中：扫描完成后从字段取值（类型做可转换检查）
+		if keyInFields {
+			kf, ok := fieldByIndexSafe(elem, info.Fields[keyIndex].Index)
+			if ok && kf.Type().ConvertibleTo(key.Type()) {
+				key.Set(kf.Convert(key.Type()))
+			}
+		}
+		if isPtr {
+			ptr := reflect.New(elemType)
+			ptr.Elem().Set(elem)
+			destMap.SetMapIndex(key, ptr)
+		} else {
+			destMap.SetMapIndex(key, elem)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Paginate 分页查询，自动计算总数。
@@ -327,6 +496,16 @@ func (b *Builder) hasEffectiveJoin() bool {
 //
 //	err := db.Builder().Table("users").Truncate(ctx)
 func (b *Builder) Truncate(ctx context.Context) error {
+	// SQLite 方言：DELETE FROM 不会重置 AUTOINCREMENT 序列，
+	// 需额外清空 sqlite_sequence 使自增主键从头开始（对齐 Laravel 行为）；
+	// 表从未使用 AUTOINCREMENT 时 sqlite_sequence 表不存在，该错误忽略
+	if _, ok := b.grammar.(*SQLiteGrammar); ok {
+		_, err := b.dao.Exec(ctx, "DELETE FROM sqlite_sequence WHERE name = ?", b.table)
+		if err != nil && !strings.Contains(err.Error(), "no such table") {
+			return err
+		}
+	}
+
 	sqlStr, err := b.ToTruncate()
 	if err != nil {
 		return err

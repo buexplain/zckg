@@ -1,6 +1,7 @@
 package zcdb
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -301,11 +302,11 @@ func TestBug_CollectSelectBindings_SubqueryOrder(t *testing.T) {
 	// SELECT 子查询（绑定 "active"）
 	selectSub := NewBuilder(g, nil).Table("orders").Select("amount").Where("status", "=", "active")
 	// FROM 子查询（绑定 25）
-	fromSub := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
+	tableSub := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
 
 	b := NewBuilder(g, nil).
 		SelectSubquery(selectSub, "sub_amount").
-		FromSub(fromSub, "u")
+		TableSub(tableSub, "u")
 
 	sql, args, err := b.ToSelect()
 	assertNoError(t, err)
@@ -884,19 +885,65 @@ func TestBuilder_ForPage_InvalidPage(t *testing.T) {
 	}
 }
 
+// TestBuilder_TableSubOverridesTable 验证 Table 与 TableSub 互斥且"后调用者生效"：
+// 先 TableSub 再 Table 应切回普通表（清除子查询状态）；先 Table 再 TableSub 应使用子查询。
+func TestBuilder_TableSubOverridesTable(t *testing.T) {
+	g := NewMySQLGrammar()
+
+	tests := []struct {
+		name     string
+		build    func() *Builder
+		expected string
+		wantArgs int
+	}{
+		{
+			name: "TableSubAfterTableWins",
+			build: func() *Builder {
+				sub := NewBuilder(g, nil).Table("orders").Where("amount", ">", 100)
+				return NewBuilder(g, nil).Table("users").TableSub(sub, "o")
+			},
+			expected: "SELECT * FROM (SELECT * FROM `orders` WHERE `amount` > ?) AS `o`",
+			wantArgs: 1,
+		},
+		{
+			name: "TableAfterTableSubRevertsToPlainTable",
+			build: func() *Builder {
+				sub := NewBuilder(g, nil).Table("orders").Where("amount", ">", 100)
+				return NewBuilder(g, nil).TableSub(sub, "o").Table("users")
+			},
+			expected: "SELECT * FROM `users`",
+			wantArgs: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := tt.build()
+			sql, args, err := b.ToSelect()
+			assertNoError(t, err)
+			if sql != tt.expected {
+				t.Errorf("SQL 不匹配：\n期望: %s\n实际: %s", tt.expected, sql)
+			}
+			if len(args) != tt.wantArgs {
+				t.Errorf("绑定参数数量不匹配：期望 %d 个，实际 %v", tt.wantArgs, args)
+			}
+		})
+	}
+}
+
 // TestBuilder_CloneDeepCopy 验证 Clone 对各种可选字段的深拷贝（提升 Clone 覆盖率）。
 func TestBuilder_CloneDeepCopy(t *testing.T) {
 	g := NewMySQLGrammar()
 
 	// 构造包含所有可选字段的 Builder
-	fromSub := NewBuilder(g, nil).Table("sub_t")
+	tableSub := NewBuilder(g, nil).Table("sub_t")
 	selectSub := NewBuilder(g, nil).Table("orders").Select("amount").Where("status", "=", "active")
 
 	b := NewBuilder(g, nil).
 		Table("users").
 		Select("name", "age").
 		Distinct().
-		FromSub(fromSub, "f").
+		TableSub(tableSub, "f").
 		SelectSubquery(selectSub, "sub_amount").
 		Join("orders", "users.id", "=", "orders.user_id").
 		LeftJoinOn("profiles", func(jb *JoinBuilder) {
@@ -918,11 +965,11 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 
 	clone := b.Clone()
 
-	// 验证 clone 的 fromSub 是独立副本
-	clone.fromSub.Where("extra", "=", 1)
+	// 验证 clone 的 tableSub 是独立副本
+	clone.tableSub.Where("extra", "=", 1)
 	origSQL, _, _ := b.ToSelect()
 	if containsStr(origSQL, "extra") {
-		t.Error("BUG: Clone 的 fromSub 与原 Builder 共享引用")
+		t.Error("BUG: Clone 的 tableSub 与原 Builder 共享引用")
 	}
 
 	// 验证 clone 的 selectSubs 是独立副本
@@ -1476,6 +1523,188 @@ func TestBug_SelectStarNotWrapped(t *testing.T) {
 	}
 }
 
+// TestBug_JoinSub_SQL 验证 JOIN 派生表（子查询）的 SQL 生成与绑定参数顺序：
+// 子查询 IN 参数位于 ON value 参数之前、外层 WHERE 参数之前；
+// PostgreSQL 的 $N 占位符必须连续递增（子查询 $1/$2 → ON $3 → WHERE $4/$5）。
+func TestBug_JoinSub_SQL(t *testing.T) {
+	codes := []any{"A", "B"}
+	buildSub := func(g Grammar) *Builder {
+		return NewBuilder(g, nil).Table("fund_net_value").
+			Select("fund_code", "MAX(ed) AS ed").
+			WhereIn("fund_code", codes).
+			GroupBy("fund_code")
+	}
+	buildQuery := func(g Grammar) *Builder {
+		return NewBuilder(g, nil).Table("fund_net_value AS t1").
+			Select("t1.*").
+			JoinSub(buildSub(g), "t2", func(j *JoinBuilder) {
+				j.On("t1.fund_code", "=", "t2.fund_code").
+					On("t1.ed", "=", "t2.ed")
+			}).
+			WhereIn("t1.fund_code", codes)
+	}
+
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "SELECT `t1`.* FROM `fund_net_value` AS `t1` INNER JOIN (SELECT `fund_code`, MAX(ed) AS ed FROM `fund_net_value` WHERE `fund_code` IN (?, ?) GROUP BY `fund_code`) AS `t2` ON `t1`.`fund_code` = `t2`.`fund_code` AND `t1`.`ed` = `t2`.`ed` WHERE `t1`.`fund_code` IN (?, ?)"},
+		{"postgres", NewPostgresGrammar(), `SELECT "t1".* FROM "fund_net_value" AS "t1" INNER JOIN (SELECT "fund_code", MAX(ed) AS ed FROM "fund_net_value" WHERE "fund_code" IN ($1, $2) GROUP BY "fund_code") AS "t2" ON "t1"."fund_code" = "t2"."fund_code" AND "t1"."ed" = "t2"."ed" WHERE "t1"."fund_code" IN ($3, $4)`},
+		{"sqlite", NewSQLiteGrammar(), `SELECT "t1".* FROM "fund_net_value" AS "t1" INNER JOIN (SELECT "fund_code", MAX(ed) AS ed FROM "fund_net_value" WHERE "fund_code" IN (?, ?) GROUP BY "fund_code") AS "t2" ON "t1"."fund_code" = "t2"."fund_code" AND "t1"."ed" = "t2"."ed" WHERE "t1"."fund_code" IN (?, ?)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sqlStr, args, err := buildQuery(tt.grammar).ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sqlStr)
+			assertArgs(t, []any{"A", "B", "A", "B"}, args)
+		})
+	}
+}
+
+// TestBug_CrossJoinSub_SQL 验证 CrossJoinSub：CROSS JOIN 派生表（无 ON 条件），
+// FROM 子查询与 JOIN 派生表子查询的绑定参数按 SQL 文本顺序收集。
+func TestBug_CrossJoinSub_SQL(t *testing.T) {
+	codes := []any{"店A", "店B"}
+	buildSub := func(g Grammar) *Builder {
+		return NewBuilder(g, nil).Table("sales").
+			Select("store_name").
+			Distinct().
+			WhereIn("store_name", codes)
+	}
+	buildQuery := func(g Grammar) *Builder {
+		m := NewBuilder(g, nil).Table("sales").Select("month").Distinct()
+		return NewBuilder(g, nil).TableSub(m, "m").
+			Select("m.month", "s.store_name").
+			CrossJoinSub(buildSub(g), "s")
+	}
+
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "SELECT `m`.`month`, `s`.`store_name` FROM (SELECT DISTINCT `month` FROM `sales`) AS `m` CROSS JOIN (SELECT DISTINCT `store_name` FROM `sales` WHERE `store_name` IN (?, ?)) AS `s`"},
+		{"postgres", NewPostgresGrammar(), `SELECT "m"."month", "s"."store_name" FROM (SELECT DISTINCT "month" FROM "sales") AS "m" CROSS JOIN (SELECT DISTINCT "store_name" FROM "sales" WHERE "store_name" IN ($1, $2)) AS "s"`},
+		{"sqlite", NewSQLiteGrammar(), `SELECT "m"."month", "s"."store_name" FROM (SELECT DISTINCT "month" FROM "sales") AS "m" CROSS JOIN (SELECT DISTINCT "store_name" FROM "sales" WHERE "store_name" IN (?, ?)) AS "s"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sqlStr, args, err := buildQuery(tt.grammar).ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sqlStr)
+			assertArgs(t, []any{"店A", "店B"}, args)
+		})
+	}
+}
+
+// TestBug_Pluck_ArgValidation 验证 Pluck 参数校验错误路径：
+// dest 必须是非 nil 的切片/map 指针，且列数与目标容器匹配（切片 1 列、map 2 列）。
+func TestBug_Pluck_ArgValidation(t *testing.T) {
+	b := NewBuilder(NewSQLiteGrammar(), nil)
+	ctx := context.Background()
+
+	// 非指针 dest
+	var names []string
+	if err := b.Pluck(ctx, names, "name"); !errors.Is(err, ErrPluckDest) {
+		t.Errorf("non-pointer dest: expected ErrPluckDest, got %v", err)
+	}
+	// nil 指针 dest
+	var p *[]string
+	if err := b.Pluck(ctx, p, "name"); !errors.Is(err, ErrPluckDest) {
+		t.Errorf("nil pointer dest: expected ErrPluckDest, got %v", err)
+	}
+	// 结构体指针 dest
+	var s struct{ Name string }
+	if err := b.Pluck(ctx, &s, "name"); !errors.Is(err, ErrPluckDest) {
+		t.Errorf("struct dest: expected ErrPluckDest, got %v", err)
+	}
+	// 切片 dest + 2 列
+	if err := b.Pluck(ctx, &names, "name", "id"); !errors.Is(err, ErrPluckColumns) {
+		t.Errorf("slice dest with 2 columns: expected ErrPluckColumns, got %v", err)
+	}
+	// 切片 dest + 0 列
+	if err := b.Pluck(ctx, &names); !errors.Is(err, ErrPluckColumns) {
+		t.Errorf("slice dest with 0 columns: expected ErrPluckColumns, got %v", err)
+	}
+	// map dest + 1 列
+	var m map[int64]string
+	if err := b.Pluck(ctx, &m, "name"); !errors.Is(err, ErrPluckColumns) {
+		t.Errorf("map dest with 1 column: expected ErrPluckColumns, got %v", err)
+	}
+
+	// keyBy 模式：map 值结构体 + 0 列
+	type User struct {
+		Name string `db:"name"`
+		Id   int    `db:"id"`
+	}
+	var mk map[int64]User
+	if err := b.Pluck(ctx, &mk); !errors.Is(err, ErrPluckColumns) {
+		t.Errorf("keyBy dest with 0 columns: expected ErrPluckColumns, got %v", err)
+	}
+	// keyBy 模式：map 值结构体 + 2 列
+	if err := b.Pluck(ctx, &mk, "id", "name"); !errors.Is(err, ErrPluckColumns) {
+		t.Errorf("keyBy dest with 2 columns: expected ErrPluckColumns, got %v", err)
+	}
+	// map 值类型非结构体（如嵌套 map）走标量键值对模式：列数仍要求 2 列
+	var mn map[int64]map[string]int
+	if err := b.Pluck(ctx, &mn, "a"); !errors.Is(err, ErrPluckColumns) {
+		t.Errorf("nested map value dest with 1 column: expected ErrPluckColumns, got %v", err)
+	}
+	// keyBy 模式：结构体无导出字段
+	var me map[int64]struct{}
+	if err := b.Pluck(ctx, &me, "id"); !errors.Is(err, ErrNoFields) {
+		t.Errorf("keyBy dest with empty struct: expected ErrNoFields, got %v", err)
+	}
+}
+
+// TestBug_JoinSub_CloneIsolation 验证 Clone 对 JOIN 派生表子查询做深拷贝：
+// 修改克隆体的子查询不影响原 Builder 的 SQL 生成。
+func TestBug_JoinSub_CloneIsolation(t *testing.T) {
+	sub := NewBuilder(NewMySQLGrammar(), nil).Table("fund_net_value").
+		Select("fund_code", "MAX(ed) AS ed").
+		GroupBy("fund_code")
+
+	b := NewBuilder(NewMySQLGrammar(), nil).Table("fund_net_value AS t1").
+		Select("t1.*").
+		JoinSub(sub, "t2", func(j *JoinBuilder) {
+			j.On("t1.fund_code", "=", "t2.fund_code")
+		})
+	origSQL, _, err := b.ToSelect()
+	assertNoError(t, err)
+
+	clone := b.Clone()
+	// 修改克隆体的子查询：追加 WHERE 条件
+	clone.joins[0].Sub.Where("fund_code", "=", "X")
+
+	// 原 Builder 不应受影响
+	afterSQL, afterArgs, err := b.ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, origSQL, afterSQL)
+	for _, a := range afterArgs {
+		if a == "X" {
+			t.Errorf("original builder args should not contain X, got %v", afterArgs)
+		}
+	}
+
+	// 克隆体 SQL 应包含新增条件（值为绑定参数，出现在 args 中）
+	cloneSQL, cloneArgs, err := clone.ToSelect()
+	assertNoError(t, err)
+	if !strings.Contains(cloneSQL, "`fund_code` = ?") {
+		t.Errorf("clone SQL should contain new where condition, got: %s", cloneSQL)
+	}
+	foundX := false
+	for _, a := range cloneArgs {
+		if a == "X" {
+			foundX = true
+		}
+	}
+	if !foundX {
+		t.Errorf("clone args should contain X, got %v", cloneArgs)
+	}
+}
+
 // ==================== 测试辅助函数 ====================
 
 func assertNoError(t *testing.T, err error) {
@@ -1741,5 +1970,52 @@ func TestSelectRaw_ClonePreservesRawFlag(t *testing.T) {
 	clone.columns[1] = SelectColumn{Value: "2", Raw: true}
 	if b.columns[1].Value != "1" {
 		t.Error("original should not be affected by clone modification")
+	}
+}
+
+// TestPostgresGrammar_RawPlaceholderEscape 验证 PG 方言原始 SQL 占位符处理：
+// ?? 转义为字面 ?（jsonb 键存在操作符）、Expression 内联不占编号、普通绑定顺序正确。
+func TestPostgresGrammar_RawPlaceholderEscape(t *testing.T) {
+	g := &PostgresGrammar{}
+
+	tests := []struct {
+		name     string
+		builder  *Builder
+		expected string
+		args     []any
+	}{
+		{
+			name:     "DoubleQuestionMarkEscapesToLiteral",
+			builder:  NewBuilder(g, nil).Table("users").WhereRaw(`"options" ?? ?`, "foo"),
+			expected: `SELECT * FROM "users" WHERE "options" ? $1`,
+			args:     []any{"foo"},
+		},
+		{
+			name:     "DoubleQuestionMarkWithoutBinding",
+			builder:  NewBuilder(g, nil).Table("users").WhereRaw(`"options" ?? 'foo'`),
+			expected: `SELECT * FROM "users" WHERE "options" ? 'foo'`,
+			args:     []any{},
+		},
+		{
+			name:     "ExpressionInlinedNotConsumingParam",
+			builder:  NewBuilder(g, nil).Table("users").WhereRaw("age > ? AND age < ?", 20, NewExpression("40")),
+			expected: `SELECT * FROM "users" WHERE age > $1 AND age < 40`,
+			args:     []any{20},
+		},
+		{
+			name:     "MixedLiteralOperatorAndBindings",
+			builder:  NewBuilder(g, nil).Table("users").WhereRaw("\"a\" ?? ? AND \"b\" = ?", "k", 1),
+			expected: `SELECT * FROM "users" WHERE "a" ? $1 AND "b" = $2`,
+			args:     []any{"k", 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args, err := tt.builder.ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+			assertArgs(t, tt.args, args)
+		})
 	}
 }

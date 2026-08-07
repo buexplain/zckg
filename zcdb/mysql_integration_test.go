@@ -56,7 +56,7 @@ func dropMySQLTables(t *testing.T, db *DBDao) {
 	t.Helper()
 	tables := []string{"users_archive", "profiles", "orders", "users",
 		"numeric_test", "datetime_test", "string_test", "binary_test", "bool_test",
-		"json_conv_test"}
+		"json_conv_test", "articles", "bit_test"}
 	for _, table := range tables {
 		_, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS `"+table+"`")
 	}
@@ -965,8 +965,8 @@ func TestMySQLInteg_WhereNotExists(t *testing.T) {
 	}
 }
 
-// TestMySQLInteg_FromSub 验证 FROM 子查询（派生表）。
-func TestMySQLInteg_FromSub(t *testing.T) {
+// TestMySQLInteg_TableSub 验证 FROM 子查询（派生表）。
+func TestMySQLInteg_TableSub(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
@@ -976,7 +976,7 @@ func TestMySQLInteg_FromSub(t *testing.T) {
 	}
 	var rows []row
 	err := db.Builder().
-		FromSub(sub, "sub").
+		TableSub(sub, "sub").
 		Select("name").
 		Where("age", ">", 28).
 		OrderBy("age", "ASC").
@@ -2176,9 +2176,9 @@ func TestMySQLInteg_Bug_UpdateWithJoinValueCondition(t *testing.T) {
 	}
 }
 
-// TestMySQLInteg_Bug_SelectSubFromSubBindingOrder 验证 SELECT 子查询与 FROM 子查询同时含绑定参数时，
+// TestMySQLInteg_Bug_SelectSubTableSubBindingOrder 验证 SELECT 子查询与 FROM 子查询同时含绑定参数时，
 // 收集顺序与 SQL 占位符顺序一致（SELECT 子查询在前，FROM 子查询在后）。
-func TestMySQLInteg_Bug_SelectSubFromSubBindingOrder(t *testing.T) {
+func TestMySQLInteg_Bug_SelectSubTableSubBindingOrder(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
@@ -2186,7 +2186,7 @@ func TestMySQLInteg_Bug_SelectSubFromSubBindingOrder(t *testing.T) {
 	// SELECT 子查询：统计 amount > 100 的订单数（标量，绑定 100），结果为 3 (120,200,150)
 	scalarSub := db.Builder().Table("orders").SelectRaw("COUNT(*)").Where("amount", ">", 100)
 	// FROM 子查询：age > 25 的用户（绑定 25），结果为 3 人 (bob,charlie,diana)
-	fromSub := db.Builder().Table("users").Select("name").Where("age", ">", 25)
+	tableSub := db.Builder().Table("users").Select("name").Where("age", ">", 25)
 
 	type row struct {
 		Name     string `db:"name"`
@@ -2196,7 +2196,7 @@ func TestMySQLInteg_Bug_SelectSubFromSubBindingOrder(t *testing.T) {
 	err := db.Builder().
 		Select("name").
 		SelectSubquery(scalarSub, "big_count").
-		FromSub(fromSub, "t").
+		TableSub(tableSub, "t").
 		Find(context.Background(), &rows)
 	if err != nil {
 		t.Fatalf("Find error: %v", err)
@@ -3181,7 +3181,7 @@ func TestMySQLInteg_DeleteEmptyTable(t *testing.T) {
 
 // ==================== 复杂SQL能力验证 ====================
 
-// TestMySQLInteg_Complex_FromSubJoinGroupHaving 验证 FROM子查询 + JOIN + GROUP BY + HAVING 组合。
+// TestMySQLInteg_Complex_TableSubJoinGroupHaving 验证 FROM子查询 + JOIN + GROUP BY + HAVING 组合。
 // SQL: SELECT users.name, t.order_count, t.total_amount
 //
 //	FROM (SELECT user_id, COUNT(*) AS order_count, SUM(amount) AS total_amount
@@ -3190,7 +3190,7 @@ func TestMySQLInteg_DeleteEmptyTable(t *testing.T) {
 //	ORDER BY t.total_amount DESC
 //
 // 预期：bob(2单,280), alice(2单,170)
-func TestMySQLInteg_Complex_FromSubJoinGroupHaving(t *testing.T) {
+func TestMySQLInteg_Complex_TableSubJoinGroupHaving(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 	setupMySQLOrdersTable(t, db)
@@ -3210,7 +3210,7 @@ func TestMySQLInteg_Complex_FromSubJoinGroupHaving(t *testing.T) {
 	var rows []row
 	err := db.Builder().
 		Select("users.name", "t.order_count", "t.total_amount").
-		FromSub(sub, "t").
+		TableSub(sub, "t").
 		JoinOn("users", func(j *JoinBuilder) {
 			j.On("t.user_id", "=", "users.id")
 		}).
@@ -4451,5 +4451,1853 @@ func TestMySQLInteg_CountWithDistinct(t *testing.T) {
 	assertNoError(t, err)
 	if count != 3 {
 		t.Fatalf("Distinct Count: expected 3 distinct values, got %d", count)
+	}
+}
+
+// TestMySQLInteg_GroupLatestPerFund 验证「分组取最新」：JOIN 派生表取每只基金 MAX(ed) 的完整记录。
+// 等价 SQL：
+//
+//	SELECT t1.* FROM fund_net_value AS t1
+//	  INNER JOIN (SELECT fund_code, MAX(ed) AS ed FROM fund_net_value
+//	    WHERE fund_code IN (?, ?) GROUP BY fund_code) AS t2
+//	  ON t1.fund_code = t2.fund_code AND t1.ed = t2.ed
+//	  WHERE t1.fund_code IN (?, ?)
+//
+// 预期：A → 2024-03-01/1.50，B → 2024-02-01/2.30；C 不在查询范围不返回。
+func TestMySQLInteg_GroupLatestPerFund(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS fund_net_value")
+	mustExec(t, db, `CREATE TABLE fund_net_value (
+		id        INT AUTO_INCREMENT PRIMARY KEY,
+		fund_code VARCHAR(20) NOT NULL,
+		ed        VARCHAR(10) NOT NULL,
+		net_value DOUBLE NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO fund_net_value (fund_code, ed, net_value) VALUES
+		('A', '2024-01-01', 1.00),
+		('A', '2024-02-01', 1.20),
+		('A', '2024-03-01', 1.50),
+		('B', '2024-01-01', 2.00),
+		('B', '2024-02-01', 2.30),
+		('C', '2024-01-01', 3.00)`)
+
+	codes := []any{"A", "B"}
+	sub := db.Builder().Table("fund_net_value").
+		Select("fund_code", "MAX(ed) AS ed").
+		WhereIn("fund_code", codes).
+		GroupBy("fund_code")
+
+	type row struct {
+		FundCode string  `db:"fund_code"`
+		Ed       string  `db:"ed"`
+		NetValue float64 `db:"net_value"`
+	}
+	var rows []row
+	err := db.Builder().Table("fund_net_value AS t1").
+		Select("t1.*").
+		JoinSub(sub, "t2", func(j *JoinBuilder) {
+			j.On("t1.fund_code", "=", "t2.fund_code").
+				On("t1.ed", "=", "t2.ed")
+		}).
+		WhereIn("t1.fund_code", codes).
+		OrderBy("t1.fund_code", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 latest rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].FundCode != "A" || rows[0].Ed != "2024-03-01" || rows[0].NetValue != 1.50 {
+		t.Errorf("row[0]: expected A/2024-03-01/1.50, got %+v", rows[0])
+	}
+	if rows[1].FundCode != "B" || rows[1].Ed != "2024-02-01" || rows[1].NetValue != 2.30 {
+		t.Errorf("row[1]: expected B/2024-02-01/2.30, got %+v", rows[1])
+	}
+}
+
+// TestMySQLInteg_GroupLatestWindow 验证「分组取最新」窗口函数写法：
+// ROW_NUMBER() OVER (PARTITION BY fund_code ORDER BY ed DESC) 取每组最新一条，结果与 JoinSub 版一致。
+// 等价 SQL：
+//
+//	SELECT x.fund_code, x.ed, x.net_value
+//	FROM (
+//	  SELECT fund_code, ed, net_value,
+//	    ROW_NUMBER() OVER (PARTITION BY fund_code ORDER BY ed DESC) AS rn
+//	  FROM fund_net_value
+//	) AS x
+//	WHERE x.fund_code IN (?, ?) AND x.rn = 1
+//
+// 预期：A → 2024-03-01/1.50，B → 2024-02-01/2.30；C 不在查询范围不返回。
+func TestMySQLInteg_GroupLatestWindow(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS fund_net_value")
+	mustExec(t, db, `CREATE TABLE fund_net_value (
+		id        INT AUTO_INCREMENT PRIMARY KEY,
+		fund_code VARCHAR(20) NOT NULL,
+		ed        VARCHAR(10) NOT NULL,
+		net_value DOUBLE NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO fund_net_value (fund_code, ed, net_value) VALUES
+		('A', '2024-01-01', 1.00),
+		('A', '2024-02-01', 1.20),
+		('A', '2024-03-01', 1.50),
+		('B', '2024-01-01', 2.00),
+		('B', '2024-02-01', 2.30),
+		('C', '2024-01-01', 3.00)`)
+
+	codes := []any{"A", "B"}
+	sub := db.Builder().Table("fund_net_value").
+		Select("fund_code", "ed", "net_value",
+			"ROW_NUMBER() OVER (PARTITION BY fund_code ORDER BY ed DESC) AS rn")
+
+	type row struct {
+		FundCode string  `db:"fund_code"`
+		Ed       string  `db:"ed"`
+		NetValue float64 `db:"net_value"`
+	}
+	var rows []row
+	err := db.Builder().TableSub(sub, "x").
+		Select("x.fund_code", "x.ed", "x.net_value").
+		WhereIn("x.fund_code", codes).
+		Where("x.rn", "=", 1).
+		OrderBy("x.fund_code", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 latest rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].FundCode != "A" || rows[0].Ed != "2024-03-01" || rows[0].NetValue != 1.50 {
+		t.Errorf("row[0]: expected A/2024-03-01/1.50, got %+v", rows[0])
+	}
+	if rows[1].FundCode != "B" || rows[1].Ed != "2024-02-01" || rows[1].NetValue != 2.30 {
+		t.Errorf("row[1]: expected B/2024-02-01/2.30, got %+v", rows[1])
+	}
+}
+
+// TestMySQLInteg_JoinSub_LeftJoin 验证 LeftJoinSub：主表 LEFT JOIN 聚合派生表，
+// 未匹配的基金行保留且派生表列为 NULL（扫描为零值）。
+// 等价 SQL：
+//
+//	SELECT f.fund_code, f.name, t2.ed, t2.cnt
+//	FROM funds AS f
+//	  LEFT JOIN (SELECT fund_code, MAX(ed) AS ed, COUNT(*) AS cnt
+//	    FROM fund_net_value GROUP BY fund_code) AS t2
+//	  ON f.fund_code = t2.fund_code
+//
+// 预期：A/基金A/2024-03-01/3，B/基金B/2024-02-01/2，D/基金D/""/0（D 无净值记录，t2 列为 NULL）。
+func TestMySQLInteg_JoinSub_LeftJoin(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS funds")
+	mustExec(t, db, "DROP TABLE IF EXISTS fund_net_value")
+	mustExec(t, db, `CREATE TABLE funds (
+		fund_code VARCHAR(20) PRIMARY KEY,
+		name      VARCHAR(32) NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO funds (fund_code, name) VALUES
+		('A', '基金A'), ('B', '基金B'), ('D', '基金D')`)
+	mustExec(t, db, `CREATE TABLE fund_net_value (
+		id        INT AUTO_INCREMENT PRIMARY KEY,
+		fund_code VARCHAR(20) NOT NULL,
+		ed        VARCHAR(10) NOT NULL,
+		net_value DOUBLE NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO fund_net_value (fund_code, ed, net_value) VALUES
+		('A', '2024-01-01', 1.00),
+		('A', '2024-02-01', 1.20),
+		('A', '2024-03-01', 1.50),
+		('B', '2024-01-01', 2.00),
+		('B', '2024-02-01', 2.30),
+		('C', '2024-01-01', 3.00)`)
+
+	sub := db.Builder().Table("fund_net_value").
+		Select("fund_code", "MAX(ed) AS ed", "COUNT(*) AS cnt").
+		GroupBy("fund_code")
+
+	type row struct {
+		FundCode string `db:"fund_code"`
+		Name     string `db:"name"`
+		Ed       string `db:"ed"`
+		Cnt      int    `db:"cnt"`
+	}
+	var rows []row
+	err := db.Builder().Table("funds AS f").
+		Select("f.fund_code", "f.name", "t2.ed", "t2.cnt").
+		LeftJoinSub(sub, "t2", func(j *JoinBuilder) {
+			j.On("f.fund_code", "=", "t2.fund_code")
+		}).
+		OrderBy("f.fund_code", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].FundCode != "A" || rows[0].Name != "基金A" || rows[0].Ed != "2024-03-01" || rows[0].Cnt != 3 {
+		t.Errorf("row[0]: expected A/基金A/2024-03-01/3, got %+v", rows[0])
+	}
+	if rows[1].FundCode != "B" || rows[1].Name != "基金B" || rows[1].Ed != "2024-02-01" || rows[1].Cnt != 2 {
+		t.Errorf("row[1]: expected B/基金B/2024-02-01/2, got %+v", rows[1])
+	}
+	if rows[2].FundCode != "D" || rows[2].Name != "基金D" || rows[2].Ed != "" || rows[2].Cnt != 0 {
+		t.Errorf("row[2]: expected D/基金D//0 (NULL scanned to zero value), got %+v", rows[2])
+	}
+}
+
+// TestMySQLInteg_JoinSub_RightJoin 验证 RightJoinSub：聚合派生表 RIGHT JOIN 主表，
+// 右侧（funds）全保留，与 LeftJoin 用例镜像。
+// 等价 SQL：
+//
+//	SELECT f.fund_code, t2.ed
+//	FROM (SELECT fund_code, MAX(ed) AS ed
+//	  FROM fund_net_value GROUP BY fund_code) AS t2
+//	  RIGHT JOIN funds AS f ON t2.fund_code = f.fund_code
+//
+// 预期：A/2024-03-01，B/2024-02-01，D/""（D 无匹配，t2.ed 为 NULL）。
+func TestMySQLInteg_JoinSub_RightJoin(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS funds")
+	mustExec(t, db, "DROP TABLE IF EXISTS fund_net_value")
+	mustExec(t, db, `CREATE TABLE funds (
+		fund_code VARCHAR(20) PRIMARY KEY,
+		name      VARCHAR(32) NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO funds (fund_code, name) VALUES
+		('A', '基金A'), ('B', '基金B'), ('D', '基金D')`)
+	mustExec(t, db, `CREATE TABLE fund_net_value (
+		id        INT AUTO_INCREMENT PRIMARY KEY,
+		fund_code VARCHAR(20) NOT NULL,
+		ed        VARCHAR(10) NOT NULL,
+		net_value DOUBLE NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO fund_net_value (fund_code, ed, net_value) VALUES
+		('A', '2024-01-01', 1.00),
+		('A', '2024-02-01', 1.20),
+		('A', '2024-03-01', 1.50),
+		('B', '2024-01-01', 2.00),
+		('B', '2024-02-01', 2.30),
+		('C', '2024-01-01', 3.00)`)
+
+	sub := db.Builder().Table("fund_net_value").
+		Select("fund_code", "MAX(ed) AS ed").
+		GroupBy("fund_code")
+
+	type row struct {
+		FundCode string `db:"fund_code"`
+		Ed       string `db:"ed"`
+	}
+	var rows []row
+	err := db.Builder().TableSub(sub, "t2").
+		Select("f.fund_code", "t2.ed").
+		RightJoinSub(db.Builder().Table("funds"), "f", func(j *JoinBuilder) {
+			j.On("t2.fund_code", "=", "f.fund_code")
+		}).
+		OrderBy("f.fund_code", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].FundCode != "A" || rows[0].Ed != "2024-03-01" {
+		t.Errorf("row[0]: expected A/2024-03-01, got %+v", rows[0])
+	}
+	if rows[1].FundCode != "B" || rows[1].Ed != "2024-02-01" {
+		t.Errorf("row[1]: expected B/2024-02-01, got %+v", rows[1])
+	}
+	if rows[2].FundCode != "D" || rows[2].Ed != "" {
+		t.Errorf("row[2]: expected D/\"\" (NULL scanned to zero value), got %+v", rows[2])
+	}
+}
+
+// TestMySQLInteg_JoinSub_MultiSub 验证同一查询串联两个 JoinSub（派生表）：
+// 子查询绑定（WhereIn + HAVING 值）、ON 值绑定（j.Where）、主查询绑定的收集顺序与 SQL 文本一致。
+// 等价 SQL：
+//
+//	SELECT t1.fund_code, t1.net_value, t3.cnt
+//	FROM fund_net_value AS t1
+//	  INNER JOIN (SELECT fund_code, MAX(ed) AS ed FROM fund_net_value
+//	    WHERE fund_code IN (?, ?) GROUP BY fund_code) AS t2
+//	  ON t1.fund_code = t2.fund_code AND t1.ed = t2.ed
+//	  INNER JOIN (SELECT fund_code, COUNT(*) AS cnt FROM fund_net_value
+//	    GROUP BY fund_code HAVING COUNT(*) >= ?) AS t3
+//	  ON t1.fund_code = t3.fund_code AND t3.cnt > ?
+//	WHERE t1.fund_code IN (?, ?)
+//
+// 绑定顺序：t2 子查询 IN → t3 子查询 HAVING → ON 值 → 主查询 WHERE。
+// 预期：A/1.50/3，B/2.30/2；C 被子查询 HAVING 过滤。
+func TestMySQLInteg_JoinSub_MultiSub(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS fund_net_value")
+	mustExec(t, db, `CREATE TABLE fund_net_value (
+		id        INT AUTO_INCREMENT PRIMARY KEY,
+		fund_code VARCHAR(20) NOT NULL,
+		ed        VARCHAR(10) NOT NULL,
+		net_value DOUBLE NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO fund_net_value (fund_code, ed, net_value) VALUES
+		('A', '2024-01-01', 1.00),
+		('A', '2024-02-01', 1.20),
+		('A', '2024-03-01', 1.50),
+		('B', '2024-01-01', 2.00),
+		('B', '2024-02-01', 2.30),
+		('C', '2024-01-01', 3.00)`)
+
+	codes := []any{"A", "B"}
+	t2 := db.Builder().Table("fund_net_value").
+		Select("fund_code", "MAX(ed) AS ed").
+		WhereIn("fund_code", codes).
+		GroupBy("fund_code")
+	t3 := db.Builder().Table("fund_net_value").
+		Select("fund_code", "COUNT(*) AS cnt").
+		GroupBy("fund_code").
+		Having("COUNT(*)", ">=", 2)
+
+	type row struct {
+		FundCode string  `db:"fund_code"`
+		NetValue float64 `db:"net_value"`
+		Cnt      int     `db:"cnt"`
+	}
+	var rows []row
+	err := db.Builder().Table("fund_net_value AS t1").
+		Select("t1.fund_code", "t1.net_value", "t3.cnt").
+		JoinSub(t2, "t2", func(j *JoinBuilder) {
+			j.On("t1.fund_code", "=", "t2.fund_code").
+				On("t1.ed", "=", "t2.ed")
+		}).
+		JoinSub(t3, "t3", func(j *JoinBuilder) {
+			j.On("t1.fund_code", "=", "t3.fund_code").
+				Where("t3.cnt", ">", 0)
+		}).
+		WhereIn("t1.fund_code", codes).
+		OrderBy("t1.fund_code", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %v", len(rows), rows)
+	}
+	if rows[0].FundCode != "A" || rows[0].NetValue != 1.50 || rows[0].Cnt != 3 {
+		t.Errorf("row[0]: expected A/1.50/3, got %+v", rows[0])
+	}
+	if rows[1].FundCode != "B" || rows[1].NetValue != 2.30 || rows[1].Cnt != 2 {
+		t.Errorf("row[1]: expected B/2.30/2, got %+v", rows[1])
+	}
+}
+
+// TestMySQLInteg_CrossJoinSub 验证 CrossJoinSub：CROSS JOIN 派生表生成「门店 × 月份」组合矩阵，
+// 再 LEFT JOIN 事实表补零（无销售记录的组合 amount=0）。
+// 等价 SQL：
+//
+//	SELECT m.month, s.store_name, COALESCE(sales.amount, 0) AS amount
+//	FROM (SELECT DISTINCT month FROM sales) AS m
+//	  CROSS JOIN (SELECT DISTINCT store_name FROM sales
+//	    WHERE store_name IN (?, ?)) AS s
+//	  LEFT JOIN sales ON sales.month = m.month AND sales.store_name = s.store_name
+//
+// 预期 6 行矩阵：店A/店B × 2024-01/02/03，其中 2024-03 店A、2024-02/03 店B 无销售记录补 0。
+func TestMySQLInteg_CrossJoinSub(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS sales")
+	mustExec(t, db, `CREATE TABLE sales (
+		id         INT AUTO_INCREMENT PRIMARY KEY,
+		store_name VARCHAR(20) NOT NULL,
+		month      VARCHAR(7) NOT NULL,
+		amount     DOUBLE NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO sales (store_name, month, amount) VALUES
+		('店A', '2024-01', 100.00),
+		('店A', '2024-02', 150.00),
+		('店B', '2024-01', 200.00),
+		('店C', '2024-01', 50.00),
+		('店C', '2024-03', 300.00)`)
+
+	codes := []any{"店A", "店B"}
+	m := db.Builder().Table("sales").Select("month").Distinct()
+	s := db.Builder().Table("sales").
+		Select("store_name").
+		Distinct().
+		WhereIn("store_name", codes)
+
+	type row struct {
+		Month  string  `db:"month"`
+		Store  string  `db:"store_name"`
+		Amount float64 `db:"amount"`
+	}
+	var rows []row
+	err := db.Builder().TableSub(m, "m").
+		Select("m.month", "s.store_name", "COALESCE(sales.amount, 0) AS amount").
+		CrossJoinSub(s, "s").
+		LeftJoinOn("sales", func(j *JoinBuilder) {
+			j.On("sales.month", "=", "m.month").
+				On("sales.store_name", "=", "s.store_name")
+		}).
+		OrderBy("m.month", "ASC").
+		OrderBy("s.store_name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 6 {
+		t.Fatalf("expected 6 matrix rows, got %d: %v", len(rows), rows)
+	}
+	expected := []row{
+		{Month: "2024-01", Store: "店A", Amount: 100},
+		{Month: "2024-01", Store: "店B", Amount: 200},
+		{Month: "2024-02", Store: "店A", Amount: 150},
+		{Month: "2024-02", Store: "店B", Amount: 0},
+		{Month: "2024-03", Store: "店A", Amount: 0},
+		{Month: "2024-03", Store: "店B", Amount: 0},
+	}
+	for i, exp := range expected {
+		if rows[i] != exp {
+			t.Errorf("row[%d]: expected %+v, got %+v", i, exp, rows[i])
+		}
+	}
+}
+
+// TestMySQLInteg_Pluck 验证 Pluck：切片目标提取单列值列表，map 目标提取「值=>键」映射（与 Laravel pluck 一致），
+// NULL 值扫描为零值（与 Find 一致），查询链（WHERE/ORDER BY）完整生效。
+func TestMySQLInteg_Pluck(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS users")
+	mustExec(t, db, `CREATE TABLE users (
+		id   INT AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(50)
+	)`)
+	mustExec(t, db, `INSERT INTO users (name) VALUES
+		('John'),
+		('Jane'),
+		(NULL),
+		('Bob')`)
+
+	// 切片模式：单列值列表（含 NULL 行扫描为零值 ""）
+	var names []string
+	err := db.Builder().Table("users").
+		OrderBy("id", "ASC").
+		Pluck(context.Background(), &names, "name")
+	if err != nil {
+		t.Fatalf("pluck slice error: %v", err)
+	}
+	expected := []string{"John", "Jane", "", "Bob"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d: %v", len(expected), len(names), names)
+	}
+	for i, exp := range expected {
+		if names[i] != exp {
+			t.Errorf("names[%d]: expected %q, got %q", i, exp, names[i])
+		}
+	}
+
+	// map 模式：值=>键 映射（第一列为值、第二列为键，nil map 自动初始化）
+	var m map[int64]string
+	err = db.Builder().Table("users").
+		OrderBy("id", "ASC").
+		Pluck(context.Background(), &m, "name", "id")
+	if err != nil {
+		t.Fatalf("pluck map error: %v", err)
+	}
+	expectMap := map[int64]string{1: "John", 2: "Jane", 3: "", 4: "Bob"}
+	if len(m) != len(expectMap) {
+		t.Fatalf("expected %d entries, got %d: %v", len(expectMap), len(m), m)
+	}
+	for id, exp := range expectMap {
+		if m[id] != exp {
+			t.Errorf("m[%d]: expected %q, got %q", id, exp, m[id])
+		}
+	}
+
+	// 查询链生效：WHERE 过滤 NULL 行，ORDER BY DESC 倒序
+	names = nil
+	err = db.Builder().Table("users").
+		Where("name", "!=", "").
+		OrderBy("id", "DESC").
+		Pluck(context.Background(), &names, "name")
+	if err != nil {
+		t.Fatalf("pluck filtered error: %v", err)
+	}
+	expectedFiltered := []string{"Bob", "Jane", "John"}
+	if len(names) != len(expectedFiltered) {
+		t.Fatalf("expected %d names, got %d: %v", len(expectedFiltered), len(names), names)
+	}
+	for i, exp := range expectedFiltered {
+		if names[i] != exp {
+			t.Errorf("names[%d]: expected %q, got %q", i, exp, names[i])
+		}
+	}
+}
+
+// TestMySQLInteg_PluckKeyBy 验证 Pluck 键列模式（keyBy）：map 值为结构体/结构体指针时，
+// 唯一列参数作为键列，整行数据按 db tag 扫描进结构体（NULL 扫零值，与 Find 一致）。
+func TestMySQLInteg_PluckKeyBy(t *testing.T) {
+	db := openMySQLTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS users")
+	mustExec(t, db, `CREATE TABLE users (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		name     VARCHAR(50),
+		nickname VARCHAR(50)
+	)`)
+	mustExec(t, db, `INSERT INTO users (name, nickname) VALUES
+		('John', 'JJ'),
+		('Jane', NULL),
+		(NULL, 'NN'),
+		('Bob', 'BB')`)
+
+	// 场景 A：map 值为结构体，键列在结构体字段中（id 字段同时填充并作键）
+	type User struct {
+		Id       int
+		Name     string
+		Nickname string
+	}
+	var m map[int64]User
+	err := db.Builder().Table("users").
+		OrderBy("id", "ASC").
+		Pluck(context.Background(), &m, "id")
+	if err != nil {
+		t.Fatalf("pluck keyBy struct error: %v", err)
+	}
+	if len(m) != 4 {
+		t.Fatalf("expected 4 entries, got %d: %v", len(m), m)
+	}
+	expected := map[int64]User{
+		1: {Id: 1, Name: "John", Nickname: "JJ"},
+		2: {Id: 2, Name: "Jane", Nickname: ""},
+		3: {Id: 3, Name: "", Nickname: "NN"},
+		4: {Id: 4, Name: "Bob", Nickname: "BB"},
+	}
+	for id, exp := range expected {
+		if m[id] != exp {
+			t.Errorf("m[%d]: expected %+v, got %+v", id, exp, m[id])
+		}
+	}
+
+	// 场景 B：map 值为结构体指针，每行新建实例
+	var mp map[int64]*User
+	err = db.Builder().Table("users").
+		OrderBy("id", "ASC").
+		Pluck(context.Background(), &mp, "id")
+	if err != nil {
+		t.Fatalf("pluck keyBy ptr error: %v", err)
+	}
+	if len(mp) != 4 {
+		t.Fatalf("expected 4 ptr entries, got %d", len(mp))
+	}
+	for id, exp := range expected {
+		if mp[id] == nil {
+			t.Errorf("mp[%d]: expected non-nil pointer", id)
+			continue
+		}
+		if *mp[id] != exp {
+			t.Errorf("mp[%d]: expected %+v, got %+v", id, exp, *mp[id])
+		}
+	}
+
+	// 场景 C：键列不在结构体字段中，SELECT 自动追加键列
+	type userBrief struct {
+		Name     string
+		Nickname string
+	}
+	var kb map[int64]userBrief
+	err = db.Builder().Table("users").
+		OrderBy("id", "ASC").
+		Pluck(context.Background(), &kb, "id")
+	if err != nil {
+		t.Fatalf("pluck keyBy external key error: %v", err)
+	}
+	if len(kb) != 4 {
+		t.Fatalf("expected 4 brief entries, got %d: %v", len(kb), kb)
+	}
+	if kb[1] != (userBrief{Name: "John", Nickname: "JJ"}) || kb[3].Name != "" || kb[3].Nickname != "NN" {
+		t.Errorf("kb content mismatch: %+v", kb)
+	}
+}
+
+// ==================== Laravel 对比补测试 ====================
+
+// TestMySQLInteg_LaravelCmp_SelectReplacesColumns 第一章 testSelectReplacesPreviousSelection：
+// 多次 Select 为替换语义（后一次覆盖前一次）；Select("*") 恢复全列。
+func TestMySQLInteg_LaravelCmp_SelectReplacesColumns(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// 先 Select("name") 再 Select("age")：只有 age 列生效
+	type ageRow struct {
+		Age *int `db:"age"`
+	}
+	var rows []ageRow
+	err := db.Builder().Table("users").Select("name").Select("age").
+		Where("age", ">", 26).OrderBy("id", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(rows))
+	}
+
+	// Select("*") 恢复全列：所有字段可扫描
+	type fullRow struct {
+		ID     int    `db:"id"`
+		Name   string `db:"name"`
+		Age    *int   `db:"age"`
+		Email  string `db:"email"`
+		Status string `db:"status"`
+	}
+	var all []fullRow
+	err = db.Builder().Table("users").Select("name").Select("*").
+		OrderBy("id", "ASC").Find(context.Background(), &all)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(all) != 5 || all[0].ID != 1 || all[0].Name != "alice" {
+		t.Errorf("expected full rows, got %v", all)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_MixedAndOrLeadingBoolean 第三章 testUppercaseLeadingBooleansAreRemoved 等：
+// 编译层首个条件不输出前置 and，混合 AND/OR 连接执行结果正确。
+func TestMySQLInteg_LaravelCmp_MixedAndOrLeadingBoolean(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	// status='active' OR (age>30 AND id>=1)：alice/bob/diana + charlie
+	err := db.Builder().Table("users").Select("name").
+		Where("status", "=", "active").
+		OrWhere("age", ">", 30).
+		Where("id", ">=", 1).
+		OrderBy("id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_ExpressionValueNotBound 第四章 testDateBasedWheresExpressionIsNotBound：
+// Where/WhereRaw 的 Expression 值直接内联，不产生绑定参数。
+func TestMySQLInteg_LaravelCmp_ExpressionValueNotBound(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	// Where 值传 Expression：编译为 age = 30，无绑定
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		Where("age", "=", NewExpression("30")).
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "bob" {
+		t.Errorf("expected bob, got %v", rows)
+	}
+
+	// WhereRaw 混合绑定：Expression 不占位，普通绑定顺序不受影响
+	var rows2 []row
+	err = db.Builder().Table("users").Select("name").
+		WhereRaw("age > ? AND age < ?", 20, NewExpression("40")).
+		OrderBy("id", "ASC").
+		Find(context.Background(), &rows2)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows2) != 4 {
+		t.Errorf("expected 4 rows (20<age<40), got %d: %v", len(rows2), rows2)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_WhereInEmptyScalar 第九章 testBasicWhereInsException：
+// zcdb WhereIn 入参为 []any 强类型，传标量在编译期即被拒绝（无法构造运行时异常）；
+// 空切片语义：IN 空集等价 0=1 返回空，NOT IN 空集等价 1=1 返回全量。
+func TestMySQLInteg_LaravelCmp_WhereInEmptyScalar(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	// 空 IN：无结果
+	var rows []row
+	err := db.Builder().Table("users").Select("name").WhereIn("id", []any{}).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows for empty IN, got %d", len(rows))
+	}
+	// 空 NOT IN：全部行
+	var rows2 []row
+	err = db.Builder().Table("users").Select("name").WhereNotIn("id", []any{}).OrderBy("id", "ASC").Find(context.Background(), &rows2)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows2) != 5 {
+		t.Errorf("expected 5 rows for empty NOT IN, got %d", len(rows2))
+	}
+	// 单元素切片正常（标量需包成 []any）
+	var rows3 []row
+	err = db.Builder().Table("users").Select("name").WhereIn("id", []any{1}).Find(context.Background(), &rows3)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows3) != 1 || rows3[0].Name != "alice" {
+		t.Errorf("expected alice, got %v", rows3)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_MultipleUnions 第十三章 testMultipleUnions/testMultipleUnionAlls：
+// 三个子查询连续追加 UNION / UNION ALL。
+func TestMySQLInteg_LaravelCmp_MultipleUnions(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	// UNION 去重：active(3) ∪ age>30(1) ∪ age<26(1) = 4 行
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 30)
+	q3 := db.Builder().Table("users").Select("name").Where("age", "<", 26)
+	var rows []row
+	err := q1.Union(q2).Union(q3).OrderBy("name", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+
+	// UNION ALL 保留重复：3+1+1 = 5 行
+	q4 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q5 := db.Builder().Table("users").Select("name").Where("age", ">", 30)
+	q6 := db.Builder().Table("users").Select("name").Where("age", "<", 26)
+	var rows2 []row
+	err = q4.UnionAll(q5).UnionAll(q6).Find(context.Background(), &rows2)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows2) != 5 {
+		t.Errorf("expected 5 rows, got %d", len(rows2))
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_UnionWithJoin 第十三章 testUnionWithJoin：
+// union 分支子查询中带 JOIN。
+func TestMySQLInteg_LaravelCmp_UnionWithJoin(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	// 分支一：active 用户；分支二：在 orders 有订单的用户（join 去重）
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").
+		Join("orders", "orders.user_id", "=", "users.id").Distinct()
+
+	var rows []row
+	err := q1.Union(q2).OrderBy("name", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 rows, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_UnionLimitOffset 第十三章 testUnionLimitsAndOffsets：
+// union 结果整体 limit/offset。
+func TestMySQLInteg_LaravelCmp_UnionLimitOffset(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 30)
+	// 整体排序后取第 2、3 条：[alice, bob, charlie, diana] → [bob, charlie]
+	var rows []row
+	err := q1.Union(q2).OrderBy("name", "ASC").Limit(2).Offset(1).Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Name != "bob" || rows[1].Name != "charlie" {
+		t.Errorf("expected [bob, charlie], got %v", rows)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_UnionOrderByRaw 第十五章 testOrderByRawUnion：
+// union 后 OrderByRaw 执行正常（多分支 where 绑定与排序表达式绑定顺序正确）。
+func TestMySQLInteg_LaravelCmp_UnionOrderByRaw(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	q1 := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Select("name").Where("age", ">", 30)
+	var rows []row
+	err := q1.Union(q2).OrderByRaw("name ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 || rows[0].Name != "alice" || rows[3].Name != "diana" {
+		t.Errorf("expected sorted [alice bob charlie diana], got %v", rows)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_HavingThenFirst 第十六章 testHavingFollowedBySelectGet：
+// 分组聚合后 First 取数，having 绑定正确传递。
+func TestMySQLInteg_LaravelCmp_HavingThenFirst(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type groupRow struct {
+		Status string `db:"status"`
+	}
+	var g groupRow
+	// 两组均满足 COUNT(*)>1，按 status 排序取第一组（active）
+	err := db.Builder().Table("users").
+		Select("status").
+		GroupBy("status").
+		HavingRaw("COUNT(*) > ?", 1).
+		OrderBy("status", "ASC").
+		First(context.Background(), &g)
+	if err != nil {
+		t.Fatalf("First error: %v", err)
+	}
+	if g.Status != "active" {
+		t.Errorf("expected active group, got %q", g.Status)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_UnionCountWithOrdersAndPaging 第十七章 testGetCountForPaginationWithUnionOrders/...WithUnionLimitAndOffset：
+// 带排序/分页的 union 计数：总数不受 order/limit/offset 影响。
+func TestMySQLInteg_LaravelCmp_UnionCountWithOrdersAndPaging(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	q1 := db.Builder().Table("users").Where("status", "=", "active")
+	q2 := db.Builder().Table("users").Where("age", ">", 30)
+	count, err := q1.Union(q2).OrderBy("name", "ASC").Limit(2).Offset(1).Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 4 {
+		t.Errorf("expected 4, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_SubSelectResetBindings 第十九章 testSubSelectResetBindings：
+// 子查询中 Select("*") 为替换语义，无列/绑定残留。
+func TestMySQLInteg_LaravelCmp_SubSelectResetBindings(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereExists(func(sub *Builder) {
+			sub.Table("orders").Select("*").WhereColumn("orders.user_id", "=", "users.id")
+		}).
+		OrderBy("name", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("expected 4 users with orders, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_WhereSubInvalidOperator 第十九章 testSubSelect（非法参数）：
+// 子查询运算符不在白名单内时返回 ErrInvalidOperator。
+func TestMySQLInteg_LaravelCmp_WhereSubInvalidOperator(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").
+		WhereSub("id", "EVIL", func(sub *Builder) {
+			sub.Table("users").Select("id")
+		}).
+		Find(context.Background(), &rows)
+	if !errors.Is(err, ErrInvalidOperator) {
+		t.Errorf("expected ErrInvalidOperator, got %v", err)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_AggregateResetColumns 第二十二章 testAggregateResetFollowedByGet 等：
+// 聚合后 columns 状态恢复，可继续取数。
+func TestMySQLInteg_LaravelCmp_AggregateResetColumns(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	b := db.Builder().Table("users").Select("name").Where("status", "=", "active")
+	// 先聚合：COUNT 后 columns 恢复
+	count, err := b.Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3, got %d", count)
+	}
+	// 聚合后再次取数：列与绑定状态未被破坏
+	var rows []row
+	err = b.OrderBy("id", "ASC").Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+	if len(rows) != 3 || rows[0].Name != "alice" || rows[2].Name != "diana" {
+		t.Errorf("expected [alice bob diana], got %v", rows)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_AggregateIgnoreSelectSub 第二十二章 testAggregateWithSubSelect：
+// 聚合忽略子查询列及其绑定（COUNT(*) 不受 SELECT 子查询影响）。
+func TestMySQLInteg_LaravelCmp_AggregateIgnoreSelectSub(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	count, err := db.Builder().Table("users").
+		SelectSubquery(db.Builder().Table("users").Select("name").Where("id", "=", 1), "sub_name").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 5 {
+		t.Errorf("expected 5, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_InsertUsingInvalidSubquery 第二十三章 testInsertUsingInvalidSubquery：
+// InsertUsing 子查询缺少数据源或带非法运算符时直接返回错误，不生成非法 SQL。
+func TestMySQLInteg_LaravelCmp_InsertUsingInvalidSubquery(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	mustExec(t, db, `CREATE TABLE users_archive (
+		id   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(64)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+
+	// 子查询缺少数据源 → ErrEmptyTable
+	_, _, err := db.Builder().Table("users_archive").
+		ToInsertUsing([]string{"name"}, func(sub *Builder) {})
+	if !errors.Is(err, ErrEmptyTable) {
+		t.Errorf("expected ErrEmptyTable, got %v", err)
+	}
+
+	// 子查询带非法运算符 → ErrInvalidOperator
+	_, _, err = db.Builder().Table("users_archive").
+		ToInsertUsing([]string{"name"}, func(sub *Builder) {
+			sub.Table("users").Select("name").Where("id", "EVIL", 1)
+		})
+	if !errors.Is(err, ErrInvalidOperator) {
+		t.Errorf("expected ErrInvalidOperator, got %v", err)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_InsertOrIgnoreConflictZero 第二十三章 testInsertOrIgnoreReturningDoesNotMarkRecordsModifiedWhenNoRowsWereInserted：
+// 冲突未插入任何行时受影响行数为 0。
+func TestMySQLInteg_LaravelCmp_InsertOrIgnoreConflictZero(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type insertData struct {
+		Name  string `db:"name"`
+		Age   int    `db:"age"`
+		Email string `db:"email"`
+	}
+	// email 已存在（alice@test.com）：未插入任何行，受影响行数为 0
+	affected, err := db.Builder().Table("users").InsertOrIgnore(context.Background(),
+		insertData{Name: "duplicate", Age: 99, Email: "alice@test.com"})
+	if err != nil {
+		t.Fatalf("InsertOrIgnore error: %v", err)
+	}
+	if affected != 0 {
+		t.Errorf("expected 0 affected rows on conflict, got %d", affected)
+	}
+	// 新 email：正常插入 1 行
+	affected, err = db.Builder().Table("users").InsertOrIgnore(context.Background(),
+		insertData{Name: "frank", Age: 40, Email: "frank@test.com"})
+	if err != nil {
+		t.Fatalf("InsertOrIgnore error: %v", err)
+	}
+	if affected != 1 {
+		t.Errorf("expected 1 affected row, got %d", affected)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_InsertGetIdExpression 第二十三章 testInsertGetIdMethodRemovesExpressions：
+// InsertGetId 的 Expression 值内联进 SQL，不产生绑定参数。
+func TestMySQLInteg_LaravelCmp_InsertGetIdExpression(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type insertData struct {
+		Name  string `db:"name"`
+		Age   any    `db:"age"`
+		Email string `db:"email"`
+	}
+	// any 字段放 Expression：age = 40 直接内联
+	id, err := db.Builder().Table("users").InsertGetId(context.Background(),
+		insertData{Name: "frank", Age: NewExpression("40"), Email: "frank@test.com"})
+	if err != nil {
+		t.Fatalf("InsertGetId error: %v", err)
+	}
+	if id != 6 {
+		t.Errorf("expected id=6, got %d", id)
+	}
+	var age int
+	err = db.Builder().Table("users").Select("age").Where("id", "=", 6).Value(context.Background(), &age)
+	if err != nil {
+		t.Fatalf("Value error: %v", err)
+	}
+	if age != 40 {
+		t.Errorf("expected age=40, got %d", age)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_InsertGetIdEmptyData 第二十三章 testInsertGetIdWithEmptyValues：
+// 空结构体/空切片插入被拒绝（zcdb 不支持 Laravel 的 default values 空插入）。
+func TestMySQLInteg_LaravelCmp_InsertGetIdEmptyData(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// 空结构体（无 db 字段）：ErrNoFields
+	_, err := db.Builder().Table("users").InsertGetId(context.Background(), struct{}{})
+	if !errors.Is(err, ErrNoFields) {
+		t.Errorf("expected ErrNoFields, got %v", err)
+	}
+	// 空切片：ErrEmptyData
+	type insertData struct {
+		Name string `db:"name"`
+	}
+	_, err = db.Builder().Table("users").InsertGetId(context.Background(), []insertData{})
+	if !errors.Is(err, ErrEmptyData) {
+		t.Errorf("expected ErrEmptyData, got %v", err)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_UpsertEmptyUniqueBy 第二十五章 testUpsertMethodWithEmptyUniqueByArray/...String（MySQL 差异）：
+// MySQL 的 Upsert 用 ON DUPLICATE KEY UPDATE，不依赖 uniqueBy；空 uniqueBy 正常执行。
+func TestMySQLInteg_LaravelCmp_UpsertEmptyUniqueBy(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type upsertData struct {
+		Name  string `db:"name"`
+		Email string `db:"email"`
+	}
+	// 空 uniqueBy：MySQL 不生成 ON CONFLICT，正常插入
+	affected, err := db.Builder().Table("users").Upsert(context.Background(),
+		upsertData{Name: "frank", Email: "frank@test.com"},
+		nil, []string{"name"})
+	if err != nil {
+		t.Fatalf("Upsert error: %v", err)
+	}
+	if affected != 1 {
+		t.Errorf("expected 1 affected row, got %d", affected)
+	}
+	// 冲突 email：name 被更新
+	_, err = db.Builder().Table("users").Upsert(context.Background(),
+		upsertData{Name: "frank2", Email: "frank@test.com"},
+		nil, []string{"name"})
+	if err != nil {
+		t.Fatalf("Upsert error: %v", err)
+	}
+	var name string
+	err = db.Builder().Table("users").Select("name").Where("email", "=", "frank@test.com").Value(context.Background(), &name)
+	if err != nil {
+		t.Fatalf("Value error: %v", err)
+	}
+	if name != "frank2" {
+		t.Errorf("expected name=frank2 after upsert conflict, got %q", name)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_TruncateResetSequence 第二十六章 testTruncateMethod（MySQL 清序列部分）：
+// MySQL TRUNCATE 自动重置 AUTO_INCREMENT，清空后自增主键从头开始。
+func TestMySQLInteg_LaravelCmp_TruncateResetSequence(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// 先插入一条使序列推进到 6
+	_, err := db.Builder().Table("users").Insert(context.Background(), struct {
+		Name  string `db:"name"`
+		Email string `db:"email"`
+	}{Name: "frank", Email: "frank@test.com"})
+	if err != nil {
+		t.Fatalf("Insert error: %v", err)
+	}
+	// Truncate：清空数据并重置自增序列
+	if err := db.Builder().Table("users").Truncate(context.Background()); err != nil {
+		t.Fatalf("Truncate error: %v", err)
+	}
+	// 插入后 id 从头开始（1），证明 AUTO_INCREMENT 已重置
+	id, err := db.Builder().Table("users").InsertGetId(context.Background(), struct {
+		Name  string `db:"name"`
+		Email string `db:"email"`
+	}{Name: "after_truncate", Email: "after@test.com"})
+	if err != nil {
+		t.Fatalf("InsertGetId error: %v", err)
+	}
+	if id != 1 {
+		t.Errorf("expected id=1 after truncate (sequence reset), got %d", id)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_CursorByZeroSize 第三十二章 testChunkWithCountZero：
+// chunkSize 为 0 时直接返回，不执行任何查询。
+func TestMySQLInteg_LaravelCmp_CursorByZeroSize(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	n := 0
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 0, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		n++
+	}
+	if n != 0 {
+		t.Errorf("expected no iterations for chunkSize=0, got %d", n)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_CursorByQualifiedColumn 第三十二章 testChunkPaginatesUsingIdWithAlias：
+// CursorBy 键列支持 table.column 限定形式。
+func TestMySQLInteg_LaravelCmp_CursorByQualifiedColumn(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var names []string
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(context.Background(), &user, 2, "users.id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, user.Name)
+	}
+	expected := []string{"alice", "bob", "charlie", "diana", "eve"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+	for i, exp := range expected {
+		if names[i] != exp {
+			t.Errorf("names[%d]: expected %q, got %q", i, exp, names[i])
+		}
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_CursorByDesc 第三十二章 testChunkPaginatesUsingIdDesc：
+// CursorByDesc 按游标列倒序分块（对齐 Laravel chunkByIdDesc）。
+func TestMySQLInteg_LaravelCmp_CursorByDesc(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var user row
+	var names []string
+	for err := range db.Builder().Table("users").Select("id", "name").CursorByDesc(context.Background(), &user, 2, "id") {
+		if err != nil {
+			t.Fatalf("CursorByDesc error: %v", err)
+		}
+		names = append(names, user.Name)
+	}
+	expected := []string{"eve", "diana", "charlie", "bob", "alice"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+	for i, exp := range expected {
+		if names[i] != exp {
+			t.Errorf("names[%d]: expected %q, got %q", i, exp, names[i])
+		}
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_PluckDuplicateKeyOverwrite 集成附录 testPluck（重复 key 覆盖部分）：
+// Pluck map 模式重复键时后值覆盖前值；keyBy 模式重复键列时最后一行覆盖。
+func TestMySQLInteg_LaravelCmp_PluckDuplicateKeyOverwrite(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// map 值→键 模式：第一列为值、第二列为键；status 键重复时后者（id 更大）覆盖前者
+	var m map[string]int64
+	err := db.Builder().Table("users").
+		OrderBy("id", "ASC").
+		Pluck(context.Background(), &m, "id", "status")
+	if err != nil {
+		t.Fatalf("pluck error: %v", err)
+	}
+	if m["active"] != 4 || m["inactive"] != 5 {
+		t.Errorf("expected active=4 inactive=5 (last wins), got %v", m)
+	}
+
+	// keyBy 模式：插入两条同名记录，后者（id 更大）覆盖前者
+	mustExec(t, db, `INSERT INTO users (name, age, email, status) VALUES
+		('dup', 1, 'dup1@test.com', 'x'),
+		('dup', 2, 'dup2@test.com', 'y')`)
+	type userBrief struct {
+		Id  int
+		Age int
+	}
+	var dup map[string]userBrief
+	err = db.Builder().Table("users").
+		Where("name", "=", "dup").
+		OrderBy("id", "ASC").
+		Pluck(context.Background(), &dup, "name")
+	if err != nil {
+		t.Fatalf("pluck keyBy dup error: %v", err)
+	}
+	if dup["dup"].Id != 7 || dup["dup"].Age != 2 {
+		t.Errorf("expected last dup row (id=7, age=2), got %+v", dup["dup"])
+	}
+}
+
+// ==================== LaravelCmp: 现有 API 组合 ====================
+
+// TestMySQLInteg_LaravelCmp_DateWhere 验证日期 where 用 WhereRaw 手工构造
+// （date/day/month/year/time 函数，对齐 Laravel MySQL 方言）。
+func TestMySQLInteg_LaravelCmp_DateWhere(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE datetime_test (
+		id            INT AUTO_INCREMENT PRIMARY KEY,
+		date_val      DATE,
+		time_val      TIME,
+		datetime_val  DATETIME,
+		timestamp_val TIMESTAMP NULL DEFAULT NULL,
+		year_val      YEAR
+	)`)
+	mustExec(t, db, `INSERT INTO datetime_test (date_val, time_val, datetime_val, timestamp_val, year_val) VALUES
+		('2024-06-15', '14:30:00', '2024-06-15 14:30:00', '2024-06-15 14:30:00', 2024),
+		('2023-12-25', '08:05:00', '2023-12-25 08:05:00', '2023-12-25 08:05:00', 2023),
+		('2024-06-01', '23:59:59', '2024-06-01 23:59:59', '2024-06-01 23:59:59', 2024)`)
+
+	// whereDate: date(col) = ?
+	count, err := db.Builder().Table("datetime_test").
+		WhereRaw("date(datetime_val) = ?", "2024-06-15").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("whereDate Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("whereDate: expected 1, got %d", count)
+	}
+
+	// whereDay: day(col) = ?
+	count, err = db.Builder().Table("datetime_test").
+		WhereRaw("day(datetime_val) = ?", 15).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("whereDay Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("whereDay: expected 1, got %d", count)
+	}
+
+	// whereMonth: month(col) = ?（两行 6 月）
+	count, err = db.Builder().Table("datetime_test").
+		WhereRaw("month(datetime_val) = ?", 6).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("whereMonth Count error: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("whereMonth: expected 2, got %d", count)
+	}
+
+	// whereYear: year(col) = ?（两行 2024）
+	count, err = db.Builder().Table("datetime_test").
+		WhereRaw("year(datetime_val) = ?", 2024).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("whereYear Count error: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("whereYear: expected 2, got %d", count)
+	}
+
+	// whereTime: time(col) = ?
+	count, err = db.Builder().Table("datetime_test").
+		WhereRaw("time(datetime_val) = ?", "14:30:00").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("whereTime Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("whereTime: expected 1, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_Fulltext 验证全文检索用 WhereRaw 构造
+// （match ... against 三种模式，对齐 Laravel testWhereFulltextMySql 系列）。
+func TestMySQLInteg_LaravelCmp_Fulltext(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE articles (
+		id   INT AUTO_INCREMENT PRIMARY KEY,
+		body TEXT,
+		FULLTEXT KEY ft_body (body)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	mustExec(t, db, `INSERT INTO articles (body) VALUES
+		('The quick brown fox jumps over the lazy dog'),
+		('A quick brown rabbit runs fast'),
+		('Slow green turtle walks slowly')`)
+
+	// natural language mode
+	count, err := db.Builder().Table("articles").
+		WhereRaw("match (body) against (? in natural language mode)", "quick").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("natural Count error: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("natural: expected 2, got %d", count)
+	}
+
+	// boolean mode：+quick +fox 两词都必须出现
+	count, err = db.Builder().Table("articles").
+		WhereRaw("match (body) against (? in boolean mode)", "+quick +fox").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("boolean Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("boolean: expected 1, got %d", count)
+	}
+
+	// query expansion
+	count, err = db.Builder().Table("articles").
+		WhereRaw("match (body) against (? with query expansion)", "quick").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("query expansion Count error: %v", err)
+	}
+	if count < 2 {
+		t.Errorf("query expansion: expected >= 2, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_JsonUpdate 验证 JSON 更新用 Update 值传 Expression
+// （json_set 内联，对齐 Laravel testMySqlUpdateWrappingJson 系列），覆盖基本/嵌套/数组索引。
+func TestMySQLInteg_LaravelCmp_JsonUpdate(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE json_conv_test (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		json_val JSON
+	)`)
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES
+		('{"name":"alice","age":25,"address":{"city":"Shanghai"}}'),
+		('["red","green"]')`)
+
+	type jsonUpdate struct {
+		JsonVal any `db:"json_val"`
+	}
+
+	// 基本：json_set 顶层字段
+	_, err := db.Builder().Table("json_conv_test").Where("id", "=", 1).
+		Update(context.Background(), jsonUpdate{JsonVal: NewExpression("json_set(json_val, '$.age', 26)")})
+	if err != nil {
+		t.Fatalf("Update basic error: %v", err)
+	}
+	count, err := db.Builder().Table("json_conv_test").
+		WhereRaw("json_extract(json_val, '$.age') = ?", 26).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("basic verify error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("basic update: expected age=26, got %d", count)
+	}
+
+	// 嵌套：json_set 嵌套路径
+	_, err = db.Builder().Table("json_conv_test").Where("id", "=", 1).
+		Update(context.Background(), jsonUpdate{JsonVal: NewExpression("json_set(json_val, '$.address.city', 'Guangzhou')")})
+	if err != nil {
+		t.Fatalf("Update nested error: %v", err)
+	}
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_unquote(json_extract(json_val, '$.address.city')) = ?", "Guangzhou").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("nested verify error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("nested update: expected city=Guangzhou, got %d", count)
+	}
+
+	// 数组索引：json_set 修改数组元素
+	_, err = db.Builder().Table("json_conv_test").Where("id", "=", 2).
+		Update(context.Background(), jsonUpdate{JsonVal: NewExpression("json_set(json_val, '$[0]', 'blue')")})
+	if err != nil {
+		t.Fatalf("Update array error: %v", err)
+	}
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_unquote(json_extract(json_val, '$[0]')) = ?", "blue").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("array verify error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("array update: expected [0]=blue, got %d", count)
+	}
+
+	// 数组嵌套索引：json_set 修改 $[0].name
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES ('[{"name":"a"},{"name":"b"}]')`)
+	_, err = db.Builder().Table("json_conv_test").Where("id", "=", 3).
+		Update(context.Background(), jsonUpdate{JsonVal: NewExpression("json_set(json_val, '$[0].name', 'x')")})
+	if err != nil {
+		t.Fatalf("Update array index error: %v", err)
+	}
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_unquote(json_extract(json_val, '$[0].name')) = ?", "x").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("array index verify error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("array index update: expected $[0].name=x, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_JsonSelectWhereOrder 验证 JSON 提取在 select/where/orderBy
+// 中通过 SelectRaw/WhereRaw/OrderByRaw 组合（json_unquote/json_extract，含路径转义与布尔内联）。
+func TestMySQLInteg_LaravelCmp_JsonSelectWhereOrder(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE json_conv_test (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		json_val JSON
+	)`)
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES
+		('{"name":"alice","age":25,"address":{"city":"Shanghai"}}'),
+		('{"name":"bob","age":30,"address":{"city":"Beijing"}}'),
+		('{"name":"charlie","age":35,"address":{"city":"Shenzhen"}}'),
+		('{"first name":"zoe","age":40,"is_active":true}')`)
+
+	// select：json_unquote(json_extract(...)) AS name（zoe 无 name 键 → NULL）
+	var names []struct {
+		Name string `db:"name"`
+	}
+	err := db.Builder().Table("json_conv_test").
+		SelectRaw("json_unquote(json_extract(json_val, '$.name')) AS name").
+		OrderBy("id", "ASC").
+		Find(context.Background(), &names)
+	if err != nil {
+		t.Fatalf("Select Find error: %v", err)
+	}
+	if len(names) != 4 || names[0].Name != "alice" || names[2].Name != "charlie" || names[3].Name != "" {
+		t.Errorf("select: expected [alice bob charlie <nil>], got %+v", names)
+	}
+
+	// where + orderBy：age > 28（zoe40、charlie35、bob30）且按 age 降序
+	var rows []struct {
+		Name string `db:"name"`
+	}
+	err = db.Builder().Table("json_conv_test").
+		SelectRaw("json_unquote(json_extract(json_val, '$.name')) AS name").
+		WhereRaw("json_extract(json_val, '$.age') > ?", 28).
+		OrderByRaw("json_extract(json_val, '$.age') DESC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("where/orderBy Find error: %v", err)
+	}
+	if len(rows) != 3 || rows[0].Name != "" || rows[1].Name != "charlie" || rows[2].Name != "bob" {
+		t.Errorf("where/orderBy: expected [<nil> charlie bob], got %+v", rows)
+	}
+
+	// 布尔 true 内联无绑定（对齐 testMySqlWrappingJsonWithBoolean）
+	count, err := db.Builder().Table("json_conv_test").
+		WhereRaw("json_extract(json_val, '$.is_active') = true").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("boolean Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("boolean: expected 1, got %d", count)
+	}
+
+	// 路径转义：键含空格的 $.\"first name\"
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_unquote(json_extract(json_val, '$.\"first name\"')) = ?", "zoe").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("path escaping Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("path escaping: expected 1, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_JsonWhereNull 验证 JSON 空值条件用 WhereRaw 构造
+// （is null OR json_type = 'NULL' 双条件，对齐 Laravel testJsonWhereNullMysql），含 Expression 变体。
+func TestMySQLInteg_LaravelCmp_JsonWhereNull(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE json_conv_test (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		json_val JSON
+	)`)
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES
+		('{"name":"alice","age":25}'),
+		('{"name":"bob","age":null}'),
+		('{}')`)
+
+	// is null：age 为 JSON null 或不存在 → 2 行（json_type 单参，用 -> 操作符传提取表达式）
+	count, err := db.Builder().Table("json_conv_test").
+		WhereRaw("json_val->'$.age' is null or json_type(json_val->'$.age') = 'NULL'").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("is null Count error: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("is null: expected 2, got %d", count)
+	}
+
+	// is not null
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_val->'$.age' is not null and json_type(json_val->'$.age') != 'NULL'").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("is not null Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("is not null: expected 1, got %d", count)
+	}
+
+	// Expression 变体：路径用 Expression 内联不产生绑定
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_val->? is null or json_type(json_val->?) = 'NULL'",
+			NewExpression("'$.age'"), NewExpression("'$.age'")).Count(context.Background())
+	if err != nil {
+		t.Fatalf("Expression Count error: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("Expression: expected 2, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_JsonContainsOverlaps 验证 JSON 包含/重叠查询用 WhereRaw 构造
+// （json_contains/json_overlaps，对齐 Laravel testWhereJsonContainsMySql 系列）。
+func TestMySQLInteg_LaravelCmp_JsonContainsOverlaps(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE json_conv_test (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		json_val JSON
+	)`)
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES
+		('["x","y"]'),
+		('["z"]')`)
+
+	// contains：数组含 "x"（Laravel 场景列本身为数组）
+	count, err := db.Builder().Table("json_conv_test").
+		WhereRaw("json_contains(json_val, ?)", `"x"`).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("contains Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("contains: expected 1, got %d", count)
+	}
+
+	// overlaps：tags 与 "z" 有交集
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_overlaps(json_val, ?)", `"z"`).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("overlaps Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("overlaps: expected 1, got %d", count)
+	}
+
+	// doesntContain
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("not json_contains(json_val, ?)", `"x"`).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("doesntContain Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("doesntContain: expected 1, got %d", count)
+	}
+
+	// doesntOverlap
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("not json_overlaps(json_val, ?)", `"z"`).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("doesntOverlap Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("doesntOverlap: expected 1, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_JsonKeyLength 验证 JSON 键存在与长度查询用 WhereRaw 构造
+// （json_contains_path/json_length，对齐 Laravel testWhereJsonContainsKey/Length MySQL 系列）。
+func TestMySQLInteg_LaravelCmp_JsonKeyLength(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE json_conv_test (
+		id       INT AUTO_INCREMENT PRIMARY KEY,
+		json_val JSON
+	)`)
+	mustExec(t, db, `INSERT INTO json_conv_test (json_val) VALUES
+		('{"name":"alice","tags":["x","y"]}'),
+		('{"name":"bob","tags":["z"]}')`)
+
+	// containsKey：json_contains_path(col, 'one', '$.name')
+	count, err := db.Builder().Table("json_conv_test").
+		WhereRaw("json_contains_path(json_val, 'one', '$.name')").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("containsKey Count error: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("containsKey: expected 2, got %d", count)
+	}
+
+	// length：json_length(col, '$.tags') = ?
+	count, err = db.Builder().Table("json_conv_test").
+		WhereRaw("json_length(json_val, '$.tags') = ?", 2).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("length Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("length: expected 1, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_SoundsLike 验证 sounds like 条件用 WhereRaw 构造
+// （对齐 Laravel testMySqlSoundsLikeOperator）。
+func TestMySQLInteg_LaravelCmp_SoundsLike(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// SOUNDEX('alice') = SOUNDEX('Alice') = A420 → 仅 alice 匹配
+	count, err := db.Builder().Table("users").
+		WhereRaw("name sounds like ?", "Alice").
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_Bitwise 验证位运算条件用 WhereRaw/Expression 组合
+// （(flags & ?) = ?，对齐 Laravel testBitwiseOperators）。
+func TestMySQLInteg_LaravelCmp_Bitwise(t *testing.T) {
+	db := openMySQLTestDB(t)
+
+	mustExec(t, db, `CREATE TABLE bit_test (
+		id    INT AUTO_INCREMENT PRIMARY KEY,
+		flags INT NOT NULL
+	)`)
+	mustExec(t, db, `INSERT INTO bit_test (flags) VALUES (1), (2), (4), (6), (3)`)
+
+	// 位与：flags 含 bit2（2、6、3 → 3 行）
+	count, err := db.Builder().Table("bit_test").
+		WhereRaw("(flags & ?) = ?", 2, 2).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("bitwise & Count error: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("bitwise &: expected 3, got %d", count)
+	}
+
+	// Expression 形式：flags = (flags & 2)（仅 flags=2 成立）
+	count, err = db.Builder().Table("bit_test").
+		Where("flags", "=", NewExpression("flags & 2")).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("bitwise Expression Count error: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("bitwise Expression: expected 1, got %d", count)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_RowValues 验证行值比较用 WhereRaw 构造
+// （(a, b) >= (?, ?)，对齐 Laravel testWhereRowValues）。
+func TestMySQLInteg_LaravelCmp_RowValues(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLOrdersTable(t, db)
+
+	// (user_id, amount) >= (2, 100)：user2-200、user3-30、user4-150 → 3 行
+	var rows []struct {
+		ID     int64   `db:"id"`
+		UserID int64   `db:"user_id"`
+		Amount float64 `db:"amount"`
+	}
+	err := db.Builder().Table("orders").
+		Select("id", "user_id", "amount").
+		WhereRaw("(user_id, amount) >= (?, ?)", 2, 100).
+		OrderBy("id", "ASC").
+		Find(context.Background(), &rows)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+	if len(rows) != 3 || rows[0].UserID != 2 || rows[1].UserID != 3 || rows[2].UserID != 4 {
+		t.Errorf("row values: expected user_id [2 3 4], got %+v", rows)
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_InOrderOf 验证按给定顺序排序用 OrderByRaw 构造
+// （CASE WHEN ... THEN n END，对齐 Laravel testInOrderOf），含单值与 where 组合。
+func TestMySQLInteg_LaravelCmp_InOrderOf(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// 基本：active 优先，同组按 id
+	var names []struct {
+		Name string `db:"name"`
+	}
+	err := db.Builder().Table("users").
+		Select("name").
+		OrderByRaw("CASE WHEN status = 'active' THEN 0 WHEN status = 'inactive' THEN 1 ELSE 2 END, id").
+		Find(context.Background(), &names)
+	if err != nil {
+		t.Fatalf("basic Find error: %v", err)
+	}
+	expected := []string{"alice", "bob", "diana", "charlie", "eve"}
+	if len(names) != len(expected) {
+		t.Fatalf("basic: expected %v, got %+v", expected, names)
+	}
+	for i, n := range names {
+		if n.Name != expected[i] {
+			t.Errorf("basic[%d]: expected %s, got %s", i, expected[i], n.Name)
+		}
+	}
+
+	// 单值：仅一个特例优先
+	names = nil
+	err = db.Builder().Table("users").
+		Select("name").
+		OrderByRaw("CASE WHEN status = 'inactive' THEN 0 ELSE 1 END, id").
+		Find(context.Background(), &names)
+	if err != nil {
+		t.Fatalf("single value Find error: %v", err)
+	}
+	expected = []string{"charlie", "eve", "alice", "bob", "diana"}
+	if len(names) != len(expected) {
+		t.Fatalf("single value: expected %v, got %+v", expected, names)
+	}
+	for i, n := range names {
+		if n.Name != expected[i] {
+			t.Errorf("single value[%d]: expected %s, got %s", i, expected[i], n.Name)
+		}
+	}
+
+	// 与 where 组合：age > 26 且 charlie 优先
+	names = nil
+	err = db.Builder().Table("users").
+		Select("name").
+		Where("age", ">", 26).
+		OrderByRaw("CASE WHEN name = 'charlie' THEN 0 ELSE 1 END, id").
+		Find(context.Background(), &names)
+	if err != nil {
+		t.Fatalf("with where Find error: %v", err)
+	}
+	expected = []string{"charlie", "bob", "diana"}
+	if len(names) != len(expected) {
+		t.Fatalf("with where: expected %v, got %+v", expected, names)
+	}
+	for i, n := range names {
+		if n.Name != expected[i] {
+			t.Errorf("with where[%d]: expected %s, got %s", i, expected[i], n.Name)
+		}
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_OrderBySubQuery 验证排序列用子查询构造
+// （OrderByRaw 内联子查询，对齐 Laravel testOrderBySubQueries）。
+func TestMySQLInteg_LaravelCmp_OrderBySubQuery(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLOrdersTable(t, db)
+
+	// 按订单数降序（alice/bob 各 2 单，charlie/diana 各 1 单，eve 0 单），同数按 id
+	var names []struct {
+		Name string `db:"name"`
+	}
+	err := db.Builder().Table("users").
+		Select("name").
+		OrderByRaw("(SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) DESC, id ASC").
+		Find(context.Background(), &names)
+	if err != nil {
+		t.Fatalf("Find error: %v", err)
+	}
+	expected := []string{"alice", "bob", "charlie", "diana", "eve"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %v, got %+v", expected, names)
+	}
+	for i, n := range names {
+		if n.Name != expected[i] {
+			t.Errorf("[%d]: expected %s, got %s", i, expected[i], n.Name)
+		}
+	}
+}
+
+// TestMySQLInteg_LaravelCmp_ArrayWhereColumn 验证多列条件括号分组用 WhereRaw 构造
+// （(a >= ? AND b <= ?)，对齐 Laravel testArrayWhereColumn 的括号语义）。
+func TestMySQLInteg_LaravelCmp_ArrayWhereColumn(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// 25 <= age <= 30：alice(25)、bob(30)、diana(28) → 3 行
+	count, err := db.Builder().Table("users").
+		WhereRaw("(age >= ? AND age <= ?)", 25, 30).
+		Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3, got %d", count)
 	}
 }

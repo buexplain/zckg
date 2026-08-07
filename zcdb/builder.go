@@ -18,8 +18,8 @@ type Builder struct {
 	columns    []SelectColumn // 用于 SELECT 的列
 	selectSubs []SelectSub
 	distinct   bool
-	fromSub    *Builder // FROM 子查询
-	fromAlias  string   // FROM 子查询别名
+	tableSub   *Builder // FROM 子查询
+	tableAlias string   // FROM 子查询别名
 	joins      []JoinClause
 	wheres     []WhereClause
 	groups     []string
@@ -73,8 +73,12 @@ func validateOperator(op string) error {
 
 // ==================== 表和列 ====================
 
+// Table 设置查询的主表名；同时清空 TableSub 设置的 FROM 子查询，
+// 保证两者互斥且"后调用者生效"。
 func (b *Builder) Table(tableName string) *Builder {
 	b.table = tableName
+	b.tableSub = nil
+	b.tableAlias = ""
 	return b
 }
 
@@ -99,10 +103,11 @@ func (b *Builder) SelectSubquery(sub *Builder, alias string) *Builder {
 	return b
 }
 
-// FromSub 设置 FROM 子查询。
-func (b *Builder) FromSub(sub *Builder, alias string) *Builder {
-	b.fromSub = sub
-	b.fromAlias = alias
+// TableSub 设置 FROM 子查询（派生表），与 Table 互斥：后调用者生效。
+// 编译时 tableSub 非 nil 则优先输出 (子查询) AS 别名，否则输出普通表名。
+func (b *Builder) TableSub(sub *Builder, alias string) *Builder {
+	b.tableSub = sub
+	b.tableAlias = alias
 	return b
 }
 
@@ -470,6 +475,20 @@ func (b *Builder) CrossJoin(table string) *Builder {
 	return b
 }
 
+// CrossJoinSub 添加一个 CROSS JOIN 派生表（子查询），无 ON 条件，结果集为笛卡尔积。
+// 典型场景：先 CROSS JOIN 生成维度组合矩阵（如门店 × 月份），再 LEFT JOIN 事实表补零。
+// 例如：SELECT * FROM (SELECT DISTINCT month FROM sales) AS m
+//
+//	CROSS JOIN (SELECT DISTINCT store_name FROM stores) AS s
+func (b *Builder) CrossJoinSub(sub *Builder, alias string) *Builder {
+	b.joins = append(b.joins, JoinClause{
+		Type:  JoinTypeCross,
+		Sub:   sub,
+		Alias: alias,
+	})
+	return b
+}
+
 // JoinOn 添加一个 INNER JOIN（支持多条件）。
 func (b *Builder) JoinOn(table string, callback func(*JoinBuilder)) *Builder {
 	jb := &JoinBuilder{}
@@ -516,6 +535,42 @@ func (b *Builder) RightJoinOn(table string, callback func(*JoinBuilder)) *Builde
 		Conditions: jb.Conditions,
 	})
 	return b
+}
+
+// addJoinSub 添加一个派生表（子查询）JOIN，供 JoinSub/LeftJoinSub/RightJoinSub 复用。
+func (b *Builder) addJoinSub(joinType JoinType, sub *Builder, alias string, callback func(*JoinBuilder)) *Builder {
+	jb := &JoinBuilder{}
+	if callback != nil {
+		callback(jb)
+	}
+	if jb.err != nil {
+		b.err = jb.err
+		return b
+	}
+	b.joins = append(b.joins, JoinClause{
+		Type:       joinType,
+		Sub:        sub,
+		Alias:      alias,
+		Conditions: jb.Conditions,
+	})
+	return b
+}
+
+// JoinSub 添加一个 INNER JOIN 派生表（子查询）。
+// sub 为子查询 Builder，alias 为其别名，callback 构建 ON 条件。
+// 例如：SELECT * FROM a JOIN (SELECT id, MAX(t) AS t FROM b GROUP BY id) AS c ON a.id = c.id
+func (b *Builder) JoinSub(sub *Builder, alias string, callback func(*JoinBuilder)) *Builder {
+	return b.addJoinSub(JoinTypeInner, sub, alias, callback)
+}
+
+// LeftJoinSub 添加一个 LEFT JOIN 派生表（子查询）。
+func (b *Builder) LeftJoinSub(sub *Builder, alias string, callback func(*JoinBuilder)) *Builder {
+	return b.addJoinSub(JoinTypeLeft, sub, alias, callback)
+}
+
+// RightJoinSub 添加一个 RIGHT JOIN 派生表（子查询）。
+func (b *Builder) RightJoinSub(sub *Builder, alias string, callback func(*JoinBuilder)) *Builder {
+	return b.addJoinSub(JoinTypeRight, sub, alias, callback)
 }
 
 // ==================== GROUP BY / HAVING ====================
@@ -706,7 +761,7 @@ func (b *Builder) ToSelect() (string, []any, error) {
 	if b.err != nil {
 		return "", nil, b.err
 	}
-	if b.table == "" && b.fromSub == nil {
+	if b.table == "" && b.tableSub == nil {
 		return "", nil, ErrEmptyTable
 	}
 
@@ -784,10 +839,14 @@ func (b *Builder) ToInsert(data any) (string, []any, error) {
 
 	sql := b.grammar.CompileInsert(b, columns, rows)
 
-	// 扁平化所有行的值作为绑定参数
+	// 扁平化所有行的值作为绑定参数；Expression 已内联进 SQL，不作为绑定参数
 	var args []any
 	for _, row := range rows {
-		args = append(args, row...)
+		for _, v := range row {
+			if _, ok := v.(Expression); !ok {
+				args = append(args, v)
+			}
+		}
 	}
 
 	return sql, args, nil
@@ -826,7 +885,12 @@ func (b *Builder) ToInsertOrIgnore(data any) (string, []any, error) {
 
 	var args []any
 	for _, row := range rows {
-		args = append(args, row...)
+		// Expression 已内联进 SQL，不作为绑定参数
+		for _, v := range row {
+			if _, ok := v.(Expression); !ok {
+				args = append(args, v)
+			}
+		}
 	}
 
 	return sql, args, nil
@@ -874,6 +938,15 @@ func (b *Builder) ToUpsert(data any, uniqueBy []string, updateColumns []string) 
 		updateColumns = columns
 	}
 
+	// MySQL 使用 ON DUPLICATE KEY UPDATE 无需冲突目标列；
+	// PostgreSQL/SQLite 需要 uniqueBy 生成 ON CONFLICT 目标，为空时生成的 SQL 非法，直接拒绝
+	if len(uniqueBy) == 0 {
+		switch b.grammar.(type) {
+		case *PostgresGrammar, *SQLiteGrammar:
+			return "", nil, ErrUpsertUniqueByRequired
+		}
+	}
+
 	// 构造更新值：使用 VALUES() 引用插入值（MySQL）或 EXCLUDED 引用（PostgreSQL）
 	// 这里不传具体 values，Grammar 自行处理语法
 	sql := b.grammar.CompileUpsert(b, columns, rows, uniqueBy, updateColumns, nil)
@@ -914,6 +987,14 @@ func (b *Builder) ToInsertUsing(columns []string, callback func(*Builder)) (stri
 
 	sub := NewBuilder(b.grammar, b.dao)
 	callback(sub)
+
+	// 参数校验：子查询编译错误或缺少数据源时直接返回错误，避免生成非法 SQL
+	if sub.err != nil {
+		return "", nil, sub.err
+	}
+	if sub.table == "" && sub.tableSub == nil {
+		return "", nil, ErrEmptyTable
+	}
 
 	sql := b.grammar.CompileInsertUsing(b, columns, sub)
 	args := sub.collectSelectBindings()
@@ -1052,7 +1133,7 @@ func (b *Builder) ToCount() (string, []any, error) {
 	if b.err != nil {
 		return "", nil, b.err
 	}
-	if b.table == "" && b.fromSub == nil && len(b.unions) == 0 {
+	if b.table == "" && b.tableSub == nil && len(b.unions) == 0 {
 		return "", nil, ErrEmptyTable
 	}
 
@@ -1157,7 +1238,7 @@ func (b *Builder) ToExists() (string, []any, error) {
 	if b.err != nil {
 		return "", nil, b.err
 	}
-	if b.table == "" && b.fromSub == nil && len(b.unions) == 0 {
+	if b.table == "" && b.tableSub == nil && len(b.unions) == 0 {
 		return "", nil, ErrEmptyTable
 	}
 
@@ -1204,11 +1285,15 @@ func (b *Builder) collectSelectBindings() []any {
 		args = append(args, ss.Query.collectSelectBindings()...)
 	}
 	// FROM sub 的绑定参数
-	if b.fromSub != nil {
-		args = append(args, b.fromSub.collectSelectBindings()...)
+	if b.tableSub != nil {
+		args = append(args, b.tableSub.collectSelectBindings()...)
 	}
 	// JOIN 绑定参数
 	for _, j := range b.joins {
+		// 派生表子查询的绑定参数（SQL 文本顺序：位于 ON 条件之前）
+		if j.Sub != nil {
+			args = append(args, j.Sub.collectSelectBindings()...)
+		}
 		for _, c := range j.Conditions {
 			switch c.Type {
 			case "value":
@@ -1346,13 +1431,13 @@ func (b *Builder) Clone() *Builder {
 		limit:      b.limit,
 		offset:     b.offset,
 		lockClause: b.lockClause,
-		fromAlias:  b.fromAlias,
+		tableAlias: b.tableAlias,
 		force:      b.force,
 		err:        b.err,
 	}
 	// FROM 子查询深拷贝
-	if b.fromSub != nil {
-		clone.fromSub = b.fromSub.Clone()
+	if b.tableSub != nil {
+		clone.tableSub = b.tableSub.Clone()
 	}
 	if b.columns != nil {
 		clone.columns = make([]SelectColumn, len(b.columns))
@@ -1371,6 +1456,10 @@ func (b *Builder) Clone() *Builder {
 		clone.joins = make([]JoinClause, len(b.joins))
 		copy(clone.joins, b.joins)
 		for i := range clone.joins {
+			// 派生表子查询深拷贝
+			if clone.joins[i].Sub != nil {
+				clone.joins[i].Sub = clone.joins[i].Sub.Clone()
+			}
 			if clone.joins[i].Conditions != nil {
 				conds := make([]JoinCondition, len(clone.joins[i].Conditions))
 				copy(conds, clone.joins[i].Conditions)

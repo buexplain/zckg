@@ -22,13 +22,20 @@ func (g *PostgresGrammar) cloneForCompile() *PostgresGrammar {
 }
 
 // convertRawPlaceholders 将原始 SQL 中的 ? 依次替换为 $N 占位符，
-// bindings 中的 Expression 直接内嵌为 SQL 文本且不占用占位符编号。
+// bindings 中的 Expression 直接内嵌为 SQL 文本且不占用占位符编号；
+// 连续两个 ?? 转义为字面 ?（jsonb 键存在操作符），不消耗绑定（对齐 Laravel）。
 func (g *PostgresGrammar) convertRawPlaceholders(sql string, bindings []any) string {
 	var buf strings.Builder
 	buf.Grow(len(sql) + 8)
 	bi := 0
 	for i := 0; i < len(sql); i++ {
 		if sql[i] == '?' {
+			// ?? 转义为字面 ?（jsonb 键存在操作符），不占绑定
+			if i+1 < len(sql) && sql[i+1] == '?' {
+				buf.WriteByte('?')
+				i++
+				continue
+			}
 			if bi < len(bindings) {
 				if expr, ok := bindings[bi].(Expression); ok {
 					buf.WriteString(expr.Value())
@@ -151,9 +158,9 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn)
 
 	// FROM
 	sql.WriteString(" FROM ")
-	if b.fromSub != nil {
-		subSQL := g.compileSelectInner(b.fromSub, b.fromSub.columns)
-		sql.WriteString("(" + subSQL + ") AS " + g.wrapValue(b.fromAlias))
+	if b.tableSub != nil {
+		subSQL := g.compileSelectInner(b.tableSub, b.tableSub.columns)
+		sql.WriteString("(" + subSQL + ") AS " + g.wrapValue(b.tableAlias))
 	} else {
 		sql.WriteString(g.WrapTable(b.table))
 	}
@@ -189,33 +196,36 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn)
 		sql.WriteString(g.compileHavings(b))
 	}
 
-	// ORDER BY
-	if len(b.orders) > 0 {
-		sql.WriteString(" ORDER BY ")
-		for i, order := range b.orders {
-			if i > 0 {
-				sql.WriteString(", ")
-			}
-			if order.Raw != "" {
-				sql.WriteString(order.Raw)
-			} else {
-				sql.WriteString(g.WrapColumn(order.Column))
-				sql.WriteString(" ")
-				sql.WriteString(order.Direction)
+	// ORDER BY / LIMIT / OFFSET（UNION 时必须追加在 UNION 之后，故抽为内联闭包）
+	appendOrderLimitOffset := func(sb *strings.Builder) {
+		// ORDER BY
+		if len(b.orders) > 0 {
+			sb.WriteString(" ORDER BY ")
+			for i, order := range b.orders {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				if order.Raw != "" {
+					sb.WriteString(order.Raw)
+				} else {
+					sb.WriteString(g.WrapColumn(order.Column))
+					sb.WriteString(" ")
+					sb.WriteString(order.Direction)
+				}
 			}
 		}
-	}
 
-	// LIMIT
-	if b.limit > 0 {
-		sql.WriteString(" LIMIT ")
-		sql.WriteString(intToStr(b.limit))
-	}
+		// LIMIT
+		if b.limit > 0 {
+			sb.WriteString(" LIMIT ")
+			sb.WriteString(intToStr(b.limit))
+		}
 
-	// OFFSET
-	if b.offset > 0 {
-		sql.WriteString(" OFFSET ")
-		sql.WriteString(intToStr(b.offset))
+		// OFFSET
+		if b.offset > 0 {
+			sb.WriteString(" OFFSET ")
+			sb.WriteString(intToStr(b.offset))
+		}
 	}
 
 	// LOCK (PostgreSQL 使用 FOR SHARE 代替 LOCK IN SHARE MODE)
@@ -239,12 +249,17 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn)
 			unionSQL := g.compileSelectInner(union.Query, union.Query.columns)
 			result += "(" + unionSQL + ")"
 		}
+		// ORDER BY / LIMIT / OFFSET / LOCK 必须放在 UNION 之后
+		var tail strings.Builder
+		appendOrderLimitOffset(&tail)
+		result += tail.String()
 		if lockSQL != "" {
 			result += " " + lockSQL
 		}
 		return result
 	}
 
+	appendOrderLimitOffset(&sql)
 	if lockSQL != "" {
 		sql.WriteString(" ")
 		sql.WriteString(lockSQL)
@@ -279,7 +294,12 @@ func (g *PostgresGrammar) CompileInsert(b *Builder, columns []string, rows [][]a
 			if j > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(gClone.nextParam())
+			// Expression 直接内联，不生成占位符
+			if expr, ok := row[j].(Expression); ok {
+				sql.WriteString(expr.Value())
+			} else {
+				sql.WriteString(gClone.nextParam())
+			}
 		}
 		sql.WriteString(")")
 	}
@@ -471,9 +491,9 @@ func (g *PostgresGrammar) CompileDelete(b *Builder) string {
 	return sql.String()
 }
 
-// CompileTruncate 编译 TRUNCATE 语句
+// CompileTruncate 编译 TRUNCATE 语句（RESTART IDENTITY 重置自增序列，对齐 Laravel 行为）
 func (g *PostgresGrammar) CompileTruncate(b *Builder) string {
-	return "TRUNCATE TABLE " + g.WrapTable(b.table)
+	return "TRUNCATE TABLE " + g.WrapTable(b.table) + " RESTART IDENTITY"
 }
 
 // compileWheres 编译 WHERE 子句
@@ -607,7 +627,7 @@ func (g *PostgresGrammar) compileJoin(join JoinClause) string {
 		joinType = "CROSS JOIN"
 	}
 
-	result := joinType + " " + g.WrapTable(join.Table)
+	result := joinType + " " + g.joinTable(join)
 	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
 		result += " ON "
 		for i, cond := range join.Conditions {
@@ -625,6 +645,17 @@ func (g *PostgresGrammar) compileJoin(join JoinClause) string {
 		}
 	}
 	return result
+}
+
+// joinTable 编译 JOIN 目标表：普通表名或派生表（子查询）。
+// 注意：派生表必须用当前编译上下文 g 编译（compileSelectInner），
+// 以共享 $N 占位符递增计数器，否则编号会从头开始导致重复。
+func (g *PostgresGrammar) joinTable(join JoinClause) string {
+	if join.Sub != nil {
+		subSQL := g.compileSelectInner(join.Sub, join.Sub.columns)
+		return "(" + subSQL + ") AS " + g.wrapValue(join.Alias)
+	}
+	return g.WrapTable(join.Table)
 }
 
 // compileHavings 编译 HAVING 子句

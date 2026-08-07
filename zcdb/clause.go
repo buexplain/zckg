@@ -66,6 +66,8 @@ type JoinCondition struct {
 type JoinClause struct {
 	Type       JoinType
 	Table      string
+	Sub        *Builder // 非 nil 时 JOIN 派生表（子查询），优先于 Table
+	Alias      string   // 派生表别名
 	Conditions []JoinCondition
 }
 

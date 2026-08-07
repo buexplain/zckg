@@ -113,9 +113,9 @@ func (g *SQLiteGrammar) CompileSelect(b *Builder, columns []SelectColumn) string
 
 	// FROM
 	sql.WriteString(" FROM ")
-	if b.fromSub != nil {
-		subSQL := b.fromSub.grammar.CompileSelect(b.fromSub, b.fromSub.columns)
-		sql.WriteString("(" + subSQL + ") AS " + g.wrapValue(b.fromAlias))
+	if b.tableSub != nil {
+		subSQL := b.tableSub.grammar.CompileSelect(b.tableSub, b.tableSub.columns)
+		sql.WriteString("(" + subSQL + ") AS " + g.wrapValue(b.tableAlias))
 	} else {
 		sql.WriteString(g.WrapTable(b.table))
 	}
@@ -151,37 +151,40 @@ func (g *SQLiteGrammar) CompileSelect(b *Builder, columns []SelectColumn) string
 		sql.WriteString(g.compileHavings(b))
 	}
 
-	// ORDER BY
-	if len(b.orders) > 0 {
-		sql.WriteString(" ORDER BY ")
-		for i, order := range b.orders {
-			if i > 0 {
-				sql.WriteString(", ")
-			}
-			if order.Raw != "" {
-				sql.WriteString(order.Raw)
-			} else {
-				sql.WriteString(g.WrapColumn(order.Column))
-				sql.WriteString(" ")
-				sql.WriteString(order.Direction)
+	// ORDER BY / LIMIT / OFFSET（UNION 时必须追加在 UNION 之后，故抽为内联闭包）
+	appendOrderLimitOffset := func(sb *strings.Builder) {
+		// ORDER BY
+		if len(b.orders) > 0 {
+			sb.WriteString(" ORDER BY ")
+			for i, order := range b.orders {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				if order.Raw != "" {
+					sb.WriteString(order.Raw)
+				} else {
+					sb.WriteString(g.WrapColumn(order.Column))
+					sb.WriteString(" ")
+					sb.WriteString(order.Direction)
+				}
 			}
 		}
-	}
 
-	// LIMIT
-	if b.limit > 0 {
-		sql.WriteString(" LIMIT ")
-		sql.WriteString(intToStr(b.limit))
-	}
-
-	// OFFSET
-	if b.offset > 0 {
-		// SQLite 的 OFFSET 必须配合 LIMIT，无 LIMIT 时用 -1 表示不限制行数
-		if b.limit == 0 {
-			sql.WriteString(" LIMIT -1")
+		// LIMIT
+		if b.limit > 0 {
+			sb.WriteString(" LIMIT ")
+			sb.WriteString(intToStr(b.limit))
 		}
-		sql.WriteString(" OFFSET ")
-		sql.WriteString(intToStr(b.offset))
+
+		// OFFSET
+		if b.offset > 0 {
+			// SQLite 的 OFFSET 必须配合 LIMIT，无 LIMIT 时用 -1 表示不限制行数
+			if b.limit == 0 {
+				sb.WriteString(" LIMIT -1")
+			}
+			sb.WriteString(" OFFSET ")
+			sb.WriteString(intToStr(b.offset))
+		}
 	}
 
 	// UNION（SQLite 中 UNION 的子查询不允许显式括号，需要用 SELECT ... UNION SELECT ... 形式）
@@ -196,10 +199,15 @@ func (g *SQLiteGrammar) CompileSelect(b *Builder, columns []SelectColumn) string
 			unionSQL := union.Query.grammar.CompileSelect(union.Query, union.Query.columns)
 			result += unionSQL
 		}
-		return result
+		// ORDER BY / LIMIT / OFFSET 必须放在 UNION 之后
+		var tail strings.Builder
+		appendOrderLimitOffset(&tail)
+		return result + tail.String()
 	}
 
 	// LOCK: SQLite 不支持行锁，忽略
+
+	appendOrderLimitOffset(&sql)
 
 	return sql.String()
 }
@@ -228,7 +236,12 @@ func (g *SQLiteGrammar) CompileInsert(b *Builder, columns []string, rows [][]any
 			if j > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString("?")
+			// Expression 直接内联，不生成占位符
+			if expr, ok := row[j].(Expression); ok {
+				sql.WriteString(expr.Value())
+			} else {
+				sql.WriteString("?")
+			}
 		}
 		sql.WriteString(")")
 	}
@@ -260,7 +273,12 @@ func (g *SQLiteGrammar) CompileInsertOrIgnore(b *Builder, columns []string, rows
 			if j > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString("?")
+			// Expression 直接内联，不生成占位符
+			if expr, ok := row[j].(Expression); ok {
+				sql.WriteString(expr.Value())
+			} else {
+				sql.WriteString("?")
+			}
 		}
 		sql.WriteString(")")
 	}
@@ -578,7 +596,7 @@ func (g *SQLiteGrammar) compileJoin(join JoinClause) string {
 		joinType = "CROSS JOIN"
 	}
 
-	result := joinType + " " + g.WrapTable(join.Table)
+	result := joinType + " " + g.joinTable(join)
 	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
 		result += " ON "
 		for i, cond := range join.Conditions {
@@ -596,6 +614,15 @@ func (g *SQLiteGrammar) compileJoin(join JoinClause) string {
 		}
 	}
 	return result
+}
+
+// joinTable 编译 JOIN 目标表：普通表名或派生表（子查询）。
+func (g *SQLiteGrammar) joinTable(join JoinClause) string {
+	if join.Sub != nil {
+		subSQL := join.Sub.grammar.CompileSelect(join.Sub, join.Sub.columns)
+		return "(" + subSQL + ") AS " + g.wrapValue(join.Alias)
+	}
+	return g.WrapTable(join.Table)
 }
 
 // compileHavings 编译 HAVING 子句

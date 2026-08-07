@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iter"
 	"reflect"
+	"strings"
 )
 
 // Cursor 返回流式迭代器，通过 *sql.Rows 逐行扫描。
@@ -97,8 +98,23 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 //     fmt.Println(user.Name)
 //     }
 func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorColumn string) iter.Seq[error] {
+	return b.cursorBy(ctx, dest, chunkSize, cursorColumn, false)
+}
+
+// CursorByDesc 与 CursorBy 相同，但按游标列倒序分批：条件为 cursorColumn < lastValue，
+// 强制按 cursorColumn DESC 排序，适用于需要从末尾向前的批量处理（对齐 Laravel chunkByIdDesc）。
+// chunkSize 为 0 时直接返回，不执行任何查询；小于 0 时使用默认值 100。
+func (b *Builder) CursorByDesc(ctx context.Context, dest any, chunkSize int, cursorColumn string) iter.Seq[error] {
+	return b.cursorBy(ctx, dest, chunkSize, cursorColumn, true)
+}
+
+func (b *Builder) cursorBy(ctx context.Context, dest any, chunkSize int, cursorColumn string, desc bool) iter.Seq[error] {
 	return func(yield func(error) bool) {
-		if chunkSize <= 0 {
+		// chunkSize 为 0 时直接返回，不执行任何查询（对齐 Laravel chunk(0) 行为）
+		if chunkSize == 0 {
+			return
+		}
+		if chunkSize < 0 {
 			chunkSize = 100
 		}
 
@@ -126,12 +142,26 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 				}
 			}
 		}
+		// 限定列名（table.column）场景：取点号后的列名再匹配结构体字段
+		if !hasCursorField {
+			if idx := strings.LastIndex(cursorColumn, "."); idx >= 0 {
+				short := cursorColumn[idx+1:]
+				cursorIdx, hasCursorField = fieldInfo.columnIndex[toSnakeCase(short)]
+			}
+		}
 		if !hasCursorField {
 			yield(ErrCursorFieldNotFound)
 			return
 		}
 
 		wrappedCol := b.grammar.WrapColumn(cursorColumn)
+		// 倒序分块：条件为 <，排序为 DESC
+		cmpOp := ">"
+		orderDir := "ASC"
+		if desc {
+			cmpOp = "<"
+			orderDir = "DESC"
+		}
 		var lastCursorValue any
 
 		for {
@@ -140,13 +170,13 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 			clone.limit = chunkSize
 			clone.orders = nil // 清空已有排序，确保游标列是唯一排序依据
 
-			// 添加游标条件：cursorColumn > lastValue
+			// 添加游标条件：cursorColumn > lastValue（倒序为 <）
 			if lastCursorValue != nil {
-				clone.WhereRaw(wrappedCol+" > ?", lastCursorValue)
+				clone.WhereRaw(wrappedCol+" "+cmpOp+" ?", lastCursorValue)
 			}
 
 			// 按游标列排序
-			clone.OrderBy(cursorColumn, "ASC")
+			clone.OrderBy(cursorColumn, orderDir)
 
 			sqlStr, args, err := clone.ToSelect()
 			if err != nil {

@@ -8,6 +8,11 @@ var (
 	ErrNoFields      = errors.New("zcdb: struct has no exportable fields")
 	ErrEmptyTable    = errors.New("zcdb: table name is required")
 
+	// ErrPluckDest Pluck 目标必须是切片指针或 map 指针
+	ErrPluckDest = errors.New("zcdb: Pluck dest must be a pointer to a non-nil slice or map")
+	// ErrPluckColumns Pluck 列数不匹配：切片目标需 1 列，map 目标需 2 列
+	ErrPluckColumns = errors.New("zcdb: Pluck requires exactly 1 column for slice dest or exactly 2 columns for map dest")
+
 	// ErrDialectRequired DAO 层错误
 	ErrDialectRequired = errors.New("zcdb: dialect is required")
 	ErrUnknownDialect  = errors.New("zcdb: unknown dialect")
@@ -36,4 +41,7 @@ var (
 
 	// ErrCursorColumnNull 游标列值为 NULL，无法继续游标分页
 	ErrCursorColumnNull = errors.New("zcdb: cursor column value is NULL, cannot continue pagination")
+
+	// ErrUpsertUniqueByRequired PostgreSQL/SQLite 方言的 Upsert 需要 uniqueBy 生成 ON CONFLICT 目标
+	ErrUpsertUniqueByRequired = errors.New("zcdb: upsert requires uniqueBy columns for postgres and sqlite dialects")
 )
