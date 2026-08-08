@@ -211,7 +211,8 @@ func cloneJoinClauses(joins []JoinClause) []JoinClause {
 	return cloned
 }
 
-// cloneJoinConditions 深拷贝 ON 条件列表（Values/Bindings 切片、Sub 子查询、Nested 嵌套条件）。
+// cloneJoinConditions 深拷贝 ON 条件列表（Values/Bindings 切片、Sub 子查询、
+// Nested 嵌套条件（含其内部嵌套 join 组））。
 func cloneJoinConditions(conditions []JoinCondition) []JoinCondition {
 	if conditions == nil {
 		return nil
@@ -235,6 +236,7 @@ func cloneJoinConditions(conditions []JoinCondition) []JoinCondition {
 		if conds[j].Nested != nil {
 			inner := &JoinBuilder{
 				Conditions: cloneJoinConditions(conds[j].Nested.Conditions),
+				Joins:      cloneJoinClauses(conds[j].Nested.Joins),
 				grammar:    conds[j].Nested.grammar,
 				dao:        conds[j].Nested.dao,
 			}

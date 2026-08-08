@@ -795,6 +795,43 @@ func TestBug_CloneJoinDeepNesting(t *testing.T) {
 	}
 }
 
+// TestBug_CloneJoinNestedJoins 审查复现用例：
+// OnNested 回调内可再调 JoinOn 追加嵌套 join 组（JoinBuilder.Joins），
+// 但 cloneJoinConditions 重建 Nested 时只复制 Conditions，Joins 状态被丢弃，
+// 违反 Clone 深拷贝契约（克隆后状态与原 Builder 不一致）。
+func TestBug_CloneJoinNestedJoins(t *testing.T) {
+	g := NewMySQLGrammar()
+	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+		j.On("orders.user_id", "=", "users.id")
+		j.OnNested(func(q *JoinBuilder) {
+			q.On("orders.status", "=", "paid")
+			q.JoinOn("items", func(q2 *JoinBuilder) {
+				q2.On("items.order_id", "=", "orders.id")
+			})
+		})
+	})
+
+	// 前置条件：OnNested 内 JoinOn 应产生 Nested.Joins
+	origNested := b.joins[0].Conditions[1].Nested
+	if origNested == nil || len(origNested.Joins) == 0 {
+		t.Fatalf("前置条件不成立：OnNested 内 JoinOn 应产生 Nested.Joins")
+	}
+
+	clone := b.Clone()
+	cloneNested := clone.joins[0].Conditions[1].Nested
+	if cloneNested == nil {
+		t.Fatalf("Clone 丢失了 nested 条件")
+	}
+	if len(cloneNested.Joins) != len(origNested.Joins) {
+		t.Fatalf("BUG: Clone 丢失 nested JoinBuilder 的 Joins：orig=%d clone=%d", len(origNested.Joins), len(cloneNested.Joins))
+	}
+	// 深层独立：修改 clone 的嵌套 join 条件不影响原 Builder
+	cloneNested.Joins[0].Conditions[0].Second = "hacked"
+	if origNested.Joins[0].Conditions[0].Second != "orders.id" {
+		t.Errorf("BUG: clone 的 nested Joins 与原 Builder 共享底层数组")
+	}
+}
+
 // TestIntToStr 验证 intToStr 对零、正数、负数的处理。
 func TestIntToStr(t *testing.T) {
 	tests := []struct {
