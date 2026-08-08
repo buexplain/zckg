@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// Cursor 返回流式迭代器，通过 *sql.Rows 逐行扫描。
+// Cursor 返回流式迭代器，通过 *sql.Rows 逐行扫描（一次查询、服务端游标式读取）。
 // 适用于中小表或需要精确排序的场景。
 // 迭代过程中持有数据库连接，break 时自动释放。
 //
@@ -26,6 +26,7 @@ import (
 //     if err != nil { log.Fatal(err) }
 //     fmt.Println(user.Name)
 //     }
+//     // SQL: SELECT * FROM `users` ORDER BY `id` ASC（一次执行，逐行扫描）
 func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 	return func(yield func(error) bool) {
 		sqlStr, args, err := b.ToSelect()
@@ -97,6 +98,10 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 //     if err != nil { log.Fatal(err) }
 //     fmt.Println(user.Name)
 //     }
+//     // 每批 SQL 形如: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 100（首批无 WHERE 游标条件）
+//
+// chunkSize 为 0 时直接返回、不执行任何查询；小于 0 时使用默认值 100。
+// 游标列值为 NULL 时报 ErrCursorColumnNull 终止（否则条件恒假会无限重复同一批）。
 func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorColumn string) iter.Seq[error] {
 	return b.cursorBy(ctx, dest, chunkSize, cursorColumn, false)
 }
@@ -104,6 +109,8 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 // CursorByDesc 与 CursorBy 相同，但按游标列倒序分批：条件为 cursorColumn < lastValue，
 // 强制按 cursorColumn DESC 排序，适用于需要从末尾向前的批量处理（对齐 Laravel chunkByIdDesc）。
 // chunkSize 为 0 时直接返回，不执行任何查询；小于 0 时使用默认值 100。
+//
+//	// 每批 SQL 形如: SELECT * FROM `users` WHERE `id` < ? ORDER BY `id` DESC LIMIT 100（首批无 WHERE 游标条件）
 func (b *Builder) CursorByDesc(ctx context.Context, dest any, chunkSize int, cursorColumn string) iter.Seq[error] {
 	return b.cursorBy(ctx, dest, chunkSize, cursorColumn, true)
 }
