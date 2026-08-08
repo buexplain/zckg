@@ -21,3 +21,45 @@ func TestBug_PgWhereRawPlaceholder(t *testing.T) {
 	assertSQL(t, expectedSQL, sql)
 	assertArgs(t, []any{25, "alice%"}, args)
 }
+
+// TestPgGrammar_WhereNullSafe 验证空安全比较编译为 IS [NOT] DISTINCT FROM $N 形态。
+func TestPgGrammar_WhereNullSafe(t *testing.T) {
+	g := NewPostgresGrammar()
+
+	tests := []struct {
+		name      string
+		build     func() *Builder
+		expected  string
+		expectedA []any
+	}{
+		{
+			name:      "equals_nil",
+			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeEquals("email", nil) },
+			expected:  `SELECT * FROM "users" WHERE "email" IS NOT DISTINCT FROM $1`,
+			expectedA: []any{nil},
+		},
+		{
+			name:      "not_equals",
+			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeNotEquals("email", "a@b.c") },
+			expected:  `SELECT * FROM "users" WHERE "email" IS DISTINCT FROM $1`,
+			expectedA: []any{"a@b.c"},
+		},
+		{
+			name: "param_numbering_after_prior_binding",
+			build: func() *Builder {
+				return NewBuilder(g, nil).Table("users").Where("id", "=", 1).WhereNullSafeEquals("email", nil)
+			},
+			expected:  `SELECT * FROM "users" WHERE "id" = $1 AND "email" IS NOT DISTINCT FROM $2`,
+			expectedA: []any{1, nil},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args, err := tt.build().ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+			assertArgs(t, tt.expectedA, args)
+		})
+	}
+}

@@ -656,6 +656,41 @@ func TestSQLiteInteg_PoolConcurrentAddSlavePick(t *testing.T) {
 	}
 }
 
+// TestSQLiteInteg_QueryRoutingLockToWrite 验证 Builder.query 的读写路由：
+// 带锁子句的查询强制走写（主）连接，无锁查询路由读（从）连接。
+// SQLite :memory: 每个连接库独立，表仅建在主库：
+// 无锁查询打到从库应报 no such table，带锁查询打到主库应成功。
+func TestSQLiteInteg_QueryRoutingLockToWrite(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	if err := db.Pool().AddSlave(":memory:"); err != nil {
+		t.Fatalf("AddSlave error: %v", err)
+	}
+	// 仅在主（写）库建表，从库无此表
+	mustExec(t, db, `CREATE TABLE route_t (id INTEGER)`)
+	mustExec(t, db, `INSERT INTO route_t VALUES (1)`)
+
+	ctx := context.Background()
+
+	// 无锁：路由读连接（从库无 route_t → 报错）
+	rows, err := db.Builder().Table("route_t").query(ctx, `SELECT "id" FROM "route_t"`)
+	if err == nil {
+		_ = rows.Close()
+		t.Errorf("无锁查询期望打到从库报 no such table，实际无错误")
+	}
+
+	// 带锁：强制路由写连接（直接置 lockClause 绕开方言锁子句编译限制，仅验证路由分支）
+	b2 := db.Builder().Table("route_t")
+	b2.lockClause = " FOR UPDATE"
+	rows2, err2 := b2.query(ctx, `SELECT "id" FROM "route_t"`)
+	if err2 != nil {
+		t.Fatalf("带锁查询期望打到主库成功，实际报错: %v", err2)
+	}
+	defer func() { _ = rows2.Close() }()
+	if !rows2.Next() {
+		t.Errorf("带锁查询期望返回 1 行数据")
+	}
+}
+
 // TestSQLiteInteg_NullSafeField_IntTypes 验证各种整数类型的 NULL 安全扫描。
 func TestSQLiteInteg_NullSafeField_IntTypes(t *testing.T) {
 	db := openSQLiteTestDB(t)
