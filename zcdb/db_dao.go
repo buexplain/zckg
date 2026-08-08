@@ -42,6 +42,7 @@ type DBDao struct {
 	pool    *Pool                                                                       // 连接池（提供 *sql.DB 和读写路由）
 	grammar Grammar                                                                     // SQL 编译器（由 dialect 推导）
 	onSQL   func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) //SQL 回调函数
+	tagName string                                                                      // 列映射结构体标签名，创建时确定、不可变更，空值使用默认的 db 标签
 }
 
 // NewDBDao 创建数据库访问对象。
@@ -56,7 +57,10 @@ type DBDao struct {
 //	<0 禁用日志输出
 //	=0 全量日志输出
 //	>0 仅超过阈值（毫秒）时输出
-func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any)) (*DBDao, error) {
+//
+// tagName 指定结构体与数据库列映射使用的标签名（如 "zc"），
+// 空字符串使用默认的 db 标签；初始化后不可变更。
+func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any), tagName string) (*DBDao, error) {
 	grammar, err := dialectGrammar(dialect)
 	if err != nil {
 		return nil, err
@@ -64,10 +68,14 @@ func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapse
 	if pool == nil {
 		return nil, ErrPoolRequired
 	}
+	if tagName == "" {
+		tagName = defaultTagName
+	}
 	return &DBDao{
 		pool:    pool,
 		grammar: grammar,
 		onSQL:   onSQL,
+		tagName: tagName,
 	}, nil
 }
 

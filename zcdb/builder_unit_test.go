@@ -250,7 +250,7 @@ func TestBug_ExtractInsertData_NilPtrInSlice(t *testing.T) {
 			t.Errorf("BUG: extractInsertData panicked on nil pointer element: %v", r)
 		}
 	}()
-	_, _, err := extractInsertData([]*data{{Name: "a"}, nil, {Name: "c"}})
+	_, _, err := extractInsertData([]*data{{Name: "a"}, nil, {Name: "c"}}, "")
 	if err == nil {
 		t.Errorf("expected error for nil pointer element in slice, got nil")
 	}
@@ -430,7 +430,7 @@ func TestBug_EmbeddedStruct_Insert(t *testing.T) {
 // TestBug_EmbeddedStruct_Scan 验证扫描时嵌入结构体字段应被正确匹配。
 func TestBug_EmbeddedStruct_Scan(t *testing.T) {
 	// 测试 getScanFieldInfo 能正确展开嵌入结构体
-	info := getScanFieldInfo(reflect.TypeOf(UserWithEmbed{}))
+	info := getScanFieldInfo(reflect.TypeOf(UserWithEmbed{}), "")
 	if info == nil {
 		t.Fatal("getScanFieldInfo returned nil")
 	}
@@ -940,7 +940,7 @@ func TestDialectGrammar_Unknown(t *testing.T) {
 
 // TestNewDBDao_UnknownDialect 验证 NewDBDao 传入未知方言时返回错误。
 func TestNewDBDao_UnknownDialect(t *testing.T) {
-	_, err := NewDBDao(nil, "oracle", nil)
+	_, err := NewDBDao(nil, "oracle", nil, "")
 	if !errors.Is(err, ErrUnknownDialect) {
 		t.Errorf("expected ErrUnknownDialect, got %v", err)
 	}
@@ -1150,7 +1150,7 @@ func TestBug_InsertUpdateNilPointer(t *testing.T) {
 				t.Fatalf("extractInsertData panicked on nil pointer: %v", r)
 			}
 		}()
-		_, _, err := extractInsertData(u)
+		_, _, err := extractInsertData(u, "")
 		if !errors.Is(err, ErrInvalidStruct) {
 			t.Errorf("extractInsertData: expected ErrInvalidStruct, got %v", err)
 		}
@@ -1162,7 +1162,7 @@ func TestBug_InsertUpdateNilPointer(t *testing.T) {
 				t.Fatalf("extractUpdateData panicked on nil pointer: %v", r)
 			}
 		}()
-		_, _, err := extractUpdateData(u)
+		_, _, err := extractUpdateData(u, "")
 		if !errors.Is(err, ErrInvalidStruct) {
 			t.Errorf("extractUpdateData: expected ErrInvalidStruct, got %v", err)
 		}
@@ -1679,7 +1679,7 @@ func TestExtractInsertData_EmptySlice_Builder(t *testing.T) {
 	type d struct {
 		Name string `db:"name"`
 	}
-	_, _, err := extractInsertData([]d{})
+	_, _, err := extractInsertData([]d{}, "")
 	if !errors.Is(err, ErrEmptyData) {
 		t.Errorf("expected ErrEmptyData, got %v", err)
 	}
@@ -1687,7 +1687,7 @@ func TestExtractInsertData_EmptySlice_Builder(t *testing.T) {
 
 // TestExtractInsertData_NonStructSlice_Builder 验证 extractInsertData 传入非结构体切片时返回错误。
 func TestExtractInsertData_NonStructSlice_Builder(t *testing.T) {
-	_, _, err := extractInsertData([]int{1, 2, 3})
+	_, _, err := extractInsertData([]int{1, 2, 3}, "")
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -1695,7 +1695,7 @@ func TestExtractInsertData_NonStructSlice_Builder(t *testing.T) {
 
 // TestExtractUpdateData_NonStruct_Builder 验证 extractUpdateData 传入非结构体时返回错误。
 func TestExtractUpdateData_NonStruct_Builder(t *testing.T) {
-	_, _, err := extractUpdateData("not a struct")
+	_, _, err := extractUpdateData("not a struct", "")
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}

@@ -22,7 +22,7 @@ func (b *Builder) query(ctx context.Context, sqlStr string, args ...any) (*sql.R
 }
 
 // First 查询第一条记录，扫描到 dest。
-// dest 必须是结构体指针（*struct），字段按 db 标签匹配列名；未找到记录时返回 sql.ErrNoRows。
+// dest 必须是结构体指针（*struct），字段按列映射标签（默认 db，可由 NewDBDao 的 tagName 参数自定义）匹配列名；未找到记录时返回 sql.ErrNoRows。
 // 内部克隆并强制 LIMIT 1，不修改原 Builder。
 //
 //	var user User
@@ -46,7 +46,7 @@ func (b *Builder) First(ctx context.Context, dest any) error {
 	if err != nil {
 		return err
 	}
-	return ScanStructClose(rows, dest)
+	return ScanStructClose(rows, dest, b.tagName())
 }
 
 // Find 查询多条记录，扫描到 dest。
@@ -67,7 +67,7 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 		return err
 	}
 
-	return ScanStructClose(rows, dest)
+	return ScanStructClose(rows, dest, b.tagName())
 }
 
 // Pluck 提取查询结果中的列值到目标容器。
@@ -81,7 +81,7 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 //	var m map[int64]string
 //	err := db.Builder().Table("users").Pluck(ctx, &m, "name", "id") // id => name
 //
-// map 值为结构体/结构体指针时进入键列模式（keyBy）：唯一列参数作为键列，整行数据按 db tag 扫描进结构体：
+// map 值为结构体/结构体指针时进入键列模式（keyBy）：唯一列参数作为键列，整行数据按列映射标签扫描进结构体：
 //
 //	var m map[int64]User // id => User 整行
 //	err := db.Builder().Table("users").Pluck(ctx, &m, "id")
@@ -171,7 +171,7 @@ func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColu
 		elemType = elemType.Elem()
 	}
 
-	info := parseStruct(elemType)
+	info := parseStruct(elemType, b.tagName())
 	if info == nil || len(info.Fields) == 0 {
 		return ErrNoFields
 	}
@@ -202,7 +202,7 @@ func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColu
 	}
 	defer func() { _ = rows.Close() }()
 
-	fieldInfo := getScanFieldInfo(elemType)
+	fieldInfo := getScanFieldInfo(elemType, b.tagName())
 	for rows.Next() {
 		elem := reflect.New(elemType).Elem()
 		values := makeScanValues(columns, fieldInfo, elem)
@@ -272,7 +272,7 @@ func (b *Builder) Paginate(ctx context.Context, dest any) (totalCount int, err e
 		return 0, err
 	}
 
-	return total, ScanStructClose(rows, dest)
+	return total, ScanStructClose(rows, dest, b.tagName())
 }
 
 // Count 查询记录总数。

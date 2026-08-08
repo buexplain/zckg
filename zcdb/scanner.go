@@ -16,30 +16,43 @@ type scanFieldInfo struct {
 	columnIndex map[string][]int
 }
 
-// scanCache 扫描结果的字段映射缓存，按 reflect.Type 缓存。
-var scanCache sync.Map // map[reflect.Type]*scanFieldInfo
+// scanCache 扫描结果的字段映射缓存，按（类型, 标签名）复合键缓存。
+var scanCache sync.Map // map[structCacheKey]*scanFieldInfo
+
+// pickTagName 从变参中选取标签名：未传或为空时回退默认 db 标签。
+func pickTagName(tagName []string) string {
+	if len(tagName) > 0 && tagName[0] != "" {
+		return tagName[0]
+	}
+	return defaultTagName
+}
 
 // getScanFieldInfo 获取或构建结构体类型的列名→字段索引映射。
+// tagName 为列映射标签名（如 "db"），空值回退为默认的 db 标签。
 // 支持嵌入结构体（匿名字段），其内部字段会被递归展开。
-func getScanFieldInfo(t reflect.Type) *scanFieldInfo {
+func getScanFieldInfo(t reflect.Type, tagName string) *scanFieldInfo {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	if cached, ok := scanCache.Load(t); ok {
+	if tagName == "" {
+		tagName = defaultTagName
+	}
+	key := structCacheKey{typ: t, tag: tagName}
+	if cached, ok := scanCache.Load(key); ok {
 		return cached.(*scanFieldInfo)
 	}
 
 	info := &scanFieldInfo{
 		columnIndex: make(map[string][]int),
 	}
-	buildScanFields(t, info, nil)
+	buildScanFields(t, info, nil, tagName)
 
-	scanCache.Store(t, info)
+	scanCache.Store(key, info)
 	return info
 }
 
-// buildScanFields 递归构建扫描字段映射，支持嵌入结构体。
-func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int) {
+// buildScanFields 递归构建扫描字段映射，支持嵌入结构体，tagName 为列映射标签名。
+func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int, tagName string) {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if !field.IsExported() {
@@ -58,12 +71,12 @@ func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int) {
 				embeddedType = embeddedType.Elem()
 			}
 			if embeddedType.Kind() == reflect.Struct {
-				buildScanFields(embeddedType, info, index)
+				buildScanFields(embeddedType, info, index, tagName)
 				continue
 			}
 		}
 
-		tag := field.Tag.Get("db")
+		tag := field.Tag.Get(tagName)
 		if tag == "-" {
 			continue
 		}
@@ -81,14 +94,16 @@ func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int) {
 //   - *[]struct 指针：扫描所有行到结构体切片
 //   - *[]*struct 指针：扫描所有行到结构体指针切片
 //
-// 根据 db 标签或 snake_case 自动匹配列名到字段。
+// 变参 tagName 可指定列映射标签名（默认 "db"）。
+// 根据标签或 snake_case 自动匹配列名到字段。
 // 调用方负责关闭 rows。
 //
 //	rows, err := db.Query(ctx, sqlStr, args...)
 //	if err != nil { ... }
 //	defer rows.Close()
 //	err := zcdb.ScanStruct(rows, &users)
-func ScanStruct(rows *sql.Rows, dest any) error {
+func ScanStruct(rows *sql.Rows, dest any, tagName ...string) error {
+	tag := pickTagName(tagName)
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr {
 		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer, got %T", dest)
@@ -102,25 +117,26 @@ func ScanStruct(rows *sql.Rows, dest any) error {
 
 	switch destValue.Kind() {
 	case reflect.Struct:
-		return scanOneRow(rows, columns, destValue)
+		return scanOneRow(rows, columns, destValue, tag)
 	case reflect.Slice:
-		return scanAllRows(rows, columns, destValue)
+		return scanAllRows(rows, columns, destValue, tag)
 	default:
 		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer to struct or slice, got *%s", destValue.Kind())
 	}
 }
 
 // ScanStructClose 将 *sql.Rows 扫描到 dest 中，完成后自动关闭 rows。
-// 是 ScanStruct 的便捷封装，适用于不需要流式读取的场景。
-func ScanStructClose(rows *sql.Rows, dest any) error {
+// 是 ScanStruct 的便捷包装，适用于不需要流式读取的场景；
+// 变参 tagName 语义同 ScanStruct。
+func ScanStructClose(rows *sql.Rows, dest any, tagName ...string) error {
 	defer func(rows *sql.Rows) {
 		_ = rows.Close()
 	}(rows)
-	return ScanStruct(rows, dest)
+	return ScanStruct(rows, dest, tagName...)
 }
 
 // scanOneRow 扫描第一行到结构体，未找到返回 sql.ErrNoRows。
-func scanOneRow(rows *sql.Rows, columns []string, dest reflect.Value) error {
+func scanOneRow(rows *sql.Rows, columns []string, dest reflect.Value, tagName string) error {
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
 			return err
@@ -128,7 +144,7 @@ func scanOneRow(rows *sql.Rows, columns []string, dest reflect.Value) error {
 		return sql.ErrNoRows
 	}
 
-	fieldInfo := getScanFieldInfo(dest.Type())
+	fieldInfo := getScanFieldInfo(dest.Type(), tagName)
 	values := makeScanValues(columns, fieldInfo, dest)
 	if err := rows.Scan(values...); err != nil {
 		return fmt.Errorf("zcdb: scan row failed: %w", err)
@@ -137,7 +153,7 @@ func scanOneRow(rows *sql.Rows, columns []string, dest reflect.Value) error {
 }
 
 // scanAllRows 扫描所有行到结构体切片。
-func scanAllRows(rows *sql.Rows, columns []string, dest reflect.Value) error {
+func scanAllRows(rows *sql.Rows, columns []string, dest reflect.Value, tagName string) error {
 	elemType := dest.Type().Elem()
 	isPtr := elemType.Kind() == reflect.Ptr
 	if isPtr {
@@ -147,7 +163,7 @@ func scanAllRows(rows *sql.Rows, columns []string, dest reflect.Value) error {
 		return fmt.Errorf("zcdb: slice element must be struct or *struct, got %s", dest.Type().Elem())
 	}
 
-	fieldInfo := getScanFieldInfo(elemType)
+	fieldInfo := getScanFieldInfo(elemType, tagName)
 
 	for rows.Next() {
 		elem := reflect.New(elemType).Elem()

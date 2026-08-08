@@ -25,7 +25,7 @@ func openMySQLTestDB(t *testing.T) *DBDao {
 	}
 	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("failed to open mysql: %v", err)
 	}

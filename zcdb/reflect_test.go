@@ -15,7 +15,7 @@ func TestParseStruct_BasicStruct(t *testing.T) {
 		Age  int
 	}
 
-	info := parseStruct(reflect.TypeOf(User{}))
+	info := parseStruct(reflect.TypeOf(User{}), "")
 	if info == nil {
 		t.Fatal("parseStruct returned nil")
 	}
@@ -50,7 +50,7 @@ func TestParseStruct_DbTagSkip(t *testing.T) {
 		Name   string `db:"name"`
 	}
 
-	info := parseStruct(reflect.TypeOf(User{}))
+	info := parseStruct(reflect.TypeOf(User{}), "")
 	if info == nil {
 		t.Fatal("parseStruct returned nil")
 	}
@@ -72,7 +72,7 @@ func TestParseStruct_UnexportedFields(t *testing.T) {
 		Age  int    `db:"age"`
 	}
 
-	info := parseStruct(reflect.TypeOf(User{}))
+	info := parseStruct(reflect.TypeOf(User{}), "")
 	if len(info.Fields) != 2 {
 		t.Fatalf("expected 2 fields (unexported skipped), got %d", len(info.Fields))
 	}
@@ -84,7 +84,7 @@ func TestParseStruct_PointerType(t *testing.T) {
 		ID int `db:"id"`
 	}
 
-	info := parseStruct(reflect.TypeOf(&User{}))
+	info := parseStruct(reflect.TypeOf(&User{}), "")
 	if info == nil {
 		t.Fatal("parseStruct returned nil for pointer type")
 	}
@@ -95,13 +95,13 @@ func TestParseStruct_PointerType(t *testing.T) {
 
 // TestParseStruct_NonStruct 验证非结构体返回 nil。
 func TestParseStruct_NonStruct(t *testing.T) {
-	if info := parseStruct(reflect.TypeOf(123)); info != nil {
+	if info := parseStruct(reflect.TypeOf(123), ""); info != nil {
 		t.Error("expected nil for int type")
 	}
-	if info := parseStruct(reflect.TypeOf("hello")); info != nil {
+	if info := parseStruct(reflect.TypeOf("hello"), ""); info != nil {
 		t.Error("expected nil for string type")
 	}
-	if info := parseStruct(reflect.TypeOf([]int{})); info != nil {
+	if info := parseStruct(reflect.TypeOf([]int{}), ""); info != nil {
 		t.Error("expected nil for slice type")
 	}
 }
@@ -117,7 +117,7 @@ func TestParseStruct_EmbeddedStruct(t *testing.T) {
 		Age int `db:"age"`
 	}
 
-	info := parseStruct(reflect.TypeOf(User{}))
+	info := parseStruct(reflect.TypeOf(User{}), "")
 	if info == nil {
 		t.Fatal("parseStruct returned nil")
 	}
@@ -157,7 +157,7 @@ func TestParseStruct_NestedEmbed(t *testing.T) {
 		C int `db:"c"`
 	}
 
-	info := parseStruct(reflect.TypeOf(L3{}))
+	info := parseStruct(reflect.TypeOf(L3{}), "")
 	if len(info.Fields) != 3 {
 		t.Fatalf("expected 3 fields, got %d", len(info.Fields))
 	}
@@ -182,8 +182,8 @@ func TestParseStruct_CacheHit(t *testing.T) {
 		ID int `db:"id"`
 	}
 
-	info1 := parseStruct(reflect.TypeOf(User{}))
-	info2 := parseStruct(reflect.TypeOf(User{}))
+	info1 := parseStruct(reflect.TypeOf(User{}), "")
+	info2 := parseStruct(reflect.TypeOf(User{}), "")
 	if info1 != info2 {
 		t.Error("expected cache hit, got different pointers")
 	}
@@ -202,7 +202,7 @@ func TestParseStruct_EmbeddedPtrStruct(t *testing.T) {
 		Age int `db:"age"`
 	}
 
-	info := parseStruct(reflect.TypeOf(User{}))
+	info := parseStruct(reflect.TypeOf(User{}), "")
 	if info == nil {
 		t.Fatal("parseStruct returned nil")
 	}
@@ -236,7 +236,7 @@ func TestExtractInsertData_SingleStruct(t *testing.T) {
 		Age  int    `db:"age"`
 	}
 
-	cols, rows, err := extractInsertData(User{Name: "alice", Age: 25})
+	cols, rows, err := extractInsertData(User{Name: "alice", Age: 25}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestExtractInsertData_StructPointer(t *testing.T) {
 		Name string `db:"name"`
 	}
 
-	cols, rows, err := extractInsertData(&User{Name: "alice"})
+	cols, rows, err := extractInsertData(&User{Name: "alice"}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestExtractInsertData_Slice(t *testing.T) {
 		Name string `db:"name"`
 	}
 
-	cols, rows, err := extractInsertData([]User{{Name: "alice"}, {Name: "bob"}})
+	cols, rows, err := extractInsertData([]User{{Name: "alice"}, {Name: "bob"}}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestExtractInsertData_PointerSlice(t *testing.T) {
 	}
 
 	u1, u2 := &User{Name: "alice"}, &User{Name: "bob"}
-	_, rows, err := extractInsertData([]*User{u1, u2})
+	_, rows, err := extractInsertData([]*User{u1, u2}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestExtractInsertData_NilInterfaceField(t *testing.T) {
 		Extra any    `db:"extra"`
 	}
 
-	cols, _, err := extractInsertData(User{Name: "alice", Extra: nil})
+	cols, _, err := extractInsertData(User{Name: "alice", Extra: nil}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestExtractInsertData_NilPointerField(t *testing.T) {
 		Email *string `db:"email"`
 	}
 
-	cols, _, err := extractInsertData(User{Name: "alice", Email: nil})
+	cols, _, err := extractInsertData(User{Name: "alice", Email: nil}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestExtractInsertData_NonNilPointerField(t *testing.T) {
 	}
 
 	email := "alice@test.com"
-	cols, rows, err := extractInsertData(User{Name: "alice", Email: &email})
+	cols, rows, err := extractInsertData(User{Name: "alice", Email: &email}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestExtractInsertData_EmptySlice(t *testing.T) {
 		Name string `db:"name"`
 	}
 
-	_, _, err := extractInsertData([]User{})
+	_, _, err := extractInsertData([]User{}, "")
 	if err != ErrEmptyData {
 		t.Errorf("expected ErrEmptyData, got %v", err)
 	}
@@ -364,7 +364,7 @@ func TestExtractInsertData_EmptySlice(t *testing.T) {
 
 // TestExtractInsertData_NonStruct 验证非结构体返回错误。
 func TestExtractInsertData_NonStruct(t *testing.T) {
-	_, _, err := extractInsertData("not a struct")
+	_, _, err := extractInsertData("not a struct", "")
 	if err != ErrInvalidStruct {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -372,7 +372,7 @@ func TestExtractInsertData_NonStruct(t *testing.T) {
 
 // TestExtractInsertData_NilInput 验证 nil 输入返回错误。
 func TestExtractInsertData_NilInput(t *testing.T) {
-	_, _, err := extractInsertData(nil)
+	_, _, err := extractInsertData(nil, "")
 	if err != ErrInvalidStruct {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -385,7 +385,7 @@ func TestExtractInsertData_ExpressionField(t *testing.T) {
 		Age  Expression `db:"age"`
 	}
 
-	_, rows, err := extractInsertData(User{Name: "alice", Age: NewExpression("25 + 1")})
+	_, rows, err := extractInsertData(User{Name: "alice", Age: NewExpression("25 + 1")}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestExtractInsertData_SliceNilPointerInMiddle(t *testing.T) {
 		{Name: "bob", Email: nil}, // nil → SQL NULL
 	}
 
-	_, rows, err := extractInsertData(data)
+	_, rows, err := extractInsertData(data, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestExtractInsertData_EmbeddedPtrStruct(t *testing.T) {
 	}
 
 	// 非 nil 嵌入指针：id/name/age 全部提取
-	cols, rows, err := extractInsertData(&User{Base: &Base{ID: 1, Name: "alice"}, Age: 25})
+	cols, rows, err := extractInsertData(&User{Base: &Base{ID: 1, Name: "alice"}, Age: 25}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestExtractInsertData_EmbeddedPtrStruct(t *testing.T) {
 	}
 
 	// nil 嵌入指针：不 panic，id/name 跳过，只剩 age
-	cols, rows, err = extractInsertData(&User{Age: 30})
+	cols, rows, err = extractInsertData(&User{Age: 30}, "")
 	if err != nil {
 		t.Fatalf("unexpected error with nil embedded ptr: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestExtractUpdateData_SingleStruct(t *testing.T) {
 		Age  int    `db:"age"`
 	}
 
-	cols, vals, err := extractUpdateData(User{Name: "alice", Age: 25})
+	cols, vals, err := extractUpdateData(User{Name: "alice", Age: 25}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestExtractUpdateData_StructPointer(t *testing.T) {
 		Name string `db:"name"`
 	}
 
-	cols, vals, err := extractUpdateData(&User{Name: "alice"})
+	cols, vals, err := extractUpdateData(&User{Name: "alice"}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestExtractUpdateData_NilInterfaceField(t *testing.T) {
 		Extra any    `db:"extra"`
 	}
 
-	cols, _, err := extractUpdateData(User{Name: "alice", Extra: nil})
+	cols, _, err := extractUpdateData(User{Name: "alice", Extra: nil}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -512,7 +512,7 @@ func TestExtractUpdateData_NilPointerField(t *testing.T) {
 		Email *string `db:"email"`
 	}
 
-	cols, _, err := extractUpdateData(User{Name: "alice", Email: nil})
+	cols, _, err := extractUpdateData(User{Name: "alice", Email: nil}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestExtractUpdateData_NilPointerField(t *testing.T) {
 
 // TestExtractUpdateData_NonStruct 验证非结构体返回错误。
 func TestExtractUpdateData_NonStruct(t *testing.T) {
-	_, _, err := extractUpdateData(123)
+	_, _, err := extractUpdateData(123, "")
 	if err != ErrInvalidStruct {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -531,7 +531,7 @@ func TestExtractUpdateData_NonStruct(t *testing.T) {
 
 // TestExtractUpdateData_NilInput 验证 nil 输入返回错误。
 func TestExtractUpdateData_NilInput(t *testing.T) {
-	_, _, err := extractUpdateData(nil)
+	_, _, err := extractUpdateData(nil, "")
 	if err != ErrInvalidStruct {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -544,7 +544,7 @@ func TestExtractUpdateData_ExpressionField(t *testing.T) {
 		Age  Expression `db:"age"`
 	}
 
-	cols, vals, err := extractUpdateData(User{Name: "alice", Age: NewExpression("age + 1")})
+	cols, vals, err := extractUpdateData(User{Name: "alice", Age: NewExpression("age + 1")}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

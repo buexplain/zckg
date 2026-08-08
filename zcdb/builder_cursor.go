@@ -17,7 +17,7 @@ import (
 //
 //   - 必须是结构体指针（如 *User）
 //
-//   - 结构体字段通过 db 标签匹配列名，未匹配的列会被忽略
+//   - 结构体字段通过列映射标签（默认 db，可由 NewDBDao 的 tagName 参数自定义）匹配列名，未匹配的列会被忽略
 //
 //   - 每次迭代都会覆盖写入同一个 dest，无需在循环内重新声明
 //
@@ -61,7 +61,7 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 			return
 		}
 
-		fieldInfo := getScanFieldInfo(destElem.Type())
+		fieldInfo := getScanFieldInfo(destElem.Type(), b.tagName())
 		for rows.Next() {
 			values := makeScanValues(columns, fieldInfo, destElem)
 			if err := rows.Scan(values...); err != nil {
@@ -91,9 +91,9 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 //
 //   - 必须是结构体指针（如 *User）
 //
-//   - 结构体字段通过 db 标签匹配列名，未匹配的列会被忽略
+//   - 结构体字段通过列映射标签（默认 db，可由 NewDBDao 的 tagName 参数自定义）匹配列名，未匹配的列会被忽略
 //
-//   - 结构体必须包含 cursorColumn 对应的字段（通过 db 标签或字段名匹配）
+//   - 结构体必须包含 cursorColumn 对应的字段（通过标签或字段名匹配）
 //
 //   - 每次迭代都会覆盖写入同一个 dest，无需在循环内重新声明
 //
@@ -129,7 +129,7 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 		}
 
 		// 查找游标列在结构体中的字段索引
-		fieldInfo := getScanFieldInfo(destElem.Type())
+		fieldInfo := getScanFieldInfo(destElem.Type(), b.tagName())
 		cursorIdx, hasCursorField := fieldInfo.columnIndex[toSnakeCase(cursorColumn)]
 		// 也尝试直接按字段名匹配
 		if !hasCursorField {

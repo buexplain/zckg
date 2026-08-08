@@ -41,6 +41,15 @@ func NewBuilder(grammar Grammar, dao *DBDao) *Builder {
 	}
 }
 
+// tagName 返回列映射使用的结构体标签名：
+// DAO 配置了自定义标签名时优先使用，否则回退默认的 db 标签。
+func (b *Builder) tagName() string {
+	if b.dao != nil && b.dao.tagName != "" {
+		return b.dao.tagName
+	}
+	return defaultTagName
+}
+
 // validOperators 运算符白名单，防止 SQL 注入。
 var validOperators = map[string]bool{
 	"=": true, "!=": true, "<>": true,

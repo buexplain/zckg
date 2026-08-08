@@ -30,7 +30,7 @@ func openSQLiteDAO(t *testing.T) *zcdb.DBDao {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	dao, err := zcdb.NewDBDao(pool, "sqlite", nil)
+	dao, err := zcdb.NewDBDao(pool, "sqlite", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}
@@ -49,7 +49,7 @@ func openMySQLDAO(t *testing.T) *zcdb.DBDao {
 	if err != nil {
 		t.Skipf("mysql 不可用，跳过集成测试: %v", err)
 	}
-	dao, err := zcdb.NewDBDao(pool, "mysql", nil)
+	dao, err := zcdb.NewDBDao(pool, "mysql", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create mysql dao: %v", err)
 	}
@@ -75,7 +75,7 @@ func openPgDAO(t *testing.T) *zcdb.DBDao {
 	if err != nil {
 		t.Skipf("postgres 不可用，跳过集成测试: %v", err)
 	}
-	dao, err := zcdb.NewDBDao(pool, "postgres", nil)
+	dao, err := zcdb.NewDBDao(pool, "postgres", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}
@@ -101,7 +101,7 @@ func openPgDAO(t *testing.T) *zcdb.DBDao {
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
-	dao, err = zcdb.NewDBDao(pool, "postgres", nil)
+	dao, err = zcdb.NewDBDao(pool, "postgres", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}

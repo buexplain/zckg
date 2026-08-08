@@ -16,7 +16,7 @@ func TestGetScanFieldInfo_BasicStruct(t *testing.T) {
 		Age  int    // 无标签，自动转 snake_case
 	}
 
-	info := getScanFieldInfo(reflect.TypeOf(User{}))
+	info := getScanFieldInfo(reflect.TypeOf(User{}), "")
 	if info == nil {
 		t.Fatal("getScanFieldInfo returned nil")
 	}
@@ -50,7 +50,7 @@ func TestGetScanFieldInfo_DbTagSkip(t *testing.T) {
 		Name   string `db:"name"`
 	}
 
-	info := getScanFieldInfo(reflect.TypeOf(User{}))
+	info := getScanFieldInfo(reflect.TypeOf(User{}), "")
 	if info == nil {
 		t.Fatal("getScanFieldInfo returned nil")
 	}
@@ -74,7 +74,7 @@ func TestGetScanFieldInfo_UnexportedFields(t *testing.T) {
 		Age  int    `db:"age"`
 	}
 
-	info := getScanFieldInfo(reflect.TypeOf(User{}))
+	info := getScanFieldInfo(reflect.TypeOf(User{}), "")
 	if info == nil {
 		t.Fatal("getScanFieldInfo returned nil")
 	}
@@ -96,7 +96,7 @@ func TestGetScanFieldInfo_PointerType(t *testing.T) {
 		ID int `db:"id"`
 	}
 
-	info := getScanFieldInfo(reflect.TypeOf(&User{}))
+	info := getScanFieldInfo(reflect.TypeOf(&User{}), "")
 	if info == nil {
 		t.Fatal("getScanFieldInfo returned nil for pointer type")
 	}
@@ -113,9 +113,9 @@ func TestGetScanFieldInfo_CacheHit(t *testing.T) {
 	}
 
 	// 第一次调用构建缓存
-	info1 := getScanFieldInfo(reflect.TypeOf(User{}))
+	info1 := getScanFieldInfo(reflect.TypeOf(User{}), "")
 	// 第二次调用应命中缓存
-	info2 := getScanFieldInfo(reflect.TypeOf(User{}))
+	info2 := getScanFieldInfo(reflect.TypeOf(User{}), "")
 
 	if info1 != info2 {
 		t.Error("expected cache hit, got different pointers")

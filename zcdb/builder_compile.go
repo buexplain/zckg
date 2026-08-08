@@ -45,7 +45,8 @@ func (b *Builder) ToSelect() (string, []any, error) {
 // ToInsert 编译 INSERT 语句。
 //
 // data 必须是结构体或结构体切片（也可以是指向它们的指针），否则返回 ErrInvalidStruct。
-// 结构体字段通过 `db` 标签映射列名，无标签时自动转为 snake_case，`db:"-"` 的字段会被跳过。
+// 结构体字段通过列映射标签（默认 db，可由 NewDBDao 的 tagName 参数自定义）映射列名，
+// 无标签时自动转为 snake_case，标签值为 "-" 的字段会被跳过。
 //
 // 字段值处理规则：
 //   - any(interface{}) 类型字段：nil → 该列被跳过（不参与 INSERT）；非 nil → 取实际值
@@ -91,7 +92,7 @@ func (b *Builder) ToInsert(data any) (string, []any, error) {
 		return "", nil, ErrEmptyTable
 	}
 
-	columns, rows, err := extractInsertData(data)
+	columns, rows, err := extractInsertData(data, b.tagName())
 	if err != nil {
 		return "", nil, err
 	}
@@ -138,7 +139,7 @@ func (b *Builder) ToInsertOrIgnore(data any) (string, []any, error) {
 		return "", nil, ErrEmptyTable
 	}
 
-	columns, rows, err := extractInsertData(data)
+	columns, rows, err := extractInsertData(data, b.tagName())
 	if err != nil {
 		return "", nil, err
 	}
@@ -195,7 +196,7 @@ func (b *Builder) ToUpsert(data any, uniqueBy []string, updateColumns []string) 
 		return "", nil, ErrEmptyTable
 	}
 
-	columns, rows, err := extractInsertData(data)
+	columns, rows, err := extractInsertData(data, b.tagName())
 	if err != nil {
 		return "", nil, err
 	}
@@ -315,7 +316,8 @@ func (b *Builder) ToInsertOrIgnoreUsing(columns []string, callback func(*Builder
 // ToUpdate 编译 UPDATE 语句。
 //
 // data 必须是结构体（也可以是指向结构体的指针），否则返回 ErrInvalidStruct。
-// 结构体字段通过 `db` 标签映射列名，无标签时自动转为 snake_case，`db:"-"` 的字段会被跳过。
+// 结构体字段通过列映射标签（默认 db，可由 NewDBDao 的 tagName 参数自定义）映射列名，
+// 无标签时自动转为 snake_case，标签值为 "-" 的字段会被跳过。
 //
 // 字段值处理规则：
 //   - any(interface{}) 类型字段：nil → 该列被跳过（不参与 SET）；非 nil → 取实际值
@@ -358,7 +360,7 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 		return "", nil, ErrEmptyTable
 	}
 
-	columns, values, err := extractUpdateData(data)
+	columns, values, err := extractUpdateData(data, b.tagName())
 	if err != nil {
 		return "", nil, err
 	}

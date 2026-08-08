@@ -7,6 +7,9 @@ import (
 	"unicode"
 )
 
+// defaultTagName 默认的列映射结构体标签名
+const defaultTagName = "db"
+
 // structField 表示一个解析后的结构体字段信息
 type structField struct {
 	Column string // 数据库列名
@@ -18,14 +21,22 @@ type structInfo struct {
 	Fields []structField
 }
 
+// structCacheKey 结构体元信息缓存键：同一结构体在不同标签名下解析结果不同，
+// 缓存须按（类型, 标签名）复合键区分。
+type structCacheKey struct {
+	typ reflect.Type
+	tag string
+}
+
 // 结构体元信息缓存
-var structCache sync.Map // map[reflect.Type]*structInfo
+var structCache sync.Map // map[structCacheKey]*structInfo
 
 // parseStruct 解析结构体类型，提取字段列名和索引。
-// 使用 `db` 标签获取列名，无标签时自动将字段名转为 snake_case。
-// `db:"-"` 的字段会被跳过。
+// tagName 为列映射标签名（如 "db"），空值回退为默认的 db 标签；
+// 使用标签获取列名，无标签时自动将字段名转为 snake_case。
+// 标签值为 "-" 的字段会被跳过。
 // 支持嵌入结构体（匿名字段），其内部字段会被递归展开。
-func parseStruct(t reflect.Type) *structInfo {
+func parseStruct(t reflect.Type, tagName string) *structInfo {
 	// 确保是结构体类型
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
@@ -33,22 +44,26 @@ func parseStruct(t reflect.Type) *structInfo {
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
+	if tagName == "" {
+		tagName = defaultTagName
+	}
 
 	// 缓存命中
-	if cached, ok := structCache.Load(t); ok {
+	key := structCacheKey{typ: t, tag: tagName}
+	if cached, ok := structCache.Load(key); ok {
 		return cached.(*structInfo)
 	}
 
 	info := &structInfo{}
-	parseStructFields(t, info, nil)
+	parseStructFields(t, info, nil, tagName)
 
-	structCache.Store(t, info)
+	structCache.Store(key, info)
 	return info
 }
 
 // parseStructFields 递归解析结构体字段，支持嵌入结构体。
-// indexPrefix 是当前嵌入路径的前缀。
-func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int) {
+// indexPrefix 是当前嵌入路径的前缀，tagName 为列映射标签名。
+func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int, tagName string) {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 
@@ -69,13 +84,13 @@ func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int) {
 				embeddedType = embeddedType.Elem()
 			}
 			if embeddedType.Kind() == reflect.Struct {
-				parseStructFields(embeddedType, info, index)
+				parseStructFields(embeddedType, info, index, tagName)
 				continue
 			}
 		}
 
-		// 解析 db 标签
-		tag := field.Tag.Get("db")
+		// 解析列映射标签
+		tag := field.Tag.Get(tagName)
 		if tag == "-" {
 			continue
 		}
@@ -113,7 +128,7 @@ func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int) {
 //   - 其它类型：直接 fv.Interface()
 //
 // 返回 (列名列表, 值的二维切片, error)
-func extractInsertData(data any) (columns []string, rows [][]any, err error) {
+func extractInsertData(data any, tagName string) (columns []string, rows [][]any, err error) {
 	if data == nil {
 		return nil, nil, ErrInvalidStruct
 	}
@@ -136,7 +151,7 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 			return nil, nil, ErrInvalidStruct
 		}
 
-		info := parseStruct(elemType)
+		info := parseStruct(elemType, tagName)
 		if info == nil || len(info.Fields) == 0 {
 			return nil, nil, ErrNoFields
 		}
@@ -214,7 +229,7 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 		return nil, nil, ErrInvalidStruct
 	}
 
-	info := parseStruct(t)
+	info := parseStruct(t, tagName)
 	if info == nil || len(info.Fields) == 0 {
 		return nil, nil, ErrNoFields
 	}
@@ -265,7 +280,7 @@ func extractInsertData(data any) (columns []string, rows [][]any, err error) {
 //   - 其它类型（含 Expression）：直接 fv.Interface()
 //
 // 返回 (列名列表, 值列表, error)
-func extractUpdateData(data any) (columns []string, values []any, err error) {
+func extractUpdateData(data any, tagName string) (columns []string, values []any, err error) {
 	if data == nil {
 		return nil, nil, ErrInvalidStruct
 	}
@@ -286,7 +301,7 @@ func extractUpdateData(data any) (columns []string, values []any, err error) {
 		return nil, nil, ErrInvalidStruct
 	}
 
-	info := parseStruct(t)
+	info := parseStruct(t, tagName)
 	if info == nil || len(info.Fields) == 0 {
 		return nil, nil, ErrNoFields
 	}

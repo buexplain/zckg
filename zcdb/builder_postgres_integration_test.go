@@ -27,7 +27,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 	}
 	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
@@ -57,7 +57,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 	}
 	dao, err = NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
