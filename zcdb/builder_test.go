@@ -980,8 +980,8 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 	}
 
 	// 验证 clone 的 groups 是独立副本
-	clone.groups[0] = "modified"
-	if b.groups[0] == "modified" {
+	clone.groups[0].Column = "modified"
+	if b.groups[0].Column == "modified" {
 		t.Error("BUG: Clone 的 groups 与原 Builder 共享底层数组")
 	}
 

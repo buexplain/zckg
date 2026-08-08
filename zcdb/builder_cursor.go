@@ -34,7 +34,7 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 			return
 		}
 
-		rows, err := b.dao.Query(ctx, sqlStr, args...)
+		rows, err := b.query(ctx, sqlStr, args...)
 		if err != nil {
 			yield(err)
 			return
@@ -184,7 +184,7 @@ func (b *Builder) cursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 				return
 			}
 
-			rows, err := b.dao.Query(ctx, sqlStr, args...)
+			rows, err := b.query(ctx, sqlStr, args...)
 			if err != nil {
 				yield(err)
 				return

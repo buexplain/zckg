@@ -44,4 +44,16 @@ var (
 
 	// ErrUpsertUniqueByRequired PostgreSQL/SQLite 方言的 Upsert 需要 uniqueBy 生成 ON CONFLICT 目标
 	ErrUpsertUniqueByRequired = errors.New("zcdb: upsert requires uniqueBy columns for postgres and sqlite dialects")
+
+	// ErrInvalidSubQuery WhereExists 等方法的 sub 参数类型非法（仅支持 *Builder 或 func(*Builder)）
+	ErrInvalidSubQuery = errors.New("zcdb: sub must be a *Builder or func(*Builder)")
+
+	// ErrInvalidAggregate ToAggregate 的聚合函数非法（仅支持 MAX/MIN/SUM/AVG）
+	ErrInvalidAggregate = errors.New("zcdb: aggregate must be one of MAX, MIN, SUM, AVG")
+
+	// ErrIncrementColumns Increment/Decrement 的 extra 参数必须成对（column, amount, ...）
+	ErrIncrementColumns = errors.New("zcdb: Increment/Decrement extra args must be paired as (column, amount)")
+
+	// ErrDeleteJoinNoJoin DeleteJoin 要求至少一个 JOIN
+	ErrDeleteJoinNoJoin = errors.New("zcdb: DeleteJoin requires at least one JOIN")
 )

@@ -116,6 +116,18 @@ func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Resul
 // Query 执行原始查询，返回 *sql.Rows 调用方负责 Close。
 // args 类型规则同 Exec。
 func (d *DBDao) Query(ctx context.Context, sqlStr string, args ...any) (*sql.Rows, error) {
+	return d.query(ctx, sqlStr, false, args...)
+}
+
+// QueryPrimary 执行原始查询并强制走写（主库）连接，返回 *sql.Rows 调用方负责 Close。
+// 用于带锁查询（FOR UPDATE / FOR SHARE）：读写分离下锁查询必须命中主库，
+// 否则从库执行会报错或锁不生效。
+func (d *DBDao) QueryPrimary(ctx context.Context, sqlStr string, args ...any) (*sql.Rows, error) {
+	return d.query(ctx, sqlStr, true, args...)
+}
+
+// query Query/QueryPrimary 共用实现：primary 为 true 时强制写连接。
+func (d *DBDao) query(ctx context.Context, sqlStr string, primary bool, args ...any) (*sql.Rows, error) {
 	// 慢 SQL 检测：仅在配置回调时计时，避免热路径上无谓的 time.Now 开销
 	var start time.Time
 	if d.onSQL != nil {
@@ -125,11 +137,16 @@ func (d *DBDao) Query(ctx context.Context, sqlStr string, args ...any) (*sql.Row
 	var rows *sql.Rows
 	var err error
 
-	// 事务检测：有事务走事务连接，否则走读库
+	// 事务检测：有事务走事务连接；否则按 primary 路由读/写库
 	if tx := txFromCtx(ctx); tx != nil {
 		rows, err = tx.QueryContext(ctx, sqlStr, args...)
 	} else {
-		db := d.pool.PickReadDB()
+		var db *sql.DB
+		if primary {
+			db = d.pool.PickWriteDB()
+		} else {
+			db = d.pool.PickReadDB()
+		}
 		rows, err = db.QueryContext(ctx, sqlStr, args...)
 	}
 

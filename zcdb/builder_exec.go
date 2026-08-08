@@ -8,6 +8,16 @@ import (
 	"strings"
 )
 
+// query 执行 SELECT 查询的内部统一入口：
+// 带锁查询（lockClause 非空）强制走写（主库）连接，
+// 读写分离下锁查询打到从库会报错或锁不生效；无锁查询正常路由读库。
+func (b *Builder) query(ctx context.Context, sqlStr string, args ...any) (*sql.Rows, error) {
+	if b.lockClause != "" {
+		return b.dao.QueryPrimary(ctx, sqlStr, args...)
+	}
+	return b.dao.Query(ctx, sqlStr, args...)
+}
+
 // First 查询第一条记录，扫描到 dest。
 // dest 必须是结构体指针（*struct），未找到记录时返回 sql.ErrNoRows。
 //
@@ -26,7 +36,7 @@ func (b *Builder) First(ctx context.Context, dest any) error {
 	if err != nil {
 		return err
 	}
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	rows, err := b.query(ctx, sqlStr, args...)
 	if err != nil {
 		return err
 	}
@@ -43,7 +53,7 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 		return err
 	}
 
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	rows, err := b.query(ctx, sqlStr, args...)
 	if err != nil {
 		return err
 	}
@@ -112,7 +122,7 @@ func (b *Builder) Pluck(ctx context.Context, dest any, columns ...string) error 
 		return err
 	}
 
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	rows, err := b.query(ctx, sqlStr, args...)
 	if err != nil {
 		return err
 	}
@@ -177,7 +187,7 @@ func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColu
 		return err
 	}
 
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	rows, err := b.query(ctx, sqlStr, args...)
 	if err != nil {
 		return err
 	}
@@ -243,7 +253,7 @@ func (b *Builder) Paginate(ctx context.Context, dest any) (totalCount int, err e
 		return 0, err
 	}
 
-	rows, err := b.dao.Query(ctx, dataSQL, dataArgs...)
+	rows, err := b.query(ctx, dataSQL, dataArgs...)
 	if err != nil {
 		return 0, err
 	}
@@ -261,7 +271,7 @@ func (b *Builder) Count(ctx context.Context) (int, error) {
 	}
 
 	var count int
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	rows, err := b.query(ctx, sqlStr, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -286,7 +296,7 @@ func (b *Builder) Exists(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	rows, err := b.query(ctx, sqlStr, args...)
 	if err != nil {
 		return false, err
 	}
@@ -297,6 +307,68 @@ func (b *Builder) Exists(ctx context.Context) (bool, error) {
 	// 有行即存在
 	exists := rows.Next()
 	return exists, rows.Err()
+}
+
+// Max 查询指定列的最大值。
+// 空表/无匹配行时返回 (0, sql.ErrNoRows)（对齐 First 未命中语义）。
+//
+//	maxAge, err := db.Builder().Table("users").Max(ctx, "age")
+func (b *Builder) Max(ctx context.Context, column string) (float64, error) {
+	return b.aggregate(ctx, "MAX", column)
+}
+
+// Min 查询指定列的最小值。空表语义同 Max。
+func (b *Builder) Min(ctx context.Context, column string) (float64, error) {
+	return b.aggregate(ctx, "MIN", column)
+}
+
+// Sum 查询指定列的总和。空表/无匹配行时返回 0（SQL SUM 对空集聚合返回 NULL，此处归一为 0）。
+func (b *Builder) Sum(ctx context.Context, column string) (float64, error) {
+	return b.aggregate(ctx, "SUM", column)
+}
+
+// Avg 查询指定列的平均值。空表语义同 Sum。
+func (b *Builder) Avg(ctx context.Context, column string) (float64, error) {
+	return b.aggregate(ctx, "AVG", column)
+}
+
+// Average 是 Avg 的别名。
+func (b *Builder) Average(ctx context.Context, column string) (float64, error) {
+	return b.Avg(ctx, column)
+}
+
+// aggregate Max/Min/Sum/Avg 共用实现：ToAggregate + 单行 Scan。
+// MAX/MIN 结果为 NULL 时返回 sql.ErrNoRows；SUM/AVG 结果为 NULL 时返回 0。
+func (b *Builder) aggregate(ctx context.Context, fn string, column string) (float64, error) {
+	sqlStr, args, err := b.ToAggregate(fn, column)
+	if err != nil {
+		return 0, err
+	}
+
+	rows, err := b.query(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, err
+		}
+		return 0, sql.ErrNoRows
+	}
+	var result sql.NullFloat64
+	if err := rows.Scan(&result); err != nil {
+		return 0, err
+	}
+	if !result.Valid {
+		// SUM/AVG 空集聚合返回 NULL → 0；MAX/MIN 无值 → ErrNoRows
+		if fn == "MAX" || fn == "MIN" {
+			return 0, sql.ErrNoRows
+		}
+		return 0, nil
+	}
+	return result.Float64, rows.Err()
 }
 
 // Value 查询单个标量值，扫描到 dest。
@@ -317,7 +389,7 @@ func (b *Builder) Value(ctx context.Context, dest any) error {
 		return err
 	}
 
-	rows, err := b.dao.Query(ctx, sqlStr, args...)
+	rows, err := b.query(ctx, sqlStr, args...)
 	if err != nil {
 		return err
 	}
@@ -398,6 +470,22 @@ func (b *Builder) InsertUsing(ctx context.Context, columns []string, callback fu
 	return result.RowsAffected()
 }
 
+// InsertOrIgnoreUsing 将 SELECT 子查询的结果插入目标表（冲突时静默跳过），返回受影响行数。
+// 参数与语义同 InsertUsing，仅冲突处理不同。
+func (b *Builder) InsertOrIgnoreUsing(ctx context.Context, columns []string, callback func(*Builder)) (int64, error) {
+	sqlStr, args, err := b.ToInsertOrIgnoreUsing(columns, callback)
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := b.dao.Exec(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected()
+}
+
 // InsertOrIgnore 插入数据（忽略冲突），返回受影响行数。
 // data 支持类型同 Insert：struct{}、*struct{}、[]struct{}、[]*struct{}。
 //
@@ -460,6 +548,81 @@ func (b *Builder) Update(ctx context.Context, data any) (int64, error) {
 	return result.RowsAffected()
 }
 
+// Increment 原子自增指定列，返回受影响行数。
+// extra 可交替传入更多列与增量（IncrementEach 语义）：
+//
+//	Increment(ctx, "wallet", 100, "level", 1)
+//
+// 无 WHERE 条件时默认拒绝执行（同 Update），确需全表自增请显式 Force()。
+func (b *Builder) Increment(ctx context.Context, column string, amount any, extra ...any) (int64, error) {
+	columns, amounts, err := parseIncDecArgs(column, amount, extra)
+	if err != nil {
+		return 0, err
+	}
+	// 破坏性操作保护：复用 Update 的无 WHERE 拒绝机制
+	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
+		return 0, ErrUpdateWithoutWhere
+	}
+
+	sqlStr, args, err := b.ToIncrement(columns, amounts)
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := b.dao.Exec(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected()
+}
+
+// Decrement 原子自减指定列，返回受影响行数。参数规则与保护机制同 Increment。
+func (b *Builder) Decrement(ctx context.Context, column string, amount any, extra ...any) (int64, error) {
+	columns, amounts, err := parseIncDecArgs(column, amount, extra)
+	if err != nil {
+		return 0, err
+	}
+	// 破坏性操作保护：复用 Update 的无 WHERE 拒绝机制
+	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
+		return 0, ErrUpdateWithoutWhere
+	}
+
+	sqlStr, args, err := b.ToDecrement(columns, amounts)
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := b.dao.Exec(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected()
+}
+
+// parseIncDecArgs 解析 Increment/Decrement 参数：
+// 首个 (column, amount) 加上 extra 交替传入的 (column, amount) 对，
+// extra 长度为奇数（不成对）时返回 ErrIncrementColumns。
+func parseIncDecArgs(column string, amount any, extra []any) ([]string, []any, error) {
+	if len(extra)%2 != 0 {
+		return nil, nil, ErrIncrementColumns
+	}
+	columns := make([]string, 0, 1+len(extra)/2)
+	amounts := make([]any, 0, 1+len(extra)/2)
+	columns = append(columns, column)
+	amounts = append(amounts, amount)
+	for i := 0; i < len(extra); i += 2 {
+		col, ok := extra[i].(string)
+		if !ok {
+			return nil, nil, ErrIncrementColumns
+		}
+		columns = append(columns, col)
+		amounts = append(amounts, extra[i+1])
+	}
+	return columns, amounts, nil
+}
+
 // Delete 删除数据，返回受影响行数。
 // 无 WHERE 条件时默认拒绝执行（防误操作全表删除），
 // 确需全表删除请显式调用 Force()。
@@ -472,6 +635,34 @@ func (b *Builder) Delete(ctx context.Context) (int64, error) {
 	}
 
 	sqlStr, args, err := b.ToDelete()
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := b.dao.Exec(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected()
+}
+
+// DeleteJoin 按关联条件删除主表行，返回受影响行数。
+// 通过 JoinOn/Join 等链式调用指定关联，可配合 Where 追加过滤条件：
+//
+//	affected, err := db.Builder().Table("users").
+//	    JoinOn("orders", func(j *zcdb.JoinBuilder) { j.On("orders.user_id", "=", "users.id") }).
+//	    Where("orders.status", "=", "cancelled").
+//	    DeleteJoin(ctx)
+//
+// 无 WHERE 条件时默认拒绝执行（同 Delete）；带条件的 JOIN 本身视为有效限定。
+func (b *Builder) DeleteJoin(ctx context.Context) (int64, error) {
+	// 破坏性操作保护：复用 Delete 的无 WHERE 拒绝机制（hasEffectiveJoin 已覆盖 join 限定场景）
+	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
+		return 0, ErrDeleteWithoutWhere
+	}
+
+	sqlStr, args, err := b.ToDeleteJoin()
 	if err != nil {
 		return 0, err
 	}

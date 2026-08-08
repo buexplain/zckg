@@ -68,6 +68,11 @@ func (g *PostgresGrammar) CompileRandom() string {
 	return "RANDOM()"
 }
 
+// CompileWhereDate 返回 WhereDate 的日期比较表达式（PostgreSQL 用 ::date 强制转换提取日期部分）。
+func (g *PostgresGrammar) CompileWhereDate(column string) string {
+	return g.WrapColumn(column) + "::date"
+}
+
 // UpdateSetBeforeJoin PostgreSQL 的 UPDATE ... SET ... FROM ... WHERE ... 中 SET 在 JOIN 条件之前。
 func (g *PostgresGrammar) UpdateSetBeforeJoin() bool {
 	return true
@@ -186,7 +191,11 @@ func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn)
 			if i > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.WrapColumn(group))
+			if group.Raw != "" {
+				sql.WriteString(g.convertRawPlaceholders(group.Raw, group.Bindings))
+			} else {
+				sql.WriteString(g.WrapColumn(group.Column))
+			}
 		}
 	}
 
@@ -387,6 +396,11 @@ func (g *PostgresGrammar) CompileInsertUsing(b *Builder, columns []string, sub *
 	return sql.String()
 }
 
+// CompileInsertOrIgnoreUsing 编译忽略冲突的 INSERT INTO ... SELECT 语句（末尾追加 ON CONFLICT DO NOTHING）
+func (g *PostgresGrammar) CompileInsertOrIgnoreUsing(b *Builder, columns []string, sub *Builder) string {
+	return g.CompileInsertUsing(b, columns, sub) + " ON CONFLICT DO NOTHING"
+}
+
 // CompileUpdate 编译 UPDATE 语句。
 // 注意: PostgreSQL 的 UPDATE 不支持 ORDER BY 和 LIMIT。
 func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []any) string {
@@ -405,9 +419,9 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 		}
 		sql.WriteString(gClone.WrapColumn(col))
 		sql.WriteString(" = ")
-		// 检查值是否为 Expression
+		// 检查值是否为 Expression：内部的 ? 占位符需转为 $N（如 ToIncrement 的 col + ?）
 		if expr, ok := values[i].(Expression); ok {
-			sql.WriteString(expr.Value())
+			sql.WriteString(gClone.convertRawPlaceholders(expr.Value(), nil))
 		} else {
 			sql.WriteString(gClone.nextParam())
 		}
@@ -428,32 +442,7 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 	// 有 JOIN 时先将 ON 条件并入 WHERE 前部。
 	// 注意：必须在 compileWheres 之前编译 JOIN 条件，
 	// 以保证 $N 占位符顺序（JOIN 条件 → WHERE 条件）与 collectJoinBindings → collectWhereBindings 的绑定顺序一致。
-	var joinWhere string
-	if len(b.joins) > 0 {
-		var joinConditions []string
-		for _, join := range b.joins {
-			for i, cond := range join.Conditions {
-				var jc string
-				switch cond.Type {
-				case "column":
-					jc = gClone.WrapColumn(cond.First) + " " + cond.Operator + " " + gClone.WrapColumn(cond.Second)
-				case "value":
-					jc = gClone.WrapColumn(cond.First) + " " + cond.Operator + " " + gClone.nextParam()
-				case "raw":
-					jc = gClone.convertRawPlaceholders(cond.SQL, cond.Bindings)
-				}
-				if jc == "" {
-					continue
-				}
-				if i == 0 {
-					joinConditions = append(joinConditions, jc)
-				} else {
-					joinConditions = append(joinConditions, cond.Boolean+" "+jc)
-				}
-			}
-		}
-		joinWhere = strings.Join(joinConditions, " ")
-	}
+	joinWhere := gClone.compileJoinWheres(b.joins)
 
 	whereSQL := gClone.compileWheres(b)
 	if joinWhere != "" {
@@ -484,6 +473,49 @@ func (g *PostgresGrammar) CompileDelete(b *Builder) string {
 
 	// WHERE
 	if whereSQL := gClone.compileWheres(b); whereSQL != "" {
+		sql.WriteString(" WHERE ")
+		sql.WriteString(whereSQL)
+	}
+
+	return sql.String()
+}
+
+// CompileDeleteJoin 编译按关联条件删除的 DELETE 语句。
+// PostgreSQL 采用原生 USING 形式：DELETE FROM t USING t2 WHERE join条件 AND where条件。
+// 嵌套 join 组的表被展平列入 USING（条件仍按原有布尔连接符合并到 WHERE）。
+func (g *PostgresGrammar) CompileDeleteJoin(b *Builder) string {
+	gClone := g.cloneForCompile()
+
+	var sql strings.Builder
+
+	sql.WriteString("DELETE FROM ")
+	sql.WriteString(gClone.WrapTable(b.table))
+
+	// USING：展平列举全部 join 目标表（含嵌套组与派生表）
+	sql.WriteString(" USING ")
+	first := true
+	var flatten func(joins []JoinClause)
+	flatten = func(joins []JoinClause) {
+		for _, join := range joins {
+			if !first {
+				sql.WriteString(", ")
+			}
+			sql.WriteString(gClone.joinTable(join))
+			first = false
+			flatten(join.Joins)
+		}
+	}
+	flatten(b.joins)
+
+	// WHERE：先 JOIN 条件后 WHERE 条件（$N 顺序与 collectJoinBindings → collectWhereBindings 一致）
+	whereSQL := gClone.compileJoinWheres(b.joins)
+	if w := gClone.compileWheres(b); w != "" {
+		if whereSQL != "" {
+			whereSQL += " AND "
+		}
+		whereSQL += w
+	}
+	if whereSQL != "" {
 		sql.WriteString(" WHERE ")
 		sql.WriteString(whereSQL)
 	}
@@ -526,7 +558,11 @@ func (g *PostgresGrammar) compileWheres(b *Builder) string {
 			if w.Nested != nil {
 				nested := g.compileWheres(w.Nested)
 				if nested != "" {
-					clause = "(" + nested + ")"
+					if w.Not {
+						clause = "NOT (" + nested + ")"
+					} else {
+						clause = "(" + nested + ")"
+					}
 				}
 			}
 		case WhereTypeColumn:
@@ -557,16 +593,34 @@ func (g *PostgresGrammar) compileWheres(b *Builder) string {
 				clause = g.WrapColumn(w.Column) + " NOT IN (" + subSQL + ")"
 			}
 		case WhereTypeLike:
+			// PostgreSQL 默认 ILIKE（不区分大小写），区分大小写时用 LIKE
+			op := "ILIKE"
+			if w.CaseSensitive {
+				op = "LIKE"
+			}
 			if expr, ok := w.Value.(Expression); ok {
-				clause = g.WrapColumn(w.Column) + " LIKE " + expr.Value()
+				clause = g.WrapColumn(w.Column) + " " + op + " " + expr.Value()
 			} else {
-				clause = g.WrapColumn(w.Column) + " LIKE " + g.nextParam()
+				clause = g.WrapColumn(w.Column) + " " + op + " " + g.nextParam()
 			}
 		case WhereTypeNotLike:
 			if expr, ok := w.Value.(Expression); ok {
 				clause = g.WrapColumn(w.Column) + " NOT LIKE " + expr.Value()
 			} else {
 				clause = g.WrapColumn(w.Column) + " NOT LIKE " + g.nextParam()
+			}
+		case WhereTypeNullSafe:
+			// 空安全相等：PostgreSQL 用 IS NOT DISTINCT FROM
+			if expr, ok := w.Value.(Expression); ok {
+				clause = g.WrapColumn(w.Column) + " IS NOT DISTINCT FROM " + expr.Value()
+			} else {
+				clause = g.WrapColumn(w.Column) + " IS NOT DISTINCT FROM " + g.nextParam()
+			}
+		case WhereTypeNullSafeNot:
+			if expr, ok := w.Value.(Expression); ok {
+				clause = g.WrapColumn(w.Column) + " IS DISTINCT FROM " + expr.Value()
+			} else {
+				clause = g.WrapColumn(w.Column) + " IS DISTINCT FROM " + g.nextParam()
 			}
 		}
 
@@ -585,6 +639,15 @@ func (g *PostgresGrammar) compileWheres(b *Builder) string {
 }
 
 func (g *PostgresGrammar) compileWhereBasic(w WhereClause) string {
+	// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，防止永假的 = NULL
+	if w.Value == nil {
+		switch w.Operator {
+		case "=":
+			return g.WrapColumn(w.Column) + " IS NULL"
+		case "!=", "<>":
+			return g.WrapColumn(w.Column) + " IS NOT NULL"
+		}
+	}
 	if expr, ok := w.Value.(Expression); ok {
 		return g.WrapColumn(w.Column) + " " + w.Operator + " " + expr.Value()
 	}
@@ -613,7 +676,9 @@ func (g *PostgresGrammar) compileWhereNotIn(w WhereClause) string {
 	return g.WrapColumn(w.Column) + " NOT IN (" + strings.Join(placeholders, ", ") + ")"
 }
 
-// compileJoin 编译 JOIN 子句
+// compileJoin 编译 JOIN 子句。
+// 嵌套 join 组（join.Joins）编译为带括号的 join 组：
+// INNER JOIN (表 INNER JOIN 子表 ON ...) ON ...
 func (g *PostgresGrammar) compileJoin(join JoinClause) string {
 	var joinType string
 	switch join.Type {
@@ -625,26 +690,120 @@ func (g *PostgresGrammar) compileJoin(join JoinClause) string {
 		joinType = "RIGHT JOIN"
 	case JoinTypeCross:
 		joinType = "CROSS JOIN"
+	case JoinTypeCrossOn:
+		// PostgreSQL 的 CROSS JOIN 不接受 ON 条件，编译为语义等价的 INNER JOIN
+		joinType = "INNER JOIN"
 	}
 
-	result := joinType + " " + g.joinTable(join)
-	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
-		result += " ON "
-		for i, cond := range join.Conditions {
-			if i > 0 {
-				result += " " + cond.Boolean + " "
-			}
-			switch cond.Type {
-			case "column":
-				result += g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
-			case "value":
-				result += g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.nextParam()
-			case "raw":
-				result += g.convertRawPlaceholders(cond.SQL, cond.Bindings)
-			}
+	// 目标表：带嵌套 join 组时加括号
+	tablePart := g.joinTable(join)
+	if len(join.Joins) > 0 {
+		for _, inner := range join.Joins {
+			tablePart += " " + g.compileJoin(inner)
 		}
+		tablePart = "(" + tablePart + ")"
+	}
+
+	result := joinType + " " + tablePart
+	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
+		result += " ON " + g.compileJoinConditions(join.Conditions)
 	}
 	return result
+}
+
+// compileJoinConditions 编译 ON 条件列表（含新增的 null/in/inSub/exists/subValue/nested 类型）。
+// 子查询用当前编译上下文编译，共享 $N 占位符计数器。
+func (g *PostgresGrammar) compileJoinConditions(conditions []JoinCondition) string {
+	var parts []string
+	for i, cond := range conditions {
+		var clause string
+		switch cond.Type {
+		case "column":
+			clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+		case "value":
+			if expr, ok := cond.Value.(Expression); ok {
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.convertRawPlaceholders(expr.Value(), nil)
+			} else {
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.nextParam()
+			}
+		case "raw":
+			clause = g.convertRawPlaceholders(cond.SQL, cond.Bindings)
+		case "null":
+			if cond.Not {
+				clause = g.WrapColumn(cond.First) + " IS NOT NULL"
+			} else {
+				clause = g.WrapColumn(cond.First) + " IS NULL"
+			}
+		case "in":
+			if len(cond.Values) == 0 {
+				if cond.Not {
+					clause = "1 = 1"
+				} else {
+					clause = "0 = 1"
+				}
+			} else {
+				placeholders := make([]string, len(cond.Values))
+				for k := range cond.Values {
+					placeholders[k] = g.nextParam()
+				}
+				op := "IN"
+				if cond.Not {
+					op = "NOT IN"
+				}
+				clause = g.WrapColumn(cond.First) + " " + op + " (" + strings.Join(placeholders, ", ") + ")"
+			}
+		case "inSub":
+			if cond.Sub != nil {
+				subSQL := g.compileSelectInner(cond.Sub, cond.Sub.columns)
+				op := "IN"
+				if cond.Not {
+					op = "NOT IN"
+				}
+				clause = g.WrapColumn(cond.First) + " " + op + " (" + subSQL + ")"
+			}
+		case "subValue":
+			if cond.Sub != nil {
+				subSQL := g.compileSelectInner(cond.Sub, cond.Sub.columns)
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " (" + subSQL + ")"
+			}
+		case "exists":
+			if cond.Sub != nil {
+				subSQL := g.compileSelectInner(cond.Sub, cond.Sub.columns)
+				clause = "EXISTS (" + subSQL + ")"
+			}
+		case "nested":
+			if cond.Nested != nil {
+				inner := g.compileJoinConditions(cond.Nested.Conditions)
+				if inner != "" {
+					clause = "(" + inner + ")"
+				}
+			}
+		}
+		if clause == "" {
+			continue
+		}
+		if i == 0 {
+			parts = append(parts, clause)
+		} else {
+			parts = append(parts, cond.Boolean+" "+clause)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// compileJoinWheres 将 JOIN 的 ON 条件展平编译为 WHERE 条件片段（供 UPDATE FROM / DELETE USING 使用）。
+// 遍历顺序与 collectJoinClauseBindings 一致：嵌套 join 组在前、自身条件在后。
+func (g *PostgresGrammar) compileJoinWheres(joins []JoinClause) string {
+	var parts []string
+	for _, join := range joins {
+		if inner := g.compileJoinWheres(join.Joins); inner != "" {
+			parts = append(parts, inner)
+		}
+		if s := g.compileJoinConditions(join.Conditions); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, " AND ")
 }
 
 // joinTable 编译 JOIN 目标表：普通表名或派生表（子查询）。
@@ -677,6 +836,17 @@ func (g *PostgresGrammar) compileHavings(b *Builder) string {
 				clause = g.WrapColumn(h.Column) + " NOT BETWEEN " + g.nextParam() + " AND " + g.nextParam()
 			} else {
 				clause = g.WrapColumn(h.Column) + " BETWEEN " + g.nextParam() + " AND " + g.nextParam()
+			}
+		case "null":
+			clause = g.WrapColumn(h.Column) + " IS NULL"
+		case "notNull":
+			clause = g.WrapColumn(h.Column) + " IS NOT NULL"
+		case "nested":
+			if h.Nested != nil {
+				nested := g.compileHavings(h.Nested)
+				if nested != "" {
+					clause = "(" + nested + ")"
+				}
 			}
 		}
 		if clause == "" {

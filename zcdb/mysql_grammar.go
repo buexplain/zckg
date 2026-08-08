@@ -64,6 +64,11 @@ func (g *MySQLGrammar) wrapValue(value string) string {
 	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
 }
 
+// CompileWhereDate 返回 WhereDate 的日期比较表达式（MySQL 用 date() 函数提取日期部分）。
+func (g *MySQLGrammar) CompileWhereDate(column string) string {
+	return "date(" + g.WrapColumn(column) + ")"
+}
+
 // CompileSelect 编译 SELECT 查询
 func (g *MySQLGrammar) CompileSelect(b *Builder, columns []SelectColumn) string {
 	var sql strings.Builder
@@ -130,7 +135,11 @@ func (g *MySQLGrammar) CompileSelect(b *Builder, columns []SelectColumn) string 
 			if i > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.WrapColumn(group))
+			if group.Raw != "" {
+				sql.WriteString(replaceRawExpression(group.Raw, group.Bindings))
+			} else {
+				sql.WriteString(g.WrapColumn(group.Column))
+			}
 		}
 	}
 
@@ -347,6 +356,25 @@ func (g *MySQLGrammar) CompileInsertUsing(b *Builder, columns []string, sub *Bui
 	return sql.String()
 }
 
+// CompileInsertOrIgnoreUsing 编译 INSERT IGNORE INTO ... SELECT 语句（冲突时静默跳过）
+func (g *MySQLGrammar) CompileInsertOrIgnoreUsing(b *Builder, columns []string, sub *Builder) string {
+	var sql strings.Builder
+
+	sql.WriteString("INSERT IGNORE INTO ")
+	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(" (")
+	for i, col := range columns {
+		if i > 0 {
+			sql.WriteString(", ")
+		}
+		sql.WriteString(g.WrapColumn(col))
+	}
+	sql.WriteString(") ")
+	sql.WriteString(sub.grammar.CompileSelect(sub, sub.columns))
+
+	return sql.String()
+}
+
 // CompileUpdate 编译 UPDATE 语句
 func (g *MySQLGrammar) CompileUpdate(b *Builder, columns []string, values []any) string {
 	var sql strings.Builder
@@ -405,6 +433,30 @@ func (g *MySQLGrammar) CompileUpdate(b *Builder, columns []string, values []any)
 	if b.limit > 0 {
 		sql.WriteString(" LIMIT ")
 		sql.WriteString(intToStr(b.limit))
+	}
+
+	return sql.String()
+}
+
+// CompileDeleteJoin 编译按关联条件删除的 DELETE 语句（多表 DELETE 直译）。
+// 例如：DELETE `users` FROM `users` INNER JOIN `orders` ON ... WHERE ...
+func (g *MySQLGrammar) CompileDeleteJoin(b *Builder) string {
+	var sql strings.Builder
+
+	sql.WriteString("DELETE ")
+	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(" FROM ")
+	sql.WriteString(g.WrapTable(b.table))
+
+	for _, join := range b.joins {
+		sql.WriteString(" ")
+		sql.WriteString(g.compileJoin(join))
+	}
+
+	// WHERE
+	if whereSQL := g.compileWheres(b); whereSQL != "" {
+		sql.WriteString(" WHERE ")
+		sql.WriteString(whereSQL)
 	}
 
 	return sql.String()
@@ -484,7 +536,11 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 			if w.Nested != nil {
 				nested := g.compileWheres(w.Nested)
 				if nested != "" {
-					clause = "(" + nested + ")"
+					if w.Not {
+						clause = "NOT (" + nested + ")"
+					} else {
+						clause = "(" + nested + ")"
+					}
 				}
 			}
 		case WhereTypeColumn:
@@ -515,16 +571,34 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 				clause = g.WrapColumn(w.Column) + " NOT IN (" + subSQL + ")"
 			}
 		case WhereTypeLike:
+			// 区分大小写时加 BINARY 前缀（MySQL 默认 LIKE 不区分大小写）
+			prefix := ""
+			if w.CaseSensitive {
+				prefix = "BINARY "
+			}
 			if expr, ok := w.Value.(Expression); ok {
-				clause = g.WrapColumn(w.Column) + " LIKE " + expr.Value()
+				clause = prefix + g.WrapColumn(w.Column) + " LIKE " + expr.Value()
 			} else {
-				clause = g.WrapColumn(w.Column) + " LIKE ?"
+				clause = prefix + g.WrapColumn(w.Column) + " LIKE ?"
 			}
 		case WhereTypeNotLike:
 			if expr, ok := w.Value.(Expression); ok {
 				clause = g.WrapColumn(w.Column) + " NOT LIKE " + expr.Value()
 			} else {
 				clause = g.WrapColumn(w.Column) + " NOT LIKE ?"
+			}
+		case WhereTypeNullSafe:
+			// 空安全相等：MySQL 用 <=> 操作符
+			if expr, ok := w.Value.(Expression); ok {
+				clause = g.WrapColumn(w.Column) + " <=> " + expr.Value()
+			} else {
+				clause = g.WrapColumn(w.Column) + " <=> ?"
+			}
+		case WhereTypeNullSafeNot:
+			if expr, ok := w.Value.(Expression); ok {
+				clause = "NOT " + g.WrapColumn(w.Column) + " <=> " + expr.Value()
+			} else {
+				clause = "NOT " + g.WrapColumn(w.Column) + " <=> ?"
 			}
 		}
 
@@ -543,6 +617,15 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 }
 
 func (g *MySQLGrammar) compileWhereBasic(w WhereClause) string {
+	// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，防止永假的 = NULL
+	if w.Value == nil {
+		switch w.Operator {
+		case "=":
+			return g.WrapColumn(w.Column) + " IS NULL"
+		case "!=", "<>":
+			return g.WrapColumn(w.Column) + " IS NOT NULL"
+		}
+	}
 	if expr, ok := w.Value.(Expression); ok {
 		return g.WrapColumn(w.Column) + " " + w.Operator + " " + expr.Value()
 	}
@@ -571,7 +654,9 @@ func (g *MySQLGrammar) compileWhereNotIn(w WhereClause) string {
 	return g.WrapColumn(w.Column) + " NOT IN (" + strings.Join(placeholders, ", ") + ")"
 }
 
-// compileJoin 编译 JOIN 子句
+// compileJoin 编译 JOIN 子句。
+// 嵌套 join 组（join.Joins）编译为带括号的 join 组：
+// INNER JOIN (表 INNER JOIN 子表 ON ...) ON ...
 func (g *MySQLGrammar) compileJoin(join JoinClause) string {
 	var joinType string
 	switch join.Type {
@@ -583,26 +668,104 @@ func (g *MySQLGrammar) compileJoin(join JoinClause) string {
 		joinType = "RIGHT JOIN"
 	case JoinTypeCross:
 		joinType = "CROSS JOIN"
+	case JoinTypeCrossOn:
+		// MySQL 支持 CROSS JOIN ... ON ...
+		joinType = "CROSS JOIN"
 	}
 
-	result := joinType + " " + g.joinTable(join)
-	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
-		result += " ON "
-		for i, cond := range join.Conditions {
-			if i > 0 {
-				result += " " + cond.Boolean + " "
-			}
-			switch cond.Type {
-			case "column":
-				result += g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
-			case "value":
-				result += g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
-			case "raw":
-				result += replaceRawExpression(cond.SQL, cond.Bindings)
-			}
+	// 目标表：带嵌套 join 组时加括号
+	tablePart := g.joinTable(join)
+	if len(join.Joins) > 0 {
+		for _, inner := range join.Joins {
+			tablePart += " " + g.compileJoin(inner)
 		}
+		tablePart = "(" + tablePart + ")"
+	}
+
+	result := joinType + " " + tablePart
+	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
+		result += " ON " + g.compileJoinConditions(join.Conditions)
 	}
 	return result
+}
+
+// compileJoinConditions 编译 ON 条件列表（含新增的 null/in/inSub/exists/subValue/nested 类型）。
+func (g *MySQLGrammar) compileJoinConditions(conditions []JoinCondition) string {
+	var parts []string
+	for i, cond := range conditions {
+		var clause string
+		switch cond.Type {
+		case "column":
+			clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+		case "value":
+			if expr, ok := cond.Value.(Expression); ok {
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + expr.Value()
+			} else {
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
+			}
+		case "raw":
+			clause = replaceRawExpression(cond.SQL, cond.Bindings)
+		case "null":
+			if cond.Not {
+				clause = g.WrapColumn(cond.First) + " IS NOT NULL"
+			} else {
+				clause = g.WrapColumn(cond.First) + " IS NULL"
+			}
+		case "in":
+			if len(cond.Values) == 0 {
+				if cond.Not {
+					clause = "1 = 1"
+				} else {
+					clause = "0 = 1"
+				}
+			} else {
+				placeholders := make([]string, len(cond.Values))
+				for k := range cond.Values {
+					placeholders[k] = "?"
+				}
+				op := "IN"
+				if cond.Not {
+					op = "NOT IN"
+				}
+				clause = g.WrapColumn(cond.First) + " " + op + " (" + strings.Join(placeholders, ", ") + ")"
+			}
+		case "inSub":
+			if cond.Sub != nil {
+				subSQL := cond.Sub.grammar.CompileSelect(cond.Sub, cond.Sub.columns)
+				op := "IN"
+				if cond.Not {
+					op = "NOT IN"
+				}
+				clause = g.WrapColumn(cond.First) + " " + op + " (" + subSQL + ")"
+			}
+		case "subValue":
+			if cond.Sub != nil {
+				subSQL := cond.Sub.grammar.CompileSelect(cond.Sub, cond.Sub.columns)
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " (" + subSQL + ")"
+			}
+		case "exists":
+			if cond.Sub != nil {
+				subSQL := cond.Sub.grammar.CompileSelect(cond.Sub, cond.Sub.columns)
+				clause = "EXISTS (" + subSQL + ")"
+			}
+		case "nested":
+			if cond.Nested != nil {
+				inner := g.compileJoinConditions(cond.Nested.Conditions)
+				if inner != "" {
+					clause = "(" + inner + ")"
+				}
+			}
+		}
+		if clause == "" {
+			continue
+		}
+		if i == 0 {
+			parts = append(parts, clause)
+		} else {
+			parts = append(parts, cond.Boolean+" "+clause)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // joinTable 编译 JOIN 目标表：普通表名或派生表（子查询）。
@@ -633,6 +796,17 @@ func (g *MySQLGrammar) compileHavings(b *Builder) string {
 				clause = g.WrapColumn(h.Column) + " NOT BETWEEN ? AND ?"
 			} else {
 				clause = g.WrapColumn(h.Column) + " BETWEEN ? AND ?"
+			}
+		case "null":
+			clause = g.WrapColumn(h.Column) + " IS NULL"
+		case "notNull":
+			clause = g.WrapColumn(h.Column) + " IS NOT NULL"
+		case "nested":
+			if h.Nested != nil {
+				nested := g.compileHavings(h.Nested)
+				if nested != "" {
+					clause = "(" + nested + ")"
+				}
 			}
 		}
 		if clause == "" {

@@ -4240,7 +4240,7 @@ func TestPgInteg_InsertBatchPtr(t *testing.T) {
 
 // TestPgInteg_WhereLikeExpression 验证 PostgreSQL 上 WhereLike 传入 Expression 的真实执行：
 // Expression 直接内嵌为原始 SQL（无占位符、无绑定参数），SQL 语法正确且结果正确。
-// 注意：PG 的 LIKE 大小写敏感，测试数据全小写，'%a%' 命中 alice/charlie/diana。
+// 注意：§11 后 PG 默认编译为 ILIKE（不区分大小写），测试数据全小写，'%a%' 命中 alice/charlie/diana。
 func TestPgInteg_WhereLikeExpression(t *testing.T) {
 	db := openPgTestDB(t)
 	setupPgUsersTable(t, db)
@@ -4248,7 +4248,7 @@ func TestPgInteg_WhereLikeExpression(t *testing.T) {
 	// 编译层面：Expression 内嵌，无占位符、无绑定参数
 	sql, args, err := db.Builder().Table("users").WhereLike("name", NewExpression("'%a%'")).ToSelect()
 	assertNoError(t, err)
-	assertSQL(t, `SELECT * FROM "users" WHERE "name" LIKE '%a%'`, sql)
+	assertSQL(t, `SELECT * FROM "users" WHERE "name" ILIKE '%a%'`, sql)
 	assertArgs(t, nil, args)
 
 	// 执行层面：alice/charlie/diana 名字含 a → 3 行

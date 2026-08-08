@@ -18,6 +18,8 @@ type Grammar interface {
 	CompileUpsert(b *Builder, columns []string, rows [][]any, uniqueBy []string, updateColumns []string, updateValues []any) string
 	// CompileInsertUsing 编译 INSERT INTO ... SELECT 语句
 	CompileInsertUsing(b *Builder, columns []string, sub *Builder) string
+	// CompileInsertOrIgnoreUsing 编译忽略冲突的 INSERT INTO ... SELECT 语句
+	CompileInsertOrIgnoreUsing(b *Builder, columns []string, sub *Builder) string
 	// CompileUpdate 编译 UPDATE 语句
 	CompileUpdate(b *Builder, columns []string, values []any) string
 	// UpdateSetBeforeJoin 报告 UPDATE 语句中 SET 子句的绑定参数是否出现在 JOIN 条件之前。
@@ -26,6 +28,8 @@ type Grammar interface {
 	UpdateSetBeforeJoin() bool
 	// CompileDelete 编译 DELETE 语句
 	CompileDelete(b *Builder) string
+	// CompileDeleteJoin 编译按关联条件删除的 DELETE 语句（方言实现路径不同）
+	CompileDeleteJoin(b *Builder) string
 	// CompileTruncate 编译 TRUNCATE 语句
 	CompileTruncate(b *Builder) string
 	// WrapColumn 引用列标识符
@@ -34,6 +38,8 @@ type Grammar interface {
 	WrapTable(table string) string
 	// CompileRandom 返回随机排序的 SQL 表达式
 	CompileRandom() string
+	// CompileWhereDate 返回 WhereDate 的日期比较表达式（方言分支：MySQL date(col) / PG col::date / SQLite strftime）
+	CompileWhereDate(column string) string
 }
 
 // intToStr 简单的 int 转字符串（避免引入 strconv）

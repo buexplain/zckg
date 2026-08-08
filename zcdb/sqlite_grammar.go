@@ -27,6 +27,11 @@ func (g *SQLiteGrammar) CompileRandom() string {
 	return "RANDOM()"
 }
 
+// CompileWhereDate 返回 WhereDate 的日期比较表达式（SQLite 用 strftime 提取 YYYY-MM-DD 日期部分）。
+func (g *SQLiteGrammar) CompileWhereDate(column string) string {
+	return "strftime('%Y-%m-%d', " + g.WrapColumn(column) + ")"
+}
+
 // UpdateSetBeforeJoin SQLite 的 UPDATE ... SET ... FROM ... WHERE ... 中 SET 在 JOIN 条件之前。
 func (g *SQLiteGrammar) UpdateSetBeforeJoin() bool {
 	return true
@@ -141,7 +146,11 @@ func (g *SQLiteGrammar) CompileSelect(b *Builder, columns []SelectColumn) string
 			if i > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString(g.WrapColumn(group))
+			if group.Raw != "" {
+				sql.WriteString(replaceRawExpression(group.Raw, group.Bindings))
+			} else {
+				sql.WriteString(g.WrapColumn(group.Column))
+			}
 		}
 	}
 
@@ -359,6 +368,25 @@ func (g *SQLiteGrammar) CompileInsertUsing(b *Builder, columns []string, sub *Bu
 	return sql.String()
 }
 
+// CompileInsertOrIgnoreUsing 编译 INSERT OR IGNORE INTO ... SELECT 语句（冲突时静默跳过）
+func (g *SQLiteGrammar) CompileInsertOrIgnoreUsing(b *Builder, columns []string, sub *Builder) string {
+	var sql strings.Builder
+
+	sql.WriteString("INSERT OR IGNORE INTO ")
+	sql.WriteString(g.WrapTable(b.table))
+	sql.WriteString(" (")
+	for i, col := range columns {
+		if i > 0 {
+			sql.WriteString(", ")
+		}
+		sql.WriteString(g.WrapColumn(col))
+	}
+	sql.WriteString(") ")
+	sql.WriteString(sub.grammar.CompileSelect(sub, sub.columns))
+
+	return sql.String()
+}
+
 // CompileUpdate 编译 UPDATE 语句。
 // 注意: SQLite 的 UPDATE 默认不支持 JOIN、ORDER BY、LIMIT。
 // 多表更新采用 UPDATE ... SET ... FROM ...（SQLite 3.33+）。
@@ -398,32 +426,7 @@ func (g *SQLiteGrammar) CompileUpdate(b *Builder, columns []string, values []any
 	// WHERE
 	// 有 JOIN 时先将 ON 条件并入 WHERE 前部，
 	// 保证占位符顺序（JOIN 条件 → WHERE 条件）与 collectJoinBindings → collectWhereBindings 的绑定顺序一致。
-	var joinWhere string
-	if len(b.joins) > 0 {
-		var joinConditions []string
-		for _, join := range b.joins {
-			for i, cond := range join.Conditions {
-				var jc string
-				switch cond.Type {
-				case "column":
-					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
-				case "value":
-					jc = g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
-				case "raw":
-					jc = replaceRawExpression(cond.SQL, cond.Bindings)
-				}
-				if jc == "" {
-					continue
-				}
-				if i == 0 {
-					joinConditions = append(joinConditions, jc)
-				} else {
-					joinConditions = append(joinConditions, cond.Boolean+" "+jc)
-				}
-			}
-		}
-		joinWhere = strings.Join(joinConditions, " ")
-	}
+	joinWhere := g.compileJoinWheres(b.joins)
 
 	whereSQL := g.compileWheres(b)
 	if joinWhere != "" {
@@ -457,6 +460,28 @@ func (g *SQLiteGrammar) CompileDelete(b *Builder) string {
 	}
 
 	return sql.String()
+}
+
+// CompileDeleteJoin 编译按关联条件删除的 DELETE 语句。
+// SQLite 不支持多表 DELETE 语法，采用主键 IN 子查询方案（依赖主键列，默认 id）：
+// DELETE FROM t WHERE "id" IN (SELECT t."id" FROM t JOIN ... WHERE ...)
+func (g *SQLiteGrammar) CompileDeleteJoin(b *Builder) string {
+	var sub strings.Builder
+
+	sub.WriteString("SELECT ")
+	sub.WriteString(g.WrapColumn(b.table + ".id"))
+	sub.WriteString(" FROM ")
+	sub.WriteString(g.WrapTable(b.table))
+	for _, join := range b.joins {
+		sub.WriteString(" ")
+		sub.WriteString(g.compileJoin(join))
+	}
+	if whereSQL := g.compileWheres(b); whereSQL != "" {
+		sub.WriteString(" WHERE ")
+		sub.WriteString(whereSQL)
+	}
+
+	return "DELETE FROM " + g.WrapTable(b.table) + " WHERE " + g.WrapColumn("id") + " IN (" + sub.String() + ")"
 }
 
 // CompileTruncate SQLite 没有 TRUNCATE，用 DELETE FROM 代替
@@ -494,7 +519,11 @@ func (g *SQLiteGrammar) compileWheres(b *Builder) string {
 			if w.Nested != nil {
 				nested := g.compileWheres(w.Nested)
 				if nested != "" {
-					clause = "(" + nested + ")"
+					if w.Not {
+						clause = "NOT (" + nested + ")"
+					} else {
+						clause = "(" + nested + ")"
+					}
 				}
 			}
 		case WhereTypeColumn:
@@ -525,7 +554,14 @@ func (g *SQLiteGrammar) compileWheres(b *Builder) string {
 				clause = g.WrapColumn(w.Column) + " NOT IN (" + subSQL + ")"
 			}
 		case WhereTypeLike:
-			if expr, ok := w.Value.(Expression); ok {
+			// 区分大小写时用 GLOB（天然区分大小写；通配符为 * / ?，调用方需自行转换）
+			if w.CaseSensitive {
+				if expr, ok := w.Value.(Expression); ok {
+					clause = g.WrapColumn(w.Column) + " GLOB " + expr.Value()
+				} else {
+					clause = g.WrapColumn(w.Column) + " GLOB ?"
+				}
+			} else if expr, ok := w.Value.(Expression); ok {
 				clause = g.WrapColumn(w.Column) + " LIKE " + expr.Value()
 			} else {
 				clause = g.WrapColumn(w.Column) + " LIKE ?"
@@ -535,6 +571,19 @@ func (g *SQLiteGrammar) compileWheres(b *Builder) string {
 				clause = g.WrapColumn(w.Column) + " NOT LIKE " + expr.Value()
 			} else {
 				clause = g.WrapColumn(w.Column) + " NOT LIKE ?"
+			}
+		case WhereTypeNullSafe:
+			// 空安全相等：SQLite 用 IS（NULL IS NULL 为 true）
+			if expr, ok := w.Value.(Expression); ok {
+				clause = g.WrapColumn(w.Column) + " IS " + expr.Value()
+			} else {
+				clause = g.WrapColumn(w.Column) + " IS ?"
+			}
+		case WhereTypeNullSafeNot:
+			if expr, ok := w.Value.(Expression); ok {
+				clause = g.WrapColumn(w.Column) + " IS NOT " + expr.Value()
+			} else {
+				clause = g.WrapColumn(w.Column) + " IS NOT ?"
 			}
 		}
 
@@ -553,6 +602,15 @@ func (g *SQLiteGrammar) compileWheres(b *Builder) string {
 }
 
 func (g *SQLiteGrammar) compileWhereBasic(w WhereClause) string {
+	// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，防止永假的 = NULL
+	if w.Value == nil {
+		switch w.Operator {
+		case "=":
+			return g.WrapColumn(w.Column) + " IS NULL"
+		case "!=", "<>":
+			return g.WrapColumn(w.Column) + " IS NOT NULL"
+		}
+	}
 	if expr, ok := w.Value.(Expression); ok {
 		return g.WrapColumn(w.Column) + " " + w.Operator + " " + expr.Value()
 	}
@@ -581,7 +639,9 @@ func (g *SQLiteGrammar) compileWhereNotIn(w WhereClause) string {
 	return g.WrapColumn(w.Column) + " NOT IN (" + strings.Join(placeholders, ", ") + ")"
 }
 
-// compileJoin 编译 JOIN 子句
+// compileJoin 编译 JOIN 子句。
+// 嵌套 join 组（join.Joins）编译为带括号的 join 组：
+// INNER JOIN (表 INNER JOIN 子表 ON ...) ON ...
 func (g *SQLiteGrammar) compileJoin(join JoinClause) string {
 	var joinType string
 	switch join.Type {
@@ -594,26 +654,119 @@ func (g *SQLiteGrammar) compileJoin(join JoinClause) string {
 		joinType = "RIGHT JOIN"
 	case JoinTypeCross:
 		joinType = "CROSS JOIN"
+	case JoinTypeCrossOn:
+		// SQLite 支持 CROSS JOIN ... ON ...
+		joinType = "CROSS JOIN"
 	}
 
-	result := joinType + " " + g.joinTable(join)
-	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
-		result += " ON "
-		for i, cond := range join.Conditions {
-			if i > 0 {
-				result += " " + cond.Boolean + " "
-			}
-			switch cond.Type {
-			case "column":
-				result += g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
-			case "value":
-				result += g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
-			case "raw":
-				result += replaceRawExpression(cond.SQL, cond.Bindings)
-			}
+	// 目标表：带嵌套 join 组时加括号
+	tablePart := g.joinTable(join)
+	if len(join.Joins) > 0 {
+		for _, inner := range join.Joins {
+			tablePart += " " + g.compileJoin(inner)
 		}
+		tablePart = "(" + tablePart + ")"
+	}
+
+	result := joinType + " " + tablePart
+	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
+		result += " ON " + g.compileJoinConditions(join.Conditions)
 	}
 	return result
+}
+
+// compileJoinConditions 编译 ON 条件列表（含新增的 null/in/inSub/exists/subValue/nested 类型）。
+func (g *SQLiteGrammar) compileJoinConditions(conditions []JoinCondition) string {
+	var parts []string
+	for i, cond := range conditions {
+		var clause string
+		switch cond.Type {
+		case "column":
+			clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
+		case "value":
+			if expr, ok := cond.Value.(Expression); ok {
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + expr.Value()
+			} else {
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
+			}
+		case "raw":
+			clause = replaceRawExpression(cond.SQL, cond.Bindings)
+		case "null":
+			if cond.Not {
+				clause = g.WrapColumn(cond.First) + " IS NOT NULL"
+			} else {
+				clause = g.WrapColumn(cond.First) + " IS NULL"
+			}
+		case "in":
+			if len(cond.Values) == 0 {
+				if cond.Not {
+					clause = "1 = 1"
+				} else {
+					clause = "0 = 1"
+				}
+			} else {
+				placeholders := make([]string, len(cond.Values))
+				for k := range cond.Values {
+					placeholders[k] = "?"
+				}
+				op := "IN"
+				if cond.Not {
+					op = "NOT IN"
+				}
+				clause = g.WrapColumn(cond.First) + " " + op + " (" + strings.Join(placeholders, ", ") + ")"
+			}
+		case "inSub":
+			if cond.Sub != nil {
+				subSQL := cond.Sub.grammar.CompileSelect(cond.Sub, cond.Sub.columns)
+				op := "IN"
+				if cond.Not {
+					op = "NOT IN"
+				}
+				clause = g.WrapColumn(cond.First) + " " + op + " (" + subSQL + ")"
+			}
+		case "subValue":
+			if cond.Sub != nil {
+				subSQL := cond.Sub.grammar.CompileSelect(cond.Sub, cond.Sub.columns)
+				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " (" + subSQL + ")"
+			}
+		case "exists":
+			if cond.Sub != nil {
+				subSQL := cond.Sub.grammar.CompileSelect(cond.Sub, cond.Sub.columns)
+				clause = "EXISTS (" + subSQL + ")"
+			}
+		case "nested":
+			if cond.Nested != nil {
+				inner := g.compileJoinConditions(cond.Nested.Conditions)
+				if inner != "" {
+					clause = "(" + inner + ")"
+				}
+			}
+		}
+		if clause == "" {
+			continue
+		}
+		if i == 0 {
+			parts = append(parts, clause)
+		} else {
+			parts = append(parts, cond.Boolean+" "+clause)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// compileJoinWheres 将 JOIN 的 ON 条件展平编译为 WHERE 条件片段（供 UPDATE FROM 使用）。
+// 遍历顺序与 collectJoinClauseBindings 一致：嵌套 join 组在前、自身条件在后。
+func (g *SQLiteGrammar) compileJoinWheres(joins []JoinClause) string {
+	var parts []string
+	for _, join := range joins {
+		if inner := g.compileJoinWheres(join.Joins); inner != "" {
+			parts = append(parts, inner)
+		}
+		if s := g.compileJoinConditions(join.Conditions); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, " AND ")
 }
 
 // joinTable 编译 JOIN 目标表：普通表名或派生表（子查询）。
@@ -644,6 +797,17 @@ func (g *SQLiteGrammar) compileHavings(b *Builder) string {
 				clause = g.WrapColumn(h.Column) + " NOT BETWEEN ? AND ?"
 			} else {
 				clause = g.WrapColumn(h.Column) + " BETWEEN ? AND ?"
+			}
+		case "null":
+			clause = g.WrapColumn(h.Column) + " IS NULL"
+		case "notNull":
+			clause = g.WrapColumn(h.Column) + " IS NOT NULL"
+		case "nested":
+			if h.Nested != nil {
+				nested := g.compileHavings(h.Nested)
+				if nested != "" {
+					clause = "(" + nested + ")"
+				}
 			}
 		}
 		if clause == "" {
