@@ -2,22 +2,22 @@ package zcdb
 
 // 本文件包含 Builder 的排序、分页、UNION、锁构造方法：
 // OrderBy 系列、Limit/Offset/ForPage、Union/UnionAll、LockForUpdate/SharedLock。
-// 分类依据见 docs/builder-api.md 第 6 节。
 
 // ==================== ORDER BY ====================
 
 // OrderBy 添加一个 ORDER BY 子句，多次调用按顺序累积多个排序列。
-// direction 大小写不敏感，仅 "DESC"（忽略大小写）为降序，其余任何值（含空串）均归一为 ASC。
+// 可选参数 direction 大小写不敏感，仅 "DESC"（忽略大小写）为降序，其余任何值（含空串）均归一为 ASC；
+// 省略时默认升序 ASC。
 //
-//	sql, _, _ := db.Builder().Table("users").OrderBy("age", "DESC").OrderBy("name", "whatever").ToSelect()
+//	sql, _, _ := db.Builder().Table("users").OrderBy("age", "DESC").OrderBy("name").ToSelect()
 //	// SQL: SELECT * FROM `users` ORDER BY `age` DESC, `name` ASC
-func (b *Builder) OrderBy(column string, direction string) *Builder {
+func (b *Builder) OrderBy(column string, direction ...string) *Builder {
 	dir := "ASC"
-	if len(direction) > 0 {
-		upper := direction
-		if direction[0] >= 'a' && direction[0] <= 'z' {
+	if len(direction) > 0 && len(direction[0]) > 0 {
+		upper := direction[0]
+		if direction[0][0] >= 'a' && direction[0][0] <= 'z' {
 			upper = ""
-			for _, c := range direction {
+			for _, c := range direction[0] {
 				if c >= 'a' && c <= 'z' {
 					upper += string(c - 32)
 				} else {
@@ -31,14 +31,6 @@ func (b *Builder) OrderBy(column string, direction string) *Builder {
 	}
 	b.orders = append(b.orders, OrderClause{Column: column, Direction: dir})
 	return b
-}
-
-// OrderByDesc 按降序添加一个 ORDER BY 子句，等价 OrderBy(column, "DESC")。
-//
-//	sql, _, _ := db.Builder().Table("users").OrderByDesc("created_at").ToSelect()
-//	// SQL: SELECT * FROM `users` ORDER BY `created_at` DESC
-func (b *Builder) OrderByDesc(column string) *Builder {
-	return b.OrderBy(column, "DESC")
 }
 
 // OrderByRaw 添加一个原始 SQL ORDER BY 子句，不做标识符包裹、不支持绑定（需自行内联值）。

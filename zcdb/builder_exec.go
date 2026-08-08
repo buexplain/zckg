@@ -3,7 +3,7 @@ package zcdb
 // 本文件包含 Builder 的写入执行方法（终端方法）：
 // Insert/Upsert/Update/Increment/Decrement/Delete/DeleteJoin/Truncate 系列，
 // 以及无 WHERE 条件的破坏性操作保护（hasEffectiveWhere/hasEffectiveJoin）。
-// SELECT 查询执行方法见 builder_query.go；分类依据见 docs/builder-api.md 第 9 节。
+// SELECT 查询执行方法见 builder_query.go。
 
 import (
 	"context"
@@ -343,7 +343,7 @@ func (b *Builder) hasEffectiveJoin() bool {
 //	// SQLite SQL:   DELETE FROM "users"
 func (b *Builder) Truncate(ctx context.Context) error {
 	// SQLite 方言：DELETE FROM 不会重置 AUTOINCREMENT 序列，
-	// 需额外清空 sqlite_sequence 使自增主键从头开始（对齐 Laravel 行为）；
+	// 需额外清空 sqlite_sequence 使自增主键从头开始；
 	// 表从未使用 AUTOINCREMENT 时 sqlite_sequence 表不存在，该错误忽略
 	if _, ok := b.grammar.(*SQLiteGrammar); ok {
 		_, err := b.dao.Exec(ctx, "DELETE FROM sqlite_sequence WHERE name = ?", b.table)

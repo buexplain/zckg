@@ -3,7 +3,6 @@ package zcdb
 // 本文件包含 Builder 的连表 JOIN 构造方法：
 // Join/LeftJoin/RightJoin（单条件简写）、JoinOn 系列（多条件回调）、
 // CrossJoin 系列、JoinSub 系列（派生表），以及 ON 条件构造器 JoinBuilder。
-// 分类依据见 docs/builder-api.md 第 4 节。
 
 // ==================== JOIN ====================
 

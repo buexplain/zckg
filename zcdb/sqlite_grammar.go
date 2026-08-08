@@ -47,16 +47,16 @@ func (g *SQLiteGrammar) WrapColumn(column string) string {
 	if strings.Contains(column, "(") {
 		return column
 	}
-	// 处理 table.column 形式
-	if strings.Contains(column, ".") {
-		parts := strings.SplitN(column, ".", 2)
-		return g.WrapTable(parts[0]) + "." + g.wrapValue(parts[1])
-	}
-	// 处理 column AS alias 形式
+	// 处理 column AS alias 形式（先于点号检查，避免 "表.列 AS 别名" 的别名被点号分支吞掉）
 	if idx := strings.Index(strings.ToLower(column), " as "); idx != -1 {
 		col := column[:idx]
 		alias := column[idx+4:]
 		return g.WrapColumn(strings.TrimSpace(col)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
+	}
+	// 处理 table.column 形式
+	if strings.Contains(column, ".") {
+		parts := strings.SplitN(column, ".", 2)
+		return g.WrapTable(parts[0]) + "." + g.wrapValue(parts[1])
 	}
 	return g.wrapValue(column)
 }
@@ -413,14 +413,21 @@ func (g *SQLiteGrammar) CompileUpdate(b *Builder, columns []string, values []any
 	}
 
 	// FROM (SQLite 3.33+ 支持 UPDATE ... FROM ...)
+	// 展平嵌套 join 组；JoinSub 编译为派生表 (SELECT ...) AS alias
 	if len(b.joins) > 0 {
-		sql.WriteString(" FROM ")
-		for i, join := range b.joins {
-			if i > 0 {
-				sql.WriteString(", ")
+		var tables []string
+		var flatten func(joins []JoinClause)
+		flatten = func(joins []JoinClause) {
+			for _, join := range joins {
+				tables = append(tables, g.joinTable(join))
+				if len(join.Joins) > 0 {
+					flatten(join.Joins)
+				}
 			}
-			sql.WriteString(g.WrapTable(join.Table))
 		}
+		flatten(b.joins)
+		sql.WriteString(" FROM ")
+		sql.WriteString(strings.Join(tables, ", "))
 	}
 
 	// WHERE

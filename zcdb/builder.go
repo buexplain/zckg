@@ -5,10 +5,10 @@ package zcdb
 // 以及状态管理类方法 Force（全表操作授权）与 Clone（深拷贝）。
 // 其余方法按功能分类拆分到 builder_select.go / builder_where.go / builder_join.go /
 // builder_group.go / builder_order.go / builder_compile.go / builder_query.go /
-// builder_exec.go / builder_cursor.go，分类依据见 docs/builder-api.md。
+// builder_exec.go / builder_cursor.go。
 
 // Builder 是查询构造器的核心，负责收集用户的查询意图和数据。
-// 遵循 Laravel 的设计：Builder 积累状态，Grammar 负责编译 SQL。
+// Builder 积累状态，Grammar 负责编译 SQL。
 type Builder struct {
 	grammar Grammar
 	dao     *DBDao // 持有 DBDao 引用，用于终端方法执行 SQL
@@ -127,27 +127,7 @@ func (b *Builder) Clone() *Builder {
 		}
 	}
 	if b.joins != nil {
-		clone.joins = make([]JoinClause, len(b.joins))
-		copy(clone.joins, b.joins)
-		for i := range clone.joins {
-			// 派生表子查询深拷贝
-			if clone.joins[i].Sub != nil {
-				clone.joins[i].Sub = clone.joins[i].Sub.Clone()
-			}
-			clone.joins[i].Conditions = cloneJoinConditions(clone.joins[i].Conditions)
-			// 嵌套 join 组深拷贝
-			if clone.joins[i].Joins != nil {
-				innerJoins := make([]JoinClause, len(clone.joins[i].Joins))
-				copy(innerJoins, clone.joins[i].Joins)
-				for j := range innerJoins {
-					if innerJoins[j].Sub != nil {
-						innerJoins[j].Sub = innerJoins[j].Sub.Clone()
-					}
-					innerJoins[j].Conditions = cloneJoinConditions(innerJoins[j].Conditions)
-				}
-				clone.joins[i].Joins = innerJoins
-			}
-		}
+		clone.joins = cloneJoinClauses(b.joins)
 	}
 	if b.wheres != nil {
 		clone.wheres = make([]WhereClause, len(b.wheres))
@@ -210,6 +190,25 @@ func (b *Builder) Clone() *Builder {
 		}
 	}
 	return clone
+}
+
+// cloneJoinClauses 递归深拷贝 join 子句列表（含任意深度的嵌套 join 组、派生表与 ON 条件）。
+func cloneJoinClauses(joins []JoinClause) []JoinClause {
+	if joins == nil {
+		return nil
+	}
+	cloned := make([]JoinClause, len(joins))
+	copy(cloned, joins)
+	for i := range cloned {
+		// 派生表子查询深拷贝
+		if cloned[i].Sub != nil {
+			cloned[i].Sub = cloned[i].Sub.Clone()
+		}
+		cloned[i].Conditions = cloneJoinConditions(cloned[i].Conditions)
+		// 嵌套 join 组递归深拷贝
+		cloned[i].Joins = cloneJoinClauses(cloned[i].Joins)
+	}
+	return cloned
 }
 
 // cloneJoinConditions 深拷贝 ON 条件列表（Values/Bindings 切片、Sub 子查询、Nested 嵌套条件）。

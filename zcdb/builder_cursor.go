@@ -81,7 +81,11 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 // CursorBy 返回基于游标分页的迭代器，通过 WHERE cursorColumn > lastValue 分批获取数据。
 // 适用于大表批量处理，每批独立查询，不长时间占用连接。
 // cursorColumn 必须是有序且唯一的列（通常为主键）。
-// 注意：CursorBy 会忽略已设置的 ORDER BY，强制按 cursorColumn ASC 排序。
+// 注意：CursorBy 会忽略已设置的 ORDER BY，强制按 cursorColumn ASC或DESC 排序。
+//
+// 可选参数 desc 为 true 时按游标列倒序分批：条件为 cursorColumn < lastValue，
+// 强制按 cursorColumn DESC 排序，适用于从末尾向前的批量处理；
+// 省略或为 false 时默认升序 ASC。
 //
 // dest 参数要求：
 //
@@ -102,22 +106,10 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 //
 // chunkSize 为 0 时直接返回、不执行任何查询；小于 0 时使用默认值 100。
 // 游标列值为 NULL 时报 ErrCursorColumnNull 终止（否则条件恒假会无限重复同一批）。
-func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorColumn string) iter.Seq[error] {
-	return b.cursorBy(ctx, dest, chunkSize, cursorColumn, false)
-}
-
-// CursorByDesc 与 CursorBy 相同，但按游标列倒序分批：条件为 cursorColumn < lastValue，
-// 强制按 cursorColumn DESC 排序，适用于需要从末尾向前的批量处理（对齐 Laravel chunkByIdDesc）。
-// chunkSize 为 0 时直接返回，不执行任何查询；小于 0 时使用默认值 100。
-//
-//	// 每批 SQL 形如: SELECT * FROM `users` WHERE `id` < ? ORDER BY `id` DESC LIMIT 100（首批无 WHERE 游标条件）
-func (b *Builder) CursorByDesc(ctx context.Context, dest any, chunkSize int, cursorColumn string) iter.Seq[error] {
-	return b.cursorBy(ctx, dest, chunkSize, cursorColumn, true)
-}
-
-func (b *Builder) cursorBy(ctx context.Context, dest any, chunkSize int, cursorColumn string, desc bool) iter.Seq[error] {
+func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorColumn string, desc ...bool) iter.Seq[error] {
+	by := len(desc) > 0 && desc[0]
 	return func(yield func(error) bool) {
-		// chunkSize 为 0 时直接返回，不执行任何查询（对齐 Laravel chunk(0) 行为）
+		// chunkSize 为 0 时直接返回，不执行任何查询
 		if chunkSize == 0 {
 			return
 		}
@@ -165,7 +157,7 @@ func (b *Builder) cursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 		// 倒序分块：条件为 <，排序为 DESC
 		cmpOp := ">"
 		orderDir := "ASC"
-		if desc {
+		if by {
 			cmpOp = "<"
 			orderDir = "DESC"
 		}
@@ -257,6 +249,7 @@ func isNilValue(v any) bool {
 	switch rv.Kind() {
 	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
 		return rv.IsNil()
+	default:
 	}
 	return false
 }

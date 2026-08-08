@@ -3,7 +3,6 @@ package zcdb
 // 本文件包含 Builder 的 ToXxx 编译系列（只生成 SQL 与绑定参数、不执行）：
 // ToSelect/ToInsert/ToUpdate/ToDelete/ToCount/ToAggregate 等，
 // 以及配套的绑定参数收集内部方法（collectXxxBindings）。
-// 分类依据见 docs/builder-api.md 第 7 节。
 
 // ==================== 终端方法：编译 SQL ====================
 

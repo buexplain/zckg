@@ -3,7 +3,6 @@ package zcdb
 // 本文件包含 Builder 的 SELECT 查询执行方法（终端方法）：
 // First/Find/Pluck/Paginate/Count/Exists/Value 与聚合 Max/Min/Sum/Avg，
 // 以及内部统一查询入口 query（带锁查询强制走写连接）。
-// 分类依据见 docs/builder-api.md 第 8 节。
 
 import (
 	"context"
@@ -88,7 +87,7 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 //	err := db.Builder().Table("users").Pluck(ctx, &m, "id")
 //
 // NULL 值扫描为零值（与 Find 一致）；map 模式重复键后者覆盖前者，键列为 NULL 时使用零值键。
-// Pluck 会覆盖 Builder 当前的 SELECT 列（与 Laravel pluck 语义一致）。
+// Pluck 会覆盖 Builder 当前的 SELECT 列。
 func (b *Builder) Pluck(ctx context.Context, dest any, columns ...string) error {
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr || destValue.IsNil() {
@@ -358,11 +357,6 @@ func (b *Builder) Sum(ctx context.Context, column string) (float64, error) {
 //	// SQL: SELECT AVG(`age`) AS `aggregate` FROM `users`
 func (b *Builder) Avg(ctx context.Context, column string) (float64, error) {
 	return b.aggregate(ctx, "AVG", column)
-}
-
-// Average 是 Avg 的别名。
-func (b *Builder) Average(ctx context.Context, column string) (float64, error) {
-	return b.Avg(ctx, column)
 }
 
 // aggregate Max/Min/Sum/Avg 共用实现：ToAggregate + 单行 Scan。

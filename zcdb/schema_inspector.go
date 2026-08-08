@@ -13,11 +13,15 @@ type TableInfo struct {
 
 // ColumnInfo 字段元数据。
 type ColumnInfo struct {
-	Name     string  // 字段名
-	Type     string  // 字段类型（如 "varchar(255)"、"integer"）
-	Comment  string  // 字段注释（SQLite 始终为空）
-	Nullable bool    // 是否允许 NULL
-	Default  *string // 默认值（nil 表示无默认值）
+	Name     string // 字段名
+	Type     string // 字段类型（如 "varchar(255)"、"integer"）
+	Comment  string // 字段注释（SQLite 始终为空）
+	Nullable bool   // 是否允许 NULL
+	// Default 默认值（nil 表示无默认值）。
+	// 字符串为方言原生格式，不做归一化：
+	// MySQL 为裸值（active）；PostgreSQL 为表达式（'active'::character varying、nextval(...)）；
+	// SQLite 为字面量（字符串带引号 'x'，数值为 0/1.5）。
+	Default *string
 }
 
 // SchemaInspector 数据库元数据查询接口。

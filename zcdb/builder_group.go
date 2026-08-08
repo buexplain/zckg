@@ -1,7 +1,6 @@
 package zcdb
 
 // 本文件包含 Builder 的分组与 HAVING 构造方法：GroupBy/GroupByRaw 与 Having 系列。
-// 分类依据见 docs/builder-api.md 第 5 节。
 
 // ==================== GROUP BY / HAVING ====================
 

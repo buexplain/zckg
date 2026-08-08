@@ -32,16 +32,16 @@ func (g *MySQLGrammar) WrapColumn(column string) string {
 	if strings.Contains(column, "(") {
 		return column
 	}
-	// 处理 table.column 形式
-	if strings.Contains(column, ".") {
-		parts := strings.SplitN(column, ".", 2)
-		return g.WrapTable(parts[0]) + "." + g.wrapValue(parts[1])
-	}
-	// 处理 column AS alias 形式
+	// 处理 column AS alias 形式（先于点号检查，避免 "表.列 AS 别名" 的别名被点号分支吞掉）
 	if idx := strings.Index(strings.ToLower(column), " as "); idx != -1 {
 		col := column[:idx]
 		alias := column[idx+4:]
 		return g.WrapColumn(strings.TrimSpace(col)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
+	}
+	// 处理 table.column 形式
+	if strings.Contains(column, ".") {
+		parts := strings.SplitN(column, ".", 2)
+		return g.WrapTable(parts[0]) + "." + g.wrapValue(parts[1])
 	}
 	return g.wrapValue(column)
 }

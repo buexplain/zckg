@@ -1,3 +1,5 @@
+// 本文件为方言无关的 Builder 单元测试（工具函数/错误定义/Grammar 通用行为/Bug 回归等），
+// 仅验证编译与内部逻辑，不依赖数据库连接；同时存放各方言单元测试共用的断言 helper 与测试结构体。
 package zcdb
 
 import (
@@ -5,11 +7,8 @@ import (
 	"errors"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 )
-
-// ==================== 测试用结构体 ====================
 
 // INSERT/UPDATE 用结构体（字段为 any）
 type userInsert struct {
@@ -53,8 +52,6 @@ type orderItem struct {
 	UnitPrice int    // 应转为 unit_price
 }
 
-// ==================== 反射工具测试 ====================
-
 func TestSnakeCase(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -88,8 +85,6 @@ func TestSelectWithSnakeCaseColumns(t *testing.T) {
 	// UnitPrice 无标签应转为 unit_price
 	assertSQL(t, "SELECT `item_name`, `unit_price` FROM `order_items`", sql)
 }
-
-// ==================== orderItem 结构体测试（snake_case 转换 + db:"-" 跳过）====================
 
 // TestInsertWithSnakeCaseStruct 验证 ToInsert 对无标签结构体的处理：db:"-" 字段被跳过，无标签字段名自动转为 snake_case。
 func TestInsertWithSnakeCaseStruct(t *testing.T) {
@@ -132,8 +127,6 @@ func TestUpdateWithSnakeCaseStruct(t *testing.T) {
 	assertArgs(t, []any{"Gadget", 1999, 100}, args)
 }
 
-// ==================== userRow 结构体测试（具体类型字段）====================
-
 // TestInsertWithConcreteTypeStruct 验证 ToInsert 对具体类型字段结构体的处理：所有字段均被包含，列名取自 db 标签。
 func TestInsertWithConcreteTypeStruct(t *testing.T) {
 	g := NewMySQLGrammar()
@@ -164,8 +157,6 @@ func TestUpdateWithConcreteTypeStruct(t *testing.T) {
 	assertArgs(t, []any{0, "bob", 0, "", 1}, args)
 }
 
-// ==================== 错误处理测试 ====================
-
 func TestErrorEmptyTable(t *testing.T) {
 	g := NewMySQLGrammar()
 	_, _, err := NewBuilder(g, nil).ToSelect()
@@ -181,100 +172,6 @@ func TestErrorInvalidInsertData(t *testing.T) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
 }
-
-// ==================== LOCK SQL 生成测试 ====================
-
-// TestMySQLGrammar_LockSQL 验证 MySQL 方言的锁子句生成：LockForUpdate → FOR UPDATE，SharedLock → LOCK IN SHARE MODE。
-func TestMySQLGrammar_LockSQL(t *testing.T) {
-	g := &MySQLGrammar{}
-
-	tests := []struct {
-		name     string
-		builder  *Builder
-		expected string
-	}{
-		{
-			name:     "LockForUpdate",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
-			expected: "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE",
-		},
-		{
-			name:     "SharedLock",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
-			expected: "SELECT * FROM `users` WHERE `id` = ? LOCK IN SHARE MODE",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := tt.builder.ToSelect()
-			assertNoError(t, err)
-			assertSQL(t, tt.expected, sql)
-			assertArgs(t, []any{1}, args)
-		})
-	}
-}
-
-// TestPostgresGrammar_LockSQL 验证 PostgreSQL 方言的锁子句生成：LockForUpdate → FOR UPDATE，SharedLock → FOR SHARE（自动转换）。
-func TestPostgresGrammar_LockSQL(t *testing.T) {
-	g := &PostgresGrammar{}
-
-	tests := []struct {
-		name     string
-		builder  *Builder
-		expected string
-	}{
-		{
-			name:     "LockForUpdate",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
-			expected: "SELECT * FROM \"users\" WHERE \"id\" = $1 FOR UPDATE",
-		},
-		{
-			name:     "SharedLock",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
-			expected: "SELECT * FROM \"users\" WHERE \"id\" = $1 FOR SHARE",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := tt.builder.ToSelect()
-			assertNoError(t, err)
-			assertSQL(t, tt.expected, sql)
-			assertArgs(t, []any{1}, args)
-		})
-	}
-}
-
-// TestSQLiteGrammar_LockSQL 验证 SQLite 方言不支持锁子句：LockForUpdate 和 SharedLock 均返回错误。
-func TestSQLiteGrammar_LockSQL(t *testing.T) {
-	g := &SQLiteGrammar{}
-
-	tests := []struct {
-		name    string
-		builder *Builder
-	}{
-		{
-			name:    "LockForUpdate_error",
-			builder: NewBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
-		},
-		{
-			name:    "SharedLock_error",
-			builder: NewBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := tt.builder.ToSelect()
-			if !errors.Is(err, ErrSQLiteLockNotSupported) {
-				t.Errorf("expected ErrSQLiteLockNotSupported, got %v", err)
-			}
-		})
-	}
-}
-
-// ==================== Bug 验证测试 ====================
 
 // TestBug_ToCountWithUnion 验证 ToCount 对 UNION 查询生成无效 SQL。
 // 期望：COUNT 应包裹整个 UNION 为子查询。
@@ -305,7 +202,7 @@ func TestBug_CollectSelectBindings_SubqueryOrder(t *testing.T) {
 	tableSub := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
 
 	b := NewBuilder(g, nil).
-		SelectSubquery(selectSub, "sub_amount").
+		SelectSub(selectSub, "sub_amount").
 		TableSub(tableSub, "u")
 
 	sql, args, err := b.ToSelect()
@@ -316,32 +213,6 @@ func TestBug_CollectSelectBindings_SubqueryOrder(t *testing.T) {
 	assertSQL(t, expected, sql)
 	// 绑定顺序应为 ["active", 25]（与 SQL 中 ? 出现顺序一致）
 	assertArgs(t, []any{"active", 25}, args)
-}
-
-// TestBug_ToUpdateWithJoin_MySQL 验证 MySQL UPDATE + JOIN 的绑定参数数量。
-// CompileUpdate 在 JOIN ON value 条件中生成 ? 占位符，
-// 但 ToUpdate 只收集 WHERE 绑定，不收集 JOIN 绑定，导致参数数量不匹配。
-func TestBug_ToUpdateWithJoin_MySQL(t *testing.T) {
-	g := NewMySQLGrammar()
-	type updateData struct {
-		Name string `db:"name"`
-	}
-	b := NewBuilder(g, nil).
-		Table("users").
-		JoinOn("profiles", func(jb *JoinBuilder) {
-			jb.On("users.id", "=", "profiles.user_id")
-			jb.Where("profiles.active", "=", 99)
-		}).
-		Where("users.id", "=", 1)
-
-	sql, args, err := b.ToUpdate(updateData{Name: "x"})
-	assertNoError(t, err)
-
-	// SQL 中应有 3 个 ?：SET 1个 + JOIN ON value 1个 + WHERE 1个
-	expectedSQL := "UPDATE `users` INNER JOIN `profiles` ON `users`.`id` = `profiles`.`user_id` AND `profiles`.`active` = ? SET `name` = ? WHERE `users`.`id` = ?"
-	assertSQL(t, expectedSQL, sql)
-	// 绑定应为 3 个：[99, "x", 1]
-	assertArgs(t, []any{99, "x", 1}, args)
 }
 
 // TestBug_UpdateJoin_PG_DropsValueCondition 验证 PostgreSQL UPDATE + JOIN 编译时
@@ -364,30 +235,6 @@ func TestBug_UpdateJoin_PG_DropsValueCondition(t *testing.T) {
 
 	// 正确 SQL 应在 WHERE 中包含 "profiles"."active" = $2
 	expectedSQL := `UPDATE "users" SET "name" = $1 FROM "profiles" WHERE "users"."id" = "profiles"."user_id" AND "profiles"."active" = $2 AND "users"."id" = $3`
-	assertSQL(t, expectedSQL, sql)
-	assertArgs(t, []any{"x", 99, 1}, args)
-}
-
-// TestBug_UpdateJoin_SQLite_DropsValueCondition 验证 SQLite UPDATE + JOIN 编译时
-// value 类型条件被静默丢弃。
-func TestBug_UpdateJoin_SQLite_DropsValueCondition(t *testing.T) {
-	g := NewSQLiteGrammar()
-	type updateData struct {
-		Name string `db:"name"`
-	}
-	b := NewBuilder(g, nil).
-		Table("users").
-		JoinOn("profiles", func(jb *JoinBuilder) {
-			jb.On("users.id", "=", "profiles.user_id")
-			jb.Where("profiles.active", "=", 99)
-		}).
-		Where("users.id", "=", 1)
-
-	sql, args, err := b.ToUpdate(updateData{Name: "x"})
-	assertNoError(t, err)
-
-	// 正确 SQL 应在 WHERE 中包含 "profiles"."active" = ?
-	expectedSQL := `UPDATE "users" SET "name" = ? FROM "profiles" WHERE "users"."id" = "profiles"."user_id" AND "profiles"."active" = ? AND "users"."id" = ?`
 	assertSQL(t, expectedSQL, sql)
 	assertArgs(t, []any{"x", 99, 1}, args)
 }
@@ -445,58 +292,6 @@ func TestBug_CloneShallowCopy_WhereNested(t *testing.T) {
 	}
 }
 
-// ==================== 代码审查发现的 Bug 测试 ====================
-
-// TestBug_PgUnionLock 验证 PostgreSQL UNION + LOCK 返回错误（PostgreSQL 不支持此组合）。
-func TestBug_PgUnionLock(t *testing.T) {
-	g := NewPostgresGrammar()
-	union := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
-	b := NewBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union).LockForUpdate()
-
-	_, _, err := b.ToSelect()
-	if !errors.Is(err, ErrPgUnionLockNotSupported) {
-		t.Errorf("expected ErrPgUnionLockNotSupported, got %v", err)
-	}
-}
-
-// TestBug_PgUnionSharedLock 验证 PostgreSQL UNION + SharedLock 返回错误。
-func TestBug_PgUnionSharedLock(t *testing.T) {
-	g := NewPostgresGrammar()
-	union := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
-	b := NewBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union).SharedLock()
-
-	_, _, err := b.ToSelect()
-	if !errors.Is(err, ErrPgUnionLockNotSupported) {
-		t.Errorf("expected ErrPgUnionLockNotSupported, got %v", err)
-	}
-}
-
-// TestBug_PgParamCountRace 验证 PostgresGrammar 并发编译时参数计数器不互相干扰。
-func TestBug_PgParamCountRace(t *testing.T) {
-	g := NewPostgresGrammar()
-	const n = 50
-	results := make([]string, n)
-	var wg sync.WaitGroup
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func(idx int) {
-			defer wg.Done()
-			b := NewBuilder(g, nil).Table("users").Where("id", "=", 1)
-			sql, _, _ := b.ToSelect()
-			results[idx] = sql
-		}(i)
-	}
-	wg.Wait()
-
-	expected := `SELECT * FROM "users" WHERE "id" = $1`
-	for i, sql := range results {
-		if sql != expected {
-			t.Errorf("并发编译结果[%d] 不正确:\n  expected: %s\n  got:      %s", i, expected, sql)
-			return
-		}
-	}
-}
-
 // TestBug_CloneWhereValuesShallowCopy 验证 Clone 后 WhereIn 的 Values 切片不应与原 Builder 共享。
 func TestBug_CloneWhereValuesShallowCopy(t *testing.T) {
 	g := NewMySQLGrammar()
@@ -536,63 +331,6 @@ func TestBug_CloneJoinBindingsShallowCopy(t *testing.T) {
 		}
 	}
 }
-
-// TestBug_PgJoinRawPlaceholder 验证 PostgreSQL JOIN ON Raw 中 ? 应转换为 $N。
-func TestBug_PgJoinRawPlaceholder(t *testing.T) {
-	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
-		jb.On("users.id", "=", "orders.user_id").
-			Raw("orders.amount > ?", 100)
-	})
-
-	sql, args, err := b.ToSelect()
-	assertNoError(t, err)
-
-	// SQL 中不应出现 ? 占位符
-	if containsStr(sql, "?") {
-		t.Errorf("PostgreSQL JOIN ON Raw 中 ? 未转换为 $N:\n  got: %s", sql)
-	}
-	expectedSQL := `SELECT * FROM "users" INNER JOIN "orders" ON "users"."id" = "orders"."user_id" AND orders.amount > $1`
-	assertSQL(t, expectedSQL, sql)
-	assertArgs(t, []any{100}, args)
-}
-
-// TestBug_PgWhereRawPlaceholder 验证 PostgreSQL WhereRaw 中 ? 应转换为 $N。
-func TestBug_PgWhereRawPlaceholder(t *testing.T) {
-	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("users").WhereRaw("age > ? AND name LIKE ?", 25, "alice%")
-
-	sql, args, err := b.ToSelect()
-	assertNoError(t, err)
-
-	if containsStr(sql, "?") {
-		t.Errorf("PostgreSQL WhereRaw 中 ? 未转换为 $N:\n  got: %s", sql)
-	}
-	expectedSQL := `SELECT * FROM "users" WHERE age > $1 AND name LIKE $2`
-	assertSQL(t, expectedSQL, sql)
-	assertArgs(t, []any{25, "alice%"}, args)
-}
-
-// TestBug_PgHavingRawPlaceholder 验证 PostgreSQL HavingRaw 中 ? 应转换为 $N。
-func TestBug_PgHavingRawPlaceholder(t *testing.T) {
-	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("orders").
-		Select("user_id").
-		GroupBy("user_id").
-		HavingRaw("SUM(amount) > ?", 500)
-
-	sql, args, err := b.ToSelect()
-	assertNoError(t, err)
-
-	if containsStr(sql, "?") {
-		t.Errorf("PostgreSQL HavingRaw 中 ? 未转换为 $N:\n  got: %s", sql)
-	}
-	expectedSQL := `SELECT "user_id" FROM "orders" GROUP BY "user_id" HAVING SUM(amount) > $1`
-	assertSQL(t, expectedSQL, sql)
-	assertArgs(t, []any{500}, args)
-}
-
-// ==================== 代码审查问题测试 ====================
 
 // TestBug_OperatorInjection 验证恶意运算符不应被拼入 SQL。
 func TestBug_OperatorInjection(t *testing.T) {
@@ -658,8 +396,6 @@ func TestBug_ToCountPanicSafety(t *testing.T) {
 	}
 }
 
-// ==================== 嵌入结构体测试 ====================
-
 // BaseModel 用于测试嵌入结构体
 type BaseModel struct {
 	ID   int    `db:"id"`
@@ -710,8 +446,6 @@ func TestBug_EmbeddedStruct_Scan(t *testing.T) {
 	}
 }
 
-// ==================== 覆盖率提升测试 ====================
-
 // TestBuilder_InvalidOperatorErrorBranch 验证各链式方法传入非法运算符时走入错误分支。
 func TestBuilder_InvalidOperatorErrorBranch(t *testing.T) {
 	g := NewMySQLGrammar()
@@ -749,6 +483,21 @@ func TestBuilder_InvalidOperatorErrorBranch(t *testing.T) {
 				t.Errorf("%s: expected ErrInvalidOperator, got %v", tt.name, b.err)
 			}
 		})
+	}
+
+	// 边界固化（审查结论）：大小写变体行为——全小写（归一化为大写）与全大写被接受，
+	// 首字符大写的混合大小写（如 "Like"）不被归一化而是拒绝；拒绝是安全方向，不视为 bug。
+	if err := validateOperator("like"); err != nil {
+		t.Errorf("全小写 like 应被接受, got %v", err)
+	}
+	if err := validateOperator("not like"); err != nil {
+		t.Errorf("全小写 not like 应归一化后接受, got %v", err)
+	}
+	if err := validateOperator("NOT LIKE"); err != nil {
+		t.Errorf("全大写 NOT LIKE 应被接受, got %v", err)
+	}
+	if err := validateOperator("Like"); !errors.Is(err, ErrInvalidOperator) {
+		t.Errorf("混合大小写 Like 应被拒绝, got %v", err)
 	}
 }
 
@@ -870,6 +619,14 @@ func TestBuilder_OrderByBranches(t *testing.T) {
 			}
 		})
 	}
+
+	// 省略 direction 变参时默认升序 ASC
+	t.Run("omitted_defaults_ASC", func(t *testing.T) {
+		b := NewBuilder(g, nil).Table("t").OrderBy("col")
+		if len(b.orders) != 1 || b.orders[0].Direction != "ASC" {
+			t.Errorf("OrderBy without direction: expected ASC, got %v", b.orders)
+		}
+	})
 }
 
 // TestBuilder_ForPage_InvalidPage 验证 ForPage 传入 page < 1 时自动修正为 1。
@@ -944,7 +701,7 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 		Select("name", "age").
 		Distinct().
 		TableSub(tableSub, "f").
-		SelectSubquery(selectSub, "sub_amount").
+		SelectSub(selectSub, "sub_amount").
 		Join("orders", "users.id", "=", "orders.user_id").
 		LeftJoinOn("profiles", func(jb *JoinBuilder) {
 			jb.On("users.id", "=", "profiles.user_id")
@@ -998,7 +755,45 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 	}
 }
 
-// ==================== 覆盖率提升测试（第二轮）====================
+// TestBug_CloneJoinDeepNesting 审查复现用例：
+// JoinBuilder.JoinOn 可递归构造任意深度嵌套 join 组，但 Clone 只深拷贝两层，
+// 第三层嵌套的 Conditions/Sub 切片与原 Builder 共享底层数组，违反深拷贝契约。
+func TestBug_CloneJoinDeepNesting(t *testing.T) {
+	g := NewMySQLGrammar()
+	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+		j.On("orders.user_id", "=", "users.id")
+		j.JoinOn("items", func(j2 *JoinBuilder) {
+			j2.On("items.order_id", "=", "orders.id")
+			j2.JoinOn("skus", func(j3 *JoinBuilder) {
+				j3.Raw("skus.id = items.sku_id AND skus.warehouse = ?", "WH1")
+			})
+		})
+	})
+
+	// 三层嵌套编译本身应正确（compileJoin 递归支持）
+	sqlStr, args, err := b.ToSelect()
+	assertNoError(t, err)
+	assertSQL(t,
+		"SELECT * FROM `users` INNER JOIN (`orders` INNER JOIN (`items` INNER JOIN `skus` ON skus.id = items.sku_id AND skus.warehouse = ?) ON `items`.`order_id` = `orders`.`id`) ON `orders`.`user_id` = `users`.`id`",
+		sqlStr)
+	assertArgs(t, []any{"WH1"}, args)
+
+	// Clone 后第三层的 Conditions 必须与原 Builder 完全独立
+	clone := b.Clone()
+	origConds := b.joins[0].Joins[0].Joins[0].Conditions
+	cloneConds := clone.joins[0].Joins[0].Joins[0].Conditions
+	if len(origConds) != len(cloneConds) || len(origConds) == 0 {
+		t.Fatalf("expected non-empty third-level conditions, orig=%d clone=%d", len(origConds), len(cloneConds))
+	}
+	if &origConds[0] == &cloneConds[0] {
+		t.Errorf("BUG: Clone 的第三层 join Conditions 与原 Builder 共享底层数组")
+	}
+	// 修改 clone 第三层的绑定值，原 Builder 不应受影响
+	cloneConds[0].Bindings[0] = "HACKED"
+	if b.joins[0].Joins[0].Joins[0].Conditions[0].Bindings[0] == "HACKED" {
+		t.Errorf("BUG: 修改 clone 第三层 Bindings 影响了原 Builder")
+	}
+}
 
 // TestIntToStr 验证 intToStr 对零、正数、负数的处理。
 func TestIntToStr(t *testing.T) {
@@ -1160,8 +955,6 @@ func TestBuilder_WhereNotInEmpty(t *testing.T) {
 	assertSQL(t, "SELECT * FROM `users` WHERE 1 = 1", sql)
 	assertArgs(t, []any{}, args)
 }
-
-// ==================== BUG 验证测试 ====================
 
 // TestBug_HavingWithExpression 验证 Having/OrHaving 传入 Expression 时直接内嵌 SQL。
 // 当前行为（BUG）：compileHavings 的 basic 分支固定生成占位符，
@@ -1483,7 +1276,7 @@ func TestBug_ToExistsSQL(t *testing.T) {
 
 	// 状态恢复：ToExists 不应破坏原 Builder 的分页/列/锁状态
 	b = NewBuilder(NewMySQLGrammar(), nil).Table("users").
-		Select("name").Where("id", ">", 1).ForPage(2, 10).OrderByDesc("id").LockForUpdate()
+		Select("name").Where("id", ">", 1).ForPage(2, 10).OrderBy("id", "DESC").LockForUpdate()
 	_, _, err = b.ToExists()
 	assertNoError(t, err)
 	if b.limit != 10 || b.offset != 10 {
@@ -1705,8 +1498,6 @@ func TestBug_JoinSub_CloneIsolation(t *testing.T) {
 	}
 }
 
-// ==================== 测试辅助函数 ====================
-
 func assertNoError(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
@@ -1750,8 +1541,6 @@ func searchStr(s, substr string) bool {
 	return false
 }
 
-// ==================== 覆盖率提升测试（第三轮）====================
-
 // TestBuilder_WhereExpression_AllGrammars 验证三方言 Where Expression 均直接嵌入 SQL。
 func TestBuilder_WhereExpression_AllGrammars(t *testing.T) {
 	tests := []struct {
@@ -1787,6 +1576,10 @@ func TestGrammar_WrapColumn_AllGrammars(t *testing.T) {
 		{"MySQL_as_alias", &MySQLGrammar{}, "name AS user_name", "`name` AS `user_name`"},
 		{"Postgres_as_alias", &PostgresGrammar{}, "name AS user_name", `"name" AS "user_name"`},
 		{"SQLite_as_alias", &SQLiteGrammar{}, "name AS user_name", `"name" AS "user_name"`},
+		// 审查复现用例：带点号的 "表.列 AS 别名"，点号分支不应吞掉 AS 别名
+		{"MySQL_table_col_as_alias", &MySQLGrammar{}, "users.name AS n", "`users`.`name` AS `n`"},
+		{"Postgres_table_col_as_alias", &PostgresGrammar{}, "users.name AS n", `"users"."name" AS "n"`},
+		{"SQLite_table_col_as_alias", &SQLiteGrammar{}, "users.name AS n", `"users"."name" AS "n"`},
 		{"Postgres_table_col", &PostgresGrammar{}, "users.name", `"users"."name"`},
 		{"SQLite_table_col", &SQLiteGrammar{}, "users.name", `"users"."name"`},
 		{"Postgres_star", &PostgresGrammar{}, "*", "*"},
@@ -1870,8 +1663,6 @@ func TestExtractUpdateData_NonStruct_Builder(t *testing.T) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
 }
-
-// ==================== SelectRaw 原始列测试 ====================
 
 // TestSelectRaw_BypassWrapColumn 验证 SelectRaw 的表达式不经过 WrapColumn 引用，直接嵌入 SQL。
 func TestSelectRaw_BypassWrapColumn(t *testing.T) {
@@ -1973,49 +1764,278 @@ func TestSelectRaw_ClonePreservesRawFlag(t *testing.T) {
 	}
 }
 
-// TestPostgresGrammar_RawPlaceholderEscape 验证 PG 方言原始 SQL 占位符处理：
-// ?? 转义为字面 ?（jsonb 键存在操作符）、Expression 内联不占编号、普通绑定顺序正确。
-func TestPostgresGrammar_RawPlaceholderEscape(t *testing.T) {
-	g := &PostgresGrammar{}
+// TestNewApi_WhereNotAllNoneCompile 验证 WhereNot/All/Any/None 的括号/NOT 编译形态（三方言通用，以 MySQL 为例）。
+func TestNewApi_WhereNotAllNoneCompile(t *testing.T) {
+	g := NewMySQLGrammar()
 
 	tests := []struct {
-		name     string
-		builder  *Builder
-		expected string
-		args     []any
+		name    string
+		builder func() *Builder
+		sql     string
+		args    []any
 	}{
-		{
-			name:     "DoubleQuestionMarkEscapesToLiteral",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw(`"options" ?? ?`, "foo"),
-			expected: `SELECT * FROM "users" WHERE "options" ? $1`,
-			args:     []any{"foo"},
-		},
-		{
-			name:     "DoubleQuestionMarkWithoutBinding",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw(`"options" ?? 'foo'`),
-			expected: `SELECT * FROM "users" WHERE "options" ? 'foo'`,
-			args:     []any{},
-		},
-		{
-			name:     "ExpressionInlinedNotConsumingParam",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw("age > ? AND age < ?", 20, NewExpression("40")),
-			expected: `SELECT * FROM "users" WHERE age > $1 AND age < 40`,
-			args:     []any{20},
-		},
-		{
-			name:     "MixedLiteralOperatorAndBindings",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw("\"a\" ?? ? AND \"b\" = ?", "k", 1),
-			expected: `SELECT * FROM "users" WHERE "a" ? $1 AND "b" = $2`,
-			args:     []any{"k", 1},
-		},
+		{"WhereNot", func() *Builder {
+			return NewBuilder(g, nil).Table("users").WhereNot(func(q *Builder) {
+				q.Where("status", "=", "active")
+			})
+		}, "SELECT * FROM `users` WHERE NOT (`status` = ?)", []any{"active"}},
+		{"OrWhereNot", func() *Builder {
+			return NewBuilder(g, nil).Table("users").
+				Where("id", "=", 1).
+				OrWhereNot(func(q *Builder) { q.Where("age", ">", 18) })
+		}, "SELECT * FROM `users` WHERE `id` = ? OR NOT (`age` > ?)", []any{1, 18}},
+		{"WhereAll", func() *Builder {
+			return NewBuilder(g, nil).Table("users").WhereAll(func(q *Builder) {
+				q.Where("a", 1).Where("b", 2)
+			})
+		}, "SELECT * FROM `users` WHERE (`a` = ? AND `b` = ?)", []any{1, 2}},
+		{"WhereAny", func() *Builder {
+			return NewBuilder(g, nil).Table("users").WhereAny(func(q *Builder) {
+				q.Where("a", 1).Where("b", 2)
+			})
+		}, "SELECT * FROM `users` WHERE (`a` = ? OR `b` = ?)", []any{1, 2}},
+		{"WhereNone", func() *Builder {
+			return NewBuilder(g, nil).Table("users").WhereNone(func(q *Builder) {
+				q.Where("a", 1).Where("b", 2)
+			})
+		}, "SELECT * FROM `users` WHERE NOT (`a` = ? OR `b` = ?)", []any{1, 2}},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := tt.builder.ToSelect()
+			sql, args, err := tt.builder().ToSelect()
 			assertNoError(t, err)
-			assertSQL(t, tt.expected, sql)
+			assertSQL(t, tt.sql, sql)
 			assertArgs(t, tt.args, args)
 		})
 	}
+}
+
+// TestNewApi_HavingCompile 验证 Having 两参简写/HavingNested/HavingNull 的编译形态。
+func TestNewApi_HavingCompile(t *testing.T) {
+	g := NewMySQLGrammar()
+
+	tests := []struct {
+		name    string
+		builder func() *Builder
+		sql     string
+		args    []any
+	}{
+		{"HavingShorthand", func() *Builder {
+			return NewBuilder(g, nil).Table("users").SelectRaw("status, COUNT(*) AS cnt").
+				GroupBy("status").Having("cnt", 5)
+		}, "SELECT status, COUNT(*) AS cnt FROM `users` GROUP BY `status` HAVING `cnt` = ?", []any{5}},
+		{"HavingNested", func() *Builder {
+			return NewBuilder(g, nil).Table("orders").GroupBy("user_id").
+				HavingNested(func(q *Builder) {
+					q.Having("total", ">", 100).Having("count", "<", 10)
+				})
+		}, "SELECT * FROM `orders` GROUP BY `user_id` HAVING (`total` > ? AND `count` < ?)", []any{100, 10}},
+		{"OrHavingNested", func() *Builder {
+			return NewBuilder(g, nil).Table("orders").GroupBy("user_id").
+				Having("total", ">", 250).
+				OrHavingNested(func(q *Builder) { q.Having("total", "=", 30) })
+		}, "SELECT * FROM `orders` GROUP BY `user_id` HAVING `total` > ? OR (`total` = ?)", []any{250, 30}},
+		{"HavingNull", func() *Builder {
+			return NewBuilder(g, nil).Table("users").GroupBy("dept_id").HavingNull("email")
+		}, "SELECT * FROM `users` GROUP BY `dept_id` HAVING `email` IS NULL", nil},
+		{"HavingNotNullMulti", func() *Builder {
+			return NewBuilder(g, nil).Table("users").GroupBy("dept_id").HavingNotNull("email", "age")
+		}, "SELECT * FROM `users` GROUP BY `dept_id` HAVING `email` IS NOT NULL AND `age` IS NOT NULL", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args, err := tt.builder().ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.sql, sql)
+			assertArgs(t, tt.args, args)
+		})
+	}
+}
+
+// TestNewApi_ToAggregate 验证 ToAggregate 编译形态、UNION 包裹与非法聚合错误。
+func TestNewApi_ToAggregate(t *testing.T) {
+	t.Run("MySQL", func(t *testing.T) {
+		g := NewMySQLGrammar()
+		sql, args, err := NewBuilder(g, nil).Table("users").ToAggregate("MAX", "age")
+		assertNoError(t, err)
+		assertSQL(t, "SELECT MAX(`age`) AS `aggregate` FROM `users`", sql)
+		assertArgs(t, nil, args)
+	})
+
+	t.Run("Postgres", func(t *testing.T) {
+		g := NewPostgresGrammar()
+		sql, _, err := NewBuilder(g, nil).Table("users").ToAggregate("MIN", "age")
+		assertNoError(t, err)
+		assertSQL(t, `SELECT MIN("age") AS "aggregate" FROM "users"`, sql)
+	})
+
+	t.Run("SQLite", func(t *testing.T) {
+		g := NewSQLiteGrammar()
+		sql, _, err := NewBuilder(g, nil).Table("users").ToAggregate("AVG", "age")
+		assertNoError(t, err)
+		assertSQL(t, `SELECT AVG("age") AS "aggregate" FROM "users"`, sql)
+	})
+
+	t.Run("WithWhere", func(t *testing.T) {
+		g := NewMySQLGrammar()
+		sql, args, err := NewBuilder(g, nil).Table("users").
+			Where("status", "=", "active").ToAggregate("SUM", "age")
+		assertNoError(t, err)
+		assertSQL(t, "SELECT SUM(`age`) AS `aggregate` FROM `users` WHERE `status` = ?", sql)
+		assertArgs(t, []any{"active"}, args)
+	})
+
+	t.Run("UnionWrap", func(t *testing.T) {
+		g := NewMySQLGrammar()
+		b := NewBuilder(g, nil).Table("orders_a").
+			Union(NewBuilder(g, nil).Table("orders_b"))
+		sql, _, err := b.ToAggregate("SUM", "amount")
+		assertNoError(t, err)
+		assertSQL(t,
+			"SELECT SUM(`amount`) AS `aggregate` FROM ((SELECT * FROM `orders_a`) UNION (SELECT * FROM `orders_b`)) AS `t`",
+			sql)
+	})
+
+	t.Run("InvalidAggregate", func(t *testing.T) {
+		g := NewMySQLGrammar()
+		_, _, err := NewBuilder(g, nil).Table("users").ToAggregate("COUNT", "age")
+		if !errors.Is(err, ErrInvalidAggregate) {
+			t.Errorf("expected ErrInvalidAggregate, got %v", err)
+		}
+	})
+
+	t.Run("StateRestored", func(t *testing.T) {
+		// 编译后 Builder 状态应恢复，不影响后续 ToSelect
+		g := NewMySQLGrammar()
+		b := NewBuilder(g, nil).Table("users").Select("name").Limit(10)
+		_, _, err := b.ToAggregate("MAX", "age")
+		assertNoError(t, err)
+		sql, _, err := b.ToSelect()
+		assertNoError(t, err)
+		assertSQL(t, "SELECT `name` FROM `users` LIMIT 10", sql)
+	})
+}
+
+// TestNewApi_ToIncDec 验证 ToIncrement/ToDecrement 编译形态与 JOIN 绑定顺序方言差异。
+func TestNewApi_ToIncDec(t *testing.T) {
+	t.Run("MySQL_NoJoin", func(t *testing.T) {
+		g := NewMySQLGrammar()
+		sql, args, err := NewBuilder(g, nil).Table("wallets").
+			Where("id", "=", 1).
+			ToIncrement([]string{"balance", "points"}, []any{10, 5})
+		assertNoError(t, err)
+		assertSQL(t, "UPDATE `wallets` SET `balance` = `balance` + ?, `points` = `points` + ? WHERE `id` = ?", sql)
+		assertArgs(t, []any{10, 5, 1}, args)
+	})
+
+	t.Run("MySQL_JoinSetAfterJoin", func(t *testing.T) {
+		// MySQL：JOIN → SET → WHERE 绑定顺序
+		g := NewMySQLGrammar()
+		sql, args, err := NewBuilder(g, nil).Table("users").
+			Join("orders", "users.id", "=", "orders.user_id").
+			Where("orders.amount", ">", 100).
+			ToIncrement([]string{"age"}, []any{1})
+		assertNoError(t, err)
+		assertSQL(t,
+			"UPDATE `users` INNER JOIN `orders` ON `users`.`id` = `orders`.`user_id` SET `age` = `age` + ? WHERE `orders`.`amount` > ?",
+			sql)
+		assertArgs(t, []any{1, 100}, args)
+	})
+
+	t.Run("Postgres_SetBeforeJoin", func(t *testing.T) {
+		// PG：SET → JOIN(FROM) → WHERE 绑定顺序，$N 自动转换
+		g := NewPostgresGrammar()
+		sql, args, err := NewBuilder(g, nil).Table("users").
+			Join("orders", "users.id", "=", "orders.user_id").
+			Where("orders.amount", ">", 100).
+			ToIncrement([]string{"age"}, []any{1})
+		assertNoError(t, err)
+		assertSQL(t,
+			`UPDATE "users" SET "age" = "age" + $1 FROM "orders" WHERE "users"."id" = "orders"."user_id" AND "orders"."amount" > $2`,
+			sql)
+		assertArgs(t, []any{1, 100}, args)
+	})
+
+	t.Run("Decrement", func(t *testing.T) {
+		g := NewSQLiteGrammar()
+		sql, args, err := NewBuilder(g, nil).Table("wallets").
+			Where("id", "=", 1).
+			ToDecrement([]string{"balance"}, []any{30})
+		assertNoError(t, err)
+		assertSQL(t, `UPDATE "wallets" SET "balance" = "balance" - ? WHERE "id" = ?`, sql)
+		assertArgs(t, []any{30, 1}, args)
+	})
+
+	t.Run("ColumnsMismatch", func(t *testing.T) {
+		g := NewMySQLGrammar()
+		_, _, err := NewBuilder(g, nil).Table("wallets").
+			ToIncrement([]string{"balance"}, []any{10, 5})
+		if !errors.Is(err, ErrIncrementColumns) {
+			t.Errorf("expected ErrIncrementColumns, got %v", err)
+		}
+		_, _, err = NewBuilder(g, nil).Table("wallets").ToIncrement(nil, nil)
+		if !errors.Is(err, ErrIncrementColumns) {
+			t.Errorf("expected ErrIncrementColumns, got %v", err)
+		}
+	})
+}
+
+// TestNewApi_ToDeleteJoin 验证 ToDeleteJoin 的校验错误路径（编译形态已由集成测试覆盖）。
+func TestNewApi_ToDeleteJoin(t *testing.T) {
+	g := NewMySQLGrammar()
+
+	// 无 JOIN → ErrDeleteJoinNoJoin
+	_, _, err := NewBuilder(g, nil).Table("users").Where("id", "=", 1).ToDeleteJoin()
+	if !errors.Is(err, ErrDeleteJoinNoJoin) {
+		t.Errorf("expected ErrDeleteJoinNoJoin, got %v", err)
+	}
+
+	// 无表名 → ErrEmptyTable
+	_, _, err = NewBuilder(g, nil).Join("orders", "a", "=", "b").ToDeleteJoin()
+	if !errors.Is(err, ErrEmptyTable) {
+		t.Errorf("expected ErrEmptyTable, got %v", err)
+	}
+}
+
+// TestNewApi_WhereShorthandInvalid 验证 Where 三参形式的非法运算符错误。
+func TestNewApi_WhereShorthandInvalid(t *testing.T) {
+	g := NewMySQLGrammar()
+
+	// 三参形式 op 非 string → ErrInvalidOperator
+	_, _, err := NewBuilder(g, nil).Table("users").Where("age", 25, 30).ToSelect()
+	if !errors.Is(err, ErrInvalidOperator) {
+		t.Errorf("expected ErrInvalidOperator, got %v", err)
+	}
+
+	// 三参形式非法运算符 → ErrInvalidOperator
+	_, _, err = NewBuilder(g, nil).Table("users").Where("age", "DROP", 30).ToSelect()
+	if !errors.Is(err, ErrInvalidOperator) {
+		t.Errorf("expected ErrInvalidOperator, got %v", err)
+	}
+}
+
+// TestNewApi_SelectSubCompile 验证 SelectSub 标量子查询列的编译形态（PG $N）。
+func TestNewApi_SelectSubCompile(t *testing.T) {
+	t.Run("Postgres", func(t *testing.T) {
+		g := NewPostgresGrammar()
+		sub := NewBuilder(g, nil).Table("orders").SelectRaw("COUNT(*)").WhereRaw("orders.user_id = users.id")
+		sql, _, err := NewBuilder(g, nil).Table("users").
+			Select("id").SelectSub(sub, "order_count").ToSelect()
+		assertNoError(t, err)
+		assertSQL(t,
+			`SELECT "id", (SELECT COUNT(*) FROM "orders" WHERE orders.user_id = users.id) AS "order_count" FROM "users"`,
+			sql)
+	})
+
+	t.Run("MySQL", func(t *testing.T) {
+		g := NewMySQLGrammar()
+		sub := NewBuilder(g, nil).Table("orders").SelectRaw("COUNT(*)").Where("amount", ">", 100)
+		sql, args, err := NewBuilder(g, nil).Table("users").
+			Select("id").SelectSub(sub, "order_count").ToSelect()
+		assertNoError(t, err)
+		assertSQL(t,
+			"SELECT `id`, (SELECT COUNT(*) FROM `orders` WHERE `amount` > ?) AS `order_count` FROM `users`",
+			sql)
+		assertArgs(t, []any{100}, args)
+	})
 }

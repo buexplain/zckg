@@ -3,6 +3,7 @@ package zcdb
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // ==================== getScanFieldInfo 测试 ====================
@@ -215,6 +216,217 @@ func TestMakeScanValues_EmbeddedStruct(t *testing.T) {
 	}
 	if _, ok := values[1].(*nullSafeField); !ok {
 		t.Errorf("values[1] should be *nullSafeField, got %T", values[1])
+	}
+}
+
+// ==================== nullSafeField.Scan 测试 ====================
+
+// TestBug_ScanStringToMapJSON 复现审查候选 #7：[]byte→map 走 JSON 反序列化，
+// 但 string→map（PG/SQLite TEXT 驱动返回 string）直接报错，导致同一
+// map[string]any 字段在 MySQL 可扫描、在 PG/SQLite 报错的方言不对称。
+func TestBug_ScanStringToMapJSON(t *testing.T) {
+	var m map[string]any
+	n := &nullSafeField{field: reflect.ValueOf(&m).Elem()}
+	if err := n.Scan(`{"a":1,"b":"x"}`); err != nil {
+		t.Fatalf("string → map[string]any 应 JSON 反序列化，实际报错: %v", err)
+	}
+	if v, ok := m["a"].(float64); !ok || v != 1 {
+		t.Errorf("expected m[\"a\"]=1, got %v", m["a"])
+	}
+	if m["b"] != "x" {
+		t.Errorf("expected m[\"b\"]=\"x\", got %v", m["b"])
+	}
+}
+
+// TestBug_ScanStringToStructJSON 复现审查候选 #7 的另一半：[]byte→struct 走 JSON，
+// string→struct 却报错（PG/SQLite TEXT 列 JSON 文本无法扫入结构体字段）。
+func TestBug_ScanStringToStructJSON(t *testing.T) {
+	type meta struct {
+		A int    `json:"a"`
+		B string `json:"b"`
+	}
+	var s meta
+	n := &nullSafeField{field: reflect.ValueOf(&s).Elem()}
+	if err := n.Scan(`{"a":7,"b":"y"}`); err != nil {
+		t.Fatalf("string → struct 应 JSON 反序列化，实际报错: %v", err)
+	}
+	if s.A != 7 || s.B != "y" {
+		t.Errorf("expected {7 y}, got %+v", s)
+	}
+}
+
+// TestNullSafeFieldScan_Boundaries 边界固化用例（审查结论）：
+// 固化 nullSafeField.Scan 的类型转换矩阵与错误语义（返回错误而非 panic）。
+func TestNullSafeFieldScan_Boundaries(t *testing.T) {
+	newField := func(dst any) *nullSafeField {
+		return &nullSafeField{field: reflect.ValueOf(dst).Elem()}
+	}
+
+	t.Run("NULL→零值与 nil 指针", func(t *testing.T) {
+		s := "dirty"
+		if err := newField(&s).Scan(nil); err != nil || s != "" {
+			t.Errorf("NULL → 非指针字段应置零值, s=%q err=%v", s, err)
+		}
+		v := new(int)
+		if err := newField(&v).Scan(nil); err != nil || v != nil {
+			t.Errorf("NULL → 指针字段应置 nil, v=%v err=%v", v, err)
+		}
+	})
+
+	t.Run("[]byte→基础类型", func(t *testing.T) {
+		s := ""
+		if err := newField(&s).Scan([]byte("abc")); err != nil || s != "abc" {
+			t.Errorf("[]byte→string 失败: s=%q err=%v", s, err)
+		}
+		i := int64(0)
+		if err := newField(&i).Scan([]byte("123")); err != nil || i != 123 {
+			t.Errorf("[]byte→int64 失败: i=%d err=%v", i, err)
+		}
+		u := uint64(0)
+		if err := newField(&u).Scan([]byte("456")); err != nil || u != 456 {
+			t.Errorf("[]byte→uint64 失败: u=%d err=%v", u, err)
+		}
+		f := 0.0
+		if err := newField(&f).Scan([]byte("1.5")); err != nil || f != 1.5 {
+			t.Errorf("[]byte→float64 失败: f=%v err=%v", f, err)
+		}
+		b := false
+		if err := newField(&b).Scan([]byte("true")); err != nil || !b {
+			t.Errorf("[]byte→bool 失败: b=%v err=%v", b, err)
+		}
+		var slice []int
+		if err := newField(&slice).Scan([]byte("[1,2]")); err != nil || len(slice) != 2 {
+			t.Errorf("[]byte→[]int JSON 失败: %v err=%v", slice, err)
+		}
+		// 非法 JSON / 非法数字 → 返回错误而非 panic
+		if err := newField(&slice).Scan([]byte("not-json")); err == nil {
+			t.Error("非法 JSON → []int 应报错")
+		}
+		if err := newField(&i).Scan([]byte("abc")); err == nil {
+			t.Error("非数字 []byte → int64 应报错")
+		}
+		// []byte → []byte 拷贝隔离
+		src := []byte("xyz")
+		var dst []byte
+		if err := newField(&dst).Scan(src); err != nil || string(dst) != "xyz" {
+			t.Errorf("[]byte→[]byte 失败: %v err=%v", dst, err)
+		}
+		// 非 string 键的 map → 报错而非 panic
+		var im map[int]string
+		if err := newField(&im).Scan([]byte("{\"1\":\"a\"}")); err == nil {
+			t.Error("[]byte → map[int]string 应报错")
+		}
+	})
+
+	t.Run("time.Time→string", func(t *testing.T) {
+		s := ""
+		ts := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+		if err := newField(&s).Scan(ts); err != nil || s != "2024-01-02T03:04:05Z" {
+			t.Errorf("time.Time→string 应为 RFC3339: s=%q err=%v", s, err)
+		}
+		// time.Time → time.Time 直接匹配
+		var t2 time.Time
+		if err := newField(&t2).Scan(ts); err != nil || !t2.Equal(ts) {
+			t.Errorf("time.Time→time.Time 失败: %v err=%v", t2, err)
+		}
+	})
+
+	t.Run("数值→string 显式格式化", func(t *testing.T) {
+		// 若误走 ConvertibleTo 会把数值当 rune 转字符（123 → "{"），必须固化数字字符串行为
+		s := ""
+		if err := newField(&s).Scan(int64(123)); err != nil || s != "123" {
+			t.Errorf("int64→string 应为 \"123\": s=%q err=%v", s, err)
+		}
+		if err := newField(&s).Scan(uint64(456)); err != nil || s != "456" {
+			t.Errorf("uint64→string 应为 \"456\": s=%q err=%v", s, err)
+		}
+		if err := newField(&s).Scan(float64(1.5)); err != nil || s != "1.5" {
+			t.Errorf("float64→string 应为 \"1.5\": s=%q err=%v", s, err)
+		}
+	})
+
+	t.Run("string→基础类型", func(t *testing.T) {
+		bs := []byte{}
+		if err := newField(&bs).Scan("abc"); err != nil || string(bs) != "abc" {
+			t.Errorf("string→[]byte 失败: %v err=%v", bs, err)
+		}
+		b := false
+		if err := newField(&b).Scan("true"); err != nil || !b {
+			t.Errorf("string→bool 失败: %v err=%v", b, err)
+		}
+		i := int64(0)
+		if err := newField(&i).Scan("42"); err != nil || i != 42 {
+			t.Errorf("string→int64 失败: %v err=%v", i, err)
+		}
+		var strs []string
+		if err := newField(&strs).Scan(`["a","b"]`); err != nil || len(strs) != 2 {
+			t.Errorf("string→[]string JSON 失败: %v err=%v", strs, err)
+		}
+		// 非法输入 → 返回错误而非 panic
+		if err := newField(&i).Scan("not-int"); err == nil {
+			t.Error("非数字 string → int64 应报错")
+		}
+	})
+
+	t.Run("数值→bool（SQLite 0/1）", func(t *testing.T) {
+		b := false
+		if err := newField(&b).Scan(int64(1)); err != nil || !b {
+			t.Errorf("int64(1)→bool 失败: %v err=%v", b, err)
+		}
+		if err := newField(&b).Scan(int64(0)); err != nil || b {
+			t.Errorf("int64(0)→bool 应为 false: %v err=%v", b, err)
+		}
+	})
+
+	t.Run("不可转换类型报错而非 panic", func(t *testing.T) {
+		var t2 time.Time
+		if err := newField(&t2).Scan(int64(1)); err == nil {
+			t.Error("int64 → time.Time 应报错")
+		}
+		var slice []int
+		if err := newField(&slice).Scan(time.Now()); err == nil {
+			t.Error("time.Time → []int 应报错")
+		}
+	})
+
+	t.Run("指针字段解间接赋值", func(t *testing.T) {
+		var p *string
+		if err := newField(&p).Scan([]byte("ptr")); err != nil || p == nil || *p != "ptr" {
+			t.Errorf("[]byte→*string 失败: p=%v err=%v", p, err)
+		}
+		var pi *int64
+		if err := newField(&pi).Scan("7"); err != nil || pi == nil || *pi != 7 {
+			t.Errorf("string→*int64 失败: pi=%v err=%v", pi, err)
+		}
+	})
+}
+
+// TestFieldByIndexSafe_NilChain 边界固化：多级嵌入指针链遇 nil 中间节点时
+// 返回不可用标记而非 panic。
+func TestFieldByIndexSafe_NilChain(t *testing.T) {
+	type L2 struct {
+		V int `db:"v"`
+	}
+	type L1 struct {
+		*L2
+	}
+	type Root struct {
+		*L1
+	}
+
+	r := Root{} // L1 为 nil
+	v, ok := fieldByIndexSafe(reflect.ValueOf(&r).Elem(), []int{0, 0, 0})
+	if ok {
+		t.Error("nil 嵌入指针链应返回 ok=false")
+	}
+	if v.IsValid() {
+		t.Error("nil 链应返回零值 Value")
+	}
+
+	r = Root{L1: &L1{L2: &L2{V: 9}}}
+	v, ok = fieldByIndexSafe(reflect.ValueOf(&r).Elem(), []int{0, 0, 0})
+	if !ok || v.Int() != 9 {
+		t.Errorf("完整指针链应取到值 9, ok=%v v=%v", ok, v)
 	}
 }
 

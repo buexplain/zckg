@@ -2,7 +2,6 @@ package zcdb
 
 // 本文件包含 Builder 的数据源与查询列构造方法：
 // Table/TableSub（FROM 数据源，互斥覆盖）、Select 系列（查询列）、Distinct。
-// 分类依据见 docs/builder-api.md 第 2 节。
 
 // SelectColumn 表示 SELECT 中的一个列。
 // Raw 为 true 时，Value 直接嵌入 SQL，不经过 WrapColumn 引用。
@@ -63,15 +62,15 @@ func (b *Builder) SelectRaw(expression string) *Builder {
 	return b
 }
 
-// SelectSubquery 添加一个子查询作为 SELECT 列，编译为 (SELECT ...) AS 别名。
+// SelectSub 添加一个子查询作为 SELECT 列（追加语义），编译为 (SELECT ...) AS 别名。
 // 子查询的绑定参数在所有其它绑定之前（绑定顺序：SELECT_SUB → FROM_SUB → JOIN → WHERE）。
 //
 //	cnt := db.Builder().Table("orders").SelectRaw("COUNT(*)").
 //	    WhereColumn("orders.user_id", "=", "users.id")
 //	sql, _, _ := db.Builder().Table("users").Select("id").
-//	    SelectSubquery(cnt, "order_count").ToSelect()
+//	    SelectSub(cnt, "order_count").ToSelect()
 //	// SQL: SELECT `id`, (SELECT COUNT(*) FROM `orders` WHERE `orders`.`user_id` = `users`.`id`) AS `order_count` FROM `users`
-func (b *Builder) SelectSubquery(sub *Builder, alias string) *Builder {
+func (b *Builder) SelectSub(sub *Builder, alias string) *Builder {
 	b.selectSubs = append(b.selectSubs, SelectSub{Query: sub, Alias: alias})
 	return b
 }
@@ -94,18 +93,6 @@ func (b *Builder) AddSelect(columns ...string) *Builder {
 			b.columns = append(b.columns, SelectColumn{Value: col, Raw: false})
 		}
 	}
-	return b
-}
-
-// AddSelectSub 追加一个子查询作为 SELECT 列（标量子查询 (SELECT ...) AS alias）。
-// 实现与 SelectSubquery 一致，命名上强调“追加”语义。
-//
-//	cnt := db.Builder().Table("orders").SelectRaw("COUNT(*)").
-//	    WhereColumn("orders.user_id", "=", "users.id")
-//	sql, _, _ := db.Builder().Table("users").AddSelectSub(cnt, "order_count").ToSelect()
-//	// SQL: SELECT (SELECT COUNT(*) FROM `orders` WHERE `orders`.`user_id` = `users`.`id`) AS `order_count` FROM `users`
-func (b *Builder) AddSelectSub(sub *Builder, alias string) *Builder {
-	b.selectSubs = append(b.selectSubs, SelectSub{Query: sub, Alias: alias})
 	return b
 }
 

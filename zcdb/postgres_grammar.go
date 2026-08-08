@@ -23,7 +23,7 @@ func (g *PostgresGrammar) cloneForCompile() *PostgresGrammar {
 
 // convertRawPlaceholders 将原始 SQL 中的 ? 依次替换为 $N 占位符，
 // bindings 中的 Expression 直接内嵌为 SQL 文本且不占用占位符编号；
-// 连续两个 ?? 转义为字面 ?（jsonb 键存在操作符），不消耗绑定（对齐 Laravel）。
+// 连续两个 ?? 转义为字面 ?（jsonb 键存在操作符），不消耗绑定。
 func (g *PostgresGrammar) convertRawPlaceholders(sql string, bindings []any) string {
 	var buf strings.Builder
 	buf.Grow(len(sql) + 8)
@@ -88,16 +88,16 @@ func (g *PostgresGrammar) WrapColumn(column string) string {
 	if strings.Contains(column, "(") {
 		return column
 	}
-	// 处理 table.column 形式
-	if strings.Contains(column, ".") {
-		parts := strings.SplitN(column, ".", 2)
-		return g.WrapTable(parts[0]) + "." + g.wrapValue(parts[1])
-	}
-	// 处理 column AS alias 形式
+	// 处理 column AS alias 形式（先于点号检查，避免 "表.列 AS 别名" 的别名被点号分支吞掉）
 	if idx := strings.Index(strings.ToLower(column), " as "); idx != -1 {
 		col := column[:idx]
 		alias := column[idx+4:]
 		return g.WrapColumn(strings.TrimSpace(col)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
+	}
+	// 处理 table.column 形式
+	if strings.Contains(column, ".") {
+		parts := strings.SplitN(column, ".", 2)
+		return g.WrapTable(parts[0]) + "." + g.wrapValue(parts[1])
 	}
 	return g.wrapValue(column)
 }
@@ -428,14 +428,21 @@ func (g *PostgresGrammar) CompileUpdate(b *Builder, columns []string, values []a
 	}
 
 	// FROM (PostgreSQL 使用 FROM 代替 JOIN 进行多表更新)
+	// 展平嵌套 join 组；JoinSub 编译为派生表 (SELECT ...) AS alias
 	if len(b.joins) > 0 {
-		sql.WriteString(" FROM ")
-		for i, join := range b.joins {
-			if i > 0 {
-				sql.WriteString(", ")
+		var tables []string
+		var flatten func(joins []JoinClause)
+		flatten = func(joins []JoinClause) {
+			for _, join := range joins {
+				tables = append(tables, gClone.joinTable(join))
+				if len(join.Joins) > 0 {
+					flatten(join.Joins)
+				}
 			}
-			sql.WriteString(gClone.WrapTable(join.Table))
 		}
+		flatten(b.joins)
+		sql.WriteString(" FROM ")
+		sql.WriteString(strings.Join(tables, ", "))
 	}
 
 	// WHERE
@@ -523,7 +530,7 @@ func (g *PostgresGrammar) CompileDeleteJoin(b *Builder) string {
 	return sql.String()
 }
 
-// CompileTruncate 编译 TRUNCATE 语句（RESTART IDENTITY 重置自增序列，对齐 Laravel 行为）
+// CompileTruncate 编译 TRUNCATE 语句（RESTART IDENTITY 重置自增序列）
 func (g *PostgresGrammar) CompileTruncate(b *Builder) string {
 	return "TRUNCATE TABLE " + g.WrapTable(b.table) + " RESTART IDENTITY"
 }
@@ -604,10 +611,11 @@ func (g *PostgresGrammar) compileWheres(b *Builder) string {
 				clause = g.WrapColumn(w.Column) + " " + op + " " + g.nextParam()
 			}
 		case WhereTypeNotLike:
+			// 与 WhereTypeLike 默认 ILIKE 对称，默认 NOT ILIKE（不区分大小写），保证二者互补
 			if expr, ok := w.Value.(Expression); ok {
-				clause = g.WrapColumn(w.Column) + " NOT LIKE " + expr.Value()
+				clause = g.WrapColumn(w.Column) + " NOT ILIKE " + expr.Value()
 			} else {
-				clause = g.WrapColumn(w.Column) + " NOT LIKE " + g.nextParam()
+				clause = g.WrapColumn(w.Column) + " NOT ILIKE " + g.nextParam()
 			}
 		case WhereTypeNullSafe:
 			// 空安全相等：PostgreSQL 用 IS NOT DISTINCT FROM

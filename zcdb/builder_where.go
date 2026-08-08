@@ -2,7 +2,6 @@ package zcdb
 
 // 本文件包含 Builder 的 WHERE 查询条件构造方法（Where/OrWhere 全系列）：
 // 基本比较、IN/NULL/BETWEEN、LIKE/空安全、嵌套逻辑组（Not/All/Any/None）、子查询条件。
-// 分类依据见 docs/builder-api.md 第 3 节。
 
 // ==================== WHERE 条件 ====================
 
@@ -587,9 +586,16 @@ func (b *Builder) addWhereLike(column string, value any, boolean string, caseSen
 
 // WhereNotLike 添加一个 WHERE column NOT LIKE value 条件。
 // value 类型规则同 WhereLike（不支持 caseSensitive 变参）。
+// 大小写语义与 WhereLike 默认行为对称：
+//
+//   - MySQL/SQLite: NOT LIKE（与 LIKE 一样默认不区分大小写，取决于排序规则/ASCII）
+//   - PostgreSQL:   NOT ILIKE（与 WhereLike 默认 ILIKE 对称，保证二者互补）
+//
+// PostgreSQL 下需区分大小写时可用 WhereRaw 自行表达（Expression 同样编译为 NOT ILIKE）。
 //
 //	sql, args, _ := db.Builder().Table("users").WhereNotLike("name", "%test%").ToSelect()
-//	// SQL:  SELECT * FROM `users` WHERE `name` NOT LIKE ?
+//	// MySQL SQL:      SELECT * FROM `users` WHERE `name` NOT LIKE ?
+//	// PostgreSQL SQL: SELECT * FROM "users" WHERE "name" NOT ILIKE $1
 //	// args: [%test%]
 func (b *Builder) WhereNotLike(column string, value any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{

@@ -346,6 +346,25 @@ func (n *nullSafeField) Scan(src any) error {
 			}
 			setFinalValue(dst.Elem())
 			return nil
+		case reflect.Map:
+			// string → map[string]any（JSON 反序列化，与 []byte→map 分支对称；
+			// PG/SQLite 驱动的 TEXT 列返回 string）
+			if targetType.Key().Kind() == reflect.String {
+				m := reflect.New(targetType).Interface()
+				if err := json.Unmarshal([]byte(val.String()), m.(any)); err != nil {
+					return fmt.Errorf("zcdb: cannot unmarshal JSON to map: %w", err)
+				}
+				setFinalValue(reflect.ValueOf(m).Elem())
+				return nil
+			}
+		case reflect.Struct:
+			// string → 自定义结构体（JSON 反序列化，与 []byte→struct 分支对称）
+			dst := reflect.New(targetType)
+			if err := json.Unmarshal([]byte(val.String()), dst.Interface()); err != nil {
+				return fmt.Errorf("zcdb: cannot unmarshal JSON to struct: %w", err)
+			}
+			setFinalValue(dst.Elem())
+			return nil
 		case reflect.Bool:
 			b, err := strconv.ParseBool(val.String())
 			if err != nil {
