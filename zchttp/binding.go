@@ -134,6 +134,31 @@ func bindValues(reqPtr reflect.Value, values map[string][]string, files map[stri
 	return nil
 }
 
+// bindPathParams 将捕获的路由路径参数值按注册顺序写入 Req 字段。
+// 路径参数覆盖同名 query/body 值，必须在 bindRequestData 之后调用。
+// 单个参数转换失败立即返回错误（区别于 bindValues 的尽力绑定策略）；
+// 被省略的尾部可选参数无捕获值，跳过绑定以保留模板默认值/零值。
+func bindPathParams(reqPtr reflect.Value, params []pathParamBinding, values []string) error {
+	elem := reqPtr.Elem()
+	if elem.Kind() != reflect.Struct {
+		return nil
+	}
+	for i := range params {
+		if i >= len(values) {
+			// 尾部可选参数被省略，剩余绑定均跳过
+			break
+		}
+		fieldValue := fieldByIndex(elem, params[i].indices)
+		if !fieldValue.CanSet() {
+			continue
+		}
+		if err := setScalar(fieldValue, values[i], params[i].timeFormat, params[i].timeLocation); err != nil {
+			return fmt.Errorf("invalid path parameter value %q: %w", values[i], err)
+		}
+	}
+	return nil
+}
+
 // resolveFieldName 解析字段绑定名：优先 form 标签，其次 json 标签，最后使用字段名
 func resolveFieldName(field reflect.StructField) string {
 	if name := tagName(field.Tag.Get("form")); name != "" {

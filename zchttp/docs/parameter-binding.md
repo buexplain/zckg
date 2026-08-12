@@ -4,6 +4,7 @@
 
 绑定与校验分为两个独立函数：
 - `bindRequestData(r, reqPtr, meta)`：仅执行数据绑定（query/body），在路由命中后立即调用。
+- `bindPathParams(reqPtr, params, values)`：仅执行路由路径参数绑定，在 `bindRequestData` 之后调用（仅参数路由触发，路径参数覆盖同名 query/body 值）。
 - `validateRequest(reqPtr, meta, needsNonzero)`：仅执行参数校验（nonzero + Validator），在洋葱模型 core 层调用；`needsNonzero` 为注册期预计算的传递性标记，全树无 nonzero 字段时跳过遍历（详见 `parameter-validate.md`）。
 
 > 默认值（`default` 标签）采用两阶段填充：注册阶段预填模板零值字段，请求阶段绑定后补填动态创建的子元素中的 nil 指针字段。详见[默认值机制](#六默认值机制)。
@@ -32,6 +33,16 @@ GET /search?keyword=go&page=3
 > `Content-Type` 会先去除 `; charset=utf-8` 等参数部分，仅保留主类型再匹配。
 >
 > `multipart/form-data` 的内存缓冲上限由 `defaultMaxMemory` 定义，默认 **32 MB**，超出部分由标准库写入临时文件。
+
+### 3. 路由路径参数（所有 method）
+
+若路由注册时使用了 `{name}` / `{name?}` 路径参数（详见 `routing.md` 中“路由参数”章节），参数值在 query/body 绑定**之后**由 `bindPathParams` 写入 Req，规则如下：
+
+- **参数名即字段绑定名**：按 form > json > 字段名优先级解析，注册阶段预计算绑定关系，参数名无对应字段时注册即 panic。
+- **覆盖语义**：路径参数覆盖同名 query/body 值（路径参数是更精确的意图）。
+- **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（`time_format`/`time_location` 标签同样生效）。
+- **失败语义区别于尽力绑定**：单个参数转换失败立即返回错误（包装为 `BindingError` 返回 400），而非跳过。
+- **可选参数省略**：`{name?}` 未出现在请求路径中时不写入字段，保留模板 `default` 值或零值。
 
 ## 二、字段名解析规则
 

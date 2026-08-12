@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -66,6 +67,23 @@ func derefType(t reflect.Type) reflect.Type {
 		t = t.Elem()
 	}
 	return t
+}
+
+// structMetaCache 全局缓存已构建的 structMeta（reflect.Type -> structMeta）。
+// 请求阶段的嵌套遍历（nonzero 校验 / 请求阶段默认值填充）会遇到注册期未预计算的
+// 嵌套类型，若每次请求都重新执行 buildStructMeta 会产生大量重复反射与标签解析；
+// structMeta 构建后只读、不可变，可安全跨 goroutine 共享。
+var structMetaCache sync.Map
+
+// cachedStructMeta 返回类型 t 的 structMeta，优先命中缓存，未命中时构建并写入缓存。
+// 请求阶段的嵌套类型元信息获取必须走本函数，避免每请求重复构建。
+func cachedStructMeta(t reflect.Type) structMeta {
+	if v, ok := structMetaCache.Load(t); ok {
+		return v.(structMeta)
+	}
+	m := buildStructMeta(t)
+	structMetaCache.Store(t, m)
+	return m
 }
 
 // buildStructMeta 通过反射遍历结构体字段，预计算 structMeta 与 fieldMeta 列表。

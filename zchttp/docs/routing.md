@@ -1,6 +1,6 @@
 # 路由注册规则
 
-路由系统实现位于 `router.go`，由 `Router`（路由器）与 `RouterGroup`（路由分组）两部分组成。注册阶段通过 `buildEntry`（`buildEntry.go`）校验 handler 签名、快照中间件链、预计算反射信息，运行时无需重复反射解析。
+路由系统实现位于 `router.go` 与 `router_trie.go`，由 `Router`（路由器）与 `RouterGroup`（路由分组）两部分组成。注册阶段通过 `buildEntry`（`buildEntry.go`）校验 handler 签名、快照中间件链、预计算反射信息，运行时无需重复反射解析。
 
 ## 一、创建路由器
 
@@ -26,7 +26,7 @@ r.CONNECT("/proxy", connectProxy)
 r.TRACE("/debug", traceHandler)
 ```
 
-路由匹配为**精确匹配**：请求先按 method 查表，再按归一化后的 `r.URL.Path` 精确查找，未命中则走 `OnNotFound`。
+路由匹配分两级：**精确匹配优先**，未命中再回退到**参数路由基数树匹配**（见下文“路由参数”章节），均未命中则走 `OnNotFound`。
 
 ### 路径归一化（normalizePath）
 
@@ -94,7 +94,47 @@ handler 注册时，`buildEntry` 会通过反射一次性预计算以下信息�
 - **nonzero 校验标记**（`needsNonzeroValidation`）：通过 `hasNonzeroInTree` 扫描 Req 整棵类型树（穿透嵌套结构体、指针、容器），判断任意深度是否存在 `nonzero:"true"` 字段。仅当该标记为 `true` 时，请求阶段才执行 `validateNonzero` 遍历，全树无 nonzero 字段的接口整体跳过。详见 `parameter-validate.md` 中"零值判定与快速跳过"章节。
 - **handler 位置信息**（`handlerName`/`handlerFile`/`handlerLine`）：通过 `runtime.FuncForPC` 提取全限定函数名与定义位置，用于路由冲突提示与 OpenAPI 操作摘要。
 
-## 四、路由冲突检测
+## 四、路由参数（必选/可选）
+
+路径中可用 `{name}` 声明**必选参数**、`{name?}` 声明**可选参数**，参数值在请求阶段自动绑定到 handler 的 `Req` 结构体字段：
+
+```go
+type GetCommentReq struct {
+    PostID    int    `json:"post_id"`
+    CommentID int    `json:"comment_id" default:"99"` // 可选参数省略时的回退值
+}
+
+r.GET("/posts/{post_id}/comments/{comment_id?}", getComment)
+// GET /posts/1/comments/2  → PostID=1, CommentID=2
+// GET /posts/1/comments    → PostID=1, CommentID=99（省略，保留 default）
+```
+
+### 语法与注册期校验
+
+| 规则 | 违反时行为 |
+| --- | --- |
+| 参数必须独占整个 path 段，形如 `{name}` / `{name?}` | 注册时 panic |
+| 参数名仅允许 `[A-Za-z_][A-Za-z0-9_]*`，同一路径内不允许重复 | 注册时 panic |
+| 可选参数必须位于路径末尾，其后不允许再出现任何段 | 注册时 panic |
+| 参数名必须与 Req 中某字段的绑定名（form > json > 字段名）精确对应 | 注册时 panic |
+| 参数目标字段不允许是上传文件字段（`*multipart.FileHeader` 及其切片） | 注册时 panic |
+| 同一 method 下参数模式重复、同位置参数名不一致、可选性不一致 | 注册时 panic（冲突提示含双方 handler 位置） |
+
+### 匹配规则
+
+- 参数路由存储于按 method 划分的基数树（`router_trie.go`），静态段优先于参数段，静态分支失败时回溯尝试参数分支。
+- 可选参数的省略分支与命中分支在插入时一次性展开，匹配时无需反复回溯。
+- 精确路由始终优先：`/user`（精确）与 `/user/{name?}`（参数）并存时，请求 `/user` 命中精确路由。
+- 参数不支持匹配含 `/` 的值（按段切分的天然限制）；末尾斜杠归一化同样适用（`/user/` ≡ `/user` 命中省略分支）。
+
+### 参数绑定与错误语义
+
+- 参数值在 query/body 绑定之后写入 Req，**路径参数覆盖同名 query/body 值**。绑定实现（`bindPathParams`）复用 `setScalar` 类型转换，支持 string/bool/int 全系/uint 全系/float/指针及 `time_format`/`time_location` 标签。详见 `parameter-binding.md` 中“路由路径参数”章节。
+- 必选参数类型转换失败（如 int 字段收到 `/posts/abc/comments`）返回 **400**（`BindingError` 通道），而非 404；段数不匹配才返回 404。
+- 可选参数被省略时不写入字段，保留注册阶段模板的 `default` 值或零值。
+- 必选参数字段上的 `default` 标签无害但无效（路径值必然覆盖）。
+
+## 五、路由冲突检测
 
 同一 method + path 重复注册会立即 **panic**，错误信息包含冲突双方的函数名、文件路径与行号：
 
@@ -105,7 +145,7 @@ conflicting with main.listUsersV2 (/app/main.go:35)
 
 位置信息在 `buildEntry` 中通过 `runtime.FuncForPC` 内联提取。
 
-## 五、路由分组（RouterGroup）
+## 六、路由分组（RouterGroup）
 
 ### 创建分组
 
@@ -134,7 +174,7 @@ v1.GET("/users", listUsers)    // 路径 /api/v1/users，中间件顺序 [全局
 
 例如 `"users/"` → `"/users"`，`"/api/"` → `"/api"`。
 
-## 六、中间件注册与快照
+## 七、中间件注册与快照
 
 - `Use(...)` 向 `Router`（全局）或 `RouterGroup`（分组）追加中间件，返回自身支持链式调用。
 - **中间件只对此后注册的路由生效**：注册路由时会将当前中间件链快照存入该路由的 `routeEntry.middlewares`。
@@ -150,9 +190,9 @@ r.GET("/b", handlerB)      // 应用 [logger, auth]；/a 不受影响
 
 > 中间件的执行模型（洋葱模型）详见 `middleware.md`。
 
-## 七、并发约束
+## 八、并发约束
 
-路由表（`Router.routes`）不支持动态注册后并发读取：
+路由表（`Router.routes`）与参数路由基数树（`Router.paramTrees`）不支持动态注册后并发读取：
 
 - **必须在服务对外提供请求之前完成所有路由注册**（典型用法：启动时注册完再 `ListenAndServe`）。
 - 服务运行期间**不支持动态注册路由**。若在服务运行中调用 `GET`/`POST` 等注册方法，会触发 Go map 并发读写导致进程崩溃（`fatal error: concurrent map read and map write`）。

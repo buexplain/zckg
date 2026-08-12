@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // routeEntry 是单条路由在注册表中的存储单元，包含 handler、该路由作用域内的中间件链快照，
@@ -41,6 +42,17 @@ type routeEntry struct {
 	needsRequestPhaseDefaults bool
 	// 请求阶段是否需要执行 validateNonzero（类型树任意深度存在 nonzero 字段，传递性标记）
 	needsNonzeroValidation bool
+	// 路由路径参数与 Req 字段的绑定关系，按注册顺序与捕获值对位；精确路由为 nil
+	pathParams []pathParamBinding
+}
+
+// pathParamBinding 描述单个路由路径参数绑定到 Req 哪个字段，
+// 注册阶段由 attachPathParamBindings 预计算，请求阶段由 bindPathParams 直接使用
+type pathParamBinding struct {
+	indices      []int          // 从 Req 根结构体出发的字段索引路径（复用 fieldMeta.indices 机制）
+	timeFormat   string         // 复用字段的 time_format 标签
+	timeLocation *time.Location // 复用字段的 time_location 标签
+	optional     bool           // 对应的路由参数是否为可选参数 {name?}
 }
 
 // buildEntry 校验 handler 签名、构建中间件链、预计算反射信息，返回完整的 routeEntry。
@@ -180,4 +192,46 @@ func buildOperationMeta(reqType reflect.Type) operationMeta {
 		return m
 	}
 	return m
+}
+
+// attachPathParamBindings 按参数名在 Req 的预计算元信息中查找对应字段，
+// 生成 pathParams 绑定列表（顺序与 segments 中的参数段一致，即注册顺序）。
+// 参数名在 Req 中无对应绑定名、或目标字段为上传文件字段时立即 panic（快速失败，
+// 消息含 method/path 与 handler 位置以便定位）。
+func attachPathParamBindings(entry *routeEntry, segments []routeSegment, method, path string) {
+	for _, seg := range segments {
+		if !seg.isParam {
+			continue
+		}
+		var found *fieldMeta
+		for i := range entry.reqMeta.fields {
+			fm := &entry.reqMeta.fields[i]
+			if fm.name == seg.name {
+				found = fm
+				break
+			}
+		}
+		if found == nil {
+			panic(fmt.Sprintf(
+				"route param {%s} of %s %s (handler %s at %s:%d) has no corresponding field in Req struct %s",
+				seg.name, method, path,
+				entry.handlerName, entry.handlerFile, entry.handlerLine,
+				entry.reqElemType.Name(),
+			))
+		}
+		if found.isFile || found.isFileSlice {
+			panic(fmt.Sprintf(
+				"route param {%s} of %s %s (handler %s at %s:%d) cannot bind to file field %q in Req struct %s",
+				seg.name, method, path,
+				entry.handlerName, entry.handlerFile, entry.handlerLine,
+				found.field.Name, entry.reqElemType.Name(),
+			))
+		}
+		entry.pathParams = append(entry.pathParams, pathParamBinding{
+			indices:      found.indices,
+			timeFormat:   found.timeFormat,
+			timeLocation: found.timeLocation,
+			optional:     seg.optional,
+		})
+	}
 }

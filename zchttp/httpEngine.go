@@ -1,6 +1,8 @@
 package zchttp
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"html"
@@ -10,6 +12,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"strings"
+	"sync"
 )
 
 // Response 统一的 JSON 响应结构
@@ -17,6 +20,39 @@ type Response struct {
 	Data    any    `json:"data"`
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// maxBodyDrainBytes 请求处理结束后为复用 keep-alive 连接而排空剩余请求体的字节上限；
+// 超出则不再排空（连接由 net/http 关闭而非复用），防止超大未读请求体拖慢服务端 IO
+const maxBodyDrainBytes = 2 << 10 // 2 KB
+
+// jsonBufEncoder 将编码器与其专属缓冲绑定一同池化（json.Encoder 不支持重定向
+// 目标 Writer，故先写入缓冲再拷到响应），避免每响应新建编码器。
+// API 响应无需嵌入 HTML，关闭 HTML 转义（< > & 不再转义为 \uXXXX）以降低编码开销
+type jsonBufEncoder struct {
+	buf bytes.Buffer
+	enc *json.Encoder
+}
+
+var jsonEncoderPool = sync.Pool{
+	New: func() any {
+		jb := &jsonBufEncoder{}
+		jb.enc = json.NewEncoder(&jb.buf)
+		jb.enc.SetEscapeHTML(false)
+		return jb
+	},
+}
+
+// encodeJSON 从池中取出编码器将 v 编码为 JSON 写入 w，用完归还
+func encodeJSON(w io.Writer, v any) error {
+	jb := jsonEncoderPool.Get().(*jsonBufEncoder)
+	err := jb.enc.Encode(v)
+	if err == nil {
+		_, err = w.Write(jb.buf.Bytes())
+	}
+	jb.buf.Reset()
+	jsonEncoderPool.Put(jb)
+	return err
 }
 
 // ResponseHandler 自定义成功响应的写入逻辑，res 为 handler 的第一个返回值
@@ -62,7 +98,7 @@ func DefaultResponseHandler(w http.ResponseWriter, r *http.Request, res any) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(Response{Data: res, Code: 0, Message: "success"}); err != nil {
+	if err := encodeJSON(w, Response{Data: res, Code: 0, Message: "success"}); err != nil {
 		slog.Error("json encode failed in DefaultResponseHandler", "error", err, "path", r.URL.Path)
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("internal server error"))
@@ -83,7 +119,7 @@ func DefaultErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
-	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusInternalServerError, Message: err.Error()}); encErr != nil {
+	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusInternalServerError, Message: err.Error()}); encErr != nil {
 		slog.Error("json encode failed in DefaultErrorHandler", "error", encErr, "path", r.URL.Path)
 	}
 }
@@ -102,7 +138,7 @@ func DefaultValidationErrorHandler(w http.ResponseWriter, r *http.Request, err e
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
-	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusBadRequest, Message: err.Error()}); encErr != nil {
+	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusBadRequest, Message: err.Error()}); encErr != nil {
 		slog.Error("json encode failed in DefaultValidationErrorHandler", "error", encErr, "path", r.URL.Path)
 	}
 }
@@ -128,7 +164,7 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
-	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusInternalServerError, Message: "internal server error"}); encErr != nil {
+	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusInternalServerError, Message: "internal server error"}); encErr != nil {
 		slog.Error("json encode failed in DefaultPanicHandler", "error", encErr, "path", r.URL.Path)
 	}
 }
@@ -147,45 +183,52 @@ func DefaultNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
-	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusNotFound, Message: "not found"}); encErr != nil {
+	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusNotFound, Message: "not found"}); encErr != nil {
 		slog.Error("json encode failed in DefaultNotFoundHandler", "error", encErr, "path", r.URL.Path)
 	}
 }
 
 func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 包装 ResponseWriter 以跟踪响应是否已被写入（提前包装，以便 panic 恢复时也能使用）
-	rw := &responseWriter{ResponseWriter: w}
+	// 从池中取出 ResponseWriter 包装器以跟踪响应是否已被写入（提前获取，以便 panic 恢复时也能使用）
+	rw := acquireResponseWriter(w)
 
-	// panic 捕获：防止单个请求的 panic 导致整个进程崩溃
+	// panic 捕获：防止单个请求的 panic 导致整个进程崩溃；
+	// 包装器在 panic 处理完成后才归还池，确保 OnPanic 仍可安全使用 rw
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			e.OnPanic(rw, r, recovered)
 		}
+		releaseResponseWriter(rw)
 	}()
 
-	// 1. 根据 method 查找路由表
-	methodRoutes, ok := e.Router.routes[r.Method]
-	if !ok {
-		e.OnNotFound(rw, r)
-		return
+	// 1. 查找路由：先按 method+path 精确匹配，未命中再回退到参数路由基数树匹配
+	//    （精确路由优先；末尾斜杠归一化，使 /hello 与 /hello/ 等价）
+	normalizedPath := normalizePath(r.URL.Path)
+	var entry *routeEntry
+	var paramValues []string
+	if methodRoutes, ok := e.Router.routes[r.Method]; ok {
+		entry = methodRoutes[normalizedPath]
 	}
-
-	// 2. 根据 path 查找具体路由（末尾斜杠归一化，使 /hello 与 /hello/ 等价）
-	entry, ok := methodRoutes[normalizePath(r.URL.Path)]
-	if !ok {
+	if entry == nil {
+		entry, paramValues = e.Router.matchParam(r.Method, normalizedPath)
+	}
+	if entry == nil {
 		e.OnNotFound(rw, r)
 		return
 	}
 
 	ctx := r.Context()
-	// 将 *HttpEngine、*http.Request 与（包装后的）ResponseWriter 注入 ctx，供 handler 通过
-	// EngineFromContext / RequestFromContext / ResponseWriterFromContext 获取
-	ctx = withEngine(ctx, e)
-	ctx = withRequestResponse(ctx, r, rw)
+	// 将请求作用域的全部状态（*HttpEngine、*http.Request、包装后的 ResponseWriter）
+	// 合并为单个 requestState 一次性注入 ctx（仅一次 context.WithValue），
+	// 供 handler 通过 EngineFromContext / RequestFromContext / ResponseWriterFromContext 获取
+	st := &requestState{engine: e, req: r, w: rw}
+	ctx = context.WithValue(ctx, stateKey, st)
 
 	if r.Body != nil {
 		defer func() {
-			_, _ = io.Copy(io.Discard, r.Body)
+			// 限量排空剩余请求体以复用 keep-alive 连接；超出上限不再排空，
+			// 连接由 net/http 关闭，避免超大未读请求体占用服务端 IO
+			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxBodyDrainBytes))
 			_ = r.Body.Close()
 		}()
 	}
@@ -203,8 +246,13 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := bindRequestData(r, reqPtr, entry.reqMeta); err != nil {
-		// 绑定失败不提前返回，将错误存入 ctx，随中间件链穿透到 core 层再处理
-		ctx = withBindingErr(ctx, NewBindingError(err))
+		// 绑定失败不提前返回，将错误存入状态，随中间件链穿透到 core 层再处理
+		st.bindingErr = NewBindingError(err)
+	} else if len(entry.pathParams) > 0 {
+		// 路由路径参数在 query/body 之后绑定，覆盖同名参数；转换失败同样走 BindingError 通道（400）
+		if err := bindPathParams(reqPtr, entry.pathParams, paramValues); err != nil {
+			st.bindingErr = NewBindingError(err)
+		}
 	}
 
 	// 请求阶段重新应用默认值：补填 JSON/表单绑定后动态创建的子元素（切片/数组/map/nested struct ptr）中的默认值。
@@ -214,21 +262,17 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = applyDefaults(reqPtr, entry.reqMeta, true)
 	}
 
-	// 4. 将解析后的 Req 注入 ctx，供中间件与 core 层获取
-	//    （即使绑定失败也注入，中间件可通过 BoundReqFromContext 拿到错误）
-	ctx = withBoundReq(ctx, reqPtr.Interface())
-
-	// 将 Res 共享容器注入 ctx，使 core 层写入的 Res 对所有中间件层（包括后置阶段）可见
-	ctx = withBoundResContainer(ctx)
+	// 4. 将解析后的 Req 存入状态，供中间件与 core 层通过 BoundReqFromContext 获取
+	//    （即使绑定失败也存入，中间件可通过 BoundReqFromContext 拿到错误）
+	st.boundReq = reqPtr.Interface()
 
 	// 5. 洋葱模型核心层：参数校验 + 反射调用 handler
+	//    直接使用闭包捕获的 reqPtr（绑定阶段产物），避免再从 ctx 取值并重复反射
 	core := func() error {
-		boundAny, err := BoundReqFromContext[any](ctx)
-		if err != nil {
-			return err
+		// 绑定阶段失败时不提前返回，错误随中间件链穿透到 core 层再统一处理
+		if st.bindingErr != nil {
+			return st.bindingErr
 		}
-		reqPtr := reflect.ValueOf(boundAny)
-
 		// 校验 Req（required 字段 + 自定义 Validator）
 		// 使用注册阶段预计算的 reqMeta，避免请求阶段重复反射解析；
 		// needsNonzeroValidation 为传递性标记：类型树任意深度存在 nonzero 字段才执行遍历
@@ -256,9 +300,11 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return errVal.(error)
 		}
 
-		// 成功：将 Res 写入共享容器，再交由响应回调处理（默认 JSON，可自定义为文件等）
-		setBoundRes(ctx, results[0].Interface())
-		e.OnResponse(rw, r, results[0].Interface())
+		// 成功：将 Res 写入共享状态，再交由响应回调处理（默认 JSON，可自定义为文件等）
+		// Interface() 仅装箱一次复用，避免重复装箱分配
+		res := results[0].Interface()
+		st.res = res
+		e.OnResponse(rw, r, res)
 		return nil
 	}
 

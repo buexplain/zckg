@@ -3,6 +3,7 @@ package zchttp
 import (
 	"context"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -453,6 +454,7 @@ func TestNormalizePath(t *testing.T) {
 		{"hello", "/hello"},
 		{"hello/", "/hello"},
 		{"hello/world", "/hello/world"},
+		{"//", "/"},
 	}
 	for _, c := range cases {
 		got := normalizePath(c.input)
@@ -666,4 +668,88 @@ func TestMiddlewareNextCalledTwice(t *testing.T) {
 	if secondErr == nil {
 		t.Fatal("second next() call should return error instead of silently re-running downstream")
 	}
+}
+
+// ======== 路由参数：注册期校验 ========
+
+// TestParamRouteInvalidSyntaxPanic 验证参数路由路径语法非法时注册 panic
+func TestParamRouteInvalidSyntaxPanic(t *testing.T) {
+	cases := []struct {
+		name    string
+		path    string
+		errPart string
+	}{
+		{"digit-leading name", "/p/{1id}", "invalid parameter name"},
+		{"empty name", "/p/{}", "invalid parameter name"},
+		{"param mixed with literal", "/p/abc{id}", "invalid parameter segment"},
+		{"required after optional", "/p/{post_id?}/{comment_id}", "not allowed after optional"},
+		{"duplicate name", "/p/{post_id}/{post_id}", "duplicate parameter name"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			expectPanicContains(t, []string{"invalid route path", c.errPart}, func() {
+				router := NewRouter()
+				router.GET(c.path, paramEcho)
+			})
+		})
+	}
+}
+
+// TestParamRouteNoFieldPanic 验证参数名在 Req 中无对应字段时注册 panic
+func TestParamRouteNoFieldPanic(t *testing.T) {
+	expectPanicContains(t, []string{"{nope}", "no corresponding field", "helloReq"}, func() {
+		router := NewRouter()
+		router.GET("/p/{nope}", hello)
+	})
+}
+
+// TestMatchParam_UnknownMethod 覆盖 paramTrees 中无对应 method 时直接返回 nil 的分支
+func TestMatchParam_UnknownMethod(t *testing.T) {
+	router := NewRouter()
+	entry, vals := router.matchParam("FOO", "/a/b")
+	if entry != nil || vals != nil {
+		t.Fatalf("expected nil for unknown method, got %v %v", entry, vals)
+	}
+	// 未初始化 paramTrees 的 Router（root 为 nil）同样安全返回 nil
+	bare := &Router{}
+	entry, vals = bare.matchParam(http.MethodGet, "/a/b")
+	if entry != nil || vals != nil {
+		t.Fatalf("expected nil for bare router, got %v %v", entry, vals)
+	}
+	// 根路径 "/" 归一化为空串后无可选参数注册时应未命中
+	entry, vals = router.matchParam(http.MethodGet, "/")
+	if entry != nil || vals != nil {
+		t.Fatalf("expected nil for root path, got %v %v", entry, vals)
+	}
+}
+
+// TestParamRouteOptionalDuplicatePanic 验证可选参数终点 entries[1] 重复注册时 panic
+func TestParamRouteOptionalDuplicatePanic(t *testing.T) {
+	type optReq struct {
+		ID string `json:"id"`
+	}
+	type optRes struct{}
+	h := func(_ context.Context, req optReq) (optRes, error) {
+		return optRes{}, nil
+	}
+	expectPanicContains(t, []string{"conflict"}, func() {
+		router := NewRouter()
+		router.GET("/opt/{id?}", h)
+		router.GET("/opt/{id?}", h)
+	})
+}
+
+// TestParamRouteFileFieldPanic 验证参数绑定目标为文件字段时注册 panic
+func TestParamRouteFileFieldPanic(t *testing.T) {
+	type fileParamReq struct {
+		File *multipart.FileHeader `json:"file"`
+	}
+	type fileParamRes struct{}
+	handler := func(_ context.Context, req fileParamReq) (fileParamRes, error) {
+		return fileParamRes{}, nil
+	}
+	expectPanicContains(t, []string{"{file}", "cannot bind to file field"}, func() {
+		router := NewRouter()
+		router.GET("/p/{file}", handler)
+	})
 }

@@ -302,3 +302,24 @@ func TestDerefType_SelfReferentialPtr(t *testing.T) {
 		t.Fatal("confirmed: derefType infinite loop on self-referential pointer type (timed out)")
 	}
 }
+
+// TestIsStructLikeVariants 覆盖结构体、指针、非结构体类型的判定分支
+func TestIsStructLikeVariants(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  reflect.Type
+		want bool
+	}{
+		{"struct", reflect.TypeOf(helloReq{}), true},
+		{"ptr to struct", reflect.TypeOf(&helloReq{}), true},
+		{"int", reflect.TypeOf(0), false},
+		{"ptr to int", reflect.TypeOf((*int)(nil)), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isStructLike(tc.typ); got != tc.want {
+				t.Fatalf("isStructLike(%v) = %v, want %v", tc.typ, got, tc.want)
+			}
+		})
+	}
+}

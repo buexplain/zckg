@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -2189,5 +2190,171 @@ func TestGenerateOpenAPI_MapArrayMultiLayerDefaultHidden(t *testing.T) {
 	// description 不受可达性影响，始终展示
 	if qtyField["description"] != "数量" {
 		t.Errorf("qty.description = %v, want 数量", qtyField["description"])
+	}
+}
+
+// ======== 工具函数分支补测 ========
+
+// TestParseJSONName 覆盖空标签、纯名称与带选项标签的字段名提取
+func TestParseJSONName(t *testing.T) {
+	cases := []struct{ tag, want string }{
+		{"", ""},
+		{"name", "name"},
+		{"name,omitempty", "name"},
+	}
+	for _, c := range cases {
+		if got := parseJSONName(c.tag); got != c.want {
+			t.Errorf("parseJSONName(%q) = %q, want %q", c.tag, got, c.want)
+		}
+	}
+}
+
+// TestCoerceExample 覆盖各 schema 类型的转换成功与失败回退分支
+func TestCoerceExample(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  string
+		raw  string
+		want any
+	}{
+		{"integer ok", "integer", "12", int64(12)},
+		{"integer invalid", "integer", "abc", "abc"},
+		{"number ok", "number", "1.5", 1.5},
+		{"number invalid", "number", "xyz", "xyz"},
+		{"boolean ok", "boolean", "true", true},
+		{"boolean invalid", "boolean", "notbool", "notbool"},
+		{"string passthrough", "string", "hello", "hello"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := coerceExample(map[string]any{"type": c.typ}, c.raw)
+			if got != c.want {
+				t.Fatalf("coerceExample(%q, %q) = %v (%T), want %v (%T)", c.typ, c.raw, got, got, c.want, c.want)
+			}
+		})
+	}
+}
+
+// TestHasFileFieldVariants 覆盖非结构体、文件切片与未导出字段的判定分支
+func TestHasFileFieldVariants(t *testing.T) {
+	type withFileSlice struct{ Files []*multipart.FileHeader }
+	type withUnexportedFile struct{ file *multipart.FileHeader }
+	cases := []struct {
+		name string
+		typ  reflect.Type
+		want bool
+	}{
+		{"non struct", reflect.TypeOf(0), false},
+		{"no file field", reflect.TypeOf(helloReq{}), false},
+		{"file slice", reflect.TypeOf(withFileSlice{}), true},
+		{"unexported file skipped", reflect.TypeOf(withUnexportedFile{}), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasFileField(tc.typ); got != tc.want {
+				t.Fatalf("hasFileField(%v) = %v, want %v", tc.typ, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUniqueNameCollision 覆盖匿名结构体命名、重名追加序号与同类型复用已有名的分支
+func TestUniqueNameCollision(t *testing.T) {
+	g := &openAPIGenerator{nameToType: map[string]reflect.Type{}}
+	t1 := reflect.TypeOf(struct{ A int }{})
+	t2 := reflect.TypeOf(struct{ B string }{})
+
+	if n := g.uniqueName(t1); n != "AnonymousStruct" {
+		t.Fatalf("first anonymous name = %q, want AnonymousStruct", n)
+	}
+	if n := g.uniqueName(t2); n != "AnonymousStruct2" {
+		t.Fatalf("colliding anonymous name = %q, want AnonymousStruct2", n)
+	}
+	if n := g.uniqueName(t1); n != "AnonymousStruct" {
+		t.Fatalf("same type should reuse existing name, got %q", n)
+	}
+}
+
+// newTestGenerator 构造字段初始化完整的测试用生成器，供直接调用内部方法补分支
+func newTestGenerator() *openAPIGenerator {
+	return &openAPIGenerator{
+		schemas:           map[string]any{},
+		typeNames:         map[reflect.Type]string{},
+		nameToType:        map[string]reflect.Type{},
+		reachedViaValue:   map[reflect.Type]bool{},
+		reachedByDefaults: map[reflect.Type]bool{},
+	}
+}
+
+// TestOpenAPIBuilderNonStructBranches 覆盖生成器各函数对非结构体 Req 的跳过分支
+func TestOpenAPIBuilderNonStructBranches(t *testing.T) {
+	g := newTestGenerator()
+	if got := g.buildQueryParams(reflect.TypeOf(0), structMeta{}); got != nil {
+		t.Fatalf("buildQueryParams(non-struct) = %v, want nil", got)
+	}
+	if got := g.buildRequestBody(reflect.TypeOf(0), structMeta{}); got != nil {
+		t.Fatalf("buildRequestBody(non-struct) = %v, want nil", got)
+	}
+	if got := g.registerStructSchema(reflect.TypeOf(0), structMeta{}); got["type"] != "object" {
+		t.Fatalf("registerStructSchema(non-struct) = %v, want generic object", got)
+	}
+}
+
+// TestBuildWrapperPropertiesNonStructWrapper 覆盖 responseWrapper 为非结构体时回退默认包装的分支
+func TestBuildWrapperPropertiesNonStructWrapper(t *testing.T) {
+	g := newTestGenerator()
+	g.responseWrapper = 42
+	wrapper := g.buildWrapperProperties(map[string]any{"type": "object"})
+	props, ok := wrapper["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("wrapper properties missing: %v", wrapper)
+	}
+	for _, key := range []string{"data", "code", "message"} {
+		if _, exists := props[key]; !exists {
+			t.Fatalf("default wrapper should contain %q, got: %v", key, props)
+		}
+	}
+}
+
+// TestWrapResponseSchemaNonStruct 覆盖 Res 非结构体时 AnonymousStruct 回退命名的分支
+func TestWrapResponseSchemaNonStruct(t *testing.T) {
+	g := newTestGenerator()
+	ref := g.wrapResponseSchema(reflect.TypeOf(0), structMeta{})
+	if ref["$ref"] != "#/components/schemas/Response_AnonymousStruct" {
+		t.Fatalf("$ref = %v, want Response_AnonymousStruct", ref["$ref"])
+	}
+}
+
+// TestBuildWrapperPropertiesSkipBranches 覆盖未导出字段与 json:"-" 字段的跳过分支
+func TestBuildWrapperPropertiesSkipBranches(t *testing.T) {
+	type wrapperWithSkip struct {
+		unexported string
+		Ignored    string `json:"-"`
+		Payload    any    `json:"payload"`
+	}
+	g := newTestGenerator()
+	g.responseWrapper = wrapperWithSkip{}
+	wrapper := g.buildWrapperProperties(map[string]any{"type": "object"})
+	props := wrapper["properties"].(map[string]any)
+	if len(props) != 1 {
+		t.Fatalf("props should only contain payload, got: %v", props)
+	}
+	if _, ok := props["payload"]; !ok {
+		t.Fatalf("interface field should be mapped to data schema, got: %v", props)
+	}
+}
+
+// TestBuildQueryParamsSkipBranches 覆盖绑定名为 "-" 与 ignore 标签字段的跳过分支
+func TestBuildQueryParamsSkipBranches(t *testing.T) {
+	g := newTestGenerator()
+	meta := structMeta{fields: []fieldMeta{
+		{name: "-", indices: []int{0}},
+		{name: "ig", indices: []int{1}, field: reflect.StructField{
+			Name: "Ig", Type: reflect.TypeOf(""), Tag: `ignore:"true"`,
+		}},
+	}}
+	params := g.buildQueryParams(reflect.TypeOf(helloReq{}), meta)
+	if len(params) != 0 {
+		t.Fatalf("ignored fields should produce no query params, got: %v", params)
 	}
 }

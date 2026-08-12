@@ -1423,3 +1423,29 @@ func TestHasNonzeroInTree(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateNonzeroNonStruct 覆盖目标非结构体时直接返回的分支
+func TestValidateNonzeroNonStruct(t *testing.T) {
+	v := reflect.New(reflect.TypeOf(0))
+	if err := validateNonzero(v, structMeta{}); err != nil {
+		t.Fatalf("non-struct should skip validation, got: %v", err)
+	}
+}
+
+// TestReleaseVisitMap_Oversized 覆盖超出池大小上限的 visited map 不归还池的分支，
+// 且归还大 map 后池仍能正常提供空 map
+func TestReleaseVisitMap_Oversized(t *testing.T) {
+	big := make(map[visitKey]bool, maxPooledVisitMapSize+1)
+	for i := 0; i <= maxPooledVisitMapSize; i++ {
+		big[visitKey{ptr: uintptr(i)}] = true
+	}
+	releaseVisitMap(big)
+	if len(big) != maxPooledVisitMapSize+1 {
+		t.Fatalf("oversized map must not be cleared in place, len=%d", len(big))
+	}
+	m := acquireVisitMap()
+	if len(m) != 0 {
+		t.Fatalf("acquired visit map should be empty, len=%d", len(m))
+	}
+	releaseVisitMap(m)
+}

@@ -1,9 +1,12 @@
 package zchttp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -398,5 +401,376 @@ func TestDefaultValidationErrorHandler_SkipWhenWritten(t *testing.T) {
 	// 响应应保持中间件写入的内容
 	if body := rec.Body.String(); body != "early" {
 		t.Fatalf("body = %q, want 'early'", body)
+	}
+}
+
+// ======== 路由参数 e2e ========
+
+// e2ePathParamReq 覆盖必选 int 参数与带默认值的可选参数
+type e2ePathParamReq struct {
+	PostID    int `json:"post_id"`
+	CommentID int `json:"comment_id" default:"99"`
+}
+type e2ePathParamRes struct {
+	PostID    int `json:"post_id"`
+	CommentID int `json:"comment_id"`
+}
+
+func e2ePathParamHandler(_ context.Context, req e2ePathParamReq) (e2ePathParamRes, error) {
+	return e2ePathParamRes{PostID: req.PostID, CommentID: req.CommentID}, nil
+}
+
+// TestPathParamE2E_BindAndOptional 验证必选参数绑定、可选参数命中与省略（省略时保留 default）
+func TestPathParamE2E_BindAndOptional(t *testing.T) {
+	router := NewRouter()
+	router.GET("/posts/{post_id}/comments/{comment_id?}", e2ePathParamHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	cases := []struct {
+		path      string
+		wantPost  int
+		wantReply int
+	}{
+		{"/posts/1/comments/5", 1, 5},   // 可选参数提供
+		{"/posts/1/comments", 1, 99},    // 可选参数省略，保留 default
+		{"/posts/42/comments/", 42, 99}, // 末尾斜杠归一化后命中省略分支
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodGet, c.path, nil)
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s expected 200, got %d", c.path, rec.Code)
+		}
+		var res e2ePathParamRes
+		decodeData(t, rec, &res)
+		if res.PostID != c.wantPost || res.CommentID != c.wantReply {
+			t.Fatalf("GET %s = %+v, want post=%d comment=%d", c.path, res, c.wantPost, c.wantReply)
+		}
+	}
+}
+
+// TestPathParamE2E_InvalidValue400 验证必选参数类型转换失败返回 400（BindingError 通道）
+func TestPathParamE2E_InvalidValue400(t *testing.T) {
+	router := NewRouter()
+	router.GET("/posts/{post_id}/comments/{comment_id?}", e2ePathParamHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	req := httptest.NewRequest(http.MethodGet, "/posts/abc/comments", nil)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid int param, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "invalid path parameter value") {
+		t.Fatalf("response should contain binding error detail, got: %s", rec.Body.String())
+	}
+}
+
+// TestPathParamE2E_NoMatch404 验证参数段数不匹配时返回 404
+func TestPathParamE2E_NoMatch404(t *testing.T) {
+	router := NewRouter()
+	router.GET("/posts/{post_id}/comments/{comment_id?}", e2ePathParamHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	for _, path := range []string{"/posts", "/posts/1/extra/deep"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("GET %s expected 404, got %d", path, rec.Code)
+		}
+	}
+}
+
+// TestPathParamE2E_OverridesQuery 验证路径参数覆盖同名 query 参数
+func TestPathParamE2E_OverridesQuery(t *testing.T) {
+	router := NewRouter()
+	router.GET("/posts/{post_id}/comments/{comment_id?}", e2ePathParamHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	req := httptest.NewRequest(http.MethodGet, "/posts/7/comments?post_id=999&comment_id=888", nil)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var res e2ePathParamRes
+	decodeData(t, rec, &res)
+	if res.PostID != 7 || res.CommentID != 888 {
+		t.Fatalf("path param should override query: got %+v, want post=7 comment=888", res)
+	}
+}
+
+// TestPathParamE2E_WithBody 验证 POST 请求体与路径参数同时绑定
+type e2eBodyParamReq struct {
+	PostID int    `json:"post_id"`
+	Body   string `json:"body"`
+}
+type e2eBodyParamRes struct {
+	PostID int    `json:"post_id"`
+	Body   string `json:"body"`
+}
+
+func TestPathParamE2E_WithBody(t *testing.T) {
+	router := NewRouter()
+	router.POST("/posts/{post_id}/comments", func(_ context.Context, req e2eBodyParamReq) (e2eBodyParamRes, error) {
+		return e2eBodyParamRes{PostID: req.PostID, Body: req.Body}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	req := httptest.NewRequest(http.MethodPost, "/posts/3/comments", strings.NewReader(`{"body":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var res e2eBodyParamRes
+	decodeData(t, rec, &res)
+	if res.PostID != 3 || res.Body != "hi" {
+		t.Fatalf("got %+v, want post=3 body=hi", res)
+	}
+}
+
+// TestPathParamE2E_GroupPrefix 验证分组前缀与参数路由组合
+func TestPathParamE2E_GroupPrefix(t *testing.T) {
+	router := NewRouter()
+	api := router.Group("/api")
+	api.GET("/items/{post_id}", e2ePathParamHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	req := httptest.NewRequest(http.MethodGet, "/api/items/8", nil)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var res e2ePathParamRes
+	decodeData(t, rec, &res)
+	if res.PostID != 8 {
+		t.Fatalf("post_id = %d, want 8", res.PostID)
+	}
+}
+
+// TestPathParamE2E_ExactRoutePreferred 验证精确路由优先于可选参数路由的省略分支
+func TestPathParamE2E_ExactRoutePreferred(t *testing.T) {
+	router := NewRouter()
+	router.GET("/user", func(_ context.Context, _ helloReq) (helloRes, error) {
+		return helloRes{Message: "exact"}, nil
+	})
+	router.GET("/user/{name?}", hello)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	// /user 命中精确路由
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/user", nil))
+	var res helloRes
+	decodeData(t, rec, &res)
+	if res.Message != "exact" {
+		t.Fatalf("message = %q, want 'exact' (exact route preferred)", res.Message)
+	}
+
+	// /user/x 命中参数路由
+	rec = httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/user/x", nil))
+	decodeData(t, rec, &res)
+	if res.Message != "Hello, x" {
+		t.Fatalf("message = %q, want 'Hello, x'", res.Message)
+	}
+}
+
+// ======== Default*Handler 编码失败分支与 Run ========
+
+// failingWriter 的 Write 永远失败，用于触发各 Default*Handler 的 json 编码失败分支
+type failingWriter struct {
+	header http.Header
+	code   int
+}
+
+func (w *failingWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *failingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+func (w *failingWriter) WriteHeader(code int)      { w.code = code }
+
+// TestDefaultResponseHandler_EncodeFail 验证 JSON 编码失败时回退 500 纯文本响应
+func TestDefaultResponseHandler_EncodeFail(t *testing.T) {
+	w := &failingWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	DefaultResponseHandler(w, req, helloRes{Message: "hi"})
+	if w.code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", w.code)
+	}
+}
+
+// TestDefaultResponseHandler_SkipWhenWritten 验证响应已写入时跳过
+func TestDefaultResponseHandler_SkipWhenWritten(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &responseWriter{ResponseWriter: rec}
+	rw.Header().Set("Content-Type", "text/plain")
+	_, _ = rw.Write([]byte("custom"))
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	DefaultResponseHandler(rw, req, helloRes{Message: "hi"})
+
+	if rec.Body.String() != "custom" {
+		t.Fatalf("body = %q, want 'custom' (response already written)", rec.Body.String())
+	}
+}
+
+// TestDefaultErrorHandler_EncodeFail 验证错误响应 JSON 编码失败时仅记录日志不 panic
+func TestDefaultErrorHandler_EncodeFail(t *testing.T) {
+	w := &failingWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	DefaultErrorHandler(w, req, fmt.Errorf("boom"))
+	if w.code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", w.code)
+	}
+}
+
+// TestDefaultValidationErrorHandler_EncodeFail 验证校验错误响应 JSON 编码失败分支
+func TestDefaultValidationErrorHandler_EncodeFail(t *testing.T) {
+	w := &failingWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	DefaultValidationErrorHandler(w, req, fmt.Errorf("bad param"))
+	if w.code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", w.code)
+	}
+}
+
+// TestDefaultPanicHandler_EncodeFail 验证 panic 响应 JSON 编码失败分支
+func TestDefaultPanicHandler_EncodeFail(t *testing.T) {
+	w := &failingWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	DefaultPanicHandler(w, req, "recovered")
+	if w.code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", w.code)
+	}
+}
+
+// TestDefaultNotFoundHandler_EncodeFail 验证 404 响应 JSON 编码失败分支
+func TestDefaultNotFoundHandler_EncodeFail(t *testing.T) {
+	w := &failingWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	DefaultNotFoundHandler(w, req)
+	if w.code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404", w.code)
+	}
+}
+
+// TestHttpEngine_Run_InvalidAddr 验证 Run 将监听错误透传返回（无效端口立即失败）
+func TestHttpEngine_Run_InvalidAddr(t *testing.T) {
+	engine := NewEngine()
+	err := engine.Run(&http.Server{Addr: "127.0.0.1:-1"})
+	if err == nil {
+		t.Fatal("expected listen error for invalid addr, got nil")
+	}
+}
+
+// TestDefaultErrorHandler_SkipWhenWritten 覆盖响应已写入时跳过的分支
+func TestDefaultErrorHandler_SkipWhenWritten(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &responseWriter{ResponseWriter: rec}
+	_, _ = rw.Write([]byte("partial"))
+	DefaultErrorHandler(rw, httptest.NewRequest(http.MethodGet, "/x", nil), fmt.Errorf("boom"))
+	if rec.Body.String() != "partial" {
+		t.Fatalf("body = %q, want 'partial' (response already written)", rec.Body.String())
+	}
+}
+
+// TestDefaultNotFoundHandler_SkipWhenWritten 覆盖响应已写入时跳过的分支
+func TestDefaultNotFoundHandler_SkipWhenWritten(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := &responseWriter{ResponseWriter: rec}
+	_, _ = rw.Write([]byte("partial"))
+	DefaultNotFoundHandler(rw, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Body.String() != "partial" {
+		t.Fatalf("body = %q, want 'partial' (response already written)", rec.Body.String())
+	}
+}
+
+// TestDefaultResponse_NoHTMLEscape 验证默认 JSON 响应不再对 < > & 做 HTML 转义（池化编码器行为锁死）
+func TestDefaultResponse_NoHTMLEscape(t *testing.T) {
+	type escRes struct {
+		Text string `json:"text"`
+	}
+	router := NewRouter()
+	router.GET("/esc", func(_ context.Context, req engineReq) (escRes, error) {
+		return escRes{Text: "<b>a&b</b>"}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/esc", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "<b>a&b</b>") {
+		t.Fatalf("expected raw HTML chars in JSON body, got %q", body)
+	}
+	if strings.Contains(body, `\u003c`) {
+		t.Fatalf("HTML escaping should be disabled, got %q", body)
+	}
+}
+
+// countingReader 统计已读字节数，用于验证请求体排空上限
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// TestBodyDrainLimited 验证 handler 未消费的超大请求体不会被全量排空，
+// 读取量不超过 maxBodyDrainBytes（防止慢客户端借排空占用服务端 IO）
+func TestBodyDrainLimited(t *testing.T) {
+	type drainEmptyReq struct{}
+	type drainEmptyRes struct{ OK bool }
+	router := NewRouter()
+	router.POST("/drain", func(_ context.Context, req drainEmptyReq) (drainEmptyRes, error) {
+		return drainEmptyRes{OK: true}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	big := make([]byte, 64<<10)
+	cr := &countingReader{r: bytes.NewReader(big)}
+	req := httptest.NewRequest(http.MethodPost, "/drain", cr)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if cr.n > maxBodyDrainBytes {
+		t.Fatalf("drained %d bytes, want <= %d", cr.n, maxBodyDrainBytes)
 	}
 }

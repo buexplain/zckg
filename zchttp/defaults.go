@@ -129,7 +129,10 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 // meta 为注册阶段预计算的 structMeta，直接遍历其 fields 避免请求阶段反射。
 func applyDefaults(reqPtr reflect.Value, meta structMeta, requestPhase ...bool) error {
 	rp := len(requestPhase) > 0 && requestPhase[0]
-	return applyDefaultsWithVisiting(reqPtr, meta, rp, nil)
+	visiting := acquireVisitMap()
+	err := applyDefaultsWithVisiting(reqPtr, meta, rp, visiting)
+	releaseVisitMap(visiting)
+	return err
 }
 
 // applyDefaultsWithVisiting 是 applyDefaults 的内部实现，携带 visiting map 用于运行时循环检测。
@@ -185,7 +188,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 			subV = subV.Elem()
 		}
 		if subV.Kind() == reflect.Struct {
-			subMeta := buildStructMeta(subV.Type())
+			subMeta := cachedStructMeta(subV.Type())
 			_ = applyDefaultsWithVisiting(subV.Addr(), subMeta, rp, visiting)
 		} else if subV.Kind() == reflect.Slice {
 			// 结构体切片/结构体指针切片：递归填充每个元素中带 default 标签的字段
@@ -195,7 +198,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 				elemType = elemType.Elem()
 			}
 			if elemType.Kind() == reflect.Struct {
-				subMeta := buildStructMeta(elemType)
+				subMeta := cachedStructMeta(elemType)
 				for i := 0; i < subV.Len(); i++ {
 					elem := subV.Index(i)
 					if isPtrElem {
@@ -215,7 +218,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 				elemType = elemType.Elem()
 			}
 			if elemType.Kind() == reflect.Struct {
-				subMeta := buildStructMeta(elemType)
+				subMeta := cachedStructMeta(elemType)
 				for i := 0; i < subV.Len(); i++ {
 					elem := subV.Index(i)
 					if isPtrElem {
@@ -242,7 +245,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 					continue
 				}
 				visiting[mapKey] = true
-				subMeta := buildStructMeta(valType)
+				subMeta := cachedStructMeta(valType)
 				for _, key := range subV.MapKeys() {
 					val := subV.MapIndex(key)
 					if isPtrVal {

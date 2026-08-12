@@ -4,17 +4,20 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"regexp"
 	"strings"
 )
 
 type Router struct {
-	routes      map[string]map[string]*routeEntry
-	middlewares []MiddlewareHandler // 全局中间件，作用于通过本 Router 注册的所有路由
+	routes      map[string]map[string]*routeEntry // 精确匹配路由表：method -> path -> entry
+	paramTrees  map[string]*routeNode             // 参数路由基数树：method -> 根节点（仅在注册了参数路由时构建）
+	middlewares []MiddlewareHandler               // 全局中间件，作用于通过本 Router 注册的所有路由
 }
 
 func NewRouter() *Router {
 	r := &Router{
-		routes: make(map[string]map[string]*routeEntry),
+		routes:     make(map[string]map[string]*routeEntry),
+		paramTrees: make(map[string]*routeNode),
 	}
 	r.routes[http.MethodGet] = make(map[string]*routeEntry)
 	r.routes[http.MethodPost] = make(map[string]*routeEntry)
@@ -25,6 +28,9 @@ func NewRouter() *Router {
 	r.routes[http.MethodOptions] = make(map[string]*routeEntry)
 	r.routes[http.MethodConnect] = make(map[string]*routeEntry)
 	r.routes[http.MethodTrace] = make(map[string]*routeEntry)
+	for method := range r.routes {
+		r.paramTrees[method] = &routeNode{static: make(map[string]*routeNode)}
+	}
 	return r
 }
 
@@ -57,6 +63,17 @@ func (r *Router) register(method, path string, handler any, groupMiddlewares []M
 	// 注册阶段扫描 Req 类型树，检测 default 标签误用（包含路由信息以便定位）
 	checkUnsupportedDefaults(entry.reqElemType, true, true, method, path, entry.handlerName, entry.handlerFile, entry.handlerLine, map[reflect.Type]bool{})
 
+	// 参数路由（含 {name}/{name?} 段）：解析路径语法、预计算 Req 字段绑定后插入基数树
+	if strings.ContainsAny(path, "{}") {
+		segments, perr := parseRoutePath(path)
+		if perr != nil {
+			panic(fmt.Sprintf("invalid route path: %s", perr))
+		}
+		attachPathParamBindings(entry, segments, method, path)
+		insertParamRoute(r.paramTrees[method], segments, entry, method, path)
+		return
+	}
+
 	if existing, ok := r.routes[method][path]; ok {
 		panic(fmt.Sprintf(
 			"route conflict: %s %s already registered by %s (%s:%d), conflicting with %s (%s:%d)",
@@ -67,6 +84,84 @@ func (r *Router) register(method, path string, handler any, groupMiddlewares []M
 	}
 
 	r.routes[method][path] = entry
+}
+
+// matchParam 在指定 method 的参数路由基数树上匹配请求路径，
+// 命中时返回 entry 与按注册顺序捕获的参数值（被省略的尾部可选参数不在切片中）；未命中返回 nil。
+// 匹配采用逐段子串扫描，不预切分整个路径；捕获切片延迟到真正捕获参数时才分配
+func (r *Router) matchParam(method, path string) (*routeEntry, []string) {
+	root := r.paramTrees[method]
+	if root == nil {
+		return nil, nil
+	}
+	if path == "/" {
+		path = ""
+	}
+	return root.matchPath(path, nil)
+}
+
+// routeSegment 表示参数路由路径中的一段：静态字面量或 {name}/{name?} 参数
+type routeSegment struct {
+	literal  string // 静态段内容（isParam=false 时有效）
+	name     string // 参数名（isParam=true 时有效）
+	isParam  bool   // 是否为参数段
+	optional bool   // 是否为可选参数 {name?}
+}
+
+// paramNamePattern 限定参数名格式：字母/下划线开头，仅含字母、数字、下划线
+var paramNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// splitPathSegments 将归一化后的路径（以 "/" 开头、无末尾 "/"）按段切分；
+// 根路径 "/" 返回空切片
+func splitPathSegments(path string) []string {
+	path = strings.TrimPrefix(path, "/")
+	if path == "" {
+		return nil
+	}
+	return strings.Split(path, "/")
+}
+
+// parseRoutePath 解析参数路由路径为段列表，并执行语法校验：
+//   - 参数必须独占整个段，形如 {name} 或 {name?}
+//   - 参数名仅允许 [A-Za-z_][A-Za-z0-9_]*，同一路径内不允许重复
+//   - 可选参数之后不允许再出现任何段（省略匹配会产生歧义，可选参数必须位于路径末尾）
+func parseRoutePath(path string) ([]routeSegment, error) {
+	parts := splitPathSegments(path)
+	segments := make([]routeSegment, 0, len(parts))
+	names := make(map[string]bool, len(parts))
+	seenOptional := false
+	for _, part := range parts {
+		if part == "" {
+			return nil, fmt.Errorf("empty path segment in %q", path)
+		}
+		if seenOptional {
+			return nil, fmt.Errorf("segment %q is not allowed after optional parameter in %q", part, path)
+		}
+		if !strings.ContainsAny(part, "{}") {
+			segments = append(segments, routeSegment{literal: part})
+			continue
+		}
+		if len(part) < 2 || part[0] != '{' || part[len(part)-1] != '}' {
+			return nil, fmt.Errorf("invalid parameter segment %q in %q: parameter must occupy a whole segment as {name} or {name?}", part, path)
+		}
+		inner := part[1 : len(part)-1]
+		optional := strings.HasSuffix(inner, "?")
+		if optional {
+			inner = inner[:len(inner)-1]
+		}
+		if !paramNamePattern.MatchString(inner) {
+			return nil, fmt.Errorf("invalid parameter name %q in %q", inner, path)
+		}
+		if names[inner] {
+			return nil, fmt.Errorf("duplicate parameter name %q in %q", inner, path)
+		}
+		names[inner] = true
+		if optional {
+			seenOptional = true
+		}
+		segments = append(segments, routeSegment{name: inner, isParam: true, optional: optional})
+	}
+	return segments, nil
 }
 
 func (r *Router) GET(path string, handler any) {

@@ -7,54 +7,134 @@ import (
 	"reflect"
 )
 
-// ctxKey 是本包内部使用的 context key 类型，避免与外部 key 冲突
-type ctxKey string
+// stateKey 是 requestState 在 context 中的唯一存储键。
+// 请求作用域的所有状态（engine/request/responseWriter/boundReq/bindingErr/res）
+// 合并存入单个 requestState 对象，仅执行一次 context.WithValue，
+// 避免逐项注入产生的多层 valueCtx 包装与多次堆分配（热路径优化）。
+type ctxStateKey struct{}
 
-const (
-	requestKey        ctxKey = "zckg.request"
-	responseWriterKey ctxKey = "zckg.responseWriter"
-	engineKey         ctxKey = "zckg.engine"
-	boundReqKey       ctxKey = "zckg.boundReq"
-	bindingErrKey     ctxKey = "zckg.bindingErr"
-	boundResKey       ctxKey = "zckg.boundRes"
-)
+var stateKey ctxStateKey
+
+// requestState 承载单个请求作用域内的全部上下文状态。
+// 在 ServeHTTP 路由命中后一次性创建并注入 ctx，后续字段原地更新，
+// 所有持有同一 ctx 的中间件层（包括后置阶段）均可见最新值。
+type requestState struct {
+	engine     *HttpEngine
+	req        *http.Request
+	w          http.ResponseWriter
+	boundReq   any
+	bindingErr error
+	res        any
+}
+
+// requestStateFromContext 从 ctx 中取出当前请求的状态对象，不存在时返回 nil
+func requestStateFromContext(ctx context.Context) *requestState {
+	st, _ := ctx.Value(stateKey).(*requestState)
+	return st
+}
+
+// withEngine 将 *HttpEngine 注入 ctx，供 handler 与中间件获取
+func withEngine(ctx context.Context, e *HttpEngine) context.Context {
+	st := requestStateFromContext(ctx)
+	if st == nil {
+		st = &requestState{}
+		ctx = context.WithValue(ctx, stateKey, st)
+	}
+	st.engine = e
+	return ctx
+}
 
 // withRequestResponse 将 *http.Request 与 http.ResponseWriter 注入 ctx，供 handler 获取
 func withRequestResponse(ctx context.Context, r *http.Request, w http.ResponseWriter) context.Context {
-	ctx = context.WithValue(ctx, requestKey, r)
-	ctx = context.WithValue(ctx, responseWriterKey, w)
+	st := requestStateFromContext(ctx)
+	if st == nil {
+		st = &requestState{}
+		ctx = context.WithValue(ctx, stateKey, st)
+	}
+	st.req = r
+	st.w = w
 	return ctx
+}
+
+// withBoundReq 将已解析绑定的 Req 注入 ctx，供中间件与 core 层获取
+func withBoundReq(ctx context.Context, req any) context.Context {
+	st := requestStateFromContext(ctx)
+	if st == nil {
+		st = &requestState{}
+		ctx = context.WithValue(ctx, stateKey, st)
+	}
+	st.boundReq = req
+	return ctx
+}
+
+// withBindingErr 将绑定阶段的错误注入 ctx，与 Req 一同存储，供 core 层统一处理
+func withBindingErr(ctx context.Context, err error) context.Context {
+	st := requestStateFromContext(ctx)
+	if st == nil {
+		st = &requestState{}
+		ctx = context.WithValue(ctx, stateKey, st)
+	}
+	st.bindingErr = err
+	return ctx
+}
+
+// boundResContainer 是旧版 Res 共享容器，仅保留用于兼容读取：
+// 若外部在调用链上游以旧方式注入了该容器，BoundResFromContext 仍可读取
+type boundResContainer struct {
+	res any
+}
+
+// boundResKey 旧版 Res 容器的 context key（兼容读取用）
+type ctxBoundResKey struct{}
+
+var boundResKey ctxBoundResKey
+
+// withBoundResContainer 标记 ctx 已具备 Res 共享能力。
+// 新版实现中 Res 存储于 requestState.res，本函数仅在 state 缺失时
+// 兜底注入旧版容器以保持向后兼容，正常请求路径不产生额外分配
+func withBoundResContainer(ctx context.Context) context.Context {
+	if requestStateFromContext(ctx) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, boundResKey, &boundResContainer{})
+}
+
+// setBoundRes 将 handler 返回的 Res 写入共享存储（core 层调用）
+func setBoundRes(ctx context.Context, res any) {
+	if st := requestStateFromContext(ctx); st != nil {
+		st.res = res
+		return
+	}
+	if c, ok := ctx.Value(boundResKey).(*boundResContainer); ok {
+		c.res = res
+	}
 }
 
 // RequestFromContext 从 ctx 中获取当前请求的 *http.Request
 // 第二个返回值表示是否存在
 func RequestFromContext(ctx context.Context) (*http.Request, bool) {
-	r, ok := ctx.Value(requestKey).(*http.Request)
-	return r, ok
+	if st := requestStateFromContext(ctx); st != nil {
+		return st.req, st.req != nil
+	}
+	return nil, false
 }
 
 // ResponseWriterFromContext 从 ctx 中获取当前请求的 http.ResponseWriter
 // 第二个返回值表示是否存在
 func ResponseWriterFromContext(ctx context.Context) (http.ResponseWriter, bool) {
-	w, ok := ctx.Value(responseWriterKey).(http.ResponseWriter)
-	return w, ok
-}
-
-// withEngine 将 *HttpEngine 注入 ctx，供 handler 与中间件获取
-func withEngine(ctx context.Context, e *HttpEngine) context.Context {
-	return context.WithValue(ctx, engineKey, e)
+	if st := requestStateFromContext(ctx); st != nil {
+		return st.w, st.w != nil
+	}
+	return nil, false
 }
 
 // EngineFromContext 从 ctx 中获取当前请求关联的 *HttpEngine
 // 第二个返回值表示是否存在
 func EngineFromContext(ctx context.Context) (*HttpEngine, bool) {
-	e, ok := ctx.Value(engineKey).(*HttpEngine)
-	return e, ok
-}
-
-// withBoundReq 将已解析绑定的 Req 注入 ctx，供中间件与 core 层获取
-func withBoundReq(ctx context.Context, req any) context.Context {
-	return context.WithValue(ctx, boundReqKey, req)
+	if st := requestStateFromContext(ctx); st != nil {
+		return st.engine, st.engine != nil
+	}
+	return nil, false
 }
 
 // BoundReqFromContext 从 ctx 中获取路由命中时已解析绑定的 Req。
@@ -69,15 +149,20 @@ func withBoundReq(ctx context.Context, req any) context.Context {
 //
 //	req, err := BoundReqFromContext[MyReq](ctx)
 func BoundReqFromContext[T any](ctx context.Context) (T, error) {
-	val := ctx.Value(boundReqKey)
+	var val any
+	var bindingErr error
+	if st := requestStateFromContext(ctx); st != nil {
+		val = st.boundReq
+		bindingErr = st.bindingErr
+	}
 	if val == nil {
 		var zero T
 		return zero, ErrBoundReqNotFound
 	}
 	// 直接类型断言（T 为指针类型时命中）
 	if req, ok := val.(T); ok {
-		if err, _ := ctx.Value(bindingErrKey).(error); err != nil {
-			return req, err
+		if bindingErr != nil {
+			return req, bindingErr
 		}
 		return req, nil
 	}
@@ -86,8 +171,8 @@ func BoundReqFromContext[T any](ctx context.Context) (T, error) {
 	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
 		elem := rv.Elem().Interface()
 		if req, ok := elem.(T); ok {
-			if err, _ := ctx.Value(bindingErrKey).(error); err != nil {
-				return req, err
+			if bindingErr != nil {
+				return req, bindingErr
 			}
 			return req, nil
 		}
@@ -99,29 +184,6 @@ func BoundReqFromContext[T any](ctx context.Context) (T, error) {
 // ErrBoundReqNotFound 表示 ctx 中不存在已绑定的 Req
 var ErrBoundReqNotFound = errors.New("bound request not found in context")
 
-// withBindingErr 将绑定阶段的错误注入 ctx，与 Req 一同存储，供 core 层统一处理
-func withBindingErr(ctx context.Context, err error) context.Context {
-	return context.WithValue(ctx, bindingErrKey, err)
-}
-
-// boundResContainer 共享可变容器，解决 core 层写入的 Res 对前置中间件不可见的问题。
-// context 存的是指针（不可变），指针指向的 res 字段可变，所有持有同一指针的层都能读到最新值。
-type boundResContainer struct {
-	res any
-}
-
-// withBoundResContainer 将空的 Res 容器注入 ctx，应在中间件链执行前调用
-func withBoundResContainer(ctx context.Context) context.Context {
-	return context.WithValue(ctx, boundResKey, &boundResContainer{})
-}
-
-// setBoundRes 将 handler 返回的 Res 写入共享容器（core 层调用）
-func setBoundRes(ctx context.Context, res any) {
-	if c, ok := ctx.Value(boundResKey).(*boundResContainer); ok {
-		c.res = res
-	}
-}
-
 // ErrBoundResNotFound 表示 ctx 中不存在已绑定的 Res
 var ErrBoundResNotFound = errors.New("bound response not found in context")
 
@@ -132,24 +194,20 @@ var ErrBoundResNotFound = errors.New("bound response not found in context")
 //
 //	res, err := BoundResFromContext[MyRes](ctx)
 func BoundResFromContext[T any](ctx context.Context) (T, error) {
-	val := ctx.Value(boundResKey)
-	if val == nil {
+	var res any
+	if st := requestStateFromContext(ctx); st != nil {
+		res = st.res
+	} else if c, ok := ctx.Value(boundResKey).(*boundResContainer); ok {
+		res = c.res
+	}
+	if res == nil {
 		var zero T
 		return zero, ErrBoundResNotFound
 	}
-	c, ok := val.(*boundResContainer)
+	v, ok := res.(T)
 	if !ok {
 		var zero T
 		return zero, ErrBoundResNotFound
 	}
-	if c.res == nil {
-		var zero T
-		return zero, ErrBoundResNotFound
-	}
-	res, ok := c.res.(T)
-	if !ok {
-		var zero T
-		return zero, ErrBoundResNotFound
-	}
-	return res, nil
+	return v, nil
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 	"strconv"
+	"sync"
 )
 
 // validateRequest 对已绑定的请求执行参数校验：nonzero 字段 + 自定义 Validator。
@@ -64,7 +65,10 @@ func validateNonzero(reqPtr reflect.Value, meta structMeta) error {
 	if elem.Kind() != reflect.Struct {
 		return nil
 	}
-	return validateNonzeroWalk(elem, meta, nil, "", false)
+	visited := acquireVisitMap()
+	err := validateNonzeroWalk(elem, meta, visited, "", false)
+	releaseVisitMap(visited)
+	return err
 }
 
 // hasNonzeroInTree 扫描 Req 类型树，判定任意深度是否存在标记 nonzero:"true" 的字段
@@ -124,6 +128,29 @@ type visitKey struct {
 	typ reflect.Type
 }
 
+// visitMapPool 复用 nonzero 校验与默认值填充的防环 visited map，减少每请求分配；
+// 归还前用 clear 清空，超大 map 不入池避免池内存膨胀
+var visitMapPool = sync.Pool{
+	New: func() any { return make(map[visitKey]bool) },
+}
+
+// maxPooledVisitMapSize 是允许归还池的 visited map 大小上限
+const maxPooledVisitMapSize = 1024
+
+// acquireVisitMap 从池中获取防环标记 map
+func acquireVisitMap() map[visitKey]bool {
+	return visitMapPool.Get().(map[visitKey]bool)
+}
+
+// releaseVisitMap 清空并归还防环标记 map；超出大小上限的不归还，交由 GC 回收
+func releaseVisitMap(m map[visitKey]bool) {
+	if len(m) > maxPooledVisitMapSize {
+		return
+	}
+	clear(m)
+	visitMapPool.Put(m)
+}
+
 // validateNonzeroWalk 递归遍历结构体树，校验每个结构体的 nonzero 字段。
 // 规则：
 //   - 若字段 nonzero 且零值 → 报错
@@ -175,7 +202,7 @@ func validateNonzeroWalk(v reflect.Value, meta structMeta, visited map[visitKey]
 			subV = subV.Elem()
 		}
 		if subV.Kind() == reflect.Struct {
-			subMeta := buildStructMeta(subV.Type())
+			subMeta := cachedStructMeta(subV.Type())
 			// 指针解引用后的目标是真实堆对象（地址稳定）；
 			// 值类型字段与所属 struct 同属一块内存，继承临时副本标记
 			if err := validateNonzeroWalk(subV, subMeta, visited, prefix+fm.name+".", isTempCopy && !wasPtr); err != nil {
@@ -189,7 +216,7 @@ func validateNonzeroWalk(v reflect.Value, meta structMeta, visited map[visitKey]
 				elemType = elemType.Elem()
 			}
 			if elemType.Kind() == reflect.Struct {
-				subMeta := buildStructMeta(elemType)
+				subMeta := cachedStructMeta(elemType)
 				for i := 0; i < subV.Len(); i++ {
 					elem := subV.Index(i)
 					if isPtrElem {
@@ -213,7 +240,7 @@ func validateNonzeroWalk(v reflect.Value, meta structMeta, visited map[visitKey]
 				elemType = elemType.Elem()
 			}
 			if elemType.Kind() == reflect.Struct {
-				subMeta := buildStructMeta(elemType)
+				subMeta := cachedStructMeta(elemType)
 				for i := 0; i < subV.Len(); i++ {
 					elem := subV.Index(i)
 					if isPtrElem {
@@ -244,7 +271,7 @@ func validateNonzeroWalk(v reflect.Value, meta structMeta, visited map[visitKey]
 					continue // 该 map 已在递归路径中处理过，跳过防止循环递归
 				}
 				visited[mapKey] = true
-				subMeta := buildStructMeta(valType)
+				subMeta := cachedStructMeta(valType)
 				for _, key := range subV.MapKeys() {
 					val := subV.MapIndex(key)
 					if isPtrVal {

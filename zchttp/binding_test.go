@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1656,5 +1657,336 @@ func TestIsAllDigits_SingleMinus(t *testing.T) {
 		if got != c.want {
 			t.Errorf("isAllDigits(%q) = %v, want %v", c.input, got, c.want)
 		}
+	}
+}
+
+// ======== bindPathParams 单元测试 ========
+
+// pathParamUnitReq 覆盖路径参数绑定的各类标量类型
+type pathParamUnitReq struct {
+	S string    `json:"s"`
+	I int       `json:"i"`
+	U uint8     `json:"u"`
+	F float64   `json:"f"`
+	B bool      `json:"b"`
+	P *int      `json:"p"`
+	T time.Time `json:"t"`
+}
+
+// unitParamBinding 从 pathParamUnitReq 的预计算元信息中按绑定名构造 pathParamBinding
+func unitParamBinding(name string, optional bool) pathParamBinding {
+	meta := buildStructMeta(reflect.TypeOf(pathParamUnitReq{}))
+	for i := range meta.fields {
+		if meta.fields[i].name == name {
+			return pathParamBinding{
+				indices:      meta.fields[i].indices,
+				timeFormat:   meta.fields[i].timeFormat,
+				timeLocation: meta.fields[i].timeLocation,
+				optional:     optional,
+			}
+		}
+	}
+	panic("field not found: " + name)
+}
+
+// TestBindPathParamsScalars 验证各类标量类型的路径参数转换
+func TestBindPathParamsScalars(t *testing.T) {
+	params := []pathParamBinding{
+		unitParamBinding("s", false),
+		unitParamBinding("i", false),
+		unitParamBinding("u", false),
+		unitParamBinding("f", false),
+		unitParamBinding("b", false),
+	}
+	reqPtr := reflect.New(reflect.TypeOf(pathParamUnitReq{}))
+	if err := bindPathParams(reqPtr, params, []string{"abc", "42", "200", "3.14", "true"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := reqPtr.Elem().Interface().(pathParamUnitReq)
+	if got.S != "abc" || got.I != 42 || got.U != 200 || got.F != 3.14 || got.B != true {
+		t.Fatalf("unexpected bind result: %+v", got)
+	}
+}
+
+// TestBindPathParamsPointerAndTime 验证指针字段分配与 time_format 标签透传
+func TestBindPathParamsPointerAndTime(t *testing.T) {
+	pb := unitParamBinding("p", false)
+	tb := unitParamBinding("t", false)
+	tb.timeFormat = "2006-01-02" // 模拟字段时间格式标签透传
+
+	reqPtr := reflect.New(reflect.TypeOf(pathParamUnitReq{}))
+	if err := bindPathParams(reqPtr, []pathParamBinding{pb, tb}, []string{"7", "2026-08-12"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := reqPtr.Elem().Interface().(pathParamUnitReq)
+	if got.P == nil || *got.P != 7 {
+		t.Fatalf("pointer param = %v, want &7", got.P)
+	}
+	want := time.Date(2026, 8, 12, 0, 0, 0, 0, time.Local)
+	if !got.T.Equal(want) {
+		t.Fatalf("time param = %v, want %v", got.T, want)
+	}
+}
+
+// TestBindPathParamsInvalidValue 验证转换失败立即返回错误（非尽力绑定）
+func TestBindPathParamsInvalidValue(t *testing.T) {
+	params := []pathParamBinding{unitParamBinding("i", false)}
+	reqPtr := reflect.New(reflect.TypeOf(pathParamUnitReq{}))
+	err := bindPathParams(reqPtr, params, []string{"abc"})
+	if err == nil {
+		t.Fatal("expected error for invalid int param, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid path parameter value") {
+		t.Fatalf("error should contain 'invalid path parameter value', got: %v", err)
+	}
+}
+
+// TestBindPathParamsOptionalOmitted 验证可选参数被省略（捕获值少于绑定数）时保留字段已有值
+func TestBindPathParamsOptionalOmitted(t *testing.T) {
+	params := []pathParamBinding{
+		unitParamBinding("s", false),
+		unitParamBinding("i", true),
+	}
+	reqPtr := reflect.New(reflect.TypeOf(pathParamUnitReq{}))
+	reqPtr.Elem().Field(1).SetInt(123) // 预置默认值
+	if err := bindPathParams(reqPtr, params, []string{"abc"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := reqPtr.Elem().Interface().(pathParamUnitReq)
+	if got.S != "abc" {
+		t.Fatalf("S = %q, want abc", got.S)
+	}
+	if got.I != 123 {
+		t.Fatalf("omitted optional param should keep preset value 123, got %d", got.I)
+	}
+}
+
+// ======== setUnix/setUnixAuto/setTime 分支补测 ========
+
+// TestSetUnixAutoBranches 覆盖 16 位（微秒）、19 位（纳秒）与其他位数（秒）分支
+func TestSetUnixAutoBranches(t *testing.T) {
+	cases := []struct {
+		value string
+		unit  time.Duration
+	}{
+		{"1234567890123456", time.Microsecond},
+		{"1234567890123456789", time.Nanosecond},
+		{"12345678901", time.Second},
+	}
+	for _, c := range cases {
+		fv := reflect.New(timeType).Elem()
+		if err := setUnixAuto(fv, c.value, time.UTC); err != nil {
+			t.Fatalf("setUnixAuto(%q): %v", c.value, err)
+		}
+		n, _ := strconv.ParseInt(c.value, 10, 64)
+		want := time.Unix(0, n*int64(c.unit)).In(time.UTC)
+		if got := fv.Interface().(time.Time); !got.Equal(want) {
+			t.Errorf("setUnixAuto(%q) = %v, want %v", c.value, got, want)
+		}
+	}
+}
+
+// TestSetUnixInvalidValue 覆盖 setUnix 的 ParseInt 错误分支
+func TestSetUnixInvalidValue(t *testing.T) {
+	fv := reflect.New(timeType).Elem()
+	if err := setUnix(fv, "abc", time.Second, time.UTC); err == nil {
+		t.Fatal("expected parse error, got nil")
+	}
+}
+
+// TestSetTimeErrorBranches 覆盖 setTime 的 unix 解析失败、显式 layout 解析失败与自动探测失败分支
+func TestSetTimeErrorBranches(t *testing.T) {
+	cases := []struct {
+		name       string
+		value      string
+		timeFormat string
+	}{
+		{"unix invalid", "abc", "unix"},
+		{"layout invalid", "bad-date", "2006-01-02"},
+		{"auto detect fail", "not-a-date", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fv := reflect.New(timeType).Elem()
+			if err := setTime(fv, c.value, c.timeFormat, nil); err == nil {
+				t.Fatalf("expected error for value %q format %q", c.value, c.timeFormat)
+			}
+		})
+	}
+}
+
+// ======== 标量转换与文件字段分支补测 ========
+
+// TestSetFieldValueSliceConvertError 覆盖切片绑定的元素转换错误返回分支
+func TestSetFieldValueSliceConvertError(t *testing.T) {
+	var dst struct{ V []int }
+	fv := reflect.ValueOf(&dst).Elem().Field(0)
+	if err := setFieldValue(fv, []string{"abc"}, "", nil); err == nil {
+		t.Fatal("expected conversion error for []int with non-numeric value")
+	}
+}
+
+// TestSetFileFieldNonFileType 覆盖非文件字段返回 false 的分支
+func TestSetFileFieldNonFileType(t *testing.T) {
+	var dst struct{ Name string }
+	fv := reflect.ValueOf(&dst).Elem().Field(0)
+	if setFileField(fv, nil) {
+		t.Fatal("non-file field should return false")
+	}
+}
+
+// selfRefPtr 自引用指针类型，用于触发 setScalar 的指针嵌套深度保护
+type selfRefPtr *selfRefPtr
+
+// TestSetScalarPointerTooDeep 覆盖指针嵌套超限的错误返回分支
+func TestSetScalarPointerTooDeep(t *testing.T) {
+	var p selfRefPtr
+	fv := reflect.ValueOf(&p).Elem()
+	err := setScalar(fv, "x", "", nil)
+	if err == nil || !strings.Contains(err.Error(), "pointer nesting too deep") {
+		t.Fatalf("expected pointer nesting error, got: %v", err)
+	}
+}
+
+// TestSetScalarUnsupportedKind 覆盖不支持类型的跳过分支（不报错不写入）
+func TestSetScalarUnsupportedKind(t *testing.T) {
+	var dst struct{ C complex128 }
+	fv := reflect.ValueOf(&dst).Elem().Field(0)
+	if err := setScalar(fv, "1+2i", "", nil); err != nil {
+		t.Fatalf("unsupported kind should be skipped without error, got: %v", err)
+	}
+	if dst.C != 0 {
+		t.Fatalf("unsupported kind should keep zero value, got: %v", dst.C)
+	}
+}
+
+// ======== bindBody 分支补测 ========
+
+// TestBindBodyEmptyJSON 覆盖 JSON 空请求体的错误分支
+func TestBindBodyEmptyJSON(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(""))
+	req.Header.Set("Content-Type", "application/json")
+	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
+	err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta)
+	if err == nil || !strings.Contains(err.Error(), "empty request body") {
+		t.Fatalf("expected empty request body error, got: %v", err)
+	}
+}
+
+// TestBindBodyJSONNoBindableFields 覆盖 JSON 无可绑定字段时跳过解码的分支
+func TestBindBodyJSONNoBindableFields(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"a":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	meta := buildStructMeta(reflect.TypeOf(struct{}{}))
+	if err := bindBody(req, reflect.New(reflect.TypeOf(struct{}{})), meta); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestBindBodyUnknownCTNoBody 覆盖未知 Content-Type 且无请求体时不绑定的分支
+func TestBindBodyUnknownCTNoBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/x", nil)
+	req.Header.Set("Content-Type", "text/plain")
+	req.Body = nil
+	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestBindPathParamsNonStruct 覆盖目标非结构体时的提前返回分支
+func TestBindPathParamsNonStruct(t *testing.T) {
+	params := []pathParamBinding{unitParamBinding("i", false)}
+	if err := bindPathParams(reflect.New(reflect.TypeOf(0)), params, []string{"1"}); err != nil {
+		t.Fatalf("non-struct target should return nil, got: %v", err)
+	}
+}
+
+// TestBindBodyJSONNilBody 覆盖 JSON Content-Type 无请求体时跳过的分支
+func TestBindBodyJSONNilBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/x", nil)
+	req.Header.Set("Content-Type", "application/json")
+	req.Body = nil
+	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestBindBodyUnknownCTInvalidJSON 覆盖默认分支解码失败（非空错误）的返回分支
+func TestBindBodyUnknownCTInvalidJSON(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "text/plain")
+	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err == nil {
+		t.Fatal("expected json decode error, got nil")
+	}
+}
+
+// TestBindBodyMultipartParseError 覆盖 multipart 解析失败的错误返回分支
+func TestBindBodyMultipartParseError(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader("garbage"))
+	req.Header.Set("Content-Type", "multipart/form-data")
+	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err == nil {
+		t.Fatal("expected multipart parse error, got nil")
+	}
+}
+
+// TestBindValuesNonStruct 覆盖目标非结构体时的提前返回分支
+func TestBindValuesNonStruct(t *testing.T) {
+	if err := bindValues(reflect.New(reflect.TypeOf(0)), nil, nil, structMeta{}); err != nil {
+		t.Fatalf("non-struct should return nil, got: %v", err)
+	}
+}
+
+// TestBindValuesSkipsIgnoredName 覆盖字段绑定名为 "-" 或空时跳过的分支
+func TestBindValuesSkipsIgnoredName(t *testing.T) {
+	var dst struct{ X string }
+	meta := structMeta{fields: []fieldMeta{
+		{name: "-", indices: []int{0}},
+		{name: "", indices: []int{0}},
+	}}
+	values := map[string][]string{"X": {"v"}}
+	if err := bindValues(reflect.ValueOf(&dst), values, nil, meta); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dst.X != "" {
+		t.Fatalf("field with ignored name should not be bound, got %q", dst.X)
+	}
+}
+
+// TestSetScalarBoolAndUintErrors 覆盖 Bool 与 Uint 的解析错误分支
+func TestSetScalarBoolAndUintErrors(t *testing.T) {
+	var dst struct {
+		B bool
+		U uint
+	}
+	elem := reflect.ValueOf(&dst).Elem()
+	if err := setScalar(elem.Field(0), "abc", "", nil); err == nil {
+		t.Fatal("expected bool parse error")
+	}
+	if err := setScalar(elem.Field(1), "-1", "", nil); err == nil {
+		t.Fatal("expected uint parse error")
+	}
+}
+
+// TestSetScalarFloatError 覆盖 Float 的解析错误分支
+func TestSetScalarFloatError(t *testing.T) {
+	var dst struct{ F float64 }
+	elem := reflect.ValueOf(&dst).Elem()
+	if err := setScalar(elem.Field(0), "abc", "", nil); err == nil {
+		t.Fatal("expected float parse error")
+	}
+}
+
+// TestBindBodyFormParseError 覆盖表单解析失败（请求体超限）的错误返回分支
+func TestBindBodyFormParseError(t *testing.T) {
+	big := strings.Repeat("a", 11<<20) // 超过默认 10MB 上限
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err == nil {
+		t.Fatal("expected form parse error, got nil")
 	}
 }

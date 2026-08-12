@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"net"
 	"net/http"
+	"sync"
 )
 
 // IsResponseWritten 判断响应是否已经写入（WriteHeader 或 Write 被调用过）
@@ -16,6 +17,27 @@ func IsResponseWritten(w http.ResponseWriter) bool {
 type responseWriter struct {
 	http.ResponseWriter
 	written bool
+}
+
+// responseWriterPool 复用 responseWriter 包装器，减少每请求分配
+var responseWriterPool = sync.Pool{
+	New: func() any { return &responseWriter{} },
+}
+
+// acquireResponseWriter 从池中取出包装器并绑定底层 ResponseWriter
+func acquireResponseWriter(w http.ResponseWriter) *responseWriter {
+	rw := responseWriterPool.Get().(*responseWriter)
+	rw.ResponseWriter = w
+	rw.written = false
+	return rw
+}
+
+// releaseResponseWriter 重置状态并归还包装器；必须在请求处理完全结束后调用
+// （含 panic 处理完成后），并清空对底层 writer 的引用避免经池长时间持有
+func releaseResponseWriter(rw *responseWriter) {
+	rw.ResponseWriter = nil
+	rw.written = false
+	responseWriterPool.Put(rw)
 }
 
 func (w *responseWriter) WriteHeader(statusCode int) {
