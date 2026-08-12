@@ -85,7 +85,7 @@ handler 注册时，`buildEntry` 会通过反射一次性预计算以下信息�
 
 - **handler 反射值**（`handlerVal`）：`reflect.ValueOf(handler)`，请求时直接 `Call` 调用，避免重复获取。
 - **Req/Res 类型信息**（`reqType`/`resType`/`reqElemType`/`reqIsPtr`/`resIsPtr`）：`reqElemType` 是解引用指针后的 Req 具体类型，用于 `reflect.New` 创建实例；`reqIsPtr`/`resIsPtr` 标记 handler 声明的是值还是指针，决定 core 层传入值还是传指针。
-- **Req/Res 元信息**（`reqMeta`/`resMeta`，类型 `structMeta`）：缓存 Req/Res 顶层字段的绑定名、`nonzero` 判定、`default` 标签值、`time_format`/`time_location`、文件字段标记等，绑定、校验与 OpenAPI 生成阶段直接使用。嵌套结构体的 meta 不在注册阶段计算，由递归校验按需现场构建。
+- **Req/Res 元信息**（`reqMeta`/`resMeta`，类型 `structMeta`）：缓存 Req/Res 顶层字段的绑定名、`nonzero` 判定、`default` 标签值、`time_format`/`time_location`、文件字段标记等，绑定、校验与 OpenAPI 生成阶段直接使用。嵌套结构体的 meta 不在注册阶段计算，而是在递归校验/默认值填充首次使用时经 `cachedStructMeta` 构建，随后存入进程级缓存（`sync.Map`），后续请求直接复用，无重复反射开销。
 - **Req 模板**（`defaultReq`）：创建 Req 实例并通过 `applyDefaults` 初始化 `default` 标签字段（注册阶段：所有零值字段均填充）。请求阶段浅拷贝复用，绑定后再次调用 `applyDefaults(requestPhase=true)` 补填动态创建的子元素（slice/数组/map/nested ptr）中的 nil 指针字段。详见[默认值机制](parameter-binding.md#六默认值机制)。
 - **操作级元信息**（`opMeta`，类型 `operationMeta`）：从 Req 嵌入的 `OpenAPIMeta` 中提取 `tags`/`summary`/`description`，供 OpenAPI 文档生成。
 - **中间件快照**（`middlewares`）：注册时将当前 `[全局中间件..., 分组中间件...]` 的副本固定到该路由条目，后续 `Use(...)` 不影响已注册路由。
@@ -122,10 +122,10 @@ r.GET("/posts/{post_id}/comments/{comment_id?}", getComment)
 
 ### 匹配规则
 
-- 参数路由存储于按 method 划分的基数树（`router_trie.go`），静态段优先于参数段，静态分支失败时回溯尝试参数分支。
+- 参数路由存储于按 method 划分的基数树（`router_trie.go`），静态段优先于参数段，静态分支失败时回溯尝试参数分支。匹配采用逐段子串扫描（`matchPath`），不预切分整个请求路径，捕获切片延迟到真正命中参数时才分配。
 - 可选参数的省略分支与命中分支在插入时一次性展开，匹配时无需反复回溯。
 - 精确路由始终优先：`/user`（精确）与 `/user/{name?}`（参数）并存时，请求 `/user` 命中精确路由。
-- 参数不支持匹配含 `/` 的值（按段切分的天然限制）；末尾斜杠归一化同样适用（`/user/` ≡ `/user` 命中省略分支）。
+- 参数不支持匹配含 `/` 的值（逐段匹配的天然限制）；末尾斜杠归一化同样适用（`/user/` ≡ `/user` 命中省略分支）。
 
 ### 参数绑定与错误语义
 

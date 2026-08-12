@@ -4,7 +4,7 @@
 
 ## 一、非零值校验（nonzero）
 
-`nonzero` 标签的解析在注册阶段由 `buildStructMeta` 一次性完成并存入 `fieldMeta.nonzero`，运行时 `validateNonzero` 和 OpenAPI 文档生成均直接读取该预计算结果，两者天然一致。注意：`buildStructMeta` 仅计算当前结构体的顶层字段（`indices` 为单层），嵌套结构体的 meta 在递归校验时按需现场计算。
+`nonzero` 标签的解析在注册阶段由 `buildStructMeta` 一次性完成并存入 `fieldMeta.nonzero`，运行时 `validateNonzero` 和 OpenAPI 文档生成均直接读取该预计算结果，两者天然一致。注意：`buildStructMeta` 仅计算当前结构体的顶层字段（`indices` 为单层），嵌套结构体的 meta 在递归校验首次使用时经 `cachedStructMeta` 构建，并进入进程级缓存（`sync.Map`）供后续请求复用。
 
 `nonzero` 标签与 `default` 标签**独立解析、互不影响**：
 

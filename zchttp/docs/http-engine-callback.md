@@ -50,6 +50,8 @@ type Response struct {
 | `DefaultNotFoundHandler` | 未命中路由时调用。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 404, message: "not found"}`），状态码统一为 404；若已写入则跳过 |
 | `DefaultPanicHandler` | 捕获 panic 时调用。通过 `slog.Error` 将 panic 值与完整堆栈输出到控制台。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML（含堆栈信息）或统一 JSON 结构（`{data: null, code: 500, message: "<panic>\n<stack>"}`）；若已写入则跳过 |
 
+默认 JSON 响应由进程级池化的 `json.Encoder` 编码（关闭 HTML 转义）：`res` 中的 `<`、`>`、`&` 字符**原样输出**，不再转义为 `\u003c`、`\u003e`、`\u0026`。若业务上需要转义后的输出，请自行替换 `OnResponse` 回调。
+
 ### WantHtml
 
 ```go
@@ -183,13 +185,14 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 1. **路由匹配**：`ServeHTTP` 按 method → normalizePath 查找路由条目，未命中 → `OnNotFound`。
 2. **panic 保护**：`defer recover` 包裹全流程，捕获 panic → `OnPanic`（`slog.Error` + 堆栈）。
 3. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body；绑定错误（`*BindingError`）随 Req 注入 ctx。
-4. **中间件链执行**：洋葱模型从外到内递归执行中间件；各中间件可通过 `BoundReqFromContext[T]` 获取已绑定的 Req。
+4. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；各中间件可通过 `BoundReqFromContext[T]` 获取已绑定的 Req。
 5. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateNonzero` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
 6. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler，成功 → `OnResponse(w, r, res)`，Res 同时注入 ctx 供后置中间件通过 `BoundResFromContext[T]` 获取。
 7. **错误分发**：任一环节返回 error，按类型分发：
     - `*BindingError` / `*ValidationError` → `OnValidationError`（默认 400）
     - 其余 → `OnError`（默认 500）
 8. 各回调收到的 `w` 均为带 `Written()` 追踪能力的包装对象，已写入则跳过默认响应。
+9. **请求收尾**：请求处理结束后限量排空剩余未读请求体（上限 `maxBodyDrainBytes` = 2 KB）以复用 keep-alive 连接；超出上限不再排空，连接由 net/http 关闭。
 
 ## 八、在 handler 与中间件中获取上下文资源
 
