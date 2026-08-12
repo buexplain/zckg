@@ -1,14 +1,11 @@
 package zchttp
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"html"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"reflect"
 	"runtime/debug"
@@ -60,12 +57,16 @@ func WantHtml(r *http.Request) bool {
 
 // DefaultResponseHandler 默认成功响应：若 handler 已写入响应（如文件下载、自定义 Content-Type 等）
 // 则跳过；否则以统一 JSON 结构返回 res
-func DefaultResponseHandler(w http.ResponseWriter, _ *http.Request, res any) {
+func DefaultResponseHandler(w http.ResponseWriter, r *http.Request, res any) {
 	if IsResponseWritten(w) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(Response{Data: res, Code: 0, Message: "success"})
+	if err := json.NewEncoder(w).Encode(Response{Data: res, Code: 0, Message: "success"}); err != nil {
+		slog.Error("json encode failed in DefaultResponseHandler", "error", err, "path", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("internal server error"))
+	}
 }
 
 // DefaultErrorHandler 默认错误响应：若响应已写入则跳过（避免重复写头）；
@@ -82,7 +83,9 @@ func DefaultErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
-	_ = json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusInternalServerError, Message: err.Error()})
+	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusInternalServerError, Message: err.Error()}); encErr != nil {
+		slog.Error("json encode failed in DefaultErrorHandler", "error", encErr, "path", r.URL.Path)
+	}
 }
 
 // DefaultValidationErrorHandler 默认参数校验失败响应：若响应已写入则跳过；
@@ -99,10 +102,13 @@ func DefaultValidationErrorHandler(w http.ResponseWriter, r *http.Request, err e
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
-	_ = json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusBadRequest, Message: err.Error()})
+	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusBadRequest, Message: err.Error()}); encErr != nil {
+		slog.Error("json encode failed in DefaultValidationErrorHandler", "error", encErr, "path", r.URL.Path)
+	}
 }
 
-// DefaultPanicHandler 默认 panic 恢复处理：用 slog 将 panic 信息与堆栈输出到控制台，向客户端返回 500 错误响应
+// DefaultPanicHandler 默认 panic 恢复处理：用 slog 将 panic 信息与堆栈输出到日志，向客户端返回 500 错误响应。
+// 响应体仅包含 "internal server error" 通用消息，不向客户端暴露完整堆栈，防止泄露服务端内部结构。
 func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) {
 	stack := debug.Stack()
 	slog.Error("panic recovered",
@@ -117,12 +123,14 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
 	if WantHtml(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("<h1>500 Internal Server Error</h1><pre>" + html.EscapeString(fmt.Sprintf("%v\n%s", recovered, stack)) + "</pre>"))
+		_, _ = w.Write([]byte("<h1>500 Internal Server Error</h1><p>internal server error</p>"))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
-	_ = json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusInternalServerError, Message: fmt.Sprintf("%v\n%s", recovered, stack)})
+	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusInternalServerError, Message: "internal server error"}); encErr != nil {
+		slog.Error("json encode failed in DefaultPanicHandler", "error", encErr, "path", r.URL.Path)
+	}
 }
 
 // DefaultNotFoundHandler 默认未命中路由响应：根据 WantHtml 决定返回 HTML 或统一 JSON 结构，
@@ -139,59 +147,9 @@ func DefaultNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
-	_ = json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusNotFound, Message: "not found"})
-}
-
-// IsResponseWritten 判断响应是否已经写入（WriteHeader 或 Write 被调用过）
-func IsResponseWritten(w http.ResponseWriter) bool {
-	rw, ok := w.(interface{ Written() bool })
-	return ok && rw.Written()
-}
-
-// responseWriter 包装 http.ResponseWriter，记录响应是否已被写入
-type responseWriter struct {
-	http.ResponseWriter
-	written bool
-}
-
-func (w *responseWriter) WriteHeader(statusCode int) {
-	w.written = true
-	w.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (w *responseWriter) Write(b []byte) (int, error) {
-	w.written = true
-	return w.ResponseWriter.Write(b)
-}
-
-// Written 返回响应是否已经写入
-func (w *responseWriter) Written() bool {
-	return w.written
-}
-
-// Flush 透传 http.Flusher，支持 SSE 等流式响应场景；底层不支持时静默忽略
-func (w *responseWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		w.written = true
-		f.Flush()
+	if encErr := json.NewEncoder(w).Encode(Response{Data: nil, Code: http.StatusNotFound, Message: "not found"}); encErr != nil {
+		slog.Error("json encode failed in DefaultNotFoundHandler", "error", encErr, "path", r.URL.Path)
 	}
-}
-
-// Hijack 透传 http.Hijacker，支持 WebSocket 等协议升级场景；底层不支持时返回错误
-func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
-		w.written = true
-		return h.Hijack()
-	}
-	return nil, nil, http.ErrNotSupported
-}
-
-// Push 透传 http.Pusher，支持 HTTP/2 服务端推送；底层不支持时返回 ErrNotSupported
-func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
-	if p, ok := w.ResponseWriter.(http.Pusher); ok {
-		return p.Push(target, opts)
-	}
-	return http.ErrNotSupported
 }
 
 func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +207,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = withBindingErr(ctx, NewBindingError(err))
 	}
 
-	// 请求阶段重新应用默认值：补填 JSON/表单绑定后动态创建的子元素（切片/map/nested struct ptr）中的默认值。
+	// 请求阶段重新应用默认值：补填 JSON/表单绑定后动态创建的子元素（切片/数组/map/nested struct ptr）中的默认值。
 	// requestPhase=true：仅填充 nil 指针字段，值类型（int/string/bool）跳过以避免覆盖用户显式传入的零值。
 	// 仅当注册阶段预计算存在带 default 的指针字段时才执行，避免无意义的递归遍历。
 	if entry.needsRequestPhaseDefaults {
@@ -272,8 +230,9 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reqPtr := reflect.ValueOf(boundAny)
 
 		// 校验 Req（required 字段 + 自定义 Validator）
-		// 使用注册阶段预计算的 reqMeta，避免请求阶段重复反射解析
-		if err := validateRequest(reqPtr, entry.reqMeta); err != nil {
+		// 使用注册阶段预计算的 reqMeta，避免请求阶段重复反射解析；
+		// needsNonzeroValidation 为传递性标记：类型树任意深度存在 nonzero 字段才执行遍历
+		if err := validateRequest(reqPtr, entry.reqMeta, entry.needsNonzeroValidation); err != nil {
 			return err
 		}
 

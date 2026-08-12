@@ -3,8 +3,8 @@ package zchttp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
-	"reflect"
 	"testing"
 	"time"
 )
@@ -1905,23 +1905,6 @@ func TestGenerateOpenAPI_ShortFuncNameFallback(t *testing.T) {
 // selfPtr 病态自引用指针类型：Elem() 返回自身，无限解引用
 type selfPtr *selfPtr
 
-// TestDerefType_SelfReferentialPtr 验证自引用指针类型不会使 derefType 死循环
-func TestDerefType_SelfReferentialPtr(t *testing.T) {
-	done := make(chan reflect.Type, 1)
-	go func() {
-		done <- derefType(reflect.TypeOf((selfPtr)(nil)))
-	}()
-	select {
-	case got := <-done:
-		// 达到深度上限后应原样返回（仍为指针类型），而非死循环
-		if got.Kind() != reflect.Ptr {
-			t.Errorf("derefType(selfPtr) kind = %v, want Ptr", got.Kind())
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("confirmed: derefType infinite loop on self-referential pointer type (timed out)")
-	}
-}
-
 // TestGenerateOpenAPI_MultiLayerContainerDefault 验证多层容器中指针字段的 default 不展示
 func TestGenerateOpenAPI_MultiLayerContainerDefault(t *testing.T) {
 	// 定义仅在多层容器中使用的结构体
@@ -2110,5 +2093,101 @@ func TestGenerateOpenAPI_PtrWrappedMap(t *testing.T) {
 	// 可序列化
 	if _, err := json.Marshal(doc); err != nil {
 		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// ========== 数组元素 default 展示测试（P2-02 展示侧回归） ==========
+
+// TestGenerateOpenAPI_ArrayElemDefaultShown 验证数组元素内指针字段的 default 在 schema 中展示：
+// applyDefaults 支持数组后，展示必须与填充能力一致（P2-02 原 bug 场景：展示 default 但运行时不填充）
+func TestGenerateOpenAPI_ArrayElemDefaultShown(t *testing.T) {
+	type oaArrayItem struct {
+		Name string `json:"name" description:"名字"`
+		Qty  *int   `json:"qty" default:"5" description:"数量"`
+	}
+	type oaArrayReq struct {
+		OpenAPIMeta `tags:"ArrayDefault" summary:"数组元素default展示测试"`
+		Items       [2]oaArrayItem `json:"items" description:"定长数组"`
+	}
+	type oaArrayRes struct {
+		OK bool `json:"ok"`
+	}
+
+	r := NewRouter()
+	r.POST("/arr", func(_ context.Context, _ oaArrayReq) (oaArrayRes, error) {
+		return oaArrayRes{}, nil
+	})
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Array Default Test", Version: "1.0.0"})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+
+	// [N]Struct 字段应生成为 array 类型 schema
+	reqSchema, ok := schemas["oaArrayReq"]
+	if !ok {
+		t.Fatalf("oaArrayReq schema missing")
+	}
+	reqProps := reqSchema.(map[string]any)["properties"].(map[string]any)
+	itemsField := reqProps["items"].(map[string]any)
+	if itemsField["type"] != "array" {
+		t.Fatalf("[N]Struct field should be array type in schema, got %v", itemsField["type"])
+	}
+
+	// 元素 schema 的指针字段 default 必须展示（数组可达）
+	itemSchema, ok := schemas["oaArrayItem"]
+	if !ok {
+		t.Fatalf("oaArrayItem schema missing")
+	}
+	props := itemSchema.(map[string]any)["properties"].(map[string]any)
+	qtyField := props["qty"].(map[string]any)
+	got, hasDefault := qtyField["default"]
+	if !hasDefault {
+		t.Fatal("P2-02 regression: array elem ptr default should be shown in schema (applyDefaults supports array)")
+	}
+	if fmt.Sprintf("%v", got) != "5" {
+		t.Fatalf("qty.default = %v, want 5", got)
+	}
+}
+
+// TestGenerateOpenAPI_MapArrayMultiLayerDefaultHidden 验证 map 值类型为数组时元素 default 不展示：
+// applyDefaults 无法穿透 map→array，展示必须与填充能力一致（对照 TestGenerateOpenAPI_MultiLayerContainerDefault 的 map→slice 场景）
+func TestGenerateOpenAPI_MapArrayMultiLayerDefaultHidden(t *testing.T) {
+	type oaMapArrayItem struct {
+		Name string `json:"name" description:"名字"`
+		Qty  *int   `json:"qty" default:"5" description:"数量"`
+	}
+	type oaMapArrayReq struct {
+		OpenAPIMeta `tags:"MapArrayDefault" summary:"map值数组边界测试"`
+		Deep        map[string][2]oaMapArrayItem `json:"deep" description:"多层容器"`
+	}
+	type oaMapArrayRes struct {
+		OK bool `json:"ok"`
+	}
+
+	r := NewRouter()
+	r.POST("/maparr", func(_ context.Context, _ oaMapArrayReq) (oaMapArrayRes, error) {
+		return oaMapArrayRes{}, nil
+	})
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Map Array Default Test", Version: "1.0.0"})
+
+	comps := doc["components"].(map[string]any)
+	schemas := comps["schemas"].(map[string]any)
+
+	itemSchema, ok := schemas["oaMapArrayItem"]
+	if !ok {
+		t.Fatalf("oaMapArrayItem schema missing")
+	}
+	props := itemSchema.(map[string]any)["properties"].(map[string]any)
+	qtyField := props["qty"].(map[string]any)
+
+	// default 不应展示（map→array 不可达）
+	if _, hasDefault := qtyField["default"]; hasDefault {
+		t.Fatalf("P2-02 boundary: map value array is not defaults-reachable, default should NOT be shown, got: %v", qtyField["default"])
+	}
+	// description 不受可达性影响，始终展示
+	if qtyField["description"] != "数量" {
+		t.Errorf("qty.description = %v, want 数量", qtyField["description"])
 	}
 }

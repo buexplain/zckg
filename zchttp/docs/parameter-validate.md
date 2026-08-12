@@ -1,6 +1,6 @@
 # 参数校验规则
 
-本文档介绍 `zchttp` 框架的参数校验机制，包括 `nonzero` 非零值校验、`Validate()` 自定义业务校验，以及校验的执行顺序与错误处理。Req 结构体的定义与标签总览见 `request.md`。相关实现位于 `binding.go` 与 `buildEntry.go`。
+本文档介绍 `zchttp` 框架的参数校验机制，包括 `nonzero` 非零值校验、`Validate()` 自定义业务校验，以及校验的执行顺序与错误处理。Req 结构体的定义与标签总览见 `request.md`。相关实现位于 `validate.go`（校验执行）与 `meta.go`（标签解析）。
 
 ## 一、非零值校验（nonzero）
 
@@ -13,7 +13,7 @@
 
 ### 递归校验
 
-`validateNonzero` 会递归进入嵌套结构体、结构体指针字段、单层容器（`[]Struct`、`[]*Struct`、`map[K]Struct`、`map[K]*Struct`）及其指针包裹形式（`*[]Struct`、`*[]*Struct`、`*map[K]Struct`、`*map[K]*Struct`，指针解引用后穿透进入元素）的元素，校验所有 `nonzero:"true"` 字段。多层容器（如 `map[K][]Struct`）的内部元素无法穿透，详见 `request.md` 中"容器嵌套深度限制"章节。规则如下：
+`validateNonzero` 会递归进入嵌套结构体、结构体指针字段、单层容器（`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`，固定长度数组与切片行为一致）及其指针包裹形式（`*[]Struct`、`*[]*Struct`、`*[N]Struct`、`*map[K]Struct`、`*map[K]*Struct`，指针解引用后穿透进入元素）的元素，校验所有 `nonzero:"true"` 字段。多层容器（如 `map[K][]Struct`、`map[K][N]Struct`）的内部元素无法穿透，详见 `request.md` 中"容器嵌套深度限制"章节。规则如下：
 
 | 本级字段 | 零值 | 行为 |
 |---------|------|------|
@@ -53,7 +53,11 @@ type Invoice struct {
 
 ### 零值判定与快速跳过
 
-运行时 `validateNonzero` 遍历 `meta.fields`，零值判定使用 `reflect.Value.IsZero`：nil 指针/切片、空字符串、数字 0、bool false 等均视为零值。`structMeta.hasNonzero` 标记是否存在 nonzero 字段，若为 `false` 则直接跳过遍历，加速请求阶段校验。
+运行时 `validateNonzero` 遍历 `meta.fields`，零值判定使用 `reflect.Value.IsZero`：nil 指针/切片、空字符串、数字 0、bool false 等均视为零值。
+
+**快速跳过（注册期传递性预计算）**：注册阶段由 `hasNonzeroInTree` 扫描 Req **整棵类型树**（穿透嵌套结构体、指针、切片/数组/map 容器），判定任意深度是否存在 `nonzero:"true"` 字段，结果存入路由条目的 `needsNonzeroValidation` 标记。请求阶段仅当该标记为 `true` 时才执行 `validateNonzero` 遍历，全树无 nonzero 字段的接口整体跳过，避免无意义的反射遍历。
+
+> 该标记是**传递性**的：顶层无 nonzero 但嵌套层有（如 `Addr Address` 未标注而 `City` 标了 nonzero）也计为 `true`。若仅统计 Req 顶层字段做跳过决策，会漏校验嵌套层 nonzero 字段，故扫描必须穿透整棵类型树。
 
 要点：
 

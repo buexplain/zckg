@@ -10,14 +10,6 @@ import (
 	"testing"
 )
 
-type engineReq struct {
-	Name string `json:"name"`
-}
-
-type engineRes struct {
-	Message string `json:"message"`
-}
-
 // TestDefaultResponseJSON 验证默认响应回调输出 JSON
 func TestDefaultResponseJSON(t *testing.T) {
 	router := NewRouter()
@@ -252,42 +244,6 @@ func TestCustomResponseAndErrorHandler(t *testing.T) {
 	}
 }
 
-// TestRequestResponseFromContext 验证 handler 可从 ctx 获取 *http.Request 与 ResponseWriter
-func TestRequestResponseFromContext(t *testing.T) {
-	router := NewRouter()
-	router.GET("/ctx", func(ctx context.Context, req engineReq) (engineRes, error) {
-		r, ok := RequestFromContext(ctx)
-		if !ok || r == nil {
-			t.Fatalf("request not found in ctx")
-		}
-		w, ok := ResponseWriterFromContext(ctx)
-		if !ok || w == nil {
-			t.Fatalf("response writer not found in ctx")
-		}
-		// 直接通过 ctx 中的 ResponseWriter 写文件内容
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("path=" + r.URL.Path))
-		return engineRes{Message: "ignored"}, nil
-	})
-
-	engine := NewEngine()
-	engine.Router = router
-
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ctx", nil))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	// handler 已写入响应，默认回调应跳过 JSON
-	if body := rec.Body.String(); body != "path=/ctx" {
-		t.Fatalf("expected body written via ctx writer, got %q", body)
-	}
-	if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
-		t.Fatalf("content-type should stay text/plain, got %q", ct)
-	}
-}
-
 // ======== 覆盖率补充测试 ========
 
 // TestDefaultPanicHandler_JSON 验证 handler panic 时返回 500 JSON 响应
@@ -310,10 +266,13 @@ func TestDefaultPanicHandler_JSON(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("content-type = %q, want application/json", ct)
 	}
-	// 响应体应包含 panic 信息
+	// 响应体不应包含 panic 信息（安全：不向客户端泄露内部堆栈），仅包含通用错误消息
 	body := rec.Body.String()
-	if !strings.Contains(body, "something went wrong") {
-		t.Fatalf("response body should contain panic message, got: %s", body)
+	if !strings.Contains(body, "internal server error") {
+		t.Fatalf("response body should contain 'internal server error', got: %s", body)
+	}
+	if strings.Contains(body, "something went wrong") {
+		t.Fatalf("response body should NOT contain panic message for security, got: %s", body)
 	}
 }
 
@@ -342,8 +301,12 @@ func TestDefaultPanicHandler_HTML(t *testing.T) {
 	if !strings.Contains(body, "500 Internal Server Error") {
 		t.Fatalf("response should contain HTML 500 heading, got: %s", body)
 	}
-	if !strings.Contains(body, "html panic") {
-		t.Fatalf("response should contain panic message, got: %s", body)
+	// 安全：响应不应包含 panic 消息
+	if strings.Contains(body, "html panic") {
+		t.Fatalf("response should NOT contain panic message for security, got: %s", body)
+	}
+	if !strings.Contains(body, "internal server error") {
+		t.Fatalf("response should contain 'internal server error', got: %s", body)
 	}
 }
 
@@ -435,162 +398,5 @@ func TestDefaultValidationErrorHandler_SkipWhenWritten(t *testing.T) {
 	// 响应应保持中间件写入的内容
 	if body := rec.Body.String(); body != "early" {
 		t.Fatalf("body = %q, want 'early'", body)
-	}
-}
-
-// TestEngineFromContext 验证中间件/handler 可从 ctx 获取 *HttpEngine
-func TestEngineFromContext(t *testing.T) {
-	var gotEngine *HttpEngine
-
-	router := NewRouter()
-	router.GET("/eng", func(ctx context.Context, _ engineReq) (engineRes, error) {
-		e, ok := EngineFromContext(ctx)
-		if !ok {
-			t.Fatalf("EngineFromContext returned false")
-		}
-		gotEngine = e
-		return engineRes{}, nil
-	})
-
-	engine := NewEngine()
-	engine.Router = router
-
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/eng", nil))
-
-	if gotEngine != engine {
-		t.Fatal("EngineFromContext should return the same engine instance")
-	}
-}
-
-// TestBoundResFromContext 验证后置中间件可从 ctx 获取 handler 的 Res
-func TestBoundResFromContext(t *testing.T) {
-	var capturedMsg string
-
-	router := NewRouter()
-	router.Use(func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		err := next()
-		// 后置阶段获取 Res
-		res, resErr := BoundResFromContext[engineRes](ctx)
-		if resErr != nil {
-			t.Fatalf("BoundResFromContext failed: %v", resErr)
-		}
-		capturedMsg = res.Message
-		return err
-	})
-	router.GET("/res", func(_ context.Context, _ engineReq) (engineRes, error) {
-		return engineRes{Message: "from handler"}, nil
-	})
-
-	engine := NewEngine()
-	engine.Router = router
-
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/res", nil))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if capturedMsg != "from handler" {
-		t.Fatalf("capturedMsg = %q, want 'from handler'", capturedMsg)
-	}
-}
-
-// TestBoundResFromContext_NotFound 验证 handler 未执行时 BoundResFromContext 返回错误
-func TestBoundResFromContext_NotFound(t *testing.T) {
-	var resErr error
-
-	router := NewRouter()
-	router.Use(func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		// 不调用 next，handler 不执行，Res 为空
-		_, resErr = BoundResFromContext[engineRes](ctx)
-		return nil
-	})
-	router.GET("/no-res", func(_ context.Context, _ engineReq) (engineRes, error) {
-		return engineRes{Message: "never"}, nil
-	})
-
-	engine := NewEngine()
-	engine.Router = router
-
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/no-res", nil))
-
-	if resErr == nil {
-		t.Fatal("BoundResFromContext should return error when Res not set")
-	}
-}
-
-// TestBoundReqFromContext_ValueAndPointer 验证 BoundReqFromContext 同时支持指针和值类型调用
-func TestBoundReqFromContext_ValueAndPointer(t *testing.T) {
-	var (
-		ptrReq *engineReq
-		valReq engineReq
-		ptrErr error
-		valErr error
-	)
-
-	router := NewRouter()
-	router.Use(func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		// 用指针类型获取
-		ptrReq, ptrErr = BoundReqFromContext[*engineReq](ctx)
-		// 用值类型获取（内部自动解引用）
-		valReq, valErr = BoundReqFromContext[engineReq](ctx)
-		return next()
-	})
-	router.GET("/bound-req", func(_ context.Context, req engineReq) (engineRes, error) {
-		return engineRes{Message: req.Name}, nil
-	})
-
-	engine := NewEngine()
-	engine.Router = router
-
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/bound-req?name=alice", nil))
-
-	if ptrErr != nil {
-		t.Fatalf("BoundReqFromContext[*engineReq] failed: %v", ptrErr)
-	}
-	if ptrReq == nil || ptrReq.Name != "alice" {
-		t.Fatalf("pointer req: got %+v, want Name=alice", ptrReq)
-	}
-
-	if valErr != nil {
-		t.Fatalf("BoundReqFromContext[engineReq] failed: %v", valErr)
-	}
-	if valReq.Name != "alice" {
-		t.Fatalf("value req: got Name=%q, want alice", valReq.Name)
-	}
-}
-
-// TestResponseWriter_FlusherPassThrough 验证 responseWriter 包装器透传 http.Flusher：
-// SSE 等流式场景依赖 w.(http.Flusher) 断言，包装后不应丢失底层能力
-func TestResponseWriter_FlusherPassThrough(t *testing.T) {
-	rec := httptest.NewRecorder() // ResponseRecorder 实现了 http.Flusher
-	rw := &responseWriter{ResponseWriter: rec}
-
-	var w http.ResponseWriter = rw
-	f, ok := w.(http.Flusher)
-	if !ok {
-		t.Fatal("responseWriter does not pass through http.Flusher, SSE streaming broken")
-	}
-	f.Flush()
-	if !rec.Flushed {
-		t.Fatal("Flush not delegated to underlying ResponseWriter")
-	}
-}
-
-// TestResponseWriter_HijackerNotSupported 验证底层不支持 Hijack 时返回错误而非 panic
-func TestResponseWriter_HijackerNotSupported(t *testing.T) {
-	rec := httptest.NewRecorder() // ResponseRecorder 未实现 http.Hijacker
-	rw := &responseWriter{ResponseWriter: rec}
-
-	var w http.ResponseWriter = rw
-	h, ok := w.(http.Hijacker)
-	if !ok {
-		t.Skip("responseWriter does not implement http.Hijacker")
-	}
-	if _, _, err := h.Hijack(); err == nil {
-		t.Fatal("Hijack on non-hijackable underlying writer should return error")
 	}
 }

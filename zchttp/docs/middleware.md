@@ -55,6 +55,8 @@ Middleware A ── 前置逻辑
 
 该链由 `runChain` 递归构建：`middlewares[0]` 在最外层，`finalHandler`（handler 调用）在最内层。每层的 `next` 仅允许调用一次，重复调用不会重新执行下游链与 handler，而是直接返回 `ErrNextCalledMultipleTimes`，避免业务副作用被重复触发。
 
+> **并发约束**：`next()` 必须在中间件所属的 goroutine 内调用，不得另起 goroutine 调用 `next()`。内部实现使用普通 `bool` 标记调用状态，未做并发安全保护。
+
 ## 三、短路控制
 
 中间件**不调用 `next()`** 即可短路，后续中间件与 handler 都不会执行：

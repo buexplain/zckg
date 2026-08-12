@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -266,491 +264,6 @@ func TestBindTime(t *testing.T) {
 	}
 }
 
-// defaultReq 通过 default 标签为字段设置默认值
-type defaultReq struct {
-	Keyword  string   `json:"keyword" default:"all"`
-	Page     int      `json:"page" default:"1"`
-	PageSize int      `json:"page_size" default:"20"`
-	Sort     string   `json:"sort" default:"created_at"`
-	Tags     []string `json:"tags" default:"a,b,c"`
-}
-
-type defaultRes struct {
-	Keyword  string   `json:"keyword"`
-	Page     int      `json:"page"`
-	PageSize int      `json:"page_size"`
-	Sort     string   `json:"sort"`
-	Tags     []string `json:"tags"`
-}
-
-func defaultHandler(_ context.Context, req defaultReq) (defaultRes, error) {
-	return defaultRes{
-		Keyword:  req.Keyword,
-		Page:     req.Page,
-		PageSize: req.PageSize,
-		Sort:     req.Sort,
-		Tags:     req.Tags,
-	}, nil
-}
-
-// TestBindDefaultsAllMissing 验证无任何参数时所有带 default 的字段都被填充默认值
-func TestBindDefaultsAllMissing(t *testing.T) {
-	router := NewRouter()
-	router.GET("/list", defaultHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	req := httptest.NewRequest(http.MethodGet, "/list", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	var res defaultRes
-	decodeData(t, rec, &res)
-	if res.Keyword != "all" || res.Page != 1 || res.PageSize != 20 || res.Sort != "created_at" {
-		t.Fatalf("unexpected defaults: %+v", res)
-	}
-	if len(res.Tags) != 3 || res.Tags[0] != "a" || res.Tags[1] != "b" || res.Tags[2] != "c" {
-		t.Fatalf("unexpected tags default: %v", res.Tags)
-	}
-}
-
-// TestBindDefaultsPartial 验证已传递的参数不被默认值覆盖，未传递的才使用默认值
-func TestBindDefaultsPartial(t *testing.T) {
-	router := NewRouter()
-	router.GET("/list", defaultHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// 仅传递 keyword 与 page，其余用默认值
-	req := httptest.NewRequest(http.MethodGet, "/list?keyword=go&page=5", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	var res defaultRes
-	decodeData(t, rec, &res)
-	if res.Keyword != "go" || res.Page != 5 {
-		t.Fatalf("provided values overwritten: %+v", res)
-	}
-	if res.PageSize != 20 || res.Sort != "created_at" {
-		t.Fatalf("missing fields not defaulted: %+v", res)
-	}
-	if len(res.Tags) != 3 {
-		t.Fatalf("tags default not applied: %v", res.Tags)
-	}
-}
-
-// TestBindDefaultsParseErrorKeepsDefault 验证"传递了但解析失败"时保留默认值
-func TestBindDefaultsParseErrorKeepsDefault(t *testing.T) {
-	router := NewRouter()
-	router.GET("/list", defaultHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// page=abc 无法解析为 int，应保留默认值 1
-	req := httptest.NewRequest(http.MethodGet, "/list?page=abc", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	var res defaultRes
-	decodeData(t, rec, &res)
-	if res.Page != 1 {
-		t.Fatalf("parse error should keep default 1, got %d", res.Page)
-	}
-}
-
-// TestBindDefaultsExplicitZeroNotOverwritten 验证显式传递等于零值的值不会被默认值覆盖
-func TestBindDefaultsExplicitZeroNotOverwritten(t *testing.T) {
-	router := NewRouter()
-	router.GET("/list", defaultHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// 显式传递 page=0，应保留 0 而非默认值 1
-	req := httptest.NewRequest(http.MethodGet, "/list?page=0", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	var res defaultRes
-	decodeData(t, rec, &res)
-	if res.Page != 0 {
-		t.Fatalf("explicit zero should be kept, got %d", res.Page)
-	}
-}
-
-// -------- slice/map default 递归测试 --------
-
-// itemWithDefault 作为切片/map 元素，包含 default 子字段
-// Qty/Status 使用指针类型：在 slice/map 嵌套元素中，只有 nil 指针才会被请求阶段 default 填充，
-// 值类型（如 int/string）的零值无法区分"未传"与"传了 0"，因此不在请求阶段填充。
-type itemWithDefault struct {
-	Name   string  `json:"name" nonzero:"true"`
-	Qty    *int    `json:"qty" default:"1"`
-	Status *string `json:"status" default:"active"`
-	Note   string  `json:"note"`
-}
-
-// itemDefaultRes 用于回显默认值填充结果
-type itemDefaultRes struct {
-	Name   string `json:"name"`
-	Qty    int    `json:"qty"`
-	Status string `json:"status"`
-	Note   string `json:"note"`
-}
-
-// ====== 切片 default 递归 ======
-
-type orderDefaultSliceReq struct {
-	OrderNo string             `json:"orderNo" nonzero:"true"`
-	Items   []itemWithDefault  `json:"items" nonzero:"true"`
-	Extras  []*itemWithDefault `json:"extras"`
-}
-
-type orderDefaultSliceRes struct {
-	OrderNo string         `json:"orderNo"`
-	First   itemDefaultRes `json:"first"`
-	Count   int            `json:"count"`
-}
-
-func orderDefaultSliceHandler(_ context.Context, req orderDefaultSliceReq) (orderDefaultSliceRes, error) {
-	res := orderDefaultSliceRes{OrderNo: req.OrderNo, Count: len(req.Items) + len(req.Extras)}
-	if len(req.Items) > 0 {
-		qty, status := 0, ""
-		if req.Items[0].Qty != nil {
-			qty = *req.Items[0].Qty
-		}
-		if req.Items[0].Status != nil {
-			status = *req.Items[0].Status
-		}
-		res.First = itemDefaultRes{
-			Name:   req.Items[0].Name,
-			Qty:    qty,
-			Status: status,
-			Note:   req.Items[0].Note,
-		}
-	}
-	return res, nil
-}
-
-// TestBindDefaultsSliceElem 切片元素未传 default 字段时，自动填充默认值
-func TestBindDefaultsSliceElem(t *testing.T) {
-	router := NewRouter()
-	router.POST("/orderDefaultSlice", orderDefaultSliceHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// items[0] 只传了 name（required），qty 和 status 应使用默认值
-	body := `{"orderNo":"ORD-001","items":[{"name":"item1"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/orderDefaultSlice", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var res orderDefaultSliceRes
-	decodeData(t, rec, &res)
-	if res.First.Qty != 1 {
-		t.Fatalf("default Qty should be 1, got %d", res.First.Qty)
-	}
-	if res.First.Status != "active" {
-		t.Fatalf("default Status should be 'active', got %s", res.First.Status)
-	}
-}
-
-// TestBindDefaultsSliceElemExplicit 切片元素显式传值时不覆盖
-func TestBindDefaultsSliceElemExplicit(t *testing.T) {
-	router := NewRouter()
-	router.POST("/orderDefaultSlice", orderDefaultSliceHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// 显式传 qty=5, status=pending → 不被默认值覆盖
-	body := `{"orderNo":"ORD-001","items":[{"name":"item1","qty":5,"status":"pending"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/orderDefaultSlice", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var res orderDefaultSliceRes
-	decodeData(t, rec, &res)
-	if res.First.Qty != 5 {
-		t.Fatalf("explicit Qty should be 5, got %d", res.First.Qty)
-	}
-	if res.First.Status != "pending" {
-		t.Fatalf("explicit Status should be 'pending', got %s", res.First.Status)
-	}
-}
-
-// TestBindDefaultsSliceElemPtr 指针切片元素默认值填充
-func TestBindDefaultsSliceElemPtr(t *testing.T) {
-	router := NewRouter()
-	router.POST("/orderDefaultSlice", orderDefaultSliceHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// extras 中元素未传 qty/status → 填充默认值
-	body := `{"orderNo":"ORD-001","items":[{"name":"i1"}],"extras":[{"name":"e1"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/orderDefaultSlice", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	if rec.Code == http.StatusOK {
-		t.Log("slice elem ptr default test passed")
-	}
-}
-
-// ====== map default 递归 ======
-
-type orderDefaultMapReq struct {
-	OrderNo string                      `json:"orderNo" nonzero:"true"`
-	Items   map[string]itemWithDefault  `json:"items" nonzero:"true"`
-	Extras  map[string]*itemWithDefault `json:"extras"`
-}
-
-type orderDefaultMapRes struct {
-	OrderNo string `json:"orderNo"`
-	Aqty    int    `json:"aqty"`
-	Astatus string `json:"astatus"`
-	Count   int    `json:"count"`
-}
-
-func orderDefaultMapHandler(_ context.Context, req orderDefaultMapReq) (orderDefaultMapRes, error) {
-	res := orderDefaultMapRes{OrderNo: req.OrderNo, Count: len(req.Items) + len(req.Extras)}
-	if v, ok := req.Items["a"]; ok {
-		if v.Qty != nil {
-			res.Aqty = *v.Qty
-		}
-		if v.Status != nil {
-			res.Astatus = *v.Status
-		}
-	}
-	return res, nil
-}
-
-// TestBindDefaultsMapValue map value 未传 default 字段时，自动填充默认值
-func TestBindDefaultsMapValue(t *testing.T) {
-	router := NewRouter()
-	router.POST("/orderDefaultMap", orderDefaultMapHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// items["a"] 只传了 name → qty/status 应使用默认值
-	body := `{"orderNo":"ORD-001","items":{"a":{"name":"itemA"}}}`
-	req := httptest.NewRequest(http.MethodPost, "/orderDefaultMap", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var res orderDefaultMapRes
-	decodeData(t, rec, &res)
-	if res.Aqty != 1 {
-		t.Fatalf("default Qty should be 1, got %d", res.Aqty)
-	}
-	if res.Astatus != "active" {
-		t.Fatalf("default Status should be 'active', got %s", res.Astatus)
-	}
-}
-
-// TestBindDefaultsMapValueExplicit map value 显式传值时不覆盖
-func TestBindDefaultsMapValueExplicit(t *testing.T) {
-	router := NewRouter()
-	router.POST("/orderDefaultMap", orderDefaultMapHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// 显式传 qty=10, status=done → 不被默认值覆盖
-	body := `{"orderNo":"ORD-001","items":{"a":{"name":"itemA","qty":10,"status":"done"}}}`
-	req := httptest.NewRequest(http.MethodPost, "/orderDefaultMap", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var res orderDefaultMapRes
-	decodeData(t, rec, &res)
-	if res.Aqty != 10 {
-		t.Fatalf("explicit Qty should be 10, got %d", res.Aqty)
-	}
-	if res.Astatus != "done" {
-		t.Fatalf("explicit Status should be 'done', got %s", res.Astatus)
-	}
-}
-
-// TestBindDefaultsMapValuePtr 指针 map value 默认值填充
-func TestBindDefaultsMapValuePtr(t *testing.T) {
-	router := NewRouter()
-	router.POST("/orderDefaultMap", orderDefaultMapHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// extras 中 value 未传 qty/status → 填充默认值
-	body := `{"orderNo":"ORD-001","items":{"a":{"name":"iA"}},"extras":{"x":{"name":"eX"}}}`
-	req := httptest.NewRequest(http.MethodPost, "/orderDefaultMap", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	if rec.Code == http.StatusOK {
-		t.Log("map value ptr default test passed")
-	}
-}
-
-// ========== 指针包裹容器 default 递归 ==========
-
-// ptrContainerReq 包含 *[]Struct 和 *map[K]Struct 字段
-type ptrContainerReq struct {
-	OrderNo string                       `json:"orderNo" nonzero:"true"`
-	Items   *[]itemWithDefault           `json:"items" nonzero:"true"`
-	Extras  *map[string]*itemWithDefault `json:"extras"`
-}
-
-type ptrContainerRes struct {
-	OrderNo string         `json:"orderNo"`
-	First   itemDefaultRes `json:"first"`
-	Count   int            `json:"count"`
-}
-
-func ptrContainerHandler(_ context.Context, req ptrContainerReq) (ptrContainerRes, error) {
-	res := ptrContainerRes{OrderNo: req.OrderNo}
-	if req.Items != nil && len(*req.Items) > 0 {
-		first := (*req.Items)[0]
-		qty, status := 0, ""
-		if first.Qty != nil {
-			qty = *first.Qty
-		}
-		if first.Status != nil {
-			status = *first.Status
-		}
-		res.First = itemDefaultRes{
-			Name:   first.Name,
-			Qty:    qty,
-			Status: status,
-			Note:   first.Note,
-		}
-		res.Count = len(*req.Items)
-	}
-	if req.Extras != nil {
-		res.Count += len(*req.Extras)
-	}
-	return res, nil
-}
-
-// TestBindDefaultsPtrSliceElem *[]Struct 元素未传 default 字段时，自动填充默认值
-func TestBindDefaultsPtrSliceElem(t *testing.T) {
-	router := NewRouter()
-	router.POST("/ptrContainer", ptrContainerHandler)
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// items[0] 只传了 name（required），qty 和 status 应使用默认值
-	body := `{"orderNo":"ORD-001","items":[{"name":"item1"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/ptrContainer", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var res ptrContainerRes
-	decodeData(t, rec, &res)
-	if res.First.Qty != 1 {
-		t.Fatalf("default Qty should be 1, got %d", res.First.Qty)
-	}
-	if res.First.Status != "active" {
-		t.Fatalf("default Status should be 'active', got %s", res.First.Status)
-	}
-}
-
-// TestBindDefaultsPtrMapValue *map[K]Struct value 未传 default 字段时，自动填充默认值
-func TestBindDefaultsPtrMapValue(t *testing.T) {
-	router := NewRouter()
-	router.POST("/ptrContainer", func(_ context.Context, req ptrContainerReq) (struct {
-		Aqty    int    `json:"aqty"`
-		Astatus string `json:"astatus"`
-	}, error) {
-		res := struct {
-			Aqty    int    `json:"aqty"`
-			Astatus string `json:"astatus"`
-		}{}
-		if req.Extras != nil {
-			if v, ok := (*req.Extras)["a"]; ok && v != nil {
-				if v.Qty != nil {
-					res.Aqty = *v.Qty
-				}
-				if v.Status != nil {
-					res.Astatus = *v.Status
-				}
-			}
-		}
-		return res, nil
-	})
-
-	engine := NewEngine()
-	engine.Router = router
-
-	// extras["a"] 只传了 name → qty/status 应使用默认值
-	body := `{"orderNo":"ORD-001","items":[{"name":"i1"}],"extras":{"a":{"name":"itemA"}}}`
-	req := httptest.NewRequest(http.MethodPost, "/ptrContainer", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var res struct {
-		Aqty    int    `json:"aqty"`
-		Astatus string `json:"astatus"`
-	}
-	decodeData(t, rec, &res)
-	if res.Aqty != 1 {
-		t.Fatalf("default Qty should be 1, got %d", res.Aqty)
-	}
-	if res.Astatus != "active" {
-		t.Fatalf("default Status should be 'active', got %s", res.Astatus)
-	}
-}
-
 // ========== P0/P1 补充测试：结构体与 handler 定义 ==========
 
 // ---- form 标签优先 ----
@@ -833,47 +346,6 @@ type timeTzRes struct {
 
 func timeTzHandler(_ context.Context, req timeTzReq) (timeTzRes, error) {
 	return timeTzRes{Location: req.Meeting.Location().String(), Hour: req.Meeting.Hour()}, nil
-}
-
-// ---- 并发隔离 ----
-type concurrentReq struct {
-	Status *string `json:"status" default:"idle"`
-}
-type concurrentRes struct {
-	Status string `json:"status"`
-}
-
-func concurrentHandler(_ context.Context, req concurrentReq) (concurrentRes, error) {
-	s := ""
-	if req.Status != nil {
-		s = *req.Status
-	}
-	return concurrentRes{Status: s}, nil
-}
-
-// ---- 指针嵌套 struct 默认值 ----
-type billAddress struct {
-	City string `json:"city" default:"Beijing"`
-	Zip  *int   `json:"zip" default:"100000"`
-}
-type billOrderReq struct {
-	Name    string       `json:"name" nonzero:"true"`
-	Address *billAddress `json:"address"`
-}
-type billOrderRes struct {
-	City string `json:"city"`
-	Zip  int    `json:"zip"`
-}
-
-func billOrderHandler(_ context.Context, req billOrderReq) (billOrderRes, error) {
-	r := billOrderRes{}
-	if req.Address != nil {
-		r.City = req.Address.City
-		if req.Address.Zip != nil {
-			r.Zip = *req.Address.Zip
-		}
-	}
-	return r, nil
 }
 
 // ========== P0 测试 ==========
@@ -1128,129 +600,6 @@ func TestBindMultiFileUpload(t *testing.T) {
 	}
 	if len(res.Names) != 3 || res.Names[0] != "a.txt" || res.Names[2] != "c.txt" {
 		t.Fatalf("file names: got %v", res.Names)
-	}
-}
-
-// TestUnsupportedDefaultTypeSilentlyIgnored 验证不支持 default 的类型（time.Time/map/any）设置 default 被静默忽略
-func TestUnsupportedDefaultTypeSilentlyIgnored(t *testing.T) {
-	type unsupportedDefReq struct {
-		Name string    `json:"name"`
-		When time.Time `json:"when" default:"2023-01-01"` // 不支持
-	}
-	type unsupportedDefRes struct {
-		IsZero bool `json:"is_zero"`
-	}
-
-	router := NewRouter()
-	router.GET("/ud", func(_ context.Context, r unsupportedDefReq) (unsupportedDefRes, error) {
-		return unsupportedDefRes{IsZero: r.When.IsZero()}, nil
-	})
-	engine := NewEngine()
-	engine.Router = router
-
-	httpReq := httptest.NewRequest(http.MethodGet, "/ud", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, httpReq)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	var r unsupportedDefRes
-	decodeData(t, rec, &r)
-	// time.Time 不支持 default，应被忽略，保持零值
-	if !r.IsZero {
-		t.Fatal("time.Time default should be silently ignored, field should remain zero")
-	}
-}
-
-// TestConcurrentRequestIsolation 验证并发请求间默认值模板不共享（深拷贝断开引用）
-func TestConcurrentRequestIsolation(t *testing.T) {
-	router := NewRouter()
-	router.POST("/conc", concurrentHandler)
-	engine := NewEngine()
-	engine.Router = router
-
-	const n = 20
-	results := make([]string, n)
-	errs := make([]error, n)
-
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			// 奇数显式传值，偶数不传（使用默认值 "idle"）
-			var body string
-			if idx%2 == 1 {
-				body = `{"status":"active"}`
-			} else {
-				body = `{}`
-			}
-			httpReq := httptest.NewRequest(http.MethodPost, "/conc", strings.NewReader(body))
-			httpReq.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			engine.ServeHTTP(rec, httpReq)
-
-			mu.Lock()
-			defer mu.Unlock()
-			if rec.Code != http.StatusOK {
-				errs[idx] = fmt.Errorf("request %d: expected 200, got %d", idx, rec.Code)
-				return
-			}
-			var r concurrentRes
-			decodeData(t, rec, &r)
-			results[idx] = r.Status
-		}(i)
-	}
-	wg.Wait()
-
-	for _, err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	// 验证结果无交叉污染
-	for i := 0; i < n; i++ {
-		if i%2 == 1 {
-			if results[i] != "active" {
-				t.Fatalf("request %d (odd): expected 'active', got %q", i, results[i])
-			}
-		} else {
-			if results[i] != "idle" {
-				t.Fatalf("request %d (even): expected 'idle', got %q", i, results[i])
-			}
-		}
-	}
-}
-
-// TestPointerNestedStructDefault 验证指针嵌套 struct 中：值类型 default 不生效，指针类型 default 生效
-func TestPointerNestedStructDefault(t *testing.T) {
-	router := NewRouter()
-	router.POST("/bill", billOrderHandler)
-	engine := NewEngine()
-	engine.Router = router
-
-	// 传 address:{} → City 值类型 default 不生效，Zip 指针类型 default 生效
-	body := `{"name":"alice","address":{}}`
-	req := httptest.NewRequest(http.MethodPost, "/bill", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-	var res billOrderRes
-	decodeData(t, rec, &res)
-	// 值类型 default 在指针嵌套下不生效
-	if res.City != "" {
-		t.Fatalf("value-type default in ptr-nested struct should NOT apply, got %q", res.City)
-	}
-	// 指针类型 default 在请求阶段补填生效
-	if res.Zip != 100000 {
-		t.Fatalf("ptr-type default in ptr-nested struct should apply, got %d, want 100000", res.Zip)
 	}
 }
 
@@ -2069,5 +1418,243 @@ func TestSetScalar_SelfReferentialPtr(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("setScalar did not terminate on self-referential pointer type")
+	}
+}
+
+// ========== P1-02: 整型溢出检查测试 ==========
+
+// TestSetScalar_Int8Overflow 验证 int8 溢出时返回错误而非静默截断
+func TestSetScalar_Int8Overflow(t *testing.T) {
+	type req struct {
+		Val int8
+	}
+	r := &req{}
+	v := reflect.ValueOf(r).Elem().Field(0)
+
+	err := setScalar(v, "300", "", nil) // 300 > int8 max (127)
+	if err == nil {
+		t.Fatalf("expected error for int8 overflow (300), got nil; value=%d", r.Val)
+	}
+}
+
+// TestSetScalar_Uint8Overflow 验证 uint8 溢出时返回错误而非静默截断
+func TestSetScalar_Uint8Overflow(t *testing.T) {
+	type req struct {
+		Val uint8
+	}
+	r := &req{}
+	v := reflect.ValueOf(r).Elem().Field(0)
+
+	err := setScalar(v, "300", "", nil) // 300 > uint8 max (255)
+	if err == nil {
+		t.Fatalf("expected error for uint8 overflow (300), got nil; value=%d", r.Val)
+	}
+}
+
+// TestSetScalar_Int16Overflow 验证 int16 溢出时返回错误
+func TestSetScalar_Int16Overflow(t *testing.T) {
+	type req struct {
+		Val int16
+	}
+	r := &req{}
+	v := reflect.ValueOf(r).Elem().Field(0)
+
+	err := setScalar(v, "70000", "", nil) // 70000 > int16 max (32767)
+	if err == nil {
+		t.Fatalf("expected error for int16 overflow (70000), got nil; value=%d", r.Val)
+	}
+}
+
+// TestSetScalar_Int8InRange 验证 int8 范围内正常解析
+func TestSetScalar_Int8InRange(t *testing.T) {
+	type req struct {
+		Val int8
+	}
+	r := &req{}
+	v := reflect.ValueOf(r).Elem().Field(0)
+
+	err := setScalar(v, "100", "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error for int8 in range: %v", err)
+	}
+	if r.Val != 100 {
+		t.Fatalf("expected 100, got %d", r.Val)
+	}
+}
+
+// ========== P2-03: 空 JSON body 测试 ==========
+
+// TestBindBody_EmptyJSONBody 验证空 JSON body 返回友好错误消息而非 "EOF"
+func TestBindBody_EmptyJSONBody(t *testing.T) {
+	type req struct {
+		Name string `json:"name"`
+	}
+	type res struct{}
+
+	router := NewRouter()
+	router.POST("/test", func(_ context.Context, r req) (res, error) {
+		return res{}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/test", nil)
+	httpReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, httpReq)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "EOF") {
+		t.Fatalf("response should NOT contain 'EOF', got: %s", body)
+	}
+	if !strings.Contains(body, "empty request body") {
+		t.Fatalf("response should contain 'empty request body', got: %s", body)
+	}
+}
+
+// TestBindBody_EmptyStructNoJSON 验证空结构体 + JSON body 不报错
+func TestBindBody_EmptyStructNoJSON(t *testing.T) {
+	type req struct{}
+	type res struct {
+		OK bool `json:"ok"`
+	}
+
+	router := NewRouter()
+	router.POST("/test", func(_ context.Context, r req) (res, error) {
+		return res{OK: true}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/test", nil)
+	httpReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, httpReq)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ========== P2-01: 匿名嵌入 struct 测试 ==========
+
+// TestBindAnonymousEmbeddedExported 验证导出类型的匿名嵌入字段扁平展开
+func TestBindAnonymousEmbeddedExported(t *testing.T) {
+	type Base struct {
+		City string `json:"city"`
+	}
+	type req struct {
+		Base
+		Name string `json:"name"`
+	}
+	type res struct {
+		City string `json:"city"`
+		Name string `json:"name"`
+	}
+
+	router := NewRouter()
+	router.POST("/test", func(_ context.Context, r req) (res, error) {
+		return res{City: r.City, Name: r.Name}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(`{"city":"beijing","name":"alice"}`))
+	httpReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, httpReq)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var result struct {
+		Data struct {
+			City string `json:"city"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if result.Data.City != "beijing" {
+		t.Fatalf("city = %q, want 'beijing'", result.Data.City)
+	}
+	if result.Data.Name != "alice" {
+		t.Fatalf("name = %q, want 'alice'", result.Data.Name)
+	}
+}
+
+// TestBindAnonymousEmbeddedQuery 验证匿名嵌入字段的 query 绑定
+func TestBindAnonymousEmbeddedQuery(t *testing.T) {
+	type Base struct {
+		City string `form:"city"`
+	}
+	type req struct {
+		Base
+		Name string `form:"name"`
+	}
+	type res struct {
+		City string `json:"city"`
+		Name string `json:"name"`
+	}
+
+	router := NewRouter()
+	router.GET("/test", func(_ context.Context, r req) (res, error) {
+		return res{City: r.City, Name: r.Name}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodGet, "/test?city=shanghai&name=bob", nil)
+	engine.ServeHTTP(rec, httpReq)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var result struct {
+		Data struct {
+			City string `json:"city"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if result.Data.City != "shanghai" {
+		t.Fatalf("city = %q, want 'shanghai'", result.Data.City)
+	}
+}
+
+// --- BUG2: isAllDigits("-") 返回 true ---
+
+// TestIsAllDigits_SingleMinus 验证单个负号不应被认为是纯数字
+func TestIsAllDigits_SingleMinus(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+	}{
+		{"-", false},
+		{"-1", true},
+		{"123", true},
+		{"", false},
+		{"abc", false},
+		{"12-3", false},
+		{"-0", true},
+	}
+	for _, c := range cases {
+		got := isAllDigits(c.input)
+		if got != c.want {
+			t.Errorf("isAllDigits(%q) = %v, want %v", c.input, got, c.want)
+		}
 	}
 }

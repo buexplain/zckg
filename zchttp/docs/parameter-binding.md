@@ -1,10 +1,10 @@
 # 参数绑定规则
 
-本框架会根据请求的方法（method）与内容类型（Content-Type），自动将请求参数绑定到 handler 的 `Req` 结构体。相关实现位于 `binding.go`。
+本框架会根据请求的方法（method）与内容类型（Content-Type），自动将请求参数绑定到 handler 的 `Req` 结构体。绑定相关实现位于 `binding.go`，校验相关实现位于 `validate.go`。
 
 绑定与校验分为两个独立函数：
-- `bindRequestData(r, reqPtr)`：仅执行数据绑定（query/body），在路由命中后立即调用。
-- `validateRequest(reqPtr)`：仅执行参数校验（nonzero + Validator），在洋葱模型 core 层调用。
+- `bindRequestData(r, reqPtr, meta)`：仅执行数据绑定（query/body），在路由命中后立即调用。
+- `validateRequest(reqPtr, meta, needsNonzero)`：仅执行参数校验（nonzero + Validator），在洋葱模型 core 层调用；`needsNonzero` 为注册期预计算的传递性标记，全树无 nonzero 字段时跳过遍历（详见 `parameter-validate.md`）。
 
 > 默认值（`default` 标签）采用两阶段填充：注册阶段预填模板零值字段，请求阶段绑定后补填动态创建的子元素中的 nil 指针字段。详见[默认值机制](#六默认值机制)。
 
@@ -168,10 +168,10 @@ func upload(ctx context.Context, req UploadReq) (Res, error) {
 | 阶段 | 时机 | 填充条件 | 说明 |
 | --- | --- | --- | --- |
 | **注册阶段** | 路由注册时（`buildEntry`） | 所有零值字段（`IsZero()`） | 对空模板一次性预填，生成 `defaultReq` |
-| **请求阶段** | JSON/表单绑定后（`httpEngine`） | 仅 nil 指针字段（`Kind==Ptr && IsNil()`） | 补填动态创建的子元素（slice/map/nested ptr），值类型跳过 |
+| **请求阶段** | JSON/表单绑定后（`httpEngine`） | 仅 nil 指针字段（`Kind==Ptr && IsNil()`） | 补填动态创建的子元素（slice/数组/map/nested ptr），值类型跳过 |
 
 - **注册阶段**：模板为空，所有零值的 `default` 字段被预填，生成 `defaultReq`。`int`/`string`/`[]string`/`*int` 等均参与。
-- **请求阶段**：JSON 解析动态创建了 slice 元素 / map value / nested ptr struct 后，递归进入并对其中 nil 的**指针字段**补填默认值。**值类型（`int`/`string`/`bool`）跳过**，避免覆盖用户显式传入的零值（如 `{"qty": 0}` 不应被改成 `1`）。
+- **请求阶段**：JSON 解析动态创建了 slice/数组元素 / map value / nested ptr struct 后，递归进入并对其中 nil 的**指针字段**补填默认值。**值类型（`int`/`string`/`bool`）跳过**，避免覆盖用户显式传入的零值（如 `{"qty": 0}` 不应被改成 `1`）。
 
 ### 完整示例
 
@@ -251,15 +251,15 @@ type OrderReq struct {
 
 路由注册时，`applyDefaults` 遍历 Req 结构体树，将所有带 `default` 标签的零值字段填入默认值，生成 `defaultReq` 模板。值类型嵌套结构体会被递归进入并预填。指针类型嵌套结构体（模板中为 nil）跳过。
 
-请求时通过 `reflect.New` + `Set(defaultReq)` 浅拷贝获得带默认值的实例。若模板中存在非 nil 的指针/切片/map 字段（`needsDeepCopy` 为 true），还会先执行 `deepCopyDefaults` 断开这些引用类型字段的共享引用，确保并发安全，然后再执行 JSON/表单绑定覆盖。
+请求时通过 `reflect.New` + `Set(defaultReq)` 浅拷贝获得带默认值的实例。若模板中存在非 nil 的指针/切片/map 字段或元素内含引用的数组字段（`needsDeepCopy` 为 true），还会先执行 `deepCopyDefaults` 断开这些引用类型字段的共享引用，确保并发安全，然后再执行 JSON/表单绑定覆盖。
 
 ### 请求阶段：仅 nil 指针补填
 
-JSON 绑定会**动态创建** slice 元素、map value、指针嵌套结构体。这些元素的子字段在注册阶段不存在（模板中容器为 nil），因此绑定后需再次调用 `applyDefaults(requestPhase=true)` 递归补填。
+JSON 绑定会**动态创建** slice/数组元素、map value、指针嵌套结构体。这些元素的子字段在注册阶段不存在（模板中容器为 nil 或零值），因此绑定后需再次调用 `applyDefaults(requestPhase=true)` 递归补填。
 
 **关键约束**：请求阶段仅对 **nil 指针字段** 填充默认值，值类型（`int`/`string`/`bool` 等）一律跳过。原因是值类型的零值（`0`、`""`、`false`）无法区分"用户未传"与"用户显式传了零值"——直接填充会覆盖用户的合法零值输入。
 
-**容器嵌套深度限制**：`applyDefaults` 仅支持单层容器（`[]Struct`、`[]*Struct`、`map[K]Struct`、`map[K]*Struct`）及其指针包裹形式（`*[]Struct`、`*[]*Struct`、`*map[K]Struct`、`*map[K]*Struct`，指针解引用后穿透进入元素）。多层容器（如 `map[K][]Struct`、`[][]Struct`）的内部元素无法被穿透，其默认值填充、nonzero 校验均不生效。详见 `request.md` 中"容器嵌套深度限制"章节。
+**容器嵌套深度限制**：`applyDefaults` 仅支持单层容器（`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`，固定长度数组与切片行为一致）及其指针包裹形式（`*[]Struct`、`*[]*Struct`、`*[N]Struct`、`*map[K]Struct`、`*map[K]*Struct`，指针解引用后穿透进入元素）。多层容器（如 `map[K][]Struct`、`map[K][N]Struct`、`[][]Struct`）的内部元素无法被穿透，其默认值填充、nonzero 校验均不生效。详见 `request.md` 中"容器嵌套深度限制"章节。
 
 ```go
 // ✅ 嵌套容器中的默认值字段推荐使用指针类型

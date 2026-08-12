@@ -140,7 +140,7 @@ func (g *openAPIGenerator) walkTypeUsage(t reflect.Type, viaValue bool, visiting
 
 	meta := buildStructMeta(t)
 	for _, fm := range meta.fields {
-		f := t.Field(fm.indices[0])
+		f := fm.field
 		ft := f.Type
 		switch ft.Kind() {
 		case reflect.Ptr:
@@ -224,7 +224,7 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 
 	meta := buildStructMeta(t)
 	for _, fm := range meta.fields {
-		f := t.Field(fm.indices[0])
+		f := fm.field
 		ft := f.Type
 		switch ft.Kind() {
 		case reflect.Ptr:
@@ -322,7 +322,7 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 		if fm.name == "" || fm.name == "-" {
 			continue
 		}
-		f := reqType.Field(fm.indices[0])
+		f := fm.field
 		if isIgnored(f) {
 			continue
 		}
@@ -477,7 +477,7 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta)
 		if fm.name == "" || fm.name == "-" {
 			continue
 		}
-		f := t.Field(fm.indices[0])
+		f := fm.field
 		if isIgnored(f) {
 			continue
 		}
@@ -674,15 +674,6 @@ func (g *openAPIGenerator) uniqueName(t reflect.Type) string {
 		}
 		name = base + strconv.Itoa(i)
 	}
-}
-
-// derefType 解引用指针类型直到得到非指针类型；
-// 带深度上限，防自引用指针类型（如 type P *P）死循环，超限时原样返回
-func derefType(t reflect.Type) reflect.Type {
-	for i := 0; t.Kind() == reflect.Ptr && i < maxPtrDerefDepth; i++ {
-		t = t.Elem()
-	}
-	return t
 }
 
 // refSchema 生成对 components/schemas 的引用对象

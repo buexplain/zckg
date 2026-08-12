@@ -143,6 +143,28 @@ func orderMapHandler(_ context.Context, req orderMapReq) (orderMapRes, error) {
 	return orderMapRes{OrderNo: req.OrderNo, Count: len(req.Items) + len(req.Extras)}, nil
 }
 
+// orderArrayReq 固定长度数组容器（P2-02 四函数对齐联动：nonzero 校验与切片同等支持）
+type orderArrayReq struct {
+	OrderNo string        `json:"orderNo" nonzero:"true"`
+	Items   [2]orderItem  `json:"items" nonzero:"true"`
+	Extras  [2]*orderItem `json:"extras"`
+}
+
+type orderArrayRes struct {
+	OrderNo string `json:"orderNo"`
+	Count   int    `json:"count"`
+}
+
+func orderArrayHandler(_ context.Context, req orderArrayReq) (orderArrayRes, error) {
+	count := 0
+	for _, it := range req.Extras {
+		if it != nil {
+			count++
+		}
+	}
+	return orderArrayRes{OrderNo: req.OrderNo, Count: len(req.Items) + count}, nil
+}
+
 // ---- 自引用结构体 ----
 type treeNode struct {
 	Name   string    `json:"name" nonzero:"true"`
@@ -837,6 +859,107 @@ func TestValidateRequiredMapOnlyRequiredFieldsChecked(t *testing.T) {
 	}
 }
 
+// ========== 数组元素递归校验（P2-02 四函数对齐联动） ==========
+
+// TestValidateRequiredArrayAllPass 结构体数组每个元素 nonzero 字段均满足，校验通过
+func TestValidateRequiredArrayAllPass(t *testing.T) {
+	router := NewRouter()
+	router.POST("/orderArray", orderArrayHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	body := `{"orderNo":"ORD-001","items":[{"productId":"P1","qty":2},{"productId":"P2","qty":1}]}`
+	req := httptest.NewRequest(http.MethodPost, "/orderArray", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestValidateRequiredArrayChildMissing 结构体数组中某个元素缺少 nonzero 字段，校验失败
+func TestValidateRequiredArrayChildMissing(t *testing.T) {
+	router := NewRouter()
+	router.POST("/orderArray", orderArrayHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	// items[1] 缺少 productId
+	body := `{"orderNo":"ORD-001","items":[{"productId":"P1","qty":2},{"qty":1}]}`
+	req := httptest.NewRequest(http.MethodPost, "/orderArray", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing productId in array element, got %d", rec.Code)
+	}
+}
+
+// TestValidateRequiredArrayMissing 必填数组未传（零值数组），校验失败
+func TestValidateRequiredArrayMissing(t *testing.T) {
+	router := NewRouter()
+	router.POST("/orderArray", orderArrayHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	// items 为 nonzero 但未传
+	body := `{"orderNo":"ORD-001"}`
+	req := httptest.NewRequest(http.MethodPost, "/orderArray", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing required array, got %d", rec.Code)
+	}
+}
+
+// TestValidateRequiredArrayPtrElemChildMissing 指针元素数组中某个元素缺少 nonzero 字段，校验失败
+func TestValidateRequiredArrayPtrElemChildMissing(t *testing.T) {
+	router := NewRouter()
+	router.POST("/orderArray", orderArrayHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	// extras[1] 缺少 qty
+	body := `{"orderNo":"ORD-001","items":[{"productId":"P1","qty":2},{"productId":"P2","qty":1}],"extras":[{"productId":"E1","qty":1},{"productId":"E2"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/orderArray", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing qty in array ptr element, got %d", rec.Code)
+	}
+}
+
+// TestValidateRequiredArrayPtrNilElement 指针元素数组中包含 nil 元素，跳过 nil 不报错，校验其余元素
+func TestValidateRequiredArrayPtrNilElement(t *testing.T) {
+	router := NewRouter()
+	router.POST("/orderArray", orderArrayHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+
+	// extras 包含一个 null → 跳过；另一个正常 → 校验通过
+	body := `{"orderNo":"ORD-001","items":[{"productId":"P1","qty":2},{"productId":"P2","qty":1}],"extras":[null,{"productId":"E1","qty":1}]}`
+	req := httptest.NewRequest(http.MethodPost, "/orderArray", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when null element skipped, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // ========== 指针包裹容器 nonzero 递归校验 ==========
 
 // ptrContainerValidateReq 包含 *[]Struct 和 *map[K]Struct 字段，用于验证指针不阻断 nonzero 校验
@@ -1195,26 +1318,108 @@ func TestValidateNonzeroWalk_MapMultipleValues(t *testing.T) {
 	}
 }
 
-// --- BUG2: isAllDigits("-") 返回 true ---
+// ========== hasNonzeroInTree 传递性扫描 ==========
 
-// TestIsAllDigits_SingleMinus 验证单个负号不应被认为是纯数字
-func TestIsAllDigits_SingleMinus(t *testing.T) {
-	cases := []struct {
-		input string
-		want  bool
-	}{
-		{"-", false},
-		{"-1", true},
-		{"123", true},
-		{"", false},
-		{"abc", false},
-		{"12-3", false},
-		{"-0", true},
+// TestHasNonzeroInTree 验证注册期传递性扫描：类型树任意深度存在 nonzero 字段即返回 true。
+// 关键场景：顶层无标记但嵌套层有时必须返回 true，否则请求阶段快速跳过会导致嵌套 nonzero 漏校验。
+func TestHasNonzeroInTree(t *testing.T) {
+	type nzitInner struct {
+		Code string `json:"code" nonzero:"true"`
 	}
-	for _, c := range cases {
-		got := isAllDigits(c.input)
-		if got != c.want {
-			t.Errorf("isAllDigits(%q) = %v, want %v", c.input, got, c.want)
-		}
+	type nzitPlain struct {
+		Code string `json:"code"`
+	}
+	type nzitSelfRef struct {
+		Name string       `json:"name"`
+		Next *nzitSelfRef `json:"next"`
+	}
+
+	cases := []struct {
+		name string
+		req  any
+		want bool
+	}{
+		{
+			name: "顶层nonzero",
+			req: struct {
+				Name string `json:"name" nonzero:"true"`
+			}{},
+			want: true,
+		},
+		{
+			name: "嵌套值结构体含nonzero（顶层未标注）",
+			req: struct {
+				Inner nzitInner `json:"inner"`
+			}{},
+			want: true,
+		},
+		{
+			name: "嵌套指针结构体含nonzero",
+			req: struct {
+				Inner *nzitInner `json:"inner"`
+			}{},
+			want: true,
+		},
+		{
+			name: "切片元素含nonzero",
+			req: struct {
+				Items []nzitInner `json:"items"`
+			}{},
+			want: true,
+		},
+		{
+			name: "数组元素含nonzero",
+			req: struct {
+				Items [2]nzitInner `json:"items"`
+			}{},
+			want: true,
+		},
+		{
+			name: "map值含nonzero",
+			req: struct {
+				Extras map[string]*nzitInner `json:"extras"`
+			}{},
+			want: true,
+		},
+		{
+			name: "多层容器深处含nonzero（保守方向不跳过）",
+			req: struct {
+				Deep map[string][]nzitInner `json:"deep"`
+			}{},
+			want: true,
+		},
+		{
+			name: "全树无nonzero",
+			req: struct {
+				Inner nzitPlain `json:"inner"`
+			}{},
+			want: false,
+		},
+		{
+			name: "nonzero:false不计入",
+			req: struct {
+				Name string `json:"name" nonzero:"false"`
+			}{},
+			want: false,
+		},
+		{
+			name: "自引用无nonzero不死循环",
+			req:  nzitSelfRef{},
+			want: false,
+		},
+		{
+			name: "标量类型",
+			req:  "",
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasNonzeroInTree(reflect.TypeOf(tc.req), nil)
+			if got != tc.want {
+				t.Fatalf("hasNonzeroInTree() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

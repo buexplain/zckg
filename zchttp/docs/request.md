@@ -1,6 +1,6 @@
 # 请求结构体（Req）定义与标签
 
-本文档介绍 handler 的请求结构体（`Req`）如何定义、支持哪些标签。参数绑定的来源与类型转换细节见 `parameter-binding.md`；校验规则见 `parameter-validate.md`。相关实现位于 `binding.go` 与 `buildEntry.go`。
+本文档介绍 handler 的请求结构体（`Req`）如何定义、支持哪些标签。参数绑定的来源与类型转换细节见 `parameter-binding.md`；校验规则见 `parameter-validate.md`。相关实现位于 `binding.go`（绑定）、`meta.go`（标签解析）与 `validate.go`（校验）。
 
 ## 一、handler 签名与 Req 形态
 
@@ -159,6 +159,10 @@ type OrderReq struct {
 | `[]*Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
 | `map[K]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
 | `map[K]*Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+| `[N]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+| `[N]*Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+
+> 固定长度数组与切片行为一致：默认值填充、nonzero 校验、OpenAPI 展示三者在数组元素上的判定规则与切片完全相同。
 
 ##### 不支持的多层容器
 
@@ -168,6 +172,7 @@ type OrderReq struct {
 | `[]map[K]Struct` | ❌ 无法穿透切片+map | ❌ 无法穿透切片+map | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
 | `map[K][]Struct` | ❌ 无法穿透 map+切片 | ❌ 无法穿透 map+切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
 | `map[K][]*Struct` | ❌ 无法穿透 map+切片 | ❌ 无法穿透 map+切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
+| `map[K][N]Struct` | ❌ 无法穿透 map+数组 | ❌ 无法穿透 map+数组 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
 | `map[K]map[K]Struct` | ❌ 无法穿透 map+map | ❌ 无法穿透 map+map | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
 
 > ¹ 若该结构体类型同时被用在单层容器中，则 `default` 会展示（类型可达性是按类型标记的，非按路径）
@@ -177,9 +182,10 @@ type OrderReq struct {
 | 容器类型 | 默认值填充 | nonzero 校验 | Schema 结构 | default 展示 | description/example | required 计算 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `*[]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
+| `*[N]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
 | `*map[K]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
 
-> 指针本身不阻断可达性：`applyDefaults`、`validateNonzero` 与 OpenAPI 可达性分析均会穿透非 nil 指针，因此 `*[]Struct` 与 `[]Struct`、`*map[K]Struct` 与 `map[K]Struct` 的行为完全一致。
+> 指针本身不阻断可达性：`applyDefaults`、`validateNonzero` 与 OpenAPI 可达性分析均会穿透非 nil 指针，因此 `*[]Struct` 与 `[]Struct`、`*[N]Struct` 与 `[N]Struct`、`*map[K]Struct` 与 `map[K]Struct` 的行为完全一致。
 
 ##### 示例：多层容器的行为差异
 
