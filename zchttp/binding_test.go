@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -1397,7 +1399,7 @@ func TestBindBody_MultipartNilForm(t *testing.T) {
 	// 注意：bindBody 内部会先调用 ParseMultipartForm，我们需要直接测试 nil 场景
 	// 实际上 ParseMultipartForm 会报错导致提前返回，所以这个 bug 在生产中不会触发
 	// 但我们仍然验证代码逻辑一致性
-	err := bindBody(r, reqVal, meta)
+	err := bindBody(r, reqVal, meta, 0)
 	// ParseMultipartForm 会失败，所以这里会提前返回 error，不会走到 nil 分支
 	_ = err
 }
@@ -1485,10 +1487,10 @@ func TestSetScalar_Int8InRange(t *testing.T) {
 
 // ========== P2-03: 空 JSON body 测试 ==========
 
-// TestBindBody_EmptyJSONBody 验证空 JSON body 返回友好错误消息而非 "EOF"
+// TestBindBody_EmptyJSONBody 验证空 JSON body 不报绑定错误，由校验阶段 nonzero 拦截缺失字段
 func TestBindBody_EmptyJSONBody(t *testing.T) {
 	type req struct {
-		Name string `json:"name"`
+		Name string `json:"name" nonzero:"true"`
 	}
 	type res struct{}
 
@@ -1501,19 +1503,17 @@ func TestBindBody_EmptyJSONBody(t *testing.T) {
 	engine.Router = router
 
 	rec := httptest.NewRecorder()
-	httpReq := httptest.NewRequest(http.MethodPost, "/test", nil)
+	httpReq := httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(""))
 	httpReq.Header.Set("Content-Type", "application/json")
 	engine.ServeHTTP(rec, httpReq)
 
+	// 空 body 绑定阶段不报错，校验阶段 nonzero 拦截缺失字段 → 400 ValidationError
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rec.Code)
 	}
 	body := rec.Body.String()
-	if strings.Contains(body, "EOF") {
-		t.Fatalf("response should NOT contain 'EOF', got: %s", body)
-	}
-	if !strings.Contains(body, "empty request body") {
-		t.Fatalf("response should contain 'empty request body', got: %s", body)
+	if !strings.Contains(body, "is required") {
+		t.Fatalf("response should contain 'is required', got: %s", body)
 	}
 }
 
@@ -1862,23 +1862,24 @@ func TestSetScalarUnsupportedKind(t *testing.T) {
 
 // ======== bindBody 分支补测 ========
 
-// TestBindBodyEmptyJSON 覆盖 JSON 空请求体的错误分支
+// TestBindBodyEmptyJSON 覆盖 JSON 空请求体不报绑定错误的分支
 func TestBindBodyEmptyJSON(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(""))
 	req.Header.Set("Content-Type", "application/json")
 	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
-	err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta)
-	if err == nil || !strings.Contains(err.Error(), "empty request body") {
-		t.Fatalf("expected empty request body error, got: %v", err)
+	err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta, 0)
+	if err != nil {
+		t.Fatalf("empty body should not return binding error, got: %v", err)
 	}
 }
 
-// TestBindBodyJSONNoBindableFields 覆盖 JSON 无可绑定字段时跳过解码的分支
+// TestBindBodyJSONNoBindableFields 验证 bindBody 在无可绑定字段时仍可正常工作：
+// 调用方（ServeHTTP）已保证不会调用本函数，但直接调用时 JSON 解码到空结构体无害成功
 func TestBindBodyJSONNoBindableFields(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"a":1}`))
 	req.Header.Set("Content-Type", "application/json")
 	meta := buildStructMeta(reflect.TypeOf(struct{}{}))
-	if err := bindBody(req, reflect.New(reflect.TypeOf(struct{}{})), meta); err != nil {
+	if err := bindBody(req, reflect.New(reflect.TypeOf(struct{}{})), meta, 0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -1889,7 +1890,7 @@ func TestBindBodyUnknownCTNoBody(t *testing.T) {
 	req.Header.Set("Content-Type", "text/plain")
 	req.Body = nil
 	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
-	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err != nil {
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta, 0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -1908,7 +1909,7 @@ func TestBindBodyJSONNilBody(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Body = nil
 	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
-	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err != nil {
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta, 0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -1918,7 +1919,7 @@ func TestBindBodyUnknownCTInvalidJSON(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader("not json"))
 	req.Header.Set("Content-Type", "text/plain")
 	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
-	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err == nil {
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta, 0); err == nil {
 		t.Fatal("expected json decode error, got nil")
 	}
 }
@@ -1928,7 +1929,7 @@ func TestBindBodyMultipartParseError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader("garbage"))
 	req.Header.Set("Content-Type", "multipart/form-data")
 	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
-	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err == nil {
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta, 0); err == nil {
 		t.Fatal("expected multipart parse error, got nil")
 	}
 }
@@ -1986,7 +1987,75 @@ func TestBindBodyFormParseError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(big))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	meta := buildStructMeta(reflect.TypeOf(helloReq{}))
-	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta); err == nil {
+	if err := bindBody(req, reflect.New(reflect.TypeOf(helloReq{})), meta, 0); err == nil {
 		t.Fatal("expected form parse error, got nil")
+	}
+}
+
+// ======== m7-③: multipart 超内存缓冲走临时文件 ========
+
+// TestBindMultipartMaxMemoryTempFile 验证 MultipartFormMaxMemory 配置的内存缓冲上限生效：
+// 文件大小超过上限时由 net/http 写入临时文件，绑定仍成功且文件内容完整可读
+func TestBindMultipartMaxMemoryTempFile(t *testing.T) {
+	type tmpFileReq struct {
+		File *multipart.FileHeader `json:"file"`
+	}
+	type tmpFileRes struct {
+		OK   bool `json:"ok"`
+		Size int  `json:"size"`
+	}
+
+	router := NewRouter()
+	router.POST("/upload", func(_ context.Context, req tmpFileReq) (tmpFileRes, error) {
+		if req.File == nil {
+			return tmpFileRes{OK: false}, nil
+		}
+		f, err := req.File.Open()
+		if err != nil {
+			return tmpFileRes{OK: false}, fmt.Errorf("open uploaded file: %w", err)
+		}
+		defer f.Close()
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return tmpFileRes{OK: false}, fmt.Errorf("read uploaded file: %w", err)
+		}
+		return tmpFileRes{OK: true, Size: len(data)}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+	// 内存缓冲上限仅 1KB：文件远超上限，必须写入临时文件
+	engine.MultipartFormMaxMemory = 1 << 10
+
+	// 构造 64KB 上传文件
+	payload := bytes.Repeat([]byte("z"), 64<<10)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", "big.bin")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := fw.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/upload", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res tmpFileRes
+	decodeData(t, rec, &res)
+	if !res.OK {
+		t.Fatal("file should be bound and readable after spilling to temp file")
+	}
+	if res.Size != len(payload) {
+		t.Fatalf("file size = %d, want %d (content must survive temp file spill)", res.Size, len(payload))
 	}
 }

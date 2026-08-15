@@ -228,7 +228,14 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 					return
 				}
 			}
+			// 迭代中断（连接错误、ctx 取消等）时 rows.Err() 非 nil，
+			// 必须向调用方报告，否则「出错截断」会被误认为「正常迭代完毕」而静默丢数据
+			iterErr := rows.Err()
 			_ = rows.Close()
+			if iterErr != nil {
+				yield(iterErr)
+				return
+			}
 
 			// 不足一批，说明已迭代完毕
 			if count < chunkSize {

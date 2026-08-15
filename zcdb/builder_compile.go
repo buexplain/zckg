@@ -201,9 +201,18 @@ func (b *Builder) ToUpsert(data any, uniqueBy []string, updateColumns []string) 
 		return "", nil, err
 	}
 
-	// 如果未指定更新列，则更新所有插入列
+	// 如果未指定更新列，则更新所有插入列（排除 uniqueBy 冲突目标列，避免冗余自赋值）；
+	// 全部插入列均为 uniqueBy 时退化为「冲突时不更新」（PG/SQLite DO NOTHING，MySQL 自赋值 no-op）
 	if len(updateColumns) == 0 {
-		updateColumns = columns
+		excluded := make(map[string]bool, len(uniqueBy))
+		for _, c := range uniqueBy {
+			excluded[c] = true
+		}
+		for _, c := range columns {
+			if !excluded[c] {
+				updateColumns = append(updateColumns, c)
+			}
+		}
 	}
 
 	// MySQL 使用 ON DUPLICATE KEY UPDATE 无需冲突目标列；
@@ -219,9 +228,14 @@ func (b *Builder) ToUpsert(data any, uniqueBy []string, updateColumns []string) 
 	// 这里不传具体 values，Grammar 自行处理语法
 	sql := b.grammar.CompileUpsert(b, columns, rows, uniqueBy, updateColumns, nil)
 
+	// 扁平化所有行的值作为绑定参数；Expression 已内联进 SQL，不作为绑定参数
 	var args []any
 	for _, row := range rows {
-		args = append(args, row...)
+		for _, v := range row {
+			if _, ok := v.(Expression); !ok {
+				args = append(args, v)
+			}
+		}
 	}
 
 	return sql, args, nil
@@ -380,11 +394,12 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 		}
 	}
 	if b.grammar.UpdateSetBeforeJoin() {
-		// SET → JOIN → WHERE
+		// PG/SQLite：SET → FROM（全部派生表子查询，按 flatten 顺序）→ WHERE（全部 ON 条件 → WHERE 条件）
 		setBindings()
-		args = append(args, b.collectJoinBindings()...)
+		args = append(args, collectJoinTableBindings(b.joins)...)
+		args = append(args, collectJoinOnBindings(b.joins)...)
 	} else {
-		// JOIN → SET → WHERE
+		// MySQL：JOIN（直译，逐 join 按 派生表→嵌套组→ON 条件 保序）→ SET → WHERE
 		args = append(args, b.collectJoinBindings()...)
 		setBindings()
 	}
@@ -453,9 +468,16 @@ func (b *Builder) ToDeleteJoin() (string, []any, error) {
 
 	sqlStr := b.grammar.CompileDeleteJoin(b)
 
-	// 绑定顺序三方言一致：JOIN 条件 → WHERE 条件
+	// 绑定顺序须与各方言编译文本一致：
+	// PG 为 DELETE ... USING（全部派生表先出）... WHERE（ON 条件并入前部）；
+	// MySQL 多表 DELETE 直译 JOIN、SQLite 主键 IN 子查询直译 JOIN，逐 join 保序。
 	var args []any
-	args = append(args, b.collectJoinBindings()...)
+	if _, ok := b.grammar.(*PostgresGrammar); ok {
+		args = append(args, collectJoinTableBindings(b.joins)...)
+		args = append(args, collectJoinOnBindings(b.joins)...)
+	} else {
+		args = append(args, b.collectJoinBindings()...)
+	}
 	args = append(args, b.collectWhereBindings()...)
 
 	return sqlStr, args, nil
@@ -472,6 +494,9 @@ func (b *Builder) ToDeleteJoin() (string, []any, error) {
 //
 // 返回 (SQL, 错误)
 func (b *Builder) ToTruncate() (string, error) {
+	if b.err != nil {
+		return "", b.err
+	}
 	if b.table == "" {
 		return "", ErrEmptyTable
 	}
@@ -757,11 +782,12 @@ func (b *Builder) toIncDec(columns []string, amounts []any, op string) (string, 
 	// 绑定顺序与 ToUpdate 一致：amounts 占据 SET 位置
 	var args []any
 	if b.grammar.UpdateSetBeforeJoin() {
-		// SET → JOIN → WHERE
+		// PG/SQLite：SET → FROM（全部派生表子查询）→ WHERE（ON 条件 → WHERE 条件）
 		args = append(args, amounts...)
-		args = append(args, b.collectJoinBindings()...)
+		args = append(args, collectJoinTableBindings(b.joins)...)
+		args = append(args, collectJoinOnBindings(b.joins)...)
 	} else {
-		// JOIN → SET → WHERE
+		// MySQL：JOIN → SET → WHERE
 		args = append(args, b.collectJoinBindings()...)
 		args = append(args, amounts...)
 	}
@@ -837,6 +863,31 @@ func collectHavingBindings(havings []HavingClause) []any {
 	return args
 }
 
+// collectJoinTableBindings 按 PG/SQLite UPDATE ... FROM / DELETE ... USING 的编译文本顺序
+// 收集 join 目标表（派生表子查询）的绑定参数：与 grammar 的 flatten 顺序一致
+// （每个 join 的自身目标表先于其嵌套 join 组，递归展开）。
+func collectJoinTableBindings(joins []JoinClause) []any {
+	var args []any
+	for _, j := range joins {
+		if j.Sub != nil {
+			args = append(args, j.Sub.collectSelectBindings()...)
+		}
+		args = append(args, collectJoinTableBindings(j.Joins)...)
+	}
+	return args
+}
+
+// collectJoinOnBindings 按 compileJoinWheres 的展平顺序收集全部 ON 条件的绑定参数：
+// 每个 join 的嵌套 join 组条件在前、自身条件在后（PG/SQLite 将 ON 并入 WHERE 前部时的编译顺序）。
+func collectJoinOnBindings(joins []JoinClause) []any {
+	var args []any
+	for _, j := range joins {
+		args = append(args, collectJoinOnBindings(j.Joins)...)
+		args = append(args, collectJoinConditionBindings(j.Conditions)...)
+	}
+	return args
+}
+
 // collectJoinBindings 收集 JOIN ON 条件中的绑定参数（value 与 raw 类型）。
 func (b *Builder) collectJoinBindings() []any {
 	var args []any
@@ -868,6 +919,10 @@ func collectJoinConditionBindings(conditions []JoinCondition) []any {
 	for _, c := range conditions {
 		switch c.Type {
 		case "value":
+			// nil 特判：= / != / <> 遇 nil 编译为 IS [NOT] NULL，无绑定参数（与 collectWhereBindings 对称）
+			if c.Value == nil && (c.Operator == "=" || c.Operator == "!=" || c.Operator == "<>") {
+				continue
+			}
 			if _, ok := c.Value.(Expression); !ok {
 				args = append(args, c.Value)
 			}

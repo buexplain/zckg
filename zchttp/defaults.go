@@ -97,7 +97,19 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 		case reflect.Slice, reflect.Array:
 			elem := ft.Elem()
 			if elem.Kind() == reflect.Ptr {
-				checkUnsupportedDefaults(elem.Elem(), false, viaDefaults, method, path, handlerName, handlerFile, handlerLine, visiting)
+				elem = elem.Elem()
+			}
+			if elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array || elem.Kind() == reflect.Map {
+				// 多层容器（[][]Struct、[]map[K]Struct、[]map[K][]Struct 等）：元素仍为容器，
+				// applyDefaults 无法穿透，继续下探直到 struct 元素并传递 viaDefaults=false，
+				// 使其中带 default 的字段触发启动期警告（与 map 分支的警告行为对齐）
+				for elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array || elem.Kind() == reflect.Map {
+					elem = elem.Elem()
+					if elem.Kind() == reflect.Ptr {
+						elem = elem.Elem()
+					}
+				}
+				checkUnsupportedDefaults(elem, false, false, method, path, handlerName, handlerFile, handlerLine, visiting)
 			} else {
 				checkUnsupportedDefaults(elem, false, viaDefaults, method, path, handlerName, handlerFile, handlerLine, visiting)
 			}
@@ -127,20 +139,19 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 // 请求阶段（requestPhase=true）：仅递归进入动态创建的子元素（切片/数组/map/nested ptr），
 // 并仅对 nil 指针字段填充默认值（值类型如 int/string 不填充，避免覆盖用户显式传入的零值）。
 // meta 为注册阶段预计算的 structMeta，直接遍历其 fields 避免请求阶段反射。
-func applyDefaults(reqPtr reflect.Value, meta structMeta, requestPhase ...bool) error {
+func applyDefaults(reqPtr reflect.Value, meta structMeta, requestPhase ...bool) {
 	rp := len(requestPhase) > 0 && requestPhase[0]
 	visiting := acquireVisitMap()
-	err := applyDefaultsWithVisiting(reqPtr, meta, rp, visiting)
+	applyDefaultsWithVisiting(reqPtr, meta, rp, visiting)
 	releaseVisitMap(visiting)
-	return err
 }
 
 // applyDefaultsWithVisiting 是 applyDefaults 的内部实现，携带 visiting map 用于运行时循环检测。
 // visiting 按 visitKey（指针地址+类型）追踪已访问的实例，避免自引用结构体导致栈溢出。
-func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, visiting map[visitKey]bool) error {
+func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, visiting map[visitKey]bool) {
 	elem := reqPtr.Elem()
 	if elem.Kind() != reflect.Struct {
-		return nil
+		return
 	}
 
 	// 运行时循环检测：若当前结构体实例已访问过，停止递归，避免自引用导致栈溢出
@@ -149,7 +160,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 		visiting = make(map[visitKey]bool)
 	}
 	if visiting[key] {
-		return nil
+		return
 	}
 	visiting[key] = true
 	defer delete(visiting, key)
@@ -170,8 +181,14 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 		if shouldFill {
 			var values []string
 			if fm.isSlice {
-				// 切片默认值以逗号分隔，如 default:"a,b,c"；去除首尾逗号避免多余空元素
-				values = strings.Split(strings.Trim(fm.defaultVal, ","), ",")
+				// 切片默认值以逗号分隔，如 default:"a,b,c"。
+				// Trim 后为空（default:""、default:" "、default:",,,"）视为空切片，
+				// 而非含单个空元素的切片（与绑定语义一致，空默认值 = 无元素）
+				trimmed := strings.TrimSpace(fm.defaultVal)
+				trimmed = strings.Trim(trimmed, ",")
+				if trimmed != "" {
+					values = strings.Split(trimmed, ",")
+				}
 			} else {
 				values = []string{strings.TrimSpace(fm.defaultVal)}
 			}
@@ -189,7 +206,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 		}
 		if subV.Kind() == reflect.Struct {
 			subMeta := cachedStructMeta(subV.Type())
-			_ = applyDefaultsWithVisiting(subV.Addr(), subMeta, rp, visiting)
+			applyDefaultsWithVisiting(subV.Addr(), subMeta, rp, visiting)
 		} else if subV.Kind() == reflect.Slice {
 			// 结构体切片/结构体指针切片：递归填充每个元素中带 default 标签的字段
 			elemType := subV.Type().Elem()
@@ -207,7 +224,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 						}
 						elem = elem.Elem()
 					}
-					_ = applyDefaultsWithVisiting(elem.Addr(), subMeta, rp, visiting)
+					applyDefaultsWithVisiting(elem.Addr(), subMeta, rp, visiting)
 				}
 			}
 		} else if subV.Kind() == reflect.Array {
@@ -227,7 +244,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 						}
 						elem = elem.Elem()
 					}
-					_ = applyDefaultsWithVisiting(elem.Addr(), subMeta, rp, visiting)
+					applyDefaultsWithVisiting(elem.Addr(), subMeta, rp, visiting)
 				}
 			}
 		} else if subV.Kind() == reflect.Map {
@@ -263,7 +280,7 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 					// MapIndex 返回的值不可寻址，需复制一份再调用 applyDefaults
 					valCopy := reflect.New(valType).Elem()
 					valCopy.Set(val)
-					_ = applyDefaultsWithVisiting(valCopy.Addr(), subMeta, rp, visiting)
+					applyDefaultsWithVisiting(valCopy.Addr(), subMeta, rp, visiting)
 					// 写回 map：值类型用 SetMapIndex，指针类型通过 pointee 写回
 					if isPtrVal {
 						subV.MapIndex(key).Elem().Set(valCopy)
@@ -274,7 +291,6 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 			}
 		}
 	}
-	return nil
 }
 
 // deepCopyDefaults 递归深拷贝结构体树中所有指针/切片/map 字段，确保并发请求间不共享底层内存。

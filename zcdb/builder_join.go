@@ -285,6 +285,7 @@ func (j *JoinBuilder) OrOn(first, op, second string) *JoinBuilder {
 
 // Where 添加一个 AND ON 值比较条件 (ON ... AND column op ?)，值走占位符绑定。
 // value 为 *Builder 时编译为子查询比较 (column op (SELECT ...))。
+// value 为 nil 时自动转换（与 Builder.Where 语义对齐）：= 转 IS NULL，!=/<> 转 IS NOT NULL。
 //
 //	j.On("orders.user_id", "=", "users.id").Where("orders.status", "=", "paid")
 //	// SQL: ... INNER JOIN `orders` ON `orders`.`user_id` = `users`.`id` AND `orders`.`status` = ?

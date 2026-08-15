@@ -46,6 +46,8 @@ zcdb 本身不依赖具体数据库驱动，需由使用方引入 `database/sql`
 | UNION + 锁 | 支持 | 不支持（编译报错） | 不支持锁 |
 | RIGHT JOIN | 支持 | 支持 | 3.39 以下不支持 |
 | CROSS JOIN ON | 直译 | 编译为 `INNER JOIN ... ON`（等价） | 直译 |
+| UNION 子查询括号 | 各查询加括号包裹 | 各查询加括号包裹 | 不加括号（SQLite 不允许） |
+| Truncate | `TRUNCATE TABLE` | `TRUNCATE TABLE ... RESTART IDENTITY` | `DELETE FROM` + 清 `sqlite_sequence` |
 | 随机排序 | `RAND()` | `RANDOM()` | `RANDOM()` |
 
 > 本文档的 SQL 示例统一以 **MySQL 形态**给出；PG/SQLite 仅按上表规则变化（包裹符与占位符），存在语义差异处会单独列出。

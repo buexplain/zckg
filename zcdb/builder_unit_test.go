@@ -485,8 +485,7 @@ func TestBuilder_InvalidOperatorErrorBranch(t *testing.T) {
 		})
 	}
 
-	// 边界固化（审查结论）：大小写变体行为——全小写（归一化为大写）与全大写被接受，
-	// 首字符大写的混合大小写（如 "Like"）不被归一化而是拒绝；拒绝是安全方向，不视为 bug。
+	// 边界固化（m3 修复后）：大小写归一化对所有形态生效，混合大小写同样被接受。
 	if err := validateOperator("like"); err != nil {
 		t.Errorf("全小写 like 应被接受, got %v", err)
 	}
@@ -496,8 +495,11 @@ func TestBuilder_InvalidOperatorErrorBranch(t *testing.T) {
 	if err := validateOperator("NOT LIKE"); err != nil {
 		t.Errorf("全大写 NOT LIKE 应被接受, got %v", err)
 	}
-	if err := validateOperator("Like"); !errors.Is(err, ErrInvalidOperator) {
-		t.Errorf("混合大小写 Like 应被拒绝, got %v", err)
+	if err := validateOperator("Like"); err != nil {
+		t.Errorf("混合大小写 Like 应被接受（m3 修复）, got %v", err)
+	}
+	if err := validateOperator("EvIl"); !errors.Is(err, ErrInvalidOperator) {
+		t.Errorf("非法运算符 EvIl 应被拒绝, got %v", err)
 	}
 }
 

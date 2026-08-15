@@ -1313,8 +1313,9 @@ func TestValidateNonzeroWalk_MapMultipleValues(t *testing.T) {
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
 	}
-	if ve.Field != "root.children.name" {
-		t.Errorf("Field = %q, want %q", ve.Field, "root.children.name")
+	// n11：map 值的字段错误路径必须包含 map key，便于定位具体哪个 value 校验失败
+	if ve.Field != "root.children.zzz_bad.name" {
+		t.Errorf("Field = %q, want %q", ve.Field, "root.children.zzz_bad.name")
 	}
 }
 

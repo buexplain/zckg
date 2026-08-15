@@ -265,10 +265,57 @@ func TestCast_Float64ToFloat32(t *testing.T) {
 	}
 }
 
-func TestCast_IntToBoolNotConvertible(t *testing.T) {
-	// int 不可转换为 bool，应返回默认值
-	if v := cast(1, false); v != false {
-		t.Errorf("int -> bool 不可转换，期望默认值 false，实际 %v", v)
+func TestCast_IntToBool(t *testing.T) {
+	// 数值类型 -> bool 特判：C 语言惯例，零值为 false，非零为 true。
+	// 此特判解决 .env 中 "1"/"0" 被 parseValue 推断为 int 后无法转 bool 的问题。
+	if v := cast(1, false); v != true {
+		t.Errorf("int(1) -> bool 期望 true，实际 %v", v)
+	}
+	if v := cast(0, false); v != false {
+		t.Errorf("int(0) -> bool 期望 false，实际 %v", v)
+	}
+	if v := cast(int64(42), false); v != true {
+		t.Errorf("int64(42) -> bool 期望 true，实际 %v", v)
+	}
+	if v := cast(0, true); v != false {
+		t.Errorf("int(0) -> bool 期望 false，实际 %v", v)
+	}
+	if v := cast(3.14, false); v != true {
+		t.Errorf("float64(3.14) -> bool 期望 true，实际 %v", v)
+	}
+	if v := cast(0.0, true); v != false {
+		t.Errorf("float64(0) -> bool 期望 false，实际 %v", v)
+	}
+}
+
+func TestCast_IntToStringReturnsDefault(t *testing.T) {
+	// 数值类型 -> string 是 Unicode 码点语义（65 -> "A"），不是数字转字符串，应返回 def
+	if v := cast(65, "fallback"); v != "fallback" {
+		t.Errorf("int -> string 应返回默认值，实际 %q（码点陷阱）", v)
+	}
+	if v := cast(int64(100), "def"); v != "def" {
+		t.Errorf("int64 -> string 应返回默认值，实际 %q", v)
+	}
+	if v := cast(uint(42), ""); v != "" {
+		t.Errorf("uint -> string 应返回默认值，实际 %q", v)
+	}
+	if v := cast(3.14, "def"); v != "def" {
+		t.Errorf("float64 -> string 应返回默认值，实际 %q", v)
+	}
+}
+
+func TestParseValue_LargeInteger(t *testing.T) {
+	// 超大整数应保留为 string，不应降级为 float64
+	v := parseValue("99999999999999999999")
+	if _, ok := v.(string); !ok {
+		t.Errorf("超大整数期望保留为 string，实际类型 %T", v)
+	}
+	// 带小数点或指数的值仍应解析为 float64
+	if f := parseValue("1.5"); f != 1.5 {
+		t.Errorf("parseValue(\"1.5\") 期望 1.5，实际 %v", f)
+	}
+	if f := parseValue("1e100"); f != 1e100 {
+		t.Errorf("parseValue(\"1e100\") 期望 1e100，实际 %v", f)
 	}
 }
 

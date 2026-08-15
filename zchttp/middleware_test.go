@@ -180,17 +180,19 @@ func TestResponseWriterPoolReuse(t *testing.T) {
 	w1 := httptest.NewRecorder()
 	rw := acquireResponseWriter(w1)
 	rw.WriteHeader(http.StatusOK)
-	if !rw.Written() {
+	if !IsResponseWritten(rw) {
 		t.Fatal("expected written=true after WriteHeader")
 	}
 	releaseResponseWriter(rw)
 
 	w2 := httptest.NewRecorder()
 	rw2 := acquireResponseWriter(w2)
-	if rw2.Written() {
+	if IsResponseWritten(rw2) {
 		t.Fatal("pooled responseWriter must reset written=false")
 	}
-	if rw2.ResponseWriter != w2 {
+	// 池化的基础包装器必须绑定新的底层 writer：写入后能到达 w2 即证明绑定正确
+	_, _ = rw2.Write([]byte("probe"))
+	if w2.Body.String() != "probe" {
 		t.Fatal("pooled responseWriter must bind the new underlying writer")
 	}
 	releaseResponseWriter(rw2)

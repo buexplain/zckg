@@ -8,10 +8,21 @@ import (
 	"strings"
 )
 
+// Router 路由注册表。注册必须在服务启动前完成，运行期并发注册属未定义行为
 type Router struct {
 	routes      map[string]map[string]*routeEntry // 精确匹配路由表：method -> path -> entry
-	paramTrees  map[string]*routeNode             // 参数路由基数树：method -> 根节点（仅在注册了参数路由时构建）
+	paramTrees  map[string]*routeNode             // 参数路由基数树：method -> 预初始化根节点
+	paramRoutes []paramRouteEntry                 // 参数路由索引（按注册顺序）：供 OpenAPI 生成遍历
 	middlewares []MiddlewareHandler               // 全局中间件，作用于通过本 Router 注册的所有路由
+}
+
+// paramRouteEntry 保存参数路由的 method/path 模板与 entry，
+// 参数路由不写入精确路由表，GenerateOpenAPI 依赖此索引还原路径模板
+// （path 为注册时归一化前的原始模板，含 {name} 参数段）
+type paramRouteEntry struct {
+	method string
+	path   string
+	entry  *routeEntry
 }
 
 func NewRouter() *Router {
@@ -63,7 +74,8 @@ func (r *Router) register(method, path string, handler any, groupMiddlewares []M
 	// 注册阶段扫描 Req 类型树，检测 default 标签误用（包含路由信息以便定位）
 	checkUnsupportedDefaults(entry.reqElemType, true, true, method, path, entry.handlerName, entry.handlerFile, entry.handlerLine, map[reflect.Type]bool{})
 
-	// 参数路由（含 {name}/{name?} 段）：解析路径语法、预计算 Req 字段绑定后插入基数树
+	// 参数路由（含 {name}/{name?} 段）：解析路径语法、预计算 Req 字段绑定后插入基数树；
+	// 同时写入 paramRoutes 索引，供 OpenAPI 生成（参数路由不写入精确路由表）
 	if strings.ContainsAny(path, "{}") {
 		segments, perr := parseRoutePath(path)
 		if perr != nil {
@@ -71,6 +83,7 @@ func (r *Router) register(method, path string, handler any, groupMiddlewares []M
 		}
 		attachPathParamBindings(entry, segments, method, path)
 		insertParamRoute(r.paramTrees[method], segments, entry, method, path)
+		r.paramRoutes = append(r.paramRoutes, paramRouteEntry{method: method, path: path, entry: entry})
 		return
 	}
 

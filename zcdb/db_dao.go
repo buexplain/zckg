@@ -52,11 +52,9 @@ type DBDao struct {
 //	"postgresql" → PostgresGrammar
 //	"sqlite"     → SQLiteGrammar
 //
-// slowSQLMillis 控制慢 SQL 检测行为：
-//
-//	<0 禁用日志输出
-//	=0 全量日志输出
-//	>0 仅超过阈值（毫秒）时输出
+// onSQL 为 SQL 回调（常用于慢 SQL 检测）：非 nil 时每条经 DAO 执行的 SQL 都会回调，
+// 传入执行耗时、SQL 文本与绑定参数，阈值判断由回调内部自行决定；为 nil 时不计时（零开销）。
+// 回调内 panic 会被 recover 隔离，不影响主流程。
 //
 // tagName 指定结构体与数据库列映射使用的标签名（如 "zc"），
 // 空字符串使用默认的 db 标签；初始化后不可变更。
@@ -113,9 +111,12 @@ func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Resul
 		result, err = db.ExecContext(ctx, sqlStr, args...)
 	}
 
-	// 慢 SQL 检测
+	// 慢 SQL 检测（recover 隔离：回调 panic 不影响主流程）
 	if d.onSQL != nil {
-		d.onSQL(ctx, time.Since(start), sqlStr, args)
+		func() {
+			defer func() { _ = recover() }()
+			d.onSQL(ctx, time.Since(start), sqlStr, args)
+		}()
 	}
 
 	return result, err
@@ -158,9 +159,12 @@ func (d *DBDao) query(ctx context.Context, sqlStr string, primary bool, args ...
 		rows, err = db.QueryContext(ctx, sqlStr, args...)
 	}
 
-	// 慢 SQL 检测
+	// 慢 SQL 检测（recover 隔离：回调 panic 不影响主流程）
 	if d.onSQL != nil {
-		d.onSQL(ctx, time.Since(start), sqlStr, args)
+		func() {
+			defer func() { _ = recover() }()
+			d.onSQL(ctx, time.Since(start), sqlStr, args)
+		}()
 	}
 
 	return rows, err

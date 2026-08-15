@@ -94,7 +94,7 @@ sql, args, _ := db.Builder().Table("users").
 // PG:    INSERT INTO "users" (...) VALUES (...) ON CONFLICT ("email") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"
 ```
 
-`updateColumns` 为空时默认更新所有插入列；PostgreSQL/SQLite 下 `uniqueBy` 为空返回 `ErrUpsertUniqueByRequired`。
+`updateColumns` 为空时默认更新所有插入列（排除 uniqueBy 列；全部插入列均为 uniqueBy 时退化为「冲突时不更新」：PG/SQLite 编译为 `DO NOTHING`，MySQL 编译为自赋值 no-op）；PostgreSQL/SQLite 下 `uniqueBy` 为空返回 `ErrUpsertUniqueByRequired`。
 
 ### ToInsertUsing / ToInsertOrIgnoreUsing
 

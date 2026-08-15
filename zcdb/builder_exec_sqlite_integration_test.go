@@ -8,6 +8,7 @@ import (
 	_ "modernc.org/sqlite"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSQLiteInteg_InsertSingle 验证单条结构体插入：传入单个结构体，生成并执行 INSERT，确认数据正确写入。
@@ -1106,5 +1107,303 @@ func TestSQLiteInteg_NewApi_DeleteJoin(t *testing.T) {
 	_, err = db.Builder().Table("users").Force().DeleteJoin(ctx)
 	if !errors.Is(err, ErrDeleteJoinNoJoin) {
 		t.Errorf("expected ErrDeleteJoinNoJoin, got %v", err)
+	}
+}
+
+// TestSQLiteInteg_Bug_EmptyWhereRawProtection 锁定 B1 修复：
+// 空串/纯空白 WhereRaw 编译后无任何条件，不得计为有效 WHERE——
+// 修复前 WhereRaw("").Delete 会绕过保护删除全表（实测 affected=2）。
+func TestSQLiteInteg_Bug_EmptyWhereRawProtection(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	ctx := context.Background()
+
+	for _, raw := range []string{"", "   "} {
+		_, err := db.Builder().Table("users").WhereRaw(raw).Delete(ctx)
+		if !errors.Is(err, ErrDeleteWithoutWhere) {
+			t.Errorf("Delete with WhereRaw(%q): expected ErrDeleteWithoutWhere, got %v", raw, err)
+		}
+		_, err = db.Builder().Table("users").WhereRaw(raw).Update(ctx, struct {
+			Status string `db:"status"`
+		}{Status: "x"})
+		if !errors.Is(err, ErrUpdateWithoutWhere) {
+			t.Errorf("Update with WhereRaw(%q): expected ErrUpdateWithoutWhere, got %v", raw, err)
+		}
+		_, err = db.Builder().Table("users").WhereRaw(raw).Increment(ctx, "age", 1)
+		if !errors.Is(err, ErrUpdateWithoutWhere) {
+			t.Errorf("Increment with WhereRaw(%q): expected ErrUpdateWithoutWhere, got %v", raw, err)
+		}
+	}
+
+	// 数据未被破坏
+	count, err := db.Builder().Table("users").Count(ctx)
+	assertNoError(t, err)
+	if count != 5 {
+		t.Fatalf("users count after rejected ops: expected 5, got %d", count)
+	}
+
+	// 对照：非空 Raw 仍是有效限定/逃生口，保护逻辑不误伤
+	affected, err := db.Builder().Table("users").WhereRaw("1 = 1").Delete(ctx)
+	assertNoError(t, err)
+	if affected != 5 {
+		t.Errorf("Delete with WhereRaw(\"1 = 1\"): expected 5, got %d", affected)
+	}
+}
+
+// TestSQLiteInteg_Bug_DanglingBoolean 锁定 M3 修复：
+// 首条子句编译为空（空 Raw/空嵌套组）时，后续子句不得带悬挂连接词——
+// 修复前产出 "WHERE AND ..." / "ON AND ..." / "HAVING AND ..." 语法错误。
+func TestSQLiteInteg_Bug_DanglingBoolean(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteProfilesTable(t, db)
+	ctx := context.Background()
+
+	// ON 侧：JoinBuilder 首条件为空 Raw（修复前 "ON AND ..." 语法错误）
+	count, err := db.Builder().Table("users").
+		JoinOn("profiles", func(j *JoinBuilder) {
+			j.Raw("").On("profiles.user_id", "=", "users.id").Where("profiles.active", "=", 99)
+		}).Count(ctx)
+	assertNoError(t, err)
+	if count != 3 { // profiles 覆盖 user 1,2,3
+		t.Errorf("Join with leading empty Raw: expected 3, got %d", count)
+	}
+
+	// HAVING 侧：首条 HavingRaw 为空（修复前 "HAVING AND ..." 语法错误）
+	var statuses []string
+	err = db.Builder().Table("users").Select("status").GroupBy("status").
+		HavingRaw("").Having("status", "=", "inactive").
+		Pluck(ctx, &statuses, "status")
+	assertNoError(t, err)
+	if len(statuses) != 1 || statuses[0] != "inactive" {
+		t.Errorf("Having after empty HavingRaw: expected [inactive], got %v", statuses)
+	}
+
+	// WHERE 侧：空 Raw 后的有效条件正常生效（修复前 "WHERE AND `id` = ?" 语法错误）
+	affected, err := db.Builder().Table("users").WhereRaw("").Where("id", "=", 1).Delete(ctx)
+	assertNoError(t, err)
+	if affected != 1 {
+		t.Errorf("Delete after empty WhereRaw: expected 1, got %d", affected)
+	}
+}
+
+// TestSQLiteInteg_Bug_UpdateMixedJoinBindings 锁定 B2 修复（Update 与 toIncDec 路径）：
+// 靠前 join 带 ON 值绑定 + 靠后 join 为带绑定的派生表时，
+// 修复前占位符顺序（FROM 派生表先于 ON 条件）与绑定数组顺序（per-join 收集）错位，
+// profiles.active 会被绑成子查询的 100 → 0 行命中。
+func TestSQLiteInteg_Bug_UpdateMixedJoinBindings(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteProfilesTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+	ctx := context.Background()
+
+	// profiles.active=99 → user 1,2,3；orders amount>100 → user 1,2,4；
+	// 交集 1,2 且 status='active' → alice/bob 2 行
+	buildChain := func() *Builder {
+		sub := db.Builder().Table("orders").Select("user_id").Where("amount", ">", 100)
+		return db.Builder().Table("users").
+			JoinOn("profiles", func(j *JoinBuilder) {
+				j.On("profiles.user_id", "=", "users.id").Where("profiles.active", "=", 99)
+			}).
+			JoinSub(sub, "o", func(j *JoinBuilder) { j.On("o.user_id", "=", "users.id") }).
+			Where("users.status", "=", "active")
+	}
+
+	affected, err := buildChain().Update(ctx, struct {
+		Status string `db:"status"`
+	}{Status: "vip"})
+	assertNoError(t, err)
+	if affected != 2 {
+		t.Fatalf("Update mixed-join affected: expected 2, got %d", affected)
+	}
+	vipCount, err := db.Builder().Table("users").Where("status", "=", "vip").Count(ctx)
+	assertNoError(t, err)
+	if vipCount != 2 {
+		t.Errorf("vip count: expected 2, got %d", vipCount)
+	}
+
+	// toIncDec 路径（同样的混合 join 绑定顺序）：alice 25→26, bob 30→31
+	sub := db.Builder().Table("orders").Select("user_id").Where("amount", ">", 100)
+	affected, err = db.Builder().Table("users").
+		JoinOn("profiles", func(j *JoinBuilder) {
+			j.On("profiles.user_id", "=", "users.id").Where("profiles.active", "=", 99)
+		}).
+		JoinSub(sub, "o", func(j *JoinBuilder) { j.On("o.user_id", "=", "users.id") }).
+		Where("users.status", "=", "vip").
+		Increment(ctx, "age", 1)
+	assertNoError(t, err)
+	if affected != 2 {
+		t.Fatalf("Increment mixed-join affected: expected 2, got %d", affected)
+	}
+	var age int
+	err = db.Builder().Table("users").Select("age").Where("id", "=", 1).Value(ctx, &age)
+	assertNoError(t, err)
+	if age != 26 {
+		t.Errorf("alice age after increment: expected 26, got %d", age)
+	}
+	err = db.Builder().Table("users").Select("age").Where("id", "=", 2).Value(ctx, &age)
+	assertNoError(t, err)
+	if age != 31 {
+		t.Errorf("bob age after increment: expected 31, got %d", age)
+	}
+}
+
+// TestSQLiteInteg_Bug_DeleteJoinMixedBindings 锁定 B2 修复（DeleteJoin 路径）：
+// SQLite 走主键 IN 子查询直译 JOIN（绑定顺序天然一致，本用例防回归）；
+// 错位敏感方言为 PG（USING 形态），见 TestPgInteg_Bug_DeleteJoinMixedBindings。
+func TestSQLiteInteg_Bug_DeleteJoinMixedBindings(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	setupSQLiteProfilesTable(t, db)
+	setupSQLiteOrdersTable(t, db)
+	ctx := context.Background()
+
+	sub := db.Builder().Table("orders").Select("user_id").Where("amount", ">", 100)
+	affected, err := db.Builder().Table("users").
+		JoinOn("profiles", func(j *JoinBuilder) {
+			j.On("profiles.user_id", "=", "users.id").Where("profiles.active", "=", 99)
+		}).
+		JoinSub(sub, "o", func(j *JoinBuilder) { j.On("o.user_id", "=", "users.id") }).
+		Where("users.status", "=", "active").
+		DeleteJoin(ctx)
+	assertNoError(t, err)
+	if affected != 2 { // alice/bob
+		t.Fatalf("DeleteJoin mixed-join affected: expected 2, got %d", affected)
+	}
+	count, err := db.Builder().Table("users").Count(ctx)
+	assertNoError(t, err)
+	if count != 3 { // charlie/diana/eve
+		t.Errorf("users after DeleteJoin: expected 3, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_Bug_UpsertDefaultExcludeUniqueBy 锁定 m1 修复：
+// updateColumns 为空时默认更新所有插入列并排除 uniqueBy 列；
+// 全部插入列均为 uniqueBy 时退化为「冲突时不更新」（修复前生成空 SET → 语法错误）。
+func TestSQLiteInteg_Bug_UpsertDefaultExcludeUniqueBy(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	ctx := context.Background()
+
+	// 默认 updateColumns（nil）：冲突时更新 name/age（uniqueBy 的 email 不参与 SET）
+	_, err := db.Builder().Table("users").Upsert(ctx, struct {
+		Name  string `db:"name"`
+		Age   int    `db:"age"`
+		Email string `db:"email"`
+	}{Name: "alice_new", Age: 99, Email: "alice@test.com"}, []string{"email"}, nil)
+	assertNoError(t, err)
+	var name string
+	var age int
+	err = db.Builder().Table("users").Select("name").Where("email", "=", "alice@test.com").Value(ctx, &name)
+	assertNoError(t, err)
+	err = db.Builder().Table("users").Select("age").Where("email", "=", "alice@test.com").Value(ctx, &age)
+	assertNoError(t, err)
+	if name != "alice_new" || age != 99 {
+		t.Errorf("default upsert columns: expected alice_new/99, got %s/%d", name, age)
+	}
+
+	// 全部插入列均为 uniqueBy（自建表，避免 users.name 的 NOT NULL 约束干扰）：
+	// 冲突时 DO NOTHING，不报错、不更新（修复前生成空 SET → 语法错误）
+	mustExec(t, db, `CREATE TABLE tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE, hits INTEGER DEFAULT 0)`)
+	mustExec(t, db, `INSERT INTO tokens (token, hits) VALUES ('tok1', 5)`)
+	_, err = db.Builder().Table("tokens").Upsert(ctx, struct {
+		Token string `db:"token"`
+	}{Token: "tok1"}, []string{"token"}, nil)
+	assertNoError(t, err)
+	var hits int
+	err = db.Builder().Table("tokens").Select("hits").Where("token", "=", "tok1").Value(ctx, &hits)
+	assertNoError(t, err)
+	if hits != 5 {
+		t.Errorf("upsert all-uniqueBy should not update, got hits=%d", hits)
+	}
+
+	// 全部列为 uniqueBy 且 key 不存在：正常插入新行（默认值生效）
+	_, err = db.Builder().Table("tokens").Upsert(ctx, struct {
+		Token string `db:"token"`
+	}{Token: "tok2"}, []string{"token"}, nil)
+	assertNoError(t, err)
+	exists, err := db.Builder().Table("tokens").Where("token", "=", "tok2").Exists(ctx)
+	assertNoError(t, err)
+	if !exists {
+		t.Errorf("upsert all-uniqueBy new row should be inserted")
+	}
+}
+
+// TestSQLiteInteg_Bug_UpsertExpressionValue 锁定 m2 修复：
+// Upsert 的 Expression 字段值内联进 SQL（修复前作为绑定值传给驱动必报错）。
+func TestSQLiteInteg_Bug_UpsertExpressionValue(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	ctx := context.Background()
+
+	_, err := db.Builder().Table("users").Upsert(ctx, struct {
+		Name  string `db:"name"`
+		Age   any    `db:"age"`
+		Email string `db:"email"`
+	}{Name: "frank", Age: NewExpression("40"), Email: "frank@test.com"},
+		[]string{"email"}, []string{"name", "age"})
+	assertNoError(t, err)
+
+	var age int
+	err = db.Builder().Table("users").Select("age").Where("email", "=", "frank@test.com").Value(ctx, &age)
+	assertNoError(t, err)
+	if age != 40 {
+		t.Errorf("upsert expression age: expected 40, got %d", age)
+	}
+}
+
+// TestSQLiteInteg_Bug_MixedCaseOperatorDirection 锁定 m3 修复：
+// 运算符与排序方向的大小写归一化不再仅对首字符小写生效——
+// 修复前 "Like" 误报 ErrInvalidOperator、"Desc" 静默归一为 ASC。
+func TestSQLiteInteg_Bug_MixedCaseOperatorDirection(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+	ctx := context.Background()
+
+	var names []string
+	err := db.Builder().Table("users").Where("name", "Like", "ali%").Pluck(ctx, &names, "name")
+	assertNoError(t, err)
+	if len(names) != 1 || names[0] != "alice" {
+		t.Errorf("mixed-case Like: expected [alice], got %v", names)
+	}
+
+	var ids []int
+	err = db.Builder().Table("users").OrderBy("id", "Desc").Pluck(ctx, &ids, "id")
+	assertNoError(t, err)
+	if len(ids) != 5 || ids[0] != 5 {
+		t.Errorf("mixed-case Desc: expected first id=5, got %v", ids)
+	}
+}
+
+// TestSQLiteInteg_Bug_OnSQLPanicRecovered 锁定 m5 修复：
+// 慢 SQL 回调 panic 被 recover 隔离，不影响 Exec/Query 主流程。
+func TestSQLiteInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	panicDao, err := NewDBDao(db.Pool(), "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		panic("callback boom")
+	}, "")
+	assertNoError(t, err)
+	ctx := context.Background()
+
+	// Exec 路径
+	_, err = panicDao.Builder().Table("users").Insert(ctx, struct {
+		Name  string `db:"name"`
+		Email string `db:"email"`
+	}{Name: "frank", Email: "frank@test.com"})
+	assertNoError(t, err)
+
+	// Query 路径
+	rows, err := panicDao.Query(ctx, `SELECT COUNT(*) AS cnt FROM users`)
+	assertNoError(t, err)
+	var dest []struct {
+		Cnt int `db:"cnt"`
+	}
+	err = ScanStructClose(rows, &dest)
+	assertNoError(t, err)
+	if len(dest) != 1 || dest[0].Cnt != 6 {
+		t.Errorf("query after panicked callback: expected cnt=6, got %+v", dest)
 	}
 }

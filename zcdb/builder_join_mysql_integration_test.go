@@ -692,3 +692,53 @@ func TestMySQLInteg_NewApi_JoinBuilder(t *testing.T) {
 		t.Errorf("NestedJoin: expected 2, got %d", count)
 	}
 }
+
+// TestMySQLInteg_Bug_JoinWhereNullExpansion 锁定 M2 修复：
+// JoinBuilder.Where/OrWhere 遇 nil 值时 = 展开为 IS NULL、!=/<>
+// 展开为 IS NOT NULL（与 Builder.Where 语义对齐）——
+// 修复前编译为 "col = ?" 绑定 nil，条件恒 UNKNOWN，INNER JOIN 静默丢行。
+func TestMySQLInteg_Bug_JoinWhereNullExpansion(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+	setupMySQLProfilesTable(t, db)
+	ctx := context.Background()
+
+	// diana(user_id=4) 的 profile bio 为 NULL
+	mustExec(t, db, `INSERT INTO profiles (user_id, bio, active) VALUES (4, NULL, 99)`)
+
+	// = nil → IS NULL：命中 diana（修复前恒 UNKNOWN → 0 行）
+	var names []string
+	err := db.Builder().Table("users").
+		JoinOn("profiles", func(j *JoinBuilder) {
+			j.On("profiles.user_id", "=", "users.id").Where("profiles.bio", "=", nil)
+		}).Pluck(ctx, &names, "name")
+	assertNoError(t, err)
+	if len(names) != 1 || names[0] != "diana" {
+		t.Errorf("join where = nil: expected [diana], got %v", names)
+	}
+
+	// != nil → IS NOT NULL：命中 alice/bob/charlie（修复前恒 UNKNOWN → 0 行）
+	names = nil
+	err = db.Builder().Table("users").
+		JoinOn("profiles", func(j *JoinBuilder) {
+			j.On("profiles.user_id", "=", "users.id").Where("profiles.bio", "!=", nil)
+		}).OrderBy("users.id", "ASC").Pluck(ctx, &names, "name")
+	assertNoError(t, err)
+	if len(names) != 3 || names[0] != "alice" || names[1] != "bob" || names[2] != "charlie" {
+		t.Errorf("join where != nil: expected [alice bob charlie], got %v", names)
+	}
+
+	// OrWhere nil 变体：ON a AND (bio IS NULL OR active = 100)
+	names = nil
+	err = db.Builder().Table("users").
+		JoinOn("profiles", func(j *JoinBuilder) {
+			j.On("profiles.user_id", "=", "users.id").
+				WhereNested(func(q *JoinBuilder) {
+					q.Where("profiles.bio", "=", nil).OrWhere("profiles.active", "=", 100)
+				})
+		}).Pluck(ctx, &names, "name")
+	assertNoError(t, err)
+	if len(names) != 1 || names[0] != "diana" {
+		t.Errorf("join nested orWhere nil: expected [diana], got %v", names)
+	}
+}

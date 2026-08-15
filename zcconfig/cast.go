@@ -60,10 +60,43 @@ func cast[T any](v any, def T) T {
 		}
 	}
 
+	// 数值类型 -> bool 特判：C 语言惯例，零值为 false，非零为 true。
+	// 此分支解决 .env 中 "1"/"0" 被 parseValue 推断为 int 后无法转 bool 的问题。
+	if rt.Kind() == reflect.Bool && isNumericKind(rv.Kind()) {
+		var isZero bool
+		switch rv.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			isZero = rv.Int() == 0
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			isZero = rv.Uint() == 0
+		case reflect.Float32, reflect.Float64:
+			isZero = rv.Float() == 0
+		}
+		return any(!isZero).(T)
+	}
+
+	// 防护数值类型 -> string 的码点陷阱：
+	// Go 中 int -> string 的 ConvertibleTo 判定为 true，语义是 Unicode 码点映射（65 -> "A"），
+	// 这不是配置场景的期望行为，应返回 def。
+	if rt.Kind() == reflect.String && isNumericKind(rv.Kind()) {
+		return def
+	}
+
 	// 通过 reflect 做通用类型转换
 	if rv.IsValid() && rv.Type().ConvertibleTo(rt) {
 		return rv.Convert(rt).Interface().(T)
 	}
 
 	return def
+}
+
+// isNumericKind 判断 reflect.Kind 是否为数值类型（int/uint/float 系列）。
+func isNumericKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
 }

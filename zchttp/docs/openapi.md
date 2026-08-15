@@ -79,7 +79,9 @@ Name string `json:"name" nonzero:"true"`
 
 ### 容器嵌套深度
 
-上述规则假设 struct 可被 `applyDefaults` 到达。对于**多层容器**（如 `map[K][]Struct`、`[][]Struct`），框架无法穿透内部元素，即使是指针字段的 `default` 也**不展示**（`reachedByDefaults=false`）。详见 `request.md` 中"容器嵌套深度限制"章节。
+上述规则假设 struct 可被 `applyDefaults` 到达。对于**多层容器**（如 `map[K][]Struct`、`[][]Struct`、`[]map[K]Struct`），框架无法穿透内部元素，即使是指针字段的 `default` 也**不展示**（`reachedByDefaults=false`）。详见 `request.md` 中"容器嵌套深度限制"章节。
+
+切片类型字段的 `default` 按逗号切分后，逐元素依据 items schema 递归转换展示（如 `default:"a,b"` 展示为 `["a","b"]`，`[]int` 的 `default:"1,2"` 展示为 `[1,2]`）；Trim 后为空（`default:""`、`default:",,,"`）视为空切片 `[]`，与运行时填充语义一致。
 
 `GenerateOpenAPI` 采用**三遍遍历**架构：第一遍（`collectTypeUsages`）收集每个 struct 类型的"值嵌套可达性"（`reachedViaValue` map）；第二遍（`collectDefaultsReachability`）收集每个 struct 类型是否可被 `applyDefaults` 递归到达（`reachedByDefaults` map）；第三遍构造 schema 时 `decorate` 依据这两个可达性标记决定是否输出 `default`——指针字段依赖 `reachedByDefaults`，值字段依赖 `reachedViaValue`。
 
@@ -144,8 +146,12 @@ map 的 value 类型通过 `t.Elem()` 递归推断：
 
 ## 参数位置与响应
 
-- **GET / DELETE / HEAD**：请求字段生成为 `query` 参数（`in: query`）。
-- **其余方法**：请求字段生成为 `requestBody`；含文件字段（`*multipart.FileHeader` 或 `[]*multipart.FileHeader`）时使用
+- **GET / DELETE / HEAD**：请求字段生成为 `query` 参数（`in: query`）。**仅扁平字段**（标量、切片、指针标量、`time.Time`）参与生成：命名 struct（`time.Time` 除外）、`map` 与文件字段被跳过——query 绑定仅处理扁平字段，展示无法绑定的参数会误导 API 使用者。
+- **其余方法**：请求字段生成为 `requestBody`；含文件字段（`*multipart.FileHeader` 或 `[]*multipart.FileHeader`，含**嵌入结构体**中的文件字段）时使用
   `multipart/form-data`，否则 `application/json`。
+- **参数路由**（如 `/users/{id}`）：路径模板中的 `{name}` 参数声明为 path 参数（`in: path`，`required: true`）并从 query
+  参数中排除；可选参数 `{name?}` 转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` 语法）并以 `required: false` 声明，路径模板中不再出现 `?`。
 - **响应**：统一包装为 `Response{data, code, message}` 结构，schema 名称为 `Response_<Type>`；成功时统一返回 `200`（与
   `HttpEngine` 默认响应行为一致）。可通过 `OpenAPIInfo.ResponseWrapper` 指定自定义响应包装结构体样例（如 `MyResponse{}`），为 nil 时使用默认结构；自定义结构体中 `interface{}` 类型字段被视为 data 占位符，替换为实际 Res schema。
+
+> 输出确定性：生成前对 method 与 path 排序，多次生成的输出字节级一致（schema 序号归属稳定），快照测试/增量 diff 友好。

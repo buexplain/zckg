@@ -125,7 +125,7 @@ func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHan
 
 	// 预计算带默认值的 Req 模板：注册阶段填充默认值，请求时浅拷贝复用
 	defaultReqPtr := reflect.New(reqElemType)
-	_ = applyDefaults(defaultReqPtr, reqMeta)
+	applyDefaults(defaultReqPtr, reqMeta)
 	defaultReq := defaultReqPtr.Elem()
 
 	// 扫描模板中是否存在非 nil 引用类型字段（指针/切片/map），

@@ -45,10 +45,10 @@ type Response struct {
 | 回调 | 行为 |
 | --- | --- |
 | `DefaultResponseHandler` | 若响应尚未被写入，以 `{data: res, code: 0, message: "success"}` 的统一 JSON 结构返回；若 handler 已写入响应（如文件下载），则跳过 |
-| `DefaultErrorHandler` | 若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 500, message: err}`），状态码统一为 500；若已写入则跳过 |
+| `DefaultErrorHandler` | 若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 500, message: "internal server error"}`），状态码统一为 500；err 详情仅写入服务端日志（`slog.Error`），不向客户端暴露内部信息；若已写入则跳过 |
 | `DefaultValidationErrorHandler` | 参数校验失败或绑定失败时调用。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 400, message: err}`），状态码统一为 400；若已写入则跳过 |
 | `DefaultNotFoundHandler` | 未命中路由时调用。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 404, message: "not found"}`），状态码统一为 404；若已写入则跳过 |
-| `DefaultPanicHandler` | 捕获 panic 时调用。通过 `slog.Error` 将 panic 值与完整堆栈输出到控制台。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML（含堆栈信息）或统一 JSON 结构（`{data: null, code: 500, message: "<panic>\n<stack>"}`）；若已写入则跳过 |
+| `DefaultPanicHandler` | 捕获 panic 时调用。通过 `slog.Error` 将 panic 值与完整堆栈输出到服务端日志。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构，两者均只含通用消息 `internal server error`（不向客户端暴露堆栈，防泄漏服务端内部结构），状态码统一为 500；若已写入则跳过 |
 
 默认 JSON 响应由进程级池化的 `json.Encoder` 编码（关闭 HTML 转义）：`res` 中的 `<`、`>`、`&` 字符**原样输出**，不再转义为 `\u003c`、`\u003e`、`\u0026`。若业务上需要转义后的输出，请自行替换 `OnResponse` 回调。
 
@@ -70,7 +70,7 @@ func WantHtml(r *http.Request) bool
 
 - 若命中 `*BindingError`（绑定失败，如 JSON 格式错误）→ 交由 `OnValidationError`（默认 400）。
 - 若命中 `*ValidationError`（参数校验失败，来自 `nonzero` 非零值校验或 `Validate()` 业务校验）→ 交由 `OnValidationError`（默认 400）。
-- 其余错误 → 交由 `OnError`（默认 500）。
+- 其余错误 → 交由 `OnError`（默认 500，客户端仅收到通用 `"internal server error"` 消息，err 详情写入服务端日志）。
 
 > `*BindingError` 的定义及参数绑定细节详见 `parameter-binding.md`；`*ValidationError` 的定义及参数校验规则详见 `parameter-validate.md`。
 
@@ -94,7 +94,7 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
 
 ## 五、"是否已写入"的判定
 
-引擎用 `responseWriter` 包装原始 `http.ResponseWriter`，记录 `WriteHeader` / `Write` / `Flush` / `Hijack` / `Push` 是否被调用过（`Written()`）。`IsResponseWritten` 通过接口断言判定：
+引擎用 `responseWriter` 包装原始 `http.ResponseWriter`，记录 `WriteHeader` / `Write` / `Flush` / `Hijack` 是否被调用过（`Written()`）。`Push` 推送的是独立流（HTTP/2 server push），**不影响本响应的 written 状态**——即使中间件调用过 `Push`，后续仍可按正常流程写入响应。`IsResponseWritten` 通过接口断言判定：
 
 ```go
 func IsResponseWritten(w http.ResponseWriter) bool {
@@ -184,7 +184,7 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 
 1. **路由匹配**：`ServeHTTP` 按 method → normalizePath 查找路由条目，未命中 → `OnNotFound`。
 2. **panic 保护**：`defer recover` 包裹全流程，捕获 panic → `OnPanic`（`slog.Error` + 堆栈）。
-3. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body；绑定错误（`*BindingError`）随 Req 注入 ctx。
+3. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body，再执行 `applyDefaults(requestPhase=true)` 为 JSON/表单绑定后动态创建的子元素（切片/数组/map/nested ptr）补填 nil 指针的默认值；绑定错误（`*BindingError`）随 Req 注入 ctx。
 4. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；各中间件可通过 `BoundReqFromContext[T]` 获取已绑定的 Req。
 5. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateNonzero` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
 6. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler，成功 → `OnResponse(w, r, res)`，Res 同时注入 ctx 供后置中间件通过 `BoundResFromContext[T]` 获取。

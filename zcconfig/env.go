@@ -90,9 +90,12 @@ func parseValue(value string) any {
 	if n, err := strconv.ParseInt(value, 10, 64); err == nil {
 		return int(n)
 	}
-	// 尝试解析为 float64
-	if f, err := strconv.ParseFloat(value, 64); err == nil {
-		return f
+	// 仅当值包含小数点或指数标记时才尝试 float64，
+	// 避免超大整数静默降级为 float64 丢失精度
+	if strings.ContainsAny(value, ".eE") {
+		if f, err := strconv.ParseFloat(value, 64); err == nil {
+			return f
+		}
 	}
 	// 尝试解析为 bool
 	if b, err := strconv.ParseBool(value); err == nil {
@@ -120,14 +123,15 @@ func Env[T any](key string, def T) T {
 	return def
 }
 
-// EnvAll 返回当前所有已加载的 env 数据的副本。
+// EnvAll 返回内部 env 存储的直接引用（零拷贝，不做任何拷贝）。
 // 包含 LoadEnv 加载的数据，不含操作系统环境变量。
+//
+// 警示：
+//  1. 返回值与内部存储共享同一份数据，任何写操作都会污染全局配置；
+//  2. 写操作与并发读取（Env/LoadEnv）会产生数据竞争，可能导致程序崩溃；
+//  3. 仅限只读场景（调试输出、配置导出等）。
 func EnvAll() map[string]any {
 	envMu.RLock()
 	defer envMu.RUnlock()
-	result := make(map[string]any, len(envData))
-	for k, v := range envData {
-		result[k] = v
-	}
-	return result
+	return envData
 }

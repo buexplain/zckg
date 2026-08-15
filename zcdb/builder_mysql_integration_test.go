@@ -21,7 +21,8 @@ func openMySQLTestDB(t *testing.T) *DBDao {
 		DSN:        "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local",
 	})
 	if err != nil {
-		t.Fatalf("failed to open mysql: %v", err)
+		// 门控：MySQL 不可达时跳过而非失败，保证无数据库环境下 go test 不误报
+		t.Skipf("mysql unavailable, skipping integration test: %v", err)
 	}
 	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)

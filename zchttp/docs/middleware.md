@@ -58,6 +58,8 @@ Middleware A ── 前置逻辑
 实现上不为每层构造闭包：执行状态由池化的 `chainRunner` 对象承载，各层 `next()` 是否已调用以 `uint64` 位图按层号记录（热路径零闭包分配）；仅当中间件层数超过 64 层（极罕见场景）时回退为递归实现（`runChainRecursive`），语义与防重规则完全一致。
 
 > **并发约束**：`next()` 必须在中间件所属的 goroutine 内调用，不得另起 goroutine 调用 `next()`。内部调用状态标记（位图 / bool）未做并发安全保护。
+>
+> **已知边界**：中间件无法替换下游的 `http.ResponseWriter`。`NextFunc` 无参且链上的 `w` 在请求开始时已固定，gzip 等需要包装下游 `ResponseWriter` 的中间件模式无法实现。这是中间件签名的架构决策；若需支持，需修改 `NextFunc` 签名（破坏性变更），当前版本不支持。
 
 ## 三、短路控制
 

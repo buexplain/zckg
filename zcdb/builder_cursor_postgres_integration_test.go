@@ -96,7 +96,7 @@ func TestPgInteg_CursorBy_Keyset(t *testing.T) {
 // TestPgInteg_CursorBy_ContextCancel 边界固化用例（审查结论）：
 // CursorBy 迭代期间 ctx 被取消时，错误能传播给调用方（本库驱动均在 query 层缓冲结果集，
 // 取消在下一批 query 时报错；单批场景下驱动缓冲使 rows.Next 不受影响）。
-// 遗留建议：cursorBy 批次循环后可补 rows.Err() 防御性检查（当前驱动下无法构造红测试）。
+// 已修复：批次循环后补 rows.Err() 检查（M1），非缓冲驱动在中途出错时也能经此通道 yield 错误。
 func TestPgInteg_CursorBy_ContextCancel(t *testing.T) {
 	db := openPgTestDB(t)
 	setupPgUsersTable(t, db)

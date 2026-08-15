@@ -13,27 +13,15 @@ package zcdb
 //	// SQL: SELECT * FROM `users` ORDER BY `age` DESC, `name` ASC
 func (b *Builder) OrderBy(column string, direction ...string) *Builder {
 	dir := "ASC"
-	if len(direction) > 0 && len(direction[0]) > 0 {
-		upper := direction[0]
-		if direction[0][0] >= 'a' && direction[0][0] <= 'z' {
-			upper = ""
-			for _, c := range direction[0] {
-				if c >= 'a' && c <= 'z' {
-					upper += string(c - 32)
-				} else {
-					upper += string(c)
-				}
-			}
-		}
-		if upper == "DESC" {
-			dir = "DESC"
-		}
+	if len(direction) > 0 && toUpperASCII(direction[0]) == "DESC" {
+		dir = "DESC"
 	}
 	b.orders = append(b.orders, OrderClause{Column: column, Direction: dir})
 	return b
 }
 
 // OrderByRaw 添加一个原始 SQL ORDER BY 子句，不做标识符包裹、不支持绑定（需自行内联值）。
+// 注意：内容原样拼接进 SQL，存在注入风险时请勿拼入用户输入（防注入责任归调用方）。
 //
 //	sql, _, _ := db.Builder().Table("users").OrderByRaw("FIELD(status, 'active', 'frozen')").ToSelect()
 //	// SQL: SELECT * FROM `users` ORDER BY FIELD(status, 'active', 'frozen')

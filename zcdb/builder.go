@@ -61,23 +61,34 @@ var validOperators = map[string]bool{
 }
 
 // validateOperator 检查运算符是否在白名单内。
+// 运算符大小写不敏感（统一转大写后匹配白名单）。
 func validateOperator(op string) error {
-	// 尝试大写匹配
-	upper := op
-	if len(upper) > 0 && upper[0] >= 'a' && upper[0] <= 'z' {
-		upper = ""
-		for _, c := range op {
-			if c >= 'a' && c <= 'z' {
-				upper += string(c - 32)
-			} else {
-				upper += string(c)
-			}
-		}
-	}
+	upper := toUpperASCII(op)
 	if validOperators[upper] {
 		return nil
 	}
 	return ErrInvalidOperator
+}
+
+// toUpperASCII 将 ASCII 小写字母转大写（运算符/排序方向均为 ASCII，不引入 strings.ToUpper 的 Unicode 开销）。
+func toUpperASCII(s string) string {
+	hasLower := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'a' && s[i] <= 'z' {
+			hasLower = true
+			break
+		}
+	}
+	if !hasLower {
+		return s
+	}
+	buf := []byte(s)
+	for i, c := range buf {
+		if c >= 'a' && c <= 'z' {
+			buf[i] = c - 32
+		}
+	}
+	return string(buf)
 }
 
 // ==================== 辅助方法 ====================

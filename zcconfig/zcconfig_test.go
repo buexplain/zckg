@@ -1,8 +1,10 @@
 package zcconfig
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -16,7 +18,7 @@ func writeTestFile(t *testing.T, content string) string {
 }
 
 func TestLoadEnv_BasicTypes(t *testing.T) {
-	Reset()
+	reset()
 	content := `
 # 注释行
 APP_NAME="my app"
@@ -74,7 +76,7 @@ NO_QUOTE=hello world
 }
 
 func TestLoadEnv_MergeMultipleFiles(t *testing.T) {
-	Reset()
+	reset()
 
 	path1 := writeTestFile(t, "KEY1=value1\nSHARED=from_file1")
 	path2 := writeTestFile(t, "KEY2=value2\nSHARED=from_file2")
@@ -99,7 +101,7 @@ func TestLoadEnv_MergeMultipleFiles(t *testing.T) {
 }
 
 func TestEnv_TypeConversion(t *testing.T) {
-	Reset()
+	reset()
 	content := `
 INT_VAL=42
 FLOAT_VAL=3.14
@@ -138,7 +140,7 @@ STR_VAL=hello
 }
 
 func TestEnv_OsEnvFallback(t *testing.T) {
-	Reset()
+	reset()
 	_ = os.Setenv("MY_TEST_OS_ENV", "os_value")
 	defer func() {
 		_ = os.Unsetenv("MY_TEST_OS_ENV")
@@ -151,7 +153,7 @@ func TestEnv_OsEnvFallback(t *testing.T) {
 }
 
 func TestConfig_BasicLookup(t *testing.T) {
-	Reset()
+	reset()
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "myapp",
@@ -190,7 +192,7 @@ func TestConfig_BasicLookup(t *testing.T) {
 }
 
 func TestConfig_DefaultValues(t *testing.T) {
-	Reset()
+	reset()
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "myapp",
@@ -214,7 +216,7 @@ func TestConfig_DefaultValues(t *testing.T) {
 }
 
 func TestConfig_NestedRegistration(t *testing.T) {
-	Reset()
+	reset()
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "myapp",
@@ -246,7 +248,7 @@ func TestConfig_NestedRegistration(t *testing.T) {
 }
 
 func TestConfig_ImmediateExecution(t *testing.T) {
-	Reset()
+	reset()
 	callCount := 0
 	Register("app", func() map[string]any {
 		callCount++
@@ -268,7 +270,7 @@ func TestConfig_ImmediateExecution(t *testing.T) {
 }
 
 func TestConfig_MergeRegistration(t *testing.T) {
-	Reset()
+	reset()
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "first",
@@ -299,7 +301,7 @@ func TestConfig_MergeRegistration(t *testing.T) {
 }
 
 func TestConfig_TypeConversion(t *testing.T) {
-	Reset()
+	reset()
 	Register("db", func() map[string]any {
 		return map[string]any{
 			"port":  "3306",
@@ -319,7 +321,7 @@ func TestConfig_TypeConversion(t *testing.T) {
 }
 
 func TestEnvAll(t *testing.T) {
-	Reset()
+	reset()
 	content := "A=1\nB=hello\n"
 	path := writeTestFile(t, content)
 	if err := LoadEnv(path); err != nil {
@@ -336,7 +338,7 @@ func TestEnvAll(t *testing.T) {
 }
 
 func TestConfigAll(t *testing.T) {
-	Reset()
+	reset()
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "test",
@@ -348,5 +350,103 @@ func TestConfigAll(t *testing.T) {
 		t.Errorf("期望 app 为 map[string]any")
 	} else if v["name"] != "test" {
 		t.Errorf("期望 name=test，实际 %v", v["name"])
+	}
+}
+
+// .env 中 "1"/"0" 被 parseValue 推断为 int，经 cast 数值→bool 特判转为 bool
+func TestEnv_BoolFromIntString(t *testing.T) {
+	reset()
+	content := "BOOL_ONE=1\nBOOL_ZERO=0\n"
+	path := writeTestFile(t, content)
+	if err := LoadEnv(path); err != nil {
+		t.Fatalf("LoadEnv 失败: %v", err)
+	}
+
+	if v := Env("BOOL_ONE", false); v != true {
+		t.Errorf(".env 中 BOOL_ONE=1 期望 true，实际 %v", v)
+	}
+	if v := Env("BOOL_ZERO", true); v != false {
+		t.Errorf(".env 中 BOOL_ZERO=0 期望 false，实际 %v", v)
+	}
+}
+
+// 并发读写压力测试：并发 Register + Config 不应产生数据竞争
+func TestConcurrent_RegisterAndConfig(t *testing.T) {
+	reset()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			key := fmt.Sprintf("key_%d", n)
+			Register(key, func() map[string]any {
+				return map[string]any{"value": n}
+			})
+			if v := Config(key+".value", 0); v != n {
+				t.Errorf("期望 %d，实际 %d", n, v)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// 并发读写压力测试：并发 LoadEnv + Env + EnvAll 不应产生数据竞争
+func TestConcurrent_LoadEnvAndEnv(t *testing.T) {
+	reset()
+	path := writeTestFile(t, "KEY=value\n")
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = LoadEnv(path)
+			_ = Env("KEY", "")
+			_ = EnvAll()
+		}()
+	}
+	wg.Wait()
+}
+
+// ConfigAll 返回内部存储的直接引用（零拷贝）：写入返回值会穿透到内部
+// 注意：此写操作仅在测试单 goroutine 下安全；生产代码中写返回值会产生
+// 数据竞争，文档已警示仅限只读场景。
+func TestConfigAll_ZeroCopy(t *testing.T) {
+	reset()
+	Register("app", func() map[string]any {
+		return map[string]any{"name": "test"}
+	})
+
+	all := ConfigAll()
+	all["app"].(map[string]any)["name"] = "modified"
+
+	if v := Config("app.name", ""); v != "modified" {
+		t.Errorf("零拷贝语义：期望 'modified'（写入返回值穿透到内部），实际 %q", v)
+	}
+}
+
+// reset 后再读取：两条通道均应清空，仅剩 OS 环境变量回退
+func TestReset_ThenRead(t *testing.T) {
+	reset()
+	Register("app", func() map[string]any {
+		return map[string]any{"name": "test"}
+	})
+	path := writeTestFile(t, "RESET_ENV_KEY=reset_val\n")
+	if err := LoadEnv(path); err != nil {
+		t.Fatalf("LoadEnv 失败: %v", err)
+	}
+
+	reset()
+
+	if v := Config("app.name", "fallback"); v != "fallback" {
+		t.Errorf("Reset 后 Config 期望默认值，实际 %q", v)
+	}
+	if v := Env("RESET_ENV_KEY", "fallback"); v != "fallback" {
+		t.Errorf("Reset 后 Env 期望默认值，实际 %q", v)
+	}
+	if all := ConfigAll(); len(all) != 0 {
+		t.Errorf("Reset 后 ConfigAll 期望空 map，实际 %v", all)
+	}
+	if all := EnvAll(); len(all) != 0 {
+		t.Errorf("Reset 后 EnvAll 期望空 map，实际 %v", all)
 	}
 }

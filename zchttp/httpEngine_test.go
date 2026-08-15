@@ -82,11 +82,12 @@ func TestDefaultResponseSkipWhenWritten(t *testing.T) {
 	}
 }
 
-// TestDefaultErrorHandler 验证默认错误回调返回 500 与统一 JSON 结构
+// TestDefaultErrorHandler 验证默认错误回调返回 500 与统一 JSON 结构；
+// m4：客户端仅收到通用 "internal server error"，内部错误详情不得泄漏
 func TestDefaultErrorHandler(t *testing.T) {
 	router := NewRouter()
 	router.GET("/err", func(_ context.Context, req engineReq) (engineRes, error) {
-		return engineRes{}, fmt.Errorf("boom")
+		return engineRes{}, fmt.Errorf("sensitive db password=secret123")
 	})
 
 	engine := NewEngine()
@@ -110,12 +111,16 @@ func TestDefaultErrorHandler(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if out.Code != http.StatusInternalServerError || out.Message != "boom" {
+	if out.Code != http.StatusInternalServerError || out.Message != "internal server error" {
 		t.Fatalf("unexpected json error: code=%d message=%q", out.Code, out.Message)
+	}
+	if strings.Contains(rec.Body.String(), "secret123") {
+		t.Fatal("internal error detail leaked to client")
 	}
 }
 
-// TestDefaultErrorHandlerHtml 验证 Accept 包含 text/html 时错误回调返回 HTML
+// TestDefaultErrorHandlerHtml 验证 Accept 包含 text/html 时错误回调返回 HTML；
+// m4：HTML 分支同样脱敏，不包含内部错误详情
 func TestDefaultErrorHandlerHtml(t *testing.T) {
 	router := NewRouter()
 	router.GET("/err", func(_ context.Context, req engineReq) (engineRes, error) {
@@ -136,8 +141,12 @@ func TestDefaultErrorHandlerHtml(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Fatalf("expected html content-type, got %q", ct)
 	}
-	if body := rec.Body.String(); !strings.Contains(body, "boom") || !strings.Contains(body, "<h1>") {
+	body := rec.Body.String()
+	if !strings.Contains(body, "internal server error") || !strings.Contains(body, "<h1>") {
 		t.Fatalf("unexpected html body: %q", body)
+	}
+	if strings.Contains(body, "boom") {
+		t.Fatalf("internal error detail leaked in html body: %q", body)
 	}
 }
 
@@ -772,5 +781,177 @@ func TestBodyDrainLimited(t *testing.T) {
 	}
 	if cr.n > maxBodyDrainBytes {
 		t.Fatalf("drained %d bytes, want <= %d", cr.n, maxBodyDrainBytes)
+	}
+}
+
+// ======== m7-①: panic 中间件端到端测试 ========
+
+// TestMiddlewarePanicE2E 验证中间件内 panic 时：
+// ① 返回 500 且 OnPanic 被调用（recovered 为 panic 值）；
+// ② 池化对象未被污染——同一 engine 上后续请求行为正常（连续多次 panic 均稳定恢复）。
+func TestMiddlewarePanicE2E(t *testing.T) {
+	recoveredCh := make(chan any, 3)
+	router := NewRouter()
+	router.Use(func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		panic("middleware boom")
+	})
+	router.GET("/boom", func(_ context.Context, _ engineReq) (engineRes, error) {
+		return engineRes{Message: "unreachable"}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+	engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
+		recoveredCh <- recovered
+		DefaultPanicHandler(w, r, recovered)
+	}
+
+	// 连续 3 次 panic 请求：每次都应 500 + OnPanic 收到正确的 panic 值
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/boom", nil))
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("request %d: expected 500, got %d", i, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "internal server error") {
+			t.Fatalf("request %d: body should contain generic message, got %q", i, rec.Body.String())
+		}
+		select {
+		case recovered := <-recoveredCh:
+			if recovered != "middleware boom" {
+				t.Fatalf("request %d: recovered = %v, want 'middleware boom'", i, recovered)
+			}
+		default:
+			t.Fatalf("request %d: OnPanic was not called", i)
+		}
+	}
+
+	// 池未污染验证：同一批全局池对象被另一个正常 engine 复用后行为不变
+	okRouter := NewRouter()
+	okRouter.GET("/ok", func(_ context.Context, _ engineReq) (engineRes, error) {
+		return engineRes{Message: "alive"}, nil
+	})
+	okEngine := NewEngine()
+	okEngine.Router = okRouter
+	rec := httptest.NewRecorder()
+	okEngine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pool contamination: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ======== m5: MaxBodyBytes 请求体大小限制 ========
+
+type maxBodyReq struct {
+	Body string `json:"body"`
+}
+
+type maxBodyRes struct {
+	Len int `json:"len"`
+}
+
+func maxBodyHandler(_ context.Context, req maxBodyReq) (maxBodyRes, error) {
+	return maxBodyRes{Len: len(req.Body)}, nil
+}
+
+// TestMaxBodyBytesLimit 验证 MaxBodyBytes 超限请求绑定失败并映射为 400，
+// 未超限请求正常绑定；0（默认）表示不限制
+func TestMaxBodyBytesLimit(t *testing.T) {
+	router := NewRouter()
+	router.POST("/body", maxBodyHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+	engine.MaxBodyBytes = 32
+
+	// 超限：>32 字节 → 400（*http.MaxBytesError 经绑定错误通道映射）
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/body", strings.NewReader(`{"body":"this body is definitely longer than 32 bytes"}`))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized body: expected 400, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	// 未超限：<32 字节 → 200 且绑定成功
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/body", strings.NewReader(`{"body":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("small body: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res maxBodyRes
+	decodeData(t, rec, &res)
+	if res.Len != 2 {
+		t.Fatalf("body length = %d, want 2", res.Len)
+	}
+}
+
+// TestMaxBodyBytesDisabled 验证 MaxBodyBytes 为 0（默认）时不限制请求体大小
+func TestMaxBodyBytesDisabled(t *testing.T) {
+	router := NewRouter()
+	router.POST("/body", maxBodyHandler)
+
+	engine := NewEngine()
+	engine.Router = router
+	// MaxBodyBytes 保持默认 0
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/body", strings.NewReader(`{"body":"unlimited"}`))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ======== n10①: typed-nil error 归一化 ========
+
+// typedNilErr 自定义错误类型：handler 返回 (*typedNilErr)(nil) 时接口非 nil
+// 但指针为空，应归一化为 nil 走成功路径
+type typedNilErr struct{}
+
+func (e *typedNilErr) Error() string { return "typed nil" }
+
+// TestTypedNilErrorNormalized 验证 handler 返回 (*MyErr)(nil) 时归一化为 nil 错误走成功路径（200），
+// 而非误判为 error 走 500
+func TestTypedNilErrorNormalized(t *testing.T) {
+	router := NewRouter()
+	router.GET("/typed-nil", func(_ context.Context, _ engineReq) (engineRes, *typedNilErr) {
+		var err *typedNilErr = nil
+		return engineRes{Message: "success via typed-nil"}, err
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/typed-nil", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("typed-nil error should be normalized to nil: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res engineRes
+	decodeData(t, rec, &res)
+	if res.Message != "success via typed-nil" {
+		t.Fatalf("message = %q, want 'success via typed-nil'", res.Message)
+	}
+}
+
+// TestTypedNilErrorNonNilStillPropagates 对照组：typed-nil 检测只归一化 nil 指针，
+// 非 nil 的 typed error 仍走错误通道（500）
+func TestTypedNilErrorNonNilStillPropagates(t *testing.T) {
+	router := NewRouter()
+	router.GET("/typed-err", func(_ context.Context, _ engineReq) (engineRes, *typedNilErr) {
+		return engineRes{}, &typedNilErr{}
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/typed-err", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("non-nil typed error should propagate: expected 500, got %d, body: %s", rec.Code, rec.Body.String())
 	}
 }

@@ -1,6 +1,7 @@
 package zchttp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -2235,10 +2236,15 @@ func TestCoerceExample(t *testing.T) {
 	}
 }
 
-// TestHasFileFieldVariants 覆盖非结构体、文件切片与未导出字段的判定分支
+// TestHasFileFieldVariants 覆盖非结构体、文件切片、未导出字段与嵌入字段的判定分支
 func TestHasFileFieldVariants(t *testing.T) {
 	type withFileSlice struct{ Files []*multipart.FileHeader }
 	type withUnexportedFile struct{ file *multipart.FileHeader }
+	type embedFileBase struct{ File *multipart.FileHeader }
+	type withEmbeddedFile struct {
+		embedFileBase
+		Title string
+	}
 	cases := []struct {
 		name string
 		typ  reflect.Type
@@ -2248,10 +2254,11 @@ func TestHasFileFieldVariants(t *testing.T) {
 		{"no file field", reflect.TypeOf(helloReq{}), false},
 		{"file slice", reflect.TypeOf(withFileSlice{}), true},
 		{"unexported file skipped", reflect.TypeOf(withUnexportedFile{}), false},
+		{"embedded file field", reflect.TypeOf(withEmbeddedFile{}), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hasFileField(tc.typ); got != tc.want {
+			if got := hasFileField(buildStructMeta(tc.typ)); got != tc.want {
 				t.Fatalf("hasFileField(%v) = %v, want %v", tc.typ, got, tc.want)
 			}
 		})
@@ -2289,7 +2296,7 @@ func newTestGenerator() *openAPIGenerator {
 // TestOpenAPIBuilderNonStructBranches 覆盖生成器各函数对非结构体 Req 的跳过分支
 func TestOpenAPIBuilderNonStructBranches(t *testing.T) {
 	g := newTestGenerator()
-	if got := g.buildQueryParams(reflect.TypeOf(0), structMeta{}); got != nil {
+	if got := g.buildQueryParams(reflect.TypeOf(0), structMeta{}, nil); got != nil {
 		t.Fatalf("buildQueryParams(non-struct) = %v, want nil", got)
 	}
 	if got := g.buildRequestBody(reflect.TypeOf(0), structMeta{}); got != nil {
@@ -2353,8 +2360,187 @@ func TestBuildQueryParamsSkipBranches(t *testing.T) {
 			Name: "Ig", Type: reflect.TypeOf(""), Tag: `ignore:"true"`,
 		}},
 	}}
-	params := g.buildQueryParams(reflect.TypeOf(helloReq{}), meta)
+	params := g.buildQueryParams(reflect.TypeOf(helloReq{}), meta, nil)
 	if len(params) != 0 {
 		t.Fatalf("ignored fields should produce no query params, got: %v", params)
+	}
+}
+
+// ======== M1: 参数路由 OpenAPI 生成 ========
+
+// TestGenerateOpenAPI_ParamRoute 验证参数路由（必选 + 可选参数）被生成到 paths：
+// 路径模板转换为 OpenAPI 形式 {name}，参数声明为 in:path，
+// 必选参数 required:true，可选参数（{name?}）required:false，且路径参数不再作为 query 参数重复出现
+func TestGenerateOpenAPI_ParamRoute(t *testing.T) {
+	type oaParamUserReq struct {
+		ID int `json:"id"`
+	}
+	type oaParamUserRes struct {
+		OK bool `json:"ok"`
+	}
+
+	r := NewRouter()
+	r.GET("/users/{id}", func(_ context.Context, _ oaParamUserReq) (oaParamUserRes, error) {
+		return oaParamUserRes{}, nil
+	})
+	r.GET("/posts/{post_id}/comments/{comment_id?}", func(_ context.Context, _ struct {
+		PostID    int `json:"post_id"`
+		CommentID int `json:"comment_id" default:"99"`
+	}) (oaParamUserRes, error) {
+		return oaParamUserRes{}, nil
+	})
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Param", Version: "1.0.0"})
+	paths := doc["paths"].(map[string]any)
+
+	// 必选参数路由：路径模板保留 {id} 形式
+	item, ok := paths["/users/{id}"].(map[string]any)
+	if !ok {
+		t.Fatalf("/users/{id} missing from paths, got keys: %v", paths)
+	}
+	get := item["get"].(map[string]any)
+	params := get["parameters"].([]any)
+	found := false
+	for _, p := range params {
+		pm := p.(map[string]any)
+		if pm["name"] == "id" {
+			found = true
+			if pm["in"] != "path" {
+				t.Errorf("id.in = %v, want path", pm["in"])
+			}
+			if pm["required"] != true {
+				t.Errorf("id.required = %v, want true", pm["required"])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("path parameter 'id' missing, got %v", params)
+	}
+
+	// 可选参数路由：{comment_id?} → /posts/{post_id}/comments/{comment_id}（OpenAPI 无 ? 语法）
+	item2, ok := paths["/posts/{post_id}/comments/{comment_id}"].(map[string]any)
+	if !ok {
+		t.Fatalf("/posts/{post_id}/comments/{comment_id} missing from paths, got keys: %v", paths)
+	}
+	if _, ok := paths["/posts/{post_id}/comments/{comment_id?}"]; ok {
+		t.Error("path template should not contain '?' (OpenAPI uses {name} form)")
+	}
+	get2 := item2["get"].(map[string]any)
+	requiredBy := map[string]bool{}
+	inBy := map[string]any{}
+	for _, p := range get2["parameters"].([]any) {
+		pm := p.(map[string]any)
+		name, _ := pm["name"].(string)
+		inBy[name] = pm["in"]
+		requiredBy[name], _ = pm["required"].(bool)
+	}
+	if requiredBy["post_id"] != true {
+		t.Errorf("post_id.required = %v, want true", requiredBy["post_id"])
+	}
+	if requiredBy["comment_id"] != false {
+		t.Errorf("comment_id.required = %v, want false (optional)", requiredBy["comment_id"])
+	}
+	// 路径参数不应同时出现在 query 中
+	if inBy["post_id"] != "path" || inBy["comment_id"] != "path" {
+		t.Errorf("path params should be declared in:path only, got %v", inBy)
+	}
+}
+
+// ======== M3: 嵌入文件字段识别 ========
+
+// TestGenerateOpenAPI_EmbeddedFileField 验证嵌入结构体中的文件字段也被识别为 multipart（M3）：
+// requestBody content-type 为 multipart/form-data 而非 application/json
+func TestGenerateOpenAPI_EmbeddedFileField(t *testing.T) {
+	type oaEmbeddedFileBase struct {
+		File *multipart.FileHeader `json:"file"`
+	}
+	type oaEmbedUploadReq struct {
+		oaEmbeddedFileBase
+		Title string `json:"title"`
+	}
+
+	r := NewRouter()
+	r.POST("/embed-upload", func(_ context.Context, _ oaEmbedUploadReq) (oaFileUploadRes, error) {
+		return oaFileUploadRes{}, nil
+	})
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Embed", Version: "1.0.0"})
+	paths := doc["paths"].(map[string]any)
+	item := paths["/embed-upload"].(map[string]any)
+	post := item["post"].(map[string]any)
+	reqBody := post["requestBody"].(map[string]any)
+	content := reqBody["content"].(map[string]any)
+	if _, ok := content["multipart/form-data"]; !ok {
+		t.Errorf("embedded file field: expected multipart/form-data, got keys: %v", content)
+	}
+	if _, ok := content["application/json"]; ok {
+		t.Error("embedded file field: should NOT have application/json")
+	}
+}
+
+// ======== n5: 输出确定性排序 ========
+
+// TestGenerateOpenAPI_Deterministic 验证多次生成的输出字节级一致：
+// 不同包同名类型的 schema 序号归属随 map 遍历顺序逐次变化（修复前），
+// 修复后 method/path 排序保证输出确定性，快照测试/增量 diff 友好
+func TestGenerateOpenAPI_Deterministic(t *testing.T) {
+	type oaParamUserReq struct {
+		ID int `json:"id"`
+	}
+	type oaParamUserRes struct {
+		OK bool `json:"ok"`
+	}
+
+	mk := func() []byte {
+		r := NewRouter()
+		r.POST("/zebra", oaCreateUser)
+		r.GET("/alpha", func(_ context.Context, _ oaListReq) (oaListRes, error) {
+			return oaListRes{}, nil
+		})
+		r.GET("/users/{id}", func(_ context.Context, _ oaParamUserReq) (oaParamUserRes, error) {
+			return oaParamUserRes{}, nil
+		})
+		doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Det", Version: "1.0.0"})
+		b, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+
+	first := mk()
+	for i := 0; i < 5; i++ {
+		if got := mk(); !bytes.Equal(got, first) {
+			t.Fatalf("iteration %d: output differs from first run", i)
+		}
+	}
+}
+
+// ======== n6: coerceExample array 分支 ========
+
+// TestCoerceExampleArray 覆盖 schema type=array 的转换分支（n6）：
+// 按逗号切分后逐元素按 items 类型递归转换；Trim 后为空视为空切片
+func TestCoerceExampleArray(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema map[string]any
+		raw    string
+		want   any
+	}{
+		{"array of string", map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "a,b,c", []any{"a", "b", "c"}},
+		{"array of integer", map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "1,2", []any{int64(1), int64(2)}},
+		{"array of boolean", map[string]any{"type": "array", "items": map[string]any{"type": "boolean"}}, "true,false", []any{true, false}},
+		{"empty string", map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "", []any{}},
+		{"commas only", map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, ",,,", []any{}},
+		{"element spaces trimmed", map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, " 1 , 2 ", []any{int64(1), int64(2)}},
+		{"invalid element falls back to raw string", map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "1,abc", []any{int64(1), "abc"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := coerceExample(c.schema, c.raw)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("coerceExample(%v, %q) = %#v (%T), want %#v (%T)", c.schema, c.raw, got, got, c.want, c.want)
+			}
+		})
 	}
 }

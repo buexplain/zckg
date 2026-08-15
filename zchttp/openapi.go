@@ -3,6 +3,7 @@ package zchttp
 import (
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -58,9 +59,21 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 	g.collectDefaultsReachability(r)
 
 	paths := map[string]any{}
-	for method, routes := range r.routes {
-		for path, entry := range routes {
-			op := g.buildOperation(method, entry)
+	// 排序 method 与 path 保证输出确定性（不同包同名类型的 schema 序号稳定，快照/增量 diff 友好）
+	methods := make([]string, 0, len(r.routes))
+	for method := range r.routes {
+		methods = append(methods, method)
+	}
+	sort.Strings(methods)
+	for _, method := range methods {
+		routes := r.routes[method]
+		sortedPaths := make([]string, 0, len(routes))
+		for path := range routes {
+			sortedPaths = append(sortedPaths, path)
+		}
+		sort.Strings(sortedPaths)
+		for _, path := range sortedPaths {
+			op := g.buildOperation(method, routes[path], nil, nil)
 			if op == nil {
 				continue
 			}
@@ -71,6 +84,37 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 			}
 			item[strings.ToLower(method)] = op
 		}
+	}
+	// 参数路由：从 paramRoutes 索引遍历（注册顺序），路径模板含 {name}/{name?} 参数段。
+	// 模板中的参数名声明为 path 参数（in: path）并从 query 参数中排除；
+	// OpenAPI 无 {name?} 语法，可选参数转换为 {name} 形式并以 required:false 声明
+	for _, pre := range r.paramRoutes {
+		segments, perr := parseRoutePath(pre.path)
+		if perr != nil {
+			continue // 注册阶段已校验，防御性跳过
+		}
+		paramNames := make(map[string]bool)
+		optionalParams := make(map[string]bool)
+		for _, seg := range segments {
+			if seg.isParam {
+				paramNames[seg.name] = true
+				if seg.optional {
+					optionalParams[seg.name] = true
+				}
+			}
+		}
+		op := g.buildOperation(pre.method, pre.entry, paramNames, optionalParams)
+		if op == nil {
+			continue
+		}
+		// 路径模板转换为 OpenAPI 规范形式：{name?} → {name}
+		openapiPath := strings.ReplaceAll(pre.path, "?}", "}")
+		item, ok := paths[openapiPath].(map[string]any)
+		if !ok {
+			item = map[string]any{}
+			paths[openapiPath] = item
+		}
+		item[strings.ToLower(pre.method)] = op
 	}
 
 	infoMap := map[string]any{
@@ -263,8 +307,10 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 	}
 }
 
-// buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary）
-func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry) map[string]any {
+// buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary）。
+// paramNames 为路径模板中的 {name}/{name?} 参数名集合（精确路由为 nil）：对应字段声明为
+// path 参数（in: path）且不再作为 query 参数展示；optionalParams 标记其中可选参数。
+func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, paramNames, optionalParams map[string]bool) map[string]any {
 	// 使用注册阶段预计算的类型信息，避免重复反射
 	if entry.reqType == nil || entry.resType == nil {
 		return nil
@@ -293,7 +339,14 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry) map[
 
 	switch method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
-		if params := g.buildQueryParams(reqType, entry.reqMeta); len(params) > 0 {
+		var params []any
+		if len(paramNames) > 0 {
+			params = append(params, g.buildPathParams(reqType, entry.reqMeta, paramNames, optionalParams)...)
+		}
+		if qp := g.buildQueryParams(reqType, entry.reqMeta, paramNames); len(qp) > 0 {
+			params = append(params, qp...)
+		}
+		if len(params) > 0 {
 			op["parameters"] = params
 		}
 	default:
@@ -308,7 +361,10 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry) map[
 
 // buildQueryParams 为 GET/DELETE/HEAD 生成 query 参数列表。
 // meta 为注册阶段预计算的 structMeta，直接使用其字段名和 nonzero+default 判定，避免重复反射遍历。
-func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMeta) []any {
+// paramNames 为路径参数名集合：绑定到路径参数的字段不作为 query 参数展示。
+// 跳过非扁平字段（Map 与命名 struct）：query 绑定仅处理扁平字段，展示会误导 API 使用者；
+// 文件字段一并跳过（GET 无 multipart）。
+func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMeta, paramNames map[string]bool) []any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
 	}
@@ -322,14 +378,55 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 		if fm.name == "" || fm.name == "-" {
 			continue
 		}
+		if paramNames[fm.name] {
+			continue // 绑定到路径参数的字段，声明为 path 参数而非 query
+		}
 		f := fm.field
 		if isIgnored(f) {
 			continue
+		}
+		if fm.isFile || fm.isFileSlice {
+			continue // 文件字段无法经 query 绑定（GET 无 multipart）
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Ptr {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Map || (ft.Kind() == reflect.Struct && ft != timeType) {
+			continue // 非扁平字段：query 绑定仅处理扁平字段
 		}
 		params = append(params, map[string]any{
 			"name":     fm.name,
 			"in":       "query",
 			"required": fm.nonzero && !fm.hasDefault,
+			"schema":   g.typeToSchema(f.Type, f),
+		})
+	}
+	return params
+}
+
+// buildPathParams 为参数路由的 {name}/{name?} 段声明 path 参数。
+// meta 为注册阶段预计算的 structMeta；paramNames 为路径模板中的参数名集合；
+// optionalParams 标记可选参数（{name?}），其 required 为 false，
+// 可选参数被省略时保留字段 default 值或零值。
+func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta, paramNames, optionalParams map[string]bool) []any {
+	if reqType.Kind() != reflect.Struct {
+		return nil
+	}
+	// 设置当前类型上下文（与 registerStructSchema 一致），保证 decorate 判定正确
+	prevType := g.currentType
+	g.currentType = reqType
+	defer func() { g.currentType = prevType }()
+	var params []any
+	for _, fm := range meta.fields {
+		if !paramNames[fm.name] {
+			continue
+		}
+		f := fm.field
+		params = append(params, map[string]any{
+			"name":     fm.name,
+			"in":       "path",
+			"required": !optionalParams[fm.name],
 			"schema":   g.typeToSchema(f.Type, f),
 		})
 	}
@@ -343,7 +440,7 @@ func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMet
 		return nil
 	}
 	contentType := "application/json"
-	if hasFileField(reqType) {
+	if hasFileField(meta) {
 		contentType = "multipart/form-data"
 	}
 	return map[string]any{
@@ -621,6 +718,20 @@ func coerceExample(schema map[string]any, raw string) any {
 		if b, err := strconv.ParseBool(raw); err == nil {
 			return b
 		}
+	case "array":
+		// 切片默认值以逗号分隔（如 default:"a,b"），逐元素按 items 类型递归转换；
+		// Trim 后为空（default:""、default:",,,"）视为空切片，与运行时填充语义一致
+		trimmed := strings.Trim(strings.TrimSpace(raw), ",")
+		if trimmed == "" {
+			return []any{}
+		}
+		items, _ := schema["items"].(map[string]any)
+		parts := strings.Split(trimmed, ",")
+		arr := make([]any, 0, len(parts))
+		for _, p := range parts {
+			arr = append(arr, coerceExample(items, strings.TrimSpace(p)))
+		}
+		return arr
 	}
 	return raw
 }
@@ -635,21 +746,11 @@ func isIgnored(field reflect.StructField) bool {
 	return false
 }
 
-// hasFileField 判断结构体是否含上传文件字段（决定请求体是否使用 multipart/form-data）
-func hasFileField(t reflect.Type) bool {
-	t = derefType(t)
-	if t.Kind() != reflect.Struct {
-		return false
-	}
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if f.PkgPath != "" {
-			continue
-		}
-		if f.Type == fileHeaderPtrType {
-			return true
-		}
-		if f.Type.Kind() == reflect.Slice && f.Type.Elem() == fileHeaderPtrType {
+// hasFileField 判断结构体元信息中是否含上传文件字段（决定请求体是否使用 multipart/form-data）。
+// 复用注册阶段预计算的 meta.fields（已展开嵌入字段），与绑定端判定逻辑保持单一来源
+func hasFileField(meta structMeta) bool {
+	for i := range meta.fields {
+		if meta.fields[i].isFile || meta.fields[i].isFileSlice {
 			return true
 		}
 	}

@@ -2,6 +2,7 @@ package zchttp
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -150,6 +151,28 @@ func BenchmarkServeHTTP_WithMiddlewares(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		e.ServeHTTP(w, req)
+	}
+}
+
+// handler 内 io.Copy 大文件下载（n7-B）：验证 responseWriter.ReadFrom 透传（sendfile 优化）路径的基准，
+// 与底层 io.ReaderFrom 组合后 io.Copy 不再逐字节拷贝。
+// 每迭代新建 Recorder 防止 4MB 响应体在复用 Recorder 中无限累积。
+func BenchmarkServeHTTP_LargeFileDownload(b *testing.B) {
+	const fileSize = 4 << 20 // 4MB
+	payload := strings.Repeat("f", fileSize)
+	e := NewEngine()
+	e.Router.GET("/file", func(ctx context.Context, _ benchSimpleReq) (any, error) {
+		w, _ := ResponseWriterFromContext(ctx)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, err := io.Copy(w, strings.NewReader(payload))
+		return nil, err
+	})
+	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/file", nil))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/file", nil))
 	}
 }
 

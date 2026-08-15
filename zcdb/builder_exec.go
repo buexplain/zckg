@@ -7,6 +7,7 @@ package zcdb
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -41,13 +42,21 @@ func (b *Builder) Insert(ctx context.Context, data any) (int64, error) {
 
 // InsertGetId 插入数据并返回自增 ID。
 // data 必须是单个结构体（struct{}）或结构体指针（*struct{}），不支持切片。
+// 不支持 PostgreSQL 方言：lib/pq 不支持 LastInsertId（PG 需 RETURNING 子句），
+// 为避免「插入成功但返回错误」的半成功状态，PG 下在执行前直接返回错误。
 //
 //	id, err := db.Builder().Table("users").InsertGetId(ctx, &user)
 //	// SQL: INSERT INTO `users` (`name`, `age`) VALUES (?, ?)
 func (b *Builder) InsertGetId(ctx context.Context, data any) (int64, error) {
+	// 先做数据校验与编译（参数错误优先于方言限制返回）
 	sqlStr, args, err := b.ToInsert(data)
 	if err != nil {
 		return 0, err
+	}
+
+	// lib/pq 不支持 LastInsertId：在执行前返回错误，避免「插入成功但返回错误」的半成功状态
+	if _, ok := b.grammar.(*PostgresGrammar); ok {
+		return 0, errors.New("zcdb: InsertGetId is not supported on postgres dialect (lib/pq does not support LastInsertId); use Insert or raw SQL with RETURNING instead")
 	}
 
 	result, err := b.dao.Exec(ctx, sqlStr, args...)
@@ -306,13 +315,18 @@ func (b *Builder) DeleteJoin(ctx context.Context) (int64, error) {
 }
 
 // hasEffectiveWhere 判断是否存在实际生效的 WHERE 条件。
-// 排除空嵌套（如 WhereNested 传入空回调）等编译后为空的伪条件，
-// 防止空嵌套绕过无 WHERE 保护导致全表删除/更新。
+// 排除空嵌套（如 WhereNested 传入空回调）、空 WhereRaw（编译后为空串）等伪条件，
+// 防止空条件绕过无 WHERE 保护导致全表删除/更新。
 func (b *Builder) hasEffectiveWhere() bool {
 	for _, w := range b.wheres {
 		switch w.Type {
 		case WhereTypeNested, WhereTypeExists, WhereTypeNotExists:
 			if w.Nested != nil && w.Nested.hasEffectiveWhere() {
+				return true
+			}
+		case WhereTypeRaw:
+			// 空串/纯空白 Raw 编译后会被跳过，不产生任何条件，不得计为有效限定
+			if strings.TrimSpace(w.SQL) != "" {
 				return true
 			}
 		default:
@@ -342,8 +356,18 @@ func (b *Builder) hasEffectiveJoin() bool {
 //	// MySQL/PG SQL: TRUNCATE TABLE `users`
 //	// SQLite SQL:   DELETE FROM "users"
 func (b *Builder) Truncate(ctx context.Context) error {
+	sqlStr, err := b.ToTruncate()
+	if err != nil {
+		return err
+	}
+
+	if _, err = b.dao.Exec(ctx, sqlStr); err != nil {
+		return err
+	}
+
 	// SQLite 方言：DELETE FROM 不会重置 AUTOINCREMENT 序列，
-	// 需额外清空 sqlite_sequence 使自增主键从头开始；
+	// 数据删除成功后再清空 sqlite_sequence 使自增主键从头开始（顺序不可颠倒，
+	// 否则主语句失败时序列已被清空、状态不一致）；
 	// 表从未使用 AUTOINCREMENT 时 sqlite_sequence 表不存在，该错误忽略
 	if _, ok := b.grammar.(*SQLiteGrammar); ok {
 		_, err := b.dao.Exec(ctx, "DELETE FROM sqlite_sequence WHERE name = ?", b.table)
@@ -351,12 +375,5 @@ func (b *Builder) Truncate(ctx context.Context) error {
 			return err
 		}
 	}
-
-	sqlStr, err := b.ToTruncate()
-	if err != nil {
-		return err
-	}
-
-	_, err = b.dao.Exec(ctx, sqlStr)
-	return err
+	return nil
 }

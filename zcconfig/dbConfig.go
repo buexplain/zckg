@@ -36,6 +36,7 @@ type DBConfig struct {
 }
 
 // DBSlaveConfig 从库配置结构体，用于承载从库连接所需的各项参数。
+// 从库复用主库的 Database 和 Charset，因此不重复定义这两个字段。
 type DBSlaveConfig struct {
 	Host     string // 数据库服务器地址，如 "127.0.0.1" 或 "db.example.com"
 	Port     int    // 数据库服务器端口，如 MySQL 默认 3306、PostgreSQL 默认 5432

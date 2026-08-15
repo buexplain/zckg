@@ -16,8 +16,9 @@ zcconfig/
 ├── cast.go            # 泛型类型转换引擎（内部）
 ├── env.go             # .env 文件加载与 Env 泛型读取
 ├── config.go          # 业务配置注册与 Config 泛型读取
-├── cast_test.go       # cast 函数测试（28 个用例）
-└── zcconfig_test.go   # env 与 config 集成测试（12 个用例）
+├── dbConfig.go        # 数据库连接配置结构体（DBConfig / DBSlaveConfig）
+├── cast_test.go       # cast 函数测试
+└── zcconfig_test.go   # env 与 config 集成测试
 ```
 
 ## 架构设计
@@ -95,15 +96,15 @@ zcconfig/
 |------|------|------|
 | `LoadEnv` | `func LoadEnv(path string) error` | 读取 `.env` 文件，解析键值对存入 env 存储。值自动推断类型（int / float64 / bool / string），支持注释行、`export` 前缀、引号去除。多次调用合并数据，后加载覆盖先前。 |
 | `Env` | `func Env[T any](key string, def T) T` | 按 key 查找 env 值并转换为 T 类型。查找顺序：先查 `LoadEnv` 加载的数据，再回退 OS 环境变量。未找到或转换失败时返回默认值 `def`。 |
-| `EnvAll` | `func EnvAll() map[string]any` | 返回当前所有已加载 env 数据的浅拷贝副本（不含 OS 环境变量）。 |
+| `EnvAll` | `func EnvAll() map[string]any` | 返回内部 env 存储的直接引用（零拷贝，不含 OS 环境变量）。仅限只读场景（调试输出、配置导出等）；写操作会污染全局配置并与并发读取产生数据竞争。 |
 
 ### Config 通道
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。 |
+| `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。约定：`fn` 返回的 map 在 Register 之后不得再被修改（zcconfig 不拷贝返回值，直接存储引用）；若 `key` 路径中间层级已存在标量值，注册子节点会覆盖原标量为 map。 |
 | `Config` | `func Config[T any](key string, def T) T` | 按 `.` 分隔的 key 递归查找嵌套 `map[string]any{}`，找到后转换为 T 类型返回。路径不存在或中间层级非 map 时返回默认值 `def`。纯读操作，使用 `RLock`。 |
-| `ConfigAll` | `func ConfigAll() map[string]any` | 返回当前所有已注册业务配置数据的深拷贝副本。 |
+| `ConfigAll` | `func ConfigAll() map[string]any` | 返回内部配置存储的直接引用（零拷贝）。仅限只读场景（调试输出、配置导出等）；写操作会污染全局配置并与并发读取产生数据竞争。 |
 
 ### 辅助方法
 
@@ -189,6 +190,13 @@ NO_QUOTE=hello world
 - `envData` 由 `envMu`（`sync.RWMutex`）保护：`LoadEnv` 写时用 `Lock`，`Env` / `EnvAll` 读时用 `RLock`
 - `configData` 由 `configMu`（`sync.RWMutex`）保护：`Register` 写时用 `Lock`，`Config` / `ConfigAll` 读时用 `RLock`
 - `Register` 中 `fn()` 在锁外执行，仅合并操作持锁，避免 fn 内逻辑阻塞其他读者
+
+## 架构约定
+
+- **零拷贝**：`ConfigAll` / `EnvAll` 返回内部存储的直接引用（不做任何拷贝），仅限只读场景（调试输出、配置导出等）。任何写操作都会污染全局配置，并与并发读取（`Config` / `Env` / `Register` / `LoadEnv`）产生数据竞争，可能导致程序崩溃。
+- **启动期注册、运行期只读**：`Register` / `LoadEnv` 仅允许在启动阶段调用，运行期配置只读。
+- **注册后不可变**：`Register` 的 `fn` 返回的 map 及其嵌套结构在 Register 之后不得再被修改；zcconfig 不拷贝返回值，直接存储引用。
+- 模块选择不引入任何拷贝（浅拷贝或深拷贝）的原因：`map[string]any` 的 value 可为任意 Go 类型，部分拷贝（无论深浅）无法覆盖 slice/指针/chan/func 等全部引用类型，反而制造虚假安全感。
 
 ## 使用示例
 

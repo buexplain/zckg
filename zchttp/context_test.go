@@ -195,8 +195,8 @@ func TestBoundReqFromContext_NotInjected(t *testing.T) {
 
 // TestBoundReqFromContext_PointerWithBindingErr 覆盖指针断言命中且存在绑定错误的分支
 func TestBoundReqFromContext_PointerWithBindingErr(t *testing.T) {
-	ctx := withBoundReq(context.Background(), &engineReq{Name: "bob"})
-	ctx = withBindingErr(ctx, NewBindingError(errors.New("boom")))
+	st := &requestState{boundReq: &engineReq{Name: "bob"}, bindingErr: NewBindingError(errors.New("boom"))}
+	ctx := context.WithValue(context.Background(), stateKey, st)
 	req, err := BoundReqFromContext[*engineReq](ctx)
 	if err == nil {
 		t.Fatal("expected binding error")
@@ -208,8 +208,8 @@ func TestBoundReqFromContext_PointerWithBindingErr(t *testing.T) {
 
 // TestBoundReqFromContext_DerefWithBindingErr 覆盖值类型解引用命中且存在绑定错误的分支
 func TestBoundReqFromContext_DerefWithBindingErr(t *testing.T) {
-	ctx := withBoundReq(context.Background(), &engineReq{Name: "carol"})
-	ctx = withBindingErr(ctx, NewBindingError(errors.New("boom")))
+	st := &requestState{boundReq: &engineReq{Name: "carol"}, bindingErr: NewBindingError(errors.New("boom"))}
+	ctx := context.WithValue(context.Background(), stateKey, st)
 	req, err := BoundReqFromContext[engineReq](ctx)
 	if err == nil {
 		t.Fatal("expected binding error")
@@ -221,7 +221,8 @@ func TestBoundReqFromContext_DerefWithBindingErr(t *testing.T) {
 
 // TestBoundReqFromContext_NilPointerStored 覆盖存储 nil 指针时解引用跳过的分支
 func TestBoundReqFromContext_NilPointerStored(t *testing.T) {
-	ctx := withBoundReq(context.Background(), (*engineReq)(nil))
+	st := &requestState{boundReq: (*engineReq)(nil)}
+	ctx := context.WithValue(context.Background(), stateKey, st)
 	_, err := BoundReqFromContext[engineReq](ctx)
 	if !errors.Is(err, ErrBoundReqNotFound) {
 		t.Fatalf("expected ErrBoundReqNotFound, got: %v", err)
@@ -230,7 +231,8 @@ func TestBoundReqFromContext_NilPointerStored(t *testing.T) {
 
 // TestBoundReqFromContext_ValueStoredWithPointerT 覆盖存储值类型但以指针类型请求的分支
 func TestBoundReqFromContext_ValueStoredWithPointerT(t *testing.T) {
-	ctx := withBoundReq(context.Background(), engineReq{Name: "dave"})
+	st := &requestState{boundReq: engineReq{Name: "dave"}}
+	ctx := context.WithValue(context.Background(), stateKey, st)
 	_, err := BoundReqFromContext[*engineReq](ctx)
 	if !errors.Is(err, ErrBoundReqNotFound) {
 		t.Fatalf("expected ErrBoundReqNotFound, got: %v", err)
@@ -245,18 +247,20 @@ func TestBoundResFromContext_NotInjected(t *testing.T) {
 	}
 }
 
-// TestBoundResFromContext_NotContainer 覆盖存储值不是容器的分支
-func TestBoundResFromContext_NotContainer(t *testing.T) {
-	ctx := context.WithValue(context.Background(), boundResKey, "junk")
+// TestBoundResFromContext_WrongResType 覆盖 state 中 Res 值与期望类型不匹配的分支
+func TestBoundResFromContext_WrongResType(t *testing.T) {
+	st := &requestState{res: "junk"}
+	ctx := context.WithValue(context.Background(), stateKey, st)
 	_, err := BoundResFromContext[engineRes](ctx)
 	if !errors.Is(err, ErrBoundResNotFound) {
 		t.Fatalf("expected ErrBoundResNotFound, got: %v", err)
 	}
 }
 
-// TestBoundResFromContext_ResNil 覆盖容器内 Res 尚未写入的分支
+// TestBoundResFromContext_ResNil 覆盖 state 中 Res 尚未写入的分支
 func TestBoundResFromContext_ResNil(t *testing.T) {
-	ctx := withBoundResContainer(context.Background())
+	st := &requestState{}
+	ctx := context.WithValue(context.Background(), stateKey, st)
 	_, err := BoundResFromContext[engineRes](ctx)
 	if !errors.Is(err, ErrBoundResNotFound) {
 		t.Fatalf("expected ErrBoundResNotFound, got: %v", err)
@@ -265,8 +269,8 @@ func TestBoundResFromContext_ResNil(t *testing.T) {
 
 // TestBoundResFromContext_TypeMismatch 覆盖 Res 类型断言失败的分支
 func TestBoundResFromContext_TypeMismatch(t *testing.T) {
-	ctx := withBoundResContainer(context.Background())
-	setBoundRes(ctx, engineRes{Message: "ok"})
+	st := &requestState{res: engineRes{Message: "ok"}}
+	ctx := context.WithValue(context.Background(), stateKey, st)
 	_, err := BoundResFromContext[ctxMismatchReq](ctx)
 	if !errors.Is(err, ErrBoundResNotFound) {
 		t.Fatalf("expected ErrBoundResNotFound, got: %v", err)
@@ -284,63 +288,5 @@ func TestContextAccessors_NoState(t *testing.T) {
 	}
 	if _, ok := ResponseWriterFromContext(ctx); ok {
 		t.Fatal("ResponseWriterFromContext should return false without state")
-	}
-}
-
-// TestWithHelpers_CreateStateFromBareCtx 覆盖 withRequestResponse/withBindingErr
-// 在无状态 ctx 上自动创建 requestState 的兜底分支
-func TestWithHelpers_CreateStateFromBareCtx(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/bare", nil)
-	rec := httptest.NewRecorder()
-	ctx := withRequestResponse(context.Background(), r, rec)
-	if got, ok := RequestFromContext(ctx); !ok || got != r {
-		t.Fatal("withRequestResponse should create state on bare ctx")
-	}
-
-	ctx = withBindingErr(context.Background(), NewBindingError(errors.New("bare-err")))
-	_, err := BoundReqFromContext[engineReq](ctx)
-	if !errors.Is(err, ErrBoundReqNotFound) {
-		t.Fatalf("expected ErrBoundReqNotFound for bare ctx binding err, got: %v", err)
-	}
-}
-
-// TestContextHelpers_CreateStateOnDemand 验证 with* 兼容助手在 ctx 无状态时
-// 自动创建 requestState 并注入，各存取器可正常读回（向后兼容路径锁死）
-func TestContextHelpers_CreateStateOnDemand(t *testing.T) {
-	ctx := context.Background()
-
-	e := NewEngine()
-	ctx = withEngine(ctx, e)
-	if got, ok := EngineFromContext(ctx); !ok || got != e {
-		t.Fatalf("EngineFromContext = %v, %v; want same engine, true", got, ok)
-	}
-
-	r := httptest.NewRequest(http.MethodGet, "/compat", nil)
-	rec := httptest.NewRecorder()
-	ctx = withRequestResponse(ctx, r, rec)
-	if got, ok := RequestFromContext(ctx); !ok || got != r {
-		t.Fatal("RequestFromContext should return the injected request")
-	}
-	if got, ok := ResponseWriterFromContext(ctx); !ok || got != rec {
-		t.Fatal("ResponseWriterFromContext should return the injected writer")
-	}
-
-	ctx = withBoundReq(ctx, &engineReq{Name: "compat"})
-	req, err := BoundReqFromContext[*engineReq](ctx)
-	if err != nil || req.Name != "compat" {
-		t.Fatalf("BoundReqFromContext = %v, %v; want compat req, nil", req, err)
-	}
-
-	ctx = withBindingErr(ctx, NewBindingError(errors.New("boom")))
-	if _, err := BoundReqFromContext[*engineReq](ctx); err == nil {
-		t.Fatal("BoundReqFromContext should surface binding error")
-	}
-
-	// 已有 state 时 withBoundResContainer 直接返回原 ctx，Res 写入 state 可被读回
-	ctx2 := withBoundResContainer(ctx)
-	setBoundRes(ctx2, engineRes{Message: "compat-res"})
-	res, err := BoundResFromContext[engineRes](ctx2)
-	if err != nil || res.Message != "compat-res" {
-		t.Fatalf("BoundResFromContext = %v, %v; want compat-res, nil", res, err)
 	}
 }

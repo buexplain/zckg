@@ -292,7 +292,7 @@ func (g *MySQLGrammar) CompileInsertOrIgnore(b *Builder, columns []string, rows 
 }
 
 // CompileUpsert 编译 MySQL 的 INSERT ... ON DUPLICATE KEY UPDATE 语句
-func (g *MySQLGrammar) CompileUpsert(b *Builder, columns []string, rows [][]any, _ []string, updateColumns []string, _ []any) string {
+func (g *MySQLGrammar) CompileUpsert(b *Builder, columns []string, rows [][]any, uniqueBy []string, updateColumns []string, _ []any) string {
 	var sql strings.Builder
 
 	// INSERT 部分
@@ -316,12 +316,25 @@ func (g *MySQLGrammar) CompileUpsert(b *Builder, columns []string, rows [][]any,
 			if j > 0 {
 				sql.WriteString(", ")
 			}
-			sql.WriteString("?")
+			// Expression 直接内联，不生成占位符
+			if expr, ok := row[j].(Expression); ok {
+				sql.WriteString(expr.Value())
+			} else {
+				sql.WriteString("?")
+			}
 		}
 		sql.WriteString(")")
 	}
 
 	// ON DUPLICATE KEY UPDATE 部分
+	// updateColumns 为空（全部插入列均为 uniqueBy）时退化为 no-op 自赋值，等价冲突时不更新
+	if len(updateColumns) == 0 {
+		if len(uniqueBy) > 0 {
+			updateColumns = uniqueBy[:1]
+		} else {
+			updateColumns = columns[:1]
+		}
+	}
 	sql.WriteString(" ON DUPLICATE KEY UPDATE ")
 	for i, col := range updateColumns {
 		if i > 0 {
@@ -513,7 +526,7 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 	}
 
 	var parts []string
-	for i, w := range b.wheres {
+	for _, w := range b.wheres {
 		var clause string
 		switch w.Type {
 		case WhereTypeBasic:
@@ -606,7 +619,9 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 			continue
 		}
 
-		if i == 0 {
+		// 以 parts 是否为空判定首条有效子句：前序子句可能编译为空（空 Raw/空嵌套组）被跳过，
+		// 若按下标判定会产生 "WHERE AND ..." 悬挂连接词
+		if len(parts) == 0 {
 			parts = append(parts, clause)
 		} else {
 			parts = append(parts, w.Boolean+" "+clause)
@@ -692,13 +707,21 @@ func (g *MySQLGrammar) compileJoin(join JoinClause) string {
 // compileJoinConditions 编译 ON 条件列表（含新增的 null/in/inSub/exists/subValue/nested 类型）。
 func (g *MySQLGrammar) compileJoinConditions(conditions []JoinCondition) string {
 	var parts []string
-	for i, cond := range conditions {
+	for _, cond := range conditions {
 		var clause string
 		switch cond.Type {
 		case "column":
 			clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + g.WrapColumn(cond.Second)
 		case "value":
-			if expr, ok := cond.Value.(Expression); ok {
+			// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL（与 Builder.Where 语义对齐）；
+			// 绑定收集侧 collectJoinConditionBindings 对这三种情形跳过绑定，二者须保持一致
+			if cond.Value == nil && (cond.Operator == "=" || cond.Operator == "!=" || cond.Operator == "<>") {
+				if cond.Operator == "=" {
+					clause = g.WrapColumn(cond.First) + " IS NULL"
+				} else {
+					clause = g.WrapColumn(cond.First) + " IS NOT NULL"
+				}
+			} else if expr, ok := cond.Value.(Expression); ok {
 				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " " + expr.Value()
 			} else {
 				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
@@ -759,7 +782,8 @@ func (g *MySQLGrammar) compileJoinConditions(conditions []JoinCondition) string 
 		if clause == "" {
 			continue
 		}
-		if i == 0 {
+		// 同 compileWheres：以 parts 是否为空判定首条有效条件，避免悬挂连接词
+		if len(parts) == 0 {
 			parts = append(parts, clause)
 		} else {
 			parts = append(parts, cond.Boolean+" "+clause)
@@ -780,7 +804,7 @@ func (g *MySQLGrammar) joinTable(join JoinClause) string {
 // compileHavings 编译 HAVING 子句
 func (g *MySQLGrammar) compileHavings(b *Builder) string {
 	var parts []string
-	for i, h := range b.havings {
+	for _, h := range b.havings {
 		var clause string
 		switch h.Type {
 		case "basic":
@@ -812,7 +836,8 @@ func (g *MySQLGrammar) compileHavings(b *Builder) string {
 		if clause == "" {
 			continue
 		}
-		if i == 0 {
+		// 同 compileWheres：以 parts 是否为空判定首条有效条件，避免悬挂连接词
+		if len(parts) == 0 {
 			parts = append(parts, clause)
 		} else {
 			parts = append(parts, h.Boolean+" "+clause)

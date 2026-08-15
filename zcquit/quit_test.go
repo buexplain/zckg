@@ -5,17 +5,22 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
 
 // resetState 在每个测试前重置包级可变状态，使测试可重复执行。
-// 测试直接调用 executeShutdown（不依赖 sync.Once）以绕过无法重置的 sync.Once。
+// 测试直接调用 executeShutdown（不依赖幂等标记）以绕过全局状态；shutdownStarted 同步重置。
+// listenOnce 不重置：listen goroutine 全局仅启动一次，依赖完整退出路径（Shutdown/Listen）的
+// 用例统一放在文件末尾的 TestShutdown_FullFlow 中。
 func resetState() {
-	Ctx, cancel = context.WithCancel(context.Background())
+	ctx, cancel = context.WithCancel(context.Background())
 	signalHandlerMap = map[int][]SigHandler{}
 	signalHandlerMux = sync.RWMutex{}
 	waitChan = make(chan struct{})
+	newStopListenCh()
+	shutdownStarted.Store(false)
 }
 
 // TestAddSigHandler 测试 AddSigHandler 注册 handler 到正确的级别
@@ -193,7 +198,7 @@ func TestExecuteShutdown_ContextCancelled(t *testing.T) {
 	resetState()
 
 	select {
-	case <-Ctx.Done():
+	case <-GetCtx().Done():
 		t.Fatal("executeShutdown 之前 Ctx 不应已被取消")
 	default:
 	}
@@ -201,7 +206,7 @@ func TestExecuteShutdown_ContextCancelled(t *testing.T) {
 	executeShutdown(nil)
 
 	select {
-	case <-Ctx.Done():
+	case <-GetCtx().Done():
 		// 期望：上下文已取消
 	default:
 		t.Fatal("executeShutdown 之后 Ctx 应已被取消")
@@ -287,7 +292,7 @@ func TestExecuteShutdown_NoHandlers(t *testing.T) {
 	executeShutdown(nil)
 
 	select {
-	case <-Ctx.Done():
+	case <-GetCtx().Done():
 		// 上下文应已取消
 	case <-time.After(time.Second):
 		t.Fatal("无 handler 时 executeShutdown 应仍能正常完成")
@@ -306,7 +311,7 @@ func TestCtx_InitialState(t *testing.T) {
 	resetState()
 
 	select {
-	case <-Ctx.Done():
+	case <-GetCtx().Done():
 		t.Fatal("初始状态下 Ctx 不应已被取消")
 	default:
 		// 期望：未取消
@@ -322,7 +327,7 @@ func TestExecuteShutdown_CancelBeforeHandlers(t *testing.T) {
 	AddSigHandler(0, func(sig os.Signal) {
 		// handler 执行时，Ctx 应该已经被取消
 		select {
-		case <-Ctx.Done():
+		case <-GetCtx().Done():
 			ctxDoneDuringHandler.Store(true)
 		default:
 		}
@@ -332,5 +337,165 @@ func TestExecuteShutdown_CancelBeforeHandlers(t *testing.T) {
 
 	if !ctxDoneDuringHandler.Load() {
 		t.Fatal("handler 执行时 Ctx 应已被取消（cancel 应先于 handler 执行）")
+	}
+}
+
+// TestAddSigHandler_NilHandlerPanics 测试注册 nil handler 立即 panic（注册期防御）
+func TestAddSigHandler_NilHandlerPanics(t *testing.T) {
+	resetState()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("注册 nil handler 应触发 panic")
+		}
+	}()
+
+	// 混合传入：非 nil 在前，nil 在后，也应 panic
+	AddSigHandler(0, func(sig os.Signal) {}, nil)
+}
+
+// TestExecuteShutdown_HandlerCallsAddSigHandler 测试 handler 内调用 AddSigHandler 无死锁，且新 handler 不被本次退出执行
+func TestExecuteShutdown_HandlerCallsAddSigHandler(t *testing.T) {
+	resetState()
+
+	var newHandlerCalled atomic.Bool
+
+	AddSigHandler(0, func(sig os.Signal) {
+		// 注册更高 level 的新 handler：快照已固化，本次不应执行
+		AddSigHandler(1, func(sig os.Signal) {
+			newHandlerCalled.Store(true)
+		})
+	})
+
+	// 若无死锁，executeShutdown 将正常返回
+	executeShutdown(nil)
+
+	if newHandlerCalled.Load() {
+		t.Fatal("退出期间新注册的 handler 不应被本次退出执行（快照已固化）")
+	}
+}
+
+// TestExecuteShutdown_AllHandlersPanic 测试所有 handler 均 panic 时退出流程仍能完成
+func TestExecuteShutdown_AllHandlersPanic(t *testing.T) {
+	resetState()
+
+	AddSigHandler(0,
+		func(sig os.Signal) { panic("panic-1") },
+		func(sig os.Signal) { panic("panic-2") },
+	)
+	AddSigHandler(1, func(sig os.Signal) { panic("panic-3") })
+
+	// 若无 wg.Done 泄漏，executeShutdown 将正常返回（不会永久阻塞）
+	executeShutdown(nil)
+
+	select {
+	case <-waitChan:
+		// 期望：全部 handler panic 后 waitChan 仍被关闭
+	default:
+		t.Fatal("全部 handler panic 后 waitChan 仍应被关闭")
+	}
+}
+
+// TestConcurrent_AddSigHandlerAndShutdown 压力测试：并发注册 handler 与退出流程并发进行，验证无竞争无死锁
+func TestConcurrent_AddSigHandlerAndShutdown(t *testing.T) {
+	resetState()
+
+	var executed atomic.Int32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 20 个 goroutine 并发注册 handler，与退出流程的快照/执行形成竞争窗口
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			AddSigHandler(0, func(sig os.Signal) {
+				executed.Add(1)
+			})
+		}()
+	}
+
+	close(start)
+	executeShutdown(nil) // 与并发注册竞争：竞争安全性由 -race 检测
+	wg.Wait()
+
+	// 并发注册的 handler 可能部分落入快照之后，精确执行数量无法断言；
+	// 核心验证点：无 panic、无死锁、无数据竞争，退出流程正常完成
+	select {
+	case <-waitChan:
+		// 期望：waitChan 已关闭
+	default:
+		t.Fatal("并发压力场景下 waitChan 应被关闭")
+	}
+}
+
+// TestShutdown_FullFlow 依赖幂等标记与 listenOnce 的完整退出路径测试（声明在文件末尾）。
+// 覆盖：Shutdown 幂等、信号路径与 Shutdown 并发收敛、handler 内调用 Shutdown/AddSigHandler（无死锁）、多协程并发 Listen 解除阻塞。
+func TestShutdown_FullFlow(t *testing.T) {
+	resetState()
+
+	var execCount atomic.Int32
+	var lateHandlerCalled atomic.Bool
+
+	AddSigHandler(0, func(sig os.Signal) {
+		execCount.Add(1)
+		Shutdown() // handler 内重入：CAS 已置位，应立即返回为 no-op，无死锁
+		// 注册高 level 新 handler：快照已固化，本次不应执行
+		AddSigHandler(9, func(sig os.Signal) { lateHandlerCalled.Store(true) })
+	})
+
+	// 多个 goroutine 并发 Listen，均应被解除阻塞
+	const listenerN = 3
+	var listenDone sync.WaitGroup
+	for i := 0; i < listenerN; i++ {
+		listenDone.Add(1)
+		go func() {
+			defer listenDone.Done()
+			Listen()
+		}()
+	}
+
+	// 并发触发：多个 Shutdown + doShutdown(信号) 模拟「信号到达 + Shutdown 并发」场景
+	var trigger sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		trigger.Add(1)
+		go func() {
+			defer trigger.Done()
+			Shutdown()
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		trigger.Add(1)
+		go func() {
+			defer trigger.Done()
+			doShutdown(syscall.SIGTERM)
+		}()
+	}
+	trigger.Wait()
+
+	// 验证所有 Listen 均被解除阻塞
+	waitListenDone := make(chan struct{})
+	go func() {
+		listenDone.Wait()
+		close(waitListenDone)
+	}()
+	select {
+	case <-waitListenDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown 后并发 Listen 未在超时内返回")
+	}
+
+	if execCount.Load() != 1 {
+		t.Fatalf("退出流程应仅执行一次，实际 handler 执行次数: %d", execCount.Load())
+	}
+	if lateHandlerCalled.Load() {
+		t.Fatal("handler 内新注册的 handler 不应被本次退出执行")
+	}
+	select {
+	case <-GetCtx().Done():
+		// 期望：上下文已取消
+	default:
+		t.Fatal("完整退出流程后上下文应已被取消")
 	}
 }

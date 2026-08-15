@@ -396,3 +396,39 @@ func TestSQLiteInteg_CursorBy_Desc(t *testing.T) {
 		}
 	}
 }
+
+// TestSQLiteInteg_Bug_CursorByCtxCancel 锁定 M1 修复：
+// CursorBy 多批迭代中 ctx 取消时，错误必须 yield 给调用方（rows.Err() 检查 +
+// 下一批 query 层报错双通道），不得静默截断——否则调用方会把出错当作正常结束而丢数据。
+func TestSQLiteInteg_Bug_CursorByCtxCancel(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var user row
+	var lastErr error
+	count := 0
+	// chunkSize=2：users 共 5 行 → 3 批；首批迭代完后取消，后续批次必须报错
+	for err := range db.Builder().Table("users").Select("id", "name").CursorBy(ctx, &user, 2, "id") {
+		if err != nil {
+			lastErr = err
+			break
+		}
+		count++
+		if count == 2 {
+			cancel()
+		}
+	}
+	if lastErr == nil {
+		t.Fatalf("ctx 取消后 CursorBy 静默结束（收到 %d 行），预期 yield 错误", count)
+	}
+	if !errors.Is(lastErr, context.Canceled) {
+		t.Logf("yield 错误为 %v（非 context.Canceled 包装也可接受，关键是错误未静默）", lastErr)
+	}
+}

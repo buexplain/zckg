@@ -15,6 +15,13 @@ var (
 // fn 在注册时立即执行，返回的数据会按 key 路径深度合并到配置树中。
 // key 为空字符串 "" 时，返回值直接合并到配置树根节点。
 // 多次调用 Register 会合并数据，后注册的同名 key 会覆盖先前的值。
+//
+// 约定与行为：
+//   - fn 返回的 map 及其嵌套结构在 Register 之后不得再被修改；
+//     zcconfig 不拷贝 fn 的返回值（直接存储引用），外部修改会污染全局配置。
+//   - 若 key 路径的中间层级已存在标量值（如 "app.name" 已注册为 string），
+//     后续在该路径下注册子节点（如 "app.name.sub"）会覆盖原标量值为 map。
+//   - Register 仅允许在启动阶段调用，运行期配置只读。
 func Register(key string, fn func() map[string]any) {
 	data := fn()
 	if data == nil {
@@ -92,29 +99,23 @@ func Config[T any](key string, def T) T {
 	return def
 }
 
-// ConfigAll 返回当前所有已注册的业务配置数据的副本。
+// ConfigAll 返回内部配置存储的直接引用（零拷贝，不做任何拷贝）。
+//
+// 警示：
+//  1. 返回值与内部配置共享同一份数据，任何写操作都会污染全局配置；
+//  2. 写操作与并发读取（Config/Register）会产生数据竞争，可能导致程序崩溃；
+//  3. 仅限只读场景（调试输出、配置导出等）。
+//
+// 架构约定：Register 仅允许在启动阶段调用，运行期配置只读。
 func ConfigAll() map[string]any {
 	configMu.RLock()
 	defer configMu.RUnlock()
-	return deepCopy(configData)
+	return configData
 }
 
-// deepCopy 深拷贝 map[string]any，避免外部修改影响内部数据。
-func deepCopy(src map[string]any) map[string]any {
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		if m, ok := v.(map[string]any); ok {
-			dst[k] = deepCopy(m)
-		} else {
-			dst[k] = v
-		}
-	}
-	return dst
-}
-
-// Reset 清空所有已加载的 env 数据和已注册的业务配置数据。
+// reset 清空所有已加载的 env 数据和已注册的业务配置数据。
 // 主要用于测试场景下的状态重置。
-func Reset() {
+func reset() {
 	envMu.Lock()
 	envData = make(map[string]any)
 	envMu.Unlock()

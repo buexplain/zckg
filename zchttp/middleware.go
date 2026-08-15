@@ -15,6 +15,10 @@ var ErrNextCalledMultipleTimes = errors.New("middleware next() called multiple t
 // NextFunc 调用后继续执行下一层中间件，若当前已是最后一层则执行路由 handler
 // 返回值 error 为下游（后续中间件或 handler）产生的错误
 // 若不调用，则后续中间件与 handler 均不会执行（短路）
+//
+// 约束：next 必须在所属中间件执行期间的同一 goroutine 内同步调用。
+// 跨 goroutine 调用会与位图防重标记与层号记录产生 data race，且层号错配
+// 可能导致下游重复执行，行为未定义。
 type NextFunc func() error
 
 // MiddlewareHandler 洋葱模型中间件函数签名
@@ -29,6 +33,8 @@ type NextFunc func() error
 //	    // 后置逻辑
 //	    return err
 //	}
+//
+// 约束：next 必须在当前中间件的同一 goroutine 内同步调用（见 NextFunc 说明）。
 type MiddlewareHandler func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error
 
 // maxBitmaskMiddlewares 是位图防重标记支持的中间件层数上限，超出则回退递归实现（极罕见场景）

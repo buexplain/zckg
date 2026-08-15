@@ -71,16 +71,24 @@ type HttpEngine struct {
 	OnError           ErrorHandler                                 // 错误响应回调，默认 DefaultErrorHandler
 	OnValidationError ErrorHandler                                 // 参数校验失败回调，默认 DefaultValidationErrorHandler
 	OnPanic           PanicHandler                                 // panic 恢复回调，默认 DefaultPanicHandler
+	// MaxBodyBytes 请求体整体大小上限（字节），绑定前用 http.MaxBytesReader 包装 r.Body，
+	// 超限时绑定失败并映射为 400；0 表示不限制。对 JSON/表单/multipart 等所有请求体统一生效，
+	// 防止超大请求体造成的内存/磁盘 DoS。
+	MaxBodyBytes int64
+	// MultipartFormMaxMemory multipart/form-data 解析的内存缓冲上限（字节），
+	// 超出部分写入临时文件；默认 32 MB。
+	MultipartFormMaxMemory int64
 }
 
 func NewEngine() *HttpEngine {
 	return &HttpEngine{
-		Router:            NewRouter(),
-		OnNotFound:        DefaultNotFoundHandler,
-		OnResponse:        DefaultResponseHandler,
-		OnError:           DefaultErrorHandler,
-		OnValidationError: DefaultValidationErrorHandler,
-		OnPanic:           DefaultPanicHandler,
+		Router:                 NewRouter(),
+		OnNotFound:             DefaultNotFoundHandler,
+		OnResponse:             DefaultResponseHandler,
+		OnError:                DefaultErrorHandler,
+		OnValidationError:      DefaultValidationErrorHandler,
+		OnPanic:                DefaultPanicHandler,
+		MultipartFormMaxMemory: 32 << 20, // 32 MB
 	}
 }
 
@@ -106,20 +114,23 @@ func DefaultResponseHandler(w http.ResponseWriter, r *http.Request, res any) {
 }
 
 // DefaultErrorHandler 默认错误响应：若响应已写入则跳过（避免重复写头）；
-// 否则根据 WantHtml 决定返回 HTML 或统一 JSON 结构，状态码统一为 500
+// 否则根据 WantHtml 决定返回 HTML 或统一 JSON 结构，状态码统一为 500。
+// 客户端仅收到通用 "internal server error" 消息，错误详情只写入服务端日志，
+// 防止泄露业务内部信息（与 DefaultPanicHandler 对齐）。
 func DefaultErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	if IsResponseWritten(w) {
 		return
 	}
+	slog.Error("request failed with internal error", "error", err, "method", r.Method, "path", r.URL.Path)
 	if WantHtml(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("<h1>500 Internal Server Error</h1><p>" + html.EscapeString(err.Error()) + "</p>"))
+		_, _ = w.Write([]byte("<h1>500 Internal Server Error</h1><p>internal server error</p>"))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
-	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusInternalServerError, Message: err.Error()}); encErr != nil {
+	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusInternalServerError, Message: "internal server error"}); encErr != nil {
 		slog.Error("json encode failed in DefaultErrorHandler", "error", encErr, "path", r.URL.Path)
 	}
 }
@@ -189,6 +200,12 @@ func DefaultNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 整体请求体大小限制（MaxBodyBytes > 0 时生效）：超限请求在绑定阶段收到
+	// *http.MaxBytesError 并映射为 400，防止超大请求体造成内存/磁盘 DoS
+	if e.MaxBodyBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, e.MaxBodyBytes)
+	}
+
 	// 从池中取出 ResponseWriter 包装器以跟踪响应是否已被写入（提前获取，以便 panic 恢复时也能使用）
 	rw := acquireResponseWriter(w)
 
@@ -245,13 +262,15 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deepCopyDefaults(reqPtr.Elem())
 	}
 
-	if err := bindRequestData(r, reqPtr, entry.reqMeta); err != nil {
-		// 绑定失败不提前返回，将错误存入状态，随中间件链穿透到 core 层再处理
-		st.bindingErr = NewBindingError(err)
-	} else if len(entry.pathParams) > 0 {
-		// 路由路径参数在 query/body 之后绑定，覆盖同名参数；转换失败同样走 BindingError 通道（400）
-		if err := bindPathParams(reqPtr, entry.pathParams, paramValues); err != nil {
+	if len(entry.reqMeta.fields) > 0 {
+		if err := bindRequestData(r, reqPtr, entry.reqMeta, e.MultipartFormMaxMemory); err != nil {
+			// 绑定失败不提前返回，将错误存入状态，随中间件链穿透到 core 层再处理
 			st.bindingErr = NewBindingError(err)
+		} else if len(entry.pathParams) > 0 {
+			// 路由路径参数在 query/body 之后绑定，覆盖同名参数；转换失败同样走 BindingError 通道（400）
+			if err := bindPathParams(reqPtr, entry.pathParams, paramValues); err != nil {
+				st.bindingErr = NewBindingError(err)
+			}
 		}
 	}
 
@@ -259,7 +278,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// requestPhase=true：仅填充 nil 指针字段，值类型（int/string/bool）跳过以避免覆盖用户显式传入的零值。
 	// 仅当注册阶段预计算存在带 default 的指针字段时才执行，避免无意义的递归遍历。
 	if entry.needsRequestPhaseDefaults {
-		_ = applyDefaults(reqPtr, entry.reqMeta, true)
+		applyDefaults(reqPtr, entry.reqMeta, true)
 	}
 
 	// 4. 将解析后的 Req 存入状态，供中间件与 core 层通过 BoundReqFromContext 获取
@@ -295,9 +314,17 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 		// 处理返回值：成功交由响应回调，失败则返回 error 交由上层处理
+		// typed-nil 归一化：handler 返回 (*MyErr)(nil) 时接口非 nil，误判会走 500。
+		// errVal == nil 的快速路径零反射开销；仅当接口非 nil 时用反射检测 typed-nil
+		// （错误路径本就低频，反射开销可接受）
 		errVal := results[1].Interface()
 		if errVal != nil {
-			return errVal.(error)
+			rv := reflect.ValueOf(errVal)
+			if rv.Kind() == reflect.Ptr && rv.IsNil() {
+				errVal = nil // typed-nil 归一化为 nil，走成功路径
+			} else {
+				return errVal.(error)
+			}
 		}
 
 		// 成功：将 Res 写入共享状态，再交由响应回调处理（默认 JSON，可自定义为文件等）

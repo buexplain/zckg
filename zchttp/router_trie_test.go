@@ -135,12 +135,12 @@ func TestTrieOptionalParamMatch(t *testing.T) {
 	router := NewRouter()
 	router.GET("/user/{name?}", hello)
 
-	// 提供参数值
+	// 提供参数时
 	entry, values := router.matchParam("GET", "/user/guest")
 	if entry == nil || !reflect.DeepEqual(values, []string{"guest"}) {
 		t.Fatalf("match /user/guest = %v, %v; want hit with [guest]", entry, values)
 	}
-	// 省略可选参数
+	// 省略可选参数时
 	entry, values = router.matchParam("GET", "/user")
 	if entry == nil || len(values) != 0 {
 		t.Fatalf("match /user = %v, %v; want omitted branch with empty values", entry, values)

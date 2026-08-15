@@ -2,6 +2,7 @@ package zchttp
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"sync"
@@ -290,7 +291,10 @@ func validateNonzeroWalk(v reflect.Value, meta structMeta, visited map[visitKey]
 					// 副本为临时对象，其地址不可靠，标记 isTempCopy=true
 					valCopy := reflect.New(valType).Elem()
 					valCopy.Set(val)
-					if err := validateNonzeroWalk(valCopy, subMeta, visited, prefix+fm.name+".", true); err != nil {
+					// 错误路径拼接 map key 的字符串化，便于定位具体哪个 value 校验失败
+					// （如 children.a.name），ValidationError.Field 语义不变
+					childPrefix := prefix + fm.name + "." + fmt.Sprintf("%v", key) + "."
+					if err := validateNonzeroWalk(valCopy, subMeta, visited, childPrefix, true); err != nil {
 						return err
 					}
 				}

@@ -13,9 +13,6 @@ import (
 	"time"
 )
 
-// defaultMaxMemory 是解析 multipart/form-data 时内存缓冲上限，超出部分写入临时文件
-const defaultMaxMemory = 32 << 20 // 32 MB
-
 // fileHeaderPtrType 用于识别 handler 结构体中的上传文件字段
 var fileHeaderPtrType = reflect.TypeOf((*multipart.FileHeader)(nil))
 
@@ -39,18 +36,20 @@ var defaultTimeLayouts = []string{
 // 用于提前解析 Req 的场景（如路由命中后立即绑定，将结果注入 ctx，
 // 后续在 core 层再做校验）。
 // meta 为注册阶段预计算的 structMeta，避免请求阶段重复反射解析。
-func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta) error {
+// multipartMaxMemory 为 multipart/form-data 解析的内存缓冲上限（字节）。
+func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartMaxMemory int64) error {
 	switch r.Method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
 		return bindValues(reqPtr, r.URL.Query(), nil, meta)
 	default:
-		return bindBody(r, reqPtr, meta)
+		return bindBody(r, reqPtr, meta, multipartMaxMemory)
 	}
 }
 
 // bindBody 处理携带请求体的方法，依据 Content-Type 选择 JSON、表单或 multipart 绑定。
 // meta 为注册阶段预计算的 structMeta，透传给 bindValues。
-func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta) error {
+// multipartMaxMemory 为 multipart/form-data 解析的内存缓冲上限（字节）。
+func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartMaxMemory int64) error {
 	contentType := r.Header.Get("Content-Type")
 	// 去掉 charset 等参数，只保留主类型，如 "application/json; charset=utf-8"
 	if idx := strings.IndexByte(contentType, ';'); idx != -1 {
@@ -63,13 +62,9 @@ func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta) error {
 		if r.Body == nil {
 			return nil
 		}
-		// 仅当 req 有可绑定字段时才进行 JSON 解码，避免空结构体时 Decode 返回 EOF 报错
-		if len(meta.fields) == 0 {
-			return nil
-		}
 		if err := json.NewDecoder(r.Body).Decode(reqPtr.Interface()); err != nil {
 			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("empty request body")
+				return nil // 空 body 不报错，交给校验阶段通过 nonzero 拦截缺失字段
 			}
 			return err
 		}
@@ -80,7 +75,8 @@ func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta) error {
 		}
 		return bindValues(reqPtr, r.PostForm, nil, meta)
 	case "multipart/form-data":
-		if err := r.ParseMultipartForm(defaultMaxMemory); err != nil {
+		// 超出部分由 net/http 写入临时文件
+		if err := r.ParseMultipartForm(multipartMaxMemory); err != nil {
 			return err
 		}
 		if r.MultipartForm == nil {
@@ -88,11 +84,11 @@ func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta) error {
 		}
 		return bindValues(reqPtr, r.MultipartForm.Value, r.MultipartForm.File, meta)
 	default:
-		// 未知 Content-Type：若有请求体且有可绑定字段则尝试按 JSON 解析，否则不绑定
-		if r.Body != nil && len(meta.fields) > 0 {
+		// 未知 Content-Type：若有请求体则尝试按 JSON 解析，否则不绑定
+		if r.Body != nil {
 			if err := json.NewDecoder(r.Body).Decode(reqPtr.Interface()); err != nil {
 				if errors.Is(err, io.EOF) {
-					return fmt.Errorf("empty request body")
+					return nil // 空 body 不报错，交给校验阶段通过 nonzero 拦截缺失字段
 				}
 				return err
 			}
@@ -137,7 +133,7 @@ func bindValues(reqPtr reflect.Value, values map[string][]string, files map[stri
 // bindPathParams 将捕获的路由路径参数值按注册顺序写入 Req 字段。
 // 路径参数覆盖同名 query/body 值，必须在 bindRequestData 之后调用。
 // 单个参数转换失败立即返回错误（区别于 bindValues 的尽力绑定策略）；
-// 被省略的尾部可选参数无捕获值，跳过绑定以保留模板默认值/零值。
+// 被省略的尾部可选参数无捕获值，跳过绑定以保留模板默认值或零值。
 func bindPathParams(reqPtr reflect.Value, params []pathParamBinding, values []string) error {
 	elem := reqPtr.Elem()
 	if elem.Kind() != reflect.Struct {

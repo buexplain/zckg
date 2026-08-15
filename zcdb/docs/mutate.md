@@ -60,6 +60,8 @@ id, err := db.Builder().Table("users").InsertGetId(ctx, User{Name: "alice", Age:
 // SQL: INSERT INTO `users` (`name`, `age`) VALUES (?, ?)
 ```
 
+> 方言限制：**不支持 PostgreSQL**——lib/pq 驱动不支持 `LastInsertId`（PG 获取自增 ID 需 `RETURNING` 子句）。为避免「插入成功但返回错误」的半成功状态，PG 方言下 `InsertGetId` 在执行前直接返回错误，请改用 `Insert` 或带 `RETURNING` 的原始 SQL。
+
 ## InsertOrIgnore
 
 插入时忽略唯一键冲突，返回实际插入的行数。三方言 SQL 形态不同：
@@ -181,6 +183,8 @@ affected, err := db.Builder().Table("users").
 ```
 
 没有任何 JOIN 时调用 `DeleteJoin` 返回 `ErrDeleteJoinNoJoin`。
+
+> SQLite 方言限制：`DeleteJoin` 编译为主键 `IN` 子查询，主键列名硬编码为 `id`，主键非 `id` 的表请勿在 SQLite 下使用 DeleteJoin（改用 WhereInSub + Delete 组合）。
 
 ## Truncate
 

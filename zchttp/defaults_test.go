@@ -959,10 +959,7 @@ func TestApplyDefaults_RequestPhase(t *testing.T) {
 			reqElemType := reqPtr.Type().Elem()
 			meta := buildStructMeta(reqElemType)
 
-			err := applyDefaults(reqPtr, meta, true)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			applyDefaults(reqPtr, meta, true)
 
 			tt.check(t, reqPtr)
 		})
@@ -995,7 +992,8 @@ func TestApplyDefaults_SelfRef_NoInfiniteRecursion(t *testing.T) {
 				done <- fmt.Errorf("panic: %v", r)
 			}
 		}()
-		done <- applyDefaults(reqPtr, meta, true)
+		applyDefaults(reqPtr, meta, true)
+		done <- nil
 	}()
 
 	select {
@@ -1036,7 +1034,8 @@ func TestApplyDefaults_SelfRefMap_NoInfiniteRecursion(t *testing.T) {
 				done <- fmt.Errorf("panic: %v", r)
 			}
 		}()
-		done <- applyDefaults(reqPtr, meta, true)
+		applyDefaults(reqPtr, meta, true)
+		done <- nil
 	}()
 
 	select {
@@ -1071,10 +1070,7 @@ func TestApplyDefaults_RequestPhase_DeepNesting(t *testing.T) {
 	t.Run("全链路非nil→最深层nil指针填充", func(t *testing.T) {
 		req := &deepOuter{Mid: &deepMid{Inner: &deepInner{}}}
 		meta := buildStructMeta(reflect.TypeOf(deepOuter{}))
-		err := applyDefaults(reflect.ValueOf(req), meta, true)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		applyDefaults(reflect.ValueOf(req), meta, true)
 		if req.Mid.Inner.Value == nil || *req.Mid.Inner.Value != "deep_ok" {
 			t.Fatal("deepest nil pointer should be filled with default")
 		}
@@ -1083,10 +1079,7 @@ func TestApplyDefaults_RequestPhase_DeepNesting(t *testing.T) {
 	t.Run("中间层nil→深层不填充", func(t *testing.T) {
 		req := &deepOuter{Mid: nil}
 		meta := buildStructMeta(reflect.TypeOf(deepOuter{}))
-		err := applyDefaults(reflect.ValueOf(req), meta, true)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		applyDefaults(reflect.ValueOf(req), meta, true)
 		if req.Mid != nil {
 			t.Fatal("nil Mid should remain nil")
 		}
@@ -1095,10 +1088,7 @@ func TestApplyDefaults_RequestPhase_DeepNesting(t *testing.T) {
 	t.Run("内层nil→最深层不填充", func(t *testing.T) {
 		req := &deepOuter{Mid: &deepMid{Inner: nil}}
 		meta := buildStructMeta(reflect.TypeOf(deepOuter{}))
-		err := applyDefaults(reflect.ValueOf(req), meta, true)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		applyDefaults(reflect.ValueOf(req), meta, true)
 		if req.Mid.Inner != nil {
 			t.Fatal("nil Inner should remain nil")
 		}
@@ -1108,10 +1098,7 @@ func TestApplyDefaults_RequestPhase_DeepNesting(t *testing.T) {
 		s := "explicit"
 		req := &deepOuter{Mid: &deepMid{Inner: &deepInner{Value: &s}}}
 		meta := buildStructMeta(reflect.TypeOf(deepOuter{}))
-		err := applyDefaults(reflect.ValueOf(req), meta, true)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		applyDefaults(reflect.ValueOf(req), meta, true)
 		if *req.Mid.Inner.Value != "explicit" {
 			t.Fatalf("explicit value should not be overwritten, got %q", *req.Mid.Inner.Value)
 		}
@@ -1819,5 +1806,152 @@ func TestBindDefaultsArrayElem(t *testing.T) {
 		if *item.Qty != 5 {
 			t.Fatalf("items[%d].qty = %d, want 5", i, *item.Qty)
 		}
+	}
+}
+
+// ========== m1: 切片/数组为外层的多层容器警告 ==========
+
+// TestCheckUnsupportedDefaults_MultiLayerContainerWarning 验证切片/数组为外层的多层容器
+// （[][]Struct、[]map[K]Struct）中带 default 的字段触发启动期警告，与 map 分支的
+// "never applied" 警告行为对齐；单层切片（[]Struct）为对照组：defaults 可达，不警告。
+func TestCheckUnsupportedDefaults_MultiLayerContainerWarning(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(old)
+
+	type mclLeaf struct {
+		Qty *int `json:"qty" default:"1"`
+	}
+
+	// 对照组：单层切片，applyDefaults 可穿透到 struct 元素 → 不警告
+	type reqSingleSlice struct {
+		Items []mclLeaf `json:"items"`
+	}
+	checkUnsupportedDefaults(reflect.TypeOf(reqSingleSlice{}), true, true, "POST", "/ss", "handler", "file.go", 1, make(map[reflect.Type]bool))
+	if buf.Len() != 0 {
+		t.Fatalf("single-layer slice is defaults-reachable, expected no warning, got: %s", buf.String())
+	}
+
+	// [][]Struct：外层切片→内层切片→struct，applyDefaults 无法穿透 → 应告警
+	type reqDoubleSlice struct {
+		Matrix [][]mclLeaf `json:"matrix"`
+	}
+	checkUnsupportedDefaults(reflect.TypeOf(reqDoubleSlice{}), true, true, "POST", "/ds", "handler", "file.go", 1, make(map[reflect.Type]bool))
+	out := buf.String()
+	if !strings.Contains(out, "never applied") {
+		t.Fatalf("[][]Struct should warn 'never applied', got: %s", out)
+	}
+	if !strings.Contains(out, "mclLeaf") {
+		t.Fatalf("warning should identify struct mclLeaf, got: %s", out)
+	}
+
+	// []map[K]Struct：外层切片→map→struct，applyDefaults 无法穿透 → 应告警
+	buf.Reset()
+	type reqSliceMap struct {
+		Rows []map[string]mclLeaf `json:"rows"`
+	}
+	checkUnsupportedDefaults(reflect.TypeOf(reqSliceMap{}), true, true, "POST", "/sm", "handler", "file.go", 1, make(map[reflect.Type]bool))
+	out = buf.String()
+	if !strings.Contains(out, "never applied") {
+		t.Fatalf("[]map[K]Struct should warn 'never applied', got: %s", out)
+	}
+
+	// [][2]Struct：外层切片→内层数组→struct，同样无法穿透 → 应告警
+	buf.Reset()
+	type reqSliceArray struct {
+		Grid [][2]mclLeaf `json:"grid"`
+	}
+	checkUnsupportedDefaults(reflect.TypeOf(reqSliceArray{}), true, true, "POST", "/sa", "handler", "file.go", 1, make(map[reflect.Type]bool))
+	out = buf.String()
+	if !strings.Contains(out, "never applied") {
+		t.Fatalf("[][2]Struct should warn 'never applied', got: %s", out)
+	}
+}
+
+// ========== n4: 空切片默认值（default:"" 视为空切片） ==========
+
+// TestApplyDefaults_EmptySliceDefault 验证 default:""（及空白/纯逗号）在注册阶段产生空切片
+// （len=0 的非 nil 切片），而非含单个空元素的切片
+func TestApplyDefaults_EmptySliceDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"empty string", reflect.TypeOf(struct {
+			Tags []string `json:"tags" default:""`
+		}{})},
+		{"whitespace only", reflect.TypeOf(struct {
+			Tags []string `json:"tags" default:"   "`
+		}{})},
+		{"commas only", reflect.TypeOf(struct {
+			Tags []string `json:"tags" default:",,,"`
+		}{})},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			reqPtr := reflect.New(c.typ)
+			meta := buildStructMeta(c.typ)
+			applyDefaults(reqPtr, meta) // 注册阶段
+
+			fv := reqPtr.Elem().FieldByName("Tags")
+			if fv.Kind() != reflect.Slice {
+				t.Fatalf("Tags kind = %v, want Slice", fv.Kind())
+			}
+			if fv.IsNil() {
+				t.Fatal("default should produce a non-nil empty slice, got nil")
+			}
+			if fv.Len() != 0 {
+				t.Fatalf("default should produce an empty slice, got len=%d (%v)", fv.Len(), fv.Interface())
+			}
+		})
+	}
+}
+
+// TestApplyDefaults_EmptySliceDefaultE2E 端到端锁死：default:"" 的切片字段经完整链路后为空切片，
+// 且客户端显式传值时不被默认值覆盖
+func TestApplyDefaults_EmptySliceDefaultE2E(t *testing.T) {
+	type emptySliceReq struct {
+		Tags []string `json:"tags" default:""`
+	}
+	type emptySliceRes struct {
+		TagLen int      `json:"tag_len"`
+		Tags   []string `json:"tags"`
+	}
+
+	router := NewRouter()
+	router.POST("/tags", func(_ context.Context, req emptySliceReq) (emptySliceRes, error) {
+		return emptySliceRes{TagLen: len(req.Tags), Tags: req.Tags}, nil
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	// 未传 tags：default:"" → 空切片（len=0），而非 [""]（len=1）
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tags", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res emptySliceRes
+	decodeData(t, rec, &res)
+	if res.TagLen != 0 {
+		t.Fatalf("default:\"\" should produce empty slice, got len=%d (%v)", res.TagLen, res.Tags)
+	}
+
+	// 显式传值：不被默认值覆盖
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/tags", strings.NewReader(`{"tags":["a","b"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	res = emptySliceRes{}
+	decodeData(t, rec, &res)
+	if res.TagLen != 2 || res.Tags[0] != "a" || res.Tags[1] != "b" {
+		t.Fatalf("explicit tags should be kept, got %v", res.Tags)
 	}
 }

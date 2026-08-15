@@ -23,7 +23,8 @@ func openPgTestDB(t *testing.T) *DBDao {
 		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable",
 	})
 	if err != nil {
-		t.Fatalf("failed to open postgres: %v", err)
+		// 门控：PostgreSQL 不可达时跳过而非失败，保证无数据库环境下 go test 不误报
+		t.Skipf("postgres unavailable, skipping integration test: %v", err)
 	}
 	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
