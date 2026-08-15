@@ -112,6 +112,11 @@ affected, err := db.Builder().Table("users_archive").
 // MySQL SQL: INSERT IGNORE INTO `users_archive` (`name`, `age`) SELECT `name`, `age` FROM `users`
 ```
 
+**列数校验**：子查询通过 `Select`/`AddSelect` 显式指定列且不含通配符（`*`）时，
+`ToInsertUsing`/`ToInsertOrIgnoreUsing` 会在编译期校验目标列数与子查询列数一致，
+不一致返回哨兵错误 `ErrInsertUsingColumnMismatch`；无法静态判定列数的场景
+（如 `SELECT *` 或未显式指定列）不做编译期校验，列数一致性由数据库在运行时校验。
+
 ## Update
 
 更新数据，data 必须是**单个结构体或结构体指针**（不支持切片）。字段映射与值处理规则同 Insert（nil 跳过、指针解引用、Expression 内嵌）。

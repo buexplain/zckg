@@ -1,6 +1,7 @@
 package zcconfig
 
 import (
+	"math"
 	"reflect"
 	"strconv"
 	"time"
@@ -48,7 +49,9 @@ func cast[T any](v any, def T) T {
 				return reflect.ValueOf(n).Convert(rt).Interface().(T)
 			}
 		case reflect.Float32, reflect.Float64:
-			if f, err := strconv.ParseFloat(s, rt.Bits()); err == nil {
+			// NaN/Inf 字面量可被 ParseFloat 接受且不报错，但 NaN 参与任何比较均为 false，
+			// Inf 参与运算易产生意外结果，配置场景应视为非法输入返回 def。
+			if f, err := strconv.ParseFloat(s, rt.Bits()); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 				return reflect.ValueOf(f).Convert(rt).Interface().(T)
 			}
 		case reflect.Bool:

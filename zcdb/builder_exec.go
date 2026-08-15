@@ -350,7 +350,8 @@ func (b *Builder) hasEffectiveJoin() bool {
 
 // Truncate 清空表。
 // MySQL/PostgreSQL 编译为 TRUNCATE TABLE，SQLite 转为 DELETE FROM 并额外清空
-// sqlite_sequence（使自增主键从头开始，表从未使用 AUTOINCREMENT 时忽略该错误）。
+// sqlite_sequence（使自增主键从头开始；表从未使用 AUTOINCREMENT 时该表不存在，
+// 经 sqlite_master 预查询确认后跳过清理）。
 //
 //	err := db.Builder().Table("users").Truncate(ctx)
 //	// MySQL/PG SQL: TRUNCATE TABLE `users`
@@ -367,13 +368,41 @@ func (b *Builder) Truncate(ctx context.Context) error {
 
 	// SQLite 方言：DELETE FROM 不会重置 AUTOINCREMENT 序列，
 	// 数据删除成功后再清空 sqlite_sequence 使自增主键从头开始（顺序不可颠倒，
-	// 否则主语句失败时序列已被清空、状态不一致）；
-	// 表从未使用 AUTOINCREMENT 时 sqlite_sequence 表不存在，该错误忽略
+	// 否则主语句失败时序列已被清空、状态不一致）。
+	// 清理前先查 sqlite_master 确认 sqlite_sequence 存在：表从未使用 AUTOINCREMENT 时
+	// 该表不存在，直接跳过清理——不依赖驱动错误文案（错误文案随驱动版本变化，
+	// 且其它真实错误可能恰好含相同子串而被误吞）；清理失败是真实错误，必须如实上报。
 	if _, ok := b.grammar.(*SQLiteGrammar); ok {
-		_, err := b.dao.Exec(ctx, "DELETE FROM sqlite_sequence WHERE name = ?", b.table)
-		if err != nil && !strings.Contains(err.Error(), "no such table") {
+		exists, err := b.sqliteSequenceExists(ctx)
+		if err != nil {
 			return err
+		}
+		if exists {
+			if _, err := b.dao.Exec(ctx, "DELETE FROM sqlite_sequence WHERE name = ?", b.table); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// sqliteSequenceExists 查询 sqlite_master 判断 sqlite_sequence 表是否存在。
+// SQLite 仅在含 AUTOINCREMENT 列的表被写入后才创建 sqlite_sequence 表。
+func (b *Builder) sqliteSequenceExists(ctx context.Context) (bool, error) {
+	rows, err := b.dao.Query(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var count int
+	if rows.Next() {
+		if err := rows.Scan(&count); err != nil {
+			return false, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

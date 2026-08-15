@@ -3,6 +3,7 @@ package zchttp
 import (
 	"mime/multipart"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -321,5 +322,40 @@ func TestIsStructLikeVariants(t *testing.T) {
 				t.Fatalf("isStructLike(%v) = %v, want %v", tc.typ, got, tc.want)
 			}
 		})
+	}
+}
+
+// ========== cachedStructMeta 测试（Nit-1: LoadOrStore） ==========
+
+// TestCachedStructMeta_ConcurrentConsistent 验证并发首次构建同一类型时，
+// 所有 goroutine 经 LoadOrStore 返回同一份缓存 structMeta（内容一致），
+// 且缓存命中后的后续调用与首次构建结果一致
+func TestCachedStructMeta_ConcurrentConsistent(t *testing.T) {
+	type cacheProbe struct {
+		Name    string   `json:"name" default:"x"`
+		Count   int      `json:"count" nonzero:"true"`
+		Percent *float64 `json:"percent"`
+	}
+	tp := reflect.TypeOf(cacheProbe{})
+
+	const n = 16
+	metas := make([]structMeta, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			metas[idx] = cachedStructMeta(tp)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, m := range metas {
+		if !reflect.DeepEqual(m, metas[0]) {
+			t.Fatalf("goroutine %d returned inconsistent structMeta", i)
+		}
+	}
+	if again := cachedStructMeta(tp); !reflect.DeepEqual(again, metas[0]) {
+		t.Fatal("cache hit returned inconsistent structMeta")
 	}
 }

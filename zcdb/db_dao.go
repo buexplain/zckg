@@ -189,11 +189,11 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 	// 将事务绑定到 ctx
 	txCtx := context.WithValue(ctx, ctxTxKey{}, tx)
 
-	// 标记事务是否已提交
-	committed := false
+	// 标记事务是否已终结（提交或回滚完成）
+	settled := false
 	// defer Rollback 兜底：如果回调 panic 或 Commit 失败，确保事务回滚
 	defer func() {
-		if !committed {
+		if !settled {
 			_ = tx.Rollback()
 		}
 	}()
@@ -204,7 +204,7 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 		if rbErr := tx.Rollback(); rbErr != nil {
 			return fmt.Errorf("zcdb: rollback failed: %v, original error: %w", rbErr, err)
 		}
-		committed = true // 已回滚，defer 不再重复执行
+		settled = true // 已终结（回滚完成），defer 不再重复 Rollback
 		return err
 	}
 
@@ -212,10 +212,10 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 	if err := tx.Commit(); err != nil {
 		// Commit 失败后事务已结束，database/sql 会自动回滚，
 		// 再调用 Rollback 只会返回 ErrTxDone 这类误导性错误，故直接返回提交错误。
-		committed = true // 已提交（或自动回滚），defer 不再重复执行
+		settled = true // 已终结（提交失败，由 database/sql 自动回滚），defer 不再重复 Rollback
 		return fmt.Errorf("zcdb: commit failed: %w", err)
 	}
-	committed = true
+	settled = true
 	return nil
 }
 

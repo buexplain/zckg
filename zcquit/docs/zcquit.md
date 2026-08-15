@@ -304,16 +304,18 @@ func main() {
 
 3. **handler panic 隔离**：每个 handler 有独立的 `recover`，单个 panic 会被 `slog.Error` 记录（含所在 level），不影响同级别或后续级别的 handler 执行，也不影响 `Listen` 最终返回。
 
-4. **handler 中可安全调用 `AddSigHandler`**：`executeShutdown` 在执行前已快照 handler map 并释放锁，因此 handler 中调用 `AddSigHandler` 不会死锁。但新增的 handler **不会被本次退出执行**（本次快照已固化），且退出流程仅发生一次（见注意事项 7），因此新增的 handler **不会被执行**。handler 注册应在任何退出触发（信号或 `Shutdown()`）之前完成。
+4. **handler 中可安全调用 `AddSigHandler`**：`executeShutdown` 在执行前已快照 handler map 并释放锁，因此 handler 中调用 `AddSigHandler` 不会死锁。但新增的 handler **不会被本次退出执行**（本次快照已固化），且退出流程不可逆（见注意事项 8），因此新增的 handler **不会被执行**。handler 注册应在任何退出触发（信号或 `Shutdown()`）之前完成。
 
 5. **SIGHUP 被忽略**：SIGHUP 通常由终端会话断开触发，不代表程序需要终止。如需响应 SIGHUP（如重新加载配置），可自行扩展。
 
 6. **`Shutdown` 可多次调用**：内部通过原子幂等标记（CAS）保证退出流程仅执行一次，未抢到的调用方立即返回（不等待流程完成），`cancel` 函数本身也支持多次调用，后续调用为 no-op。
 
-7. **退出流程不可逆**：信号监听 goroutine 在收到第一个非 SIGHUP 信号后退出循环，不会再响应后续信号。`waitChan` 关闭后不可重用。
+7. **`Shutdown` 与信号并发触发时退出流程仅执行一次**：两条路径收敛到同一个 CAS 入口。若二者几乎同时到达，监听 goroutine 的 select 可能随机选中停止通知分支，此时信号被丢弃，**handler 观察到的 `sig` 可能为 nil**（与 `Shutdown()` 主动触发等价）；handler 不应假设 `sig` 非 nil 才能执行清理，应通过 `sig == nil` 区分触发来源。
 
-8. **handler 应自行控制超时**：退出流程会等待所有 handler 执行完毕（`wg.Wait()`），单个 handler 卡死会导致整个退出流程永久阻塞、进程无法退出。handler 内部应使用带超时的操作（如 `context.WithTimeout`，参考上文 HTTP 服务器集成示例中的 `srv.Shutdown(ctx)`）。
+8. **退出流程不可逆**：信号监听 goroutine 在收到第一个非 SIGHUP 信号后退出循环，不会再响应后续信号。`waitChan` 关闭后不可重用。
 
-9. **Windows 平台信号支持有限**：Windows 下 `SIGHUP` 与 `SIGQUIT` 不会被操作系统实际投递，仅 `SIGINT`（Ctrl+C）和 `SIGTERM`（如 `taskkill`）可用；`Shutdown()` 主动退出不受平台限制。
+9. **handler 应自行控制超时**：退出流程会等待所有 handler 执行完毕（`wg.Wait()`），单个 handler 卡死会导致整个退出流程永久阻塞、进程无法退出。handler 内部应使用带超时的操作（如 `context.WithTimeout`，参考上文 HTTP 服务器集成示例中的 `srv.Shutdown(ctx)`）。
 
-10. **nil handler 拒绝注册**：`AddSigHandler` 传入 nil handler 会直接 panic（注册期防御），请在注册前确保 handler 非 nil。
+10. **Windows 平台信号支持有限**：Windows 下 `SIGHUP` 与 `SIGQUIT` 不会被操作系统实际投递，仅 `SIGINT`（Ctrl+C）和 `SIGTERM`（如 `taskkill`）可用；`Shutdown()` 主动退出不受平台限制。
+
+11. **nil handler 拒绝注册**：`AddSigHandler` 传入 nil handler 会直接 panic（注册期防御），请在注册前确保 handler 非 nil。

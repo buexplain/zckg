@@ -5,7 +5,9 @@ package zcdb
 import (
 	"context"
 	_ "github.com/lib/pq"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestPgInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行读取所有数据。
@@ -259,5 +261,62 @@ func TestPgInteg_CursorBy_Desc(t *testing.T) {
 		if names[i] != exp {
 			t.Errorf("names[%d]: expected %q, got %q", i, exp, names[i])
 		}
+	}
+}
+
+// TestPgInteg_CursorBy_ExactPageBoundary 验证 PostgreSQL 下数据量恰为 chunkSize 整数倍时，
+// 末批通过多取一条探测判断结束（探测行不丢、不重），不再执行一次返回 0 行的空查询。
+func TestPgInteg_CursorBy_ExactPageBoundary(t *testing.T) {
+	openPgTestDB(t) // 确保测试库存在并完成清理
+
+	var sqlCount int32
+	pool, err := NewPool(PoolConfig{
+		DriverName: "postgres",
+		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=zckg_test_integ",
+	})
+	if err != nil {
+		t.Fatalf("failed to open postgres: %v", err)
+	}
+	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		atomic.AddInt32(&sqlCount, 1)
+	}, "")
+	if err != nil {
+		t.Fatalf("failed to create dao: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.Close() })
+
+	// 6 行数据（6 = 2 × 3，整页边界场景）
+	mustExec(t, dao, `DROP TABLE IF EXISTS cursor_items CASCADE`)
+	mustExec(t, dao, `CREATE TABLE cursor_items (
+		id BIGSERIAL PRIMARY KEY,
+		name VARCHAR(64) NOT NULL
+	)`)
+	mustExec(t, dao, `INSERT INTO cursor_items (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f')`)
+	atomic.StoreInt32(&sqlCount, 0)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var item row
+	var names []string
+	for err := range dao.Builder().Table("cursor_items").Select("id", "name").CursorBy(context.Background(), &item, 3, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, item.Name)
+	}
+	if len(names) != 6 {
+		t.Fatalf("expected 6 rows, got %d: %v", len(names), names)
+	}
+	want := []string{"a", "b", "c", "d", "e", "f"}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("names[%d]: expected %q, got %q", i, want[i], names[i])
+		}
+	}
+	// 旧实现：3+3+0 共 3 次查询（末尾一次空查询）；修复后：每批多取一条探测，共 2 次查询
+	if got := atomic.LoadInt32(&sqlCount); got != 2 {
+		t.Errorf("expected 2 queries for exact page boundary, got %d", got)
 	}
 }

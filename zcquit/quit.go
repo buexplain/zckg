@@ -64,25 +64,10 @@ var listenOnce = sync.Once{}
 // 该通道在 [executeShutdown] 中关闭。
 var waitChan = make(chan struct{})
 
-// stopListenCh 保存用于通知 listen goroutine 退出的通道指针：退出流程完成后由 [executeShutdown]
-// 关闭该通道，listen goroutine 收到通知后退出，避免退出流程完成后 listen goroutine 永久阻塞造成泄漏。
-// 使用原子指针而非裸包变量：监听方通过 Load 读取、重置方通过 Swap 替换，避免并发读写竞争。
-var stopListenCh atomic.Pointer[chan struct{}]
-
-// newStopListenCh 创建新的停止通知通道并安装为当前通道，返回其指针。
-func newStopListenCh() *chan struct{} {
-	ch := make(chan struct{})
-	stopListenCh.Store(&ch)
-	return &ch
-}
-
-// loadStopListenCh 返回当前停止通知通道的指针；若尚未初始化（理论上不应发生）则先初始化。
-func loadStopListenCh() *chan struct{} {
-	if p := stopListenCh.Load(); p != nil {
-		return p
-	}
-	return newStopListenCh()
-}
+// stopListenCh 用于通知 listen goroutine 退出：退出流程完成后由 [executeShutdown] 关闭该通道，
+// listen goroutine 收到通知后退出，避免退出流程完成后其永久阻塞造成泄漏。
+// 通道在包初始化时创建一次、此后只读（关闭与接收均为 channel 操作，天然同步），无需并发保护。
+var stopListenCh = make(chan struct{})
 
 // signalHandlerMux 保护 signalHandlerMap 的并发读写安全。
 var signalHandlerMux sync.RWMutex
@@ -102,10 +87,9 @@ var signalHandlerMap = map[int][]SigHandler{}
 // [Shutdown] 主动调用时传入 nil，handler 可通过 sig == nil 区分触发来源。
 type SigHandler func(sig os.Signal)
 
-// init 在包加载时初始化全局的 ctx、cancel 与停止通知通道。
+// init 在包加载时初始化全局的 ctx 与 cancel。
 func init() {
 	ctx, cancel = context.WithCancel(context.Background())
-	newStopListenCh()
 }
 
 // Listen 阻塞等待操作系统终止信号，触发优雅退出流程。
@@ -142,15 +126,15 @@ func listen() {
 		syscall.SIGQUIT, // 退出信号（Ctrl+\）
 	}...)
 
-	// 取当前停止通知通道的指针：后续即使通道被重置替换，本次监听仍对应启动时的通道
-	stopCh := loadStopListenCh()
-
 	var sig os.Signal
-	// 循环读取信号通道，直到收到非 SIGHUP 信号，或收到退出通知
+	// 循环读取信号通道，直到收到非 SIGHUP 信号，或收到退出通知。
+	// 注意：Shutdown 与信号并发触发时退出流程仅执行一次（shutdownStarted CAS 收敛）；
+	// 本 select 的两个分支同时就绪时由运行时随机选择——若走停止通知分支，信号被丢弃，
+	// handler 观察到的 sig 可能为 nil（与 Shutdown 主动触发的语义等价，可用 sig == nil 区分触发来源）。
 loop:
 	for {
 		select {
-		case <-*stopCh:
+		case <-stopListenCh:
 			// 退出流程已完成（如 Shutdown 先于信号到达），无需继续监听
 			signal.Stop(signalCH)
 			return
@@ -228,8 +212,14 @@ func executeShutdown(sig os.Signal) {
 		slog.Default().Info("退出处理函数执行完成", "level", level)
 	}
 
-	// 步骤 3：通知 listen goroutine 退出，避免退出流程完成后其永久阻塞造成泄漏
-	close(*loadStopListenCh())
+	// 步骤 3：通知 listen goroutine 退出，避免退出流程完成后其永久阻塞造成泄漏。
+	// 幂等关闭：stopListenCh 由包初始化创建一次、不重建，测试直接多次调用本函数时
+	// 通道可能已被上一次调用关闭，此时跳过以避免 double close panic。
+	select {
+	case <-stopListenCh:
+	default:
+		close(stopListenCh)
+	}
 
 	// 步骤 4：关闭 waitChan，解除 Listen 的阻塞
 	close(waitChan)

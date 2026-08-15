@@ -209,13 +209,18 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 从池中取出 ResponseWriter 包装器以跟踪响应是否已被写入（提前获取，以便 panic 恢复时也能使用）
 	rw := acquireResponseWriter(w)
 
+	// 包装器归还 defer 独立注册（先注册、LIFO 后执行，即 OnPanic 执行完毕后归还）：
+	// 若 OnPanic 回调自身 panic，归还 defer 仍会随栈展开执行，包装器不会从池中丢失
+	defer func() {
+		releaseResponseWriter(rw)
+	}()
+
 	// panic 捕获：防止单个请求的 panic 导致整个进程崩溃；
-	// 包装器在 panic 处理完成后才归还池，确保 OnPanic 仍可安全使用 rw
+	// 捕获后交由 OnPanic 处理（默认记录日志并返回 500）
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			e.OnPanic(rw, r, recovered)
 		}
-		releaseResponseWriter(rw)
 	}()
 
 	// 1. 查找路由：先按 method+path 精确匹配，未命中再回退到参数路由基数树匹配
@@ -314,15 +319,20 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 		// 处理返回值：成功交由响应回调，失败则返回 error 交由上层处理
-		// typed-nil 归一化：handler 返回 (*MyErr)(nil) 时接口非 nil，误判会走 500。
+		// typed-nil 归一化：handler 返回 (*MyErr)(nil) 等 typed-nil 错误时接口非 nil，误判会走 500。
 		// errVal == nil 的快速路径零反射开销；仅当接口非 nil 时用反射检测 typed-nil
-		// （错误路径本就低频，反射开销可接受）
+		// （错误路径本就低频，反射开销可接受）。nilable kind 统一判定（Ptr/Map/Slice/Func/Chan），
+		// 覆盖以 map/slice 等类型实现 error 的罕见自定义错误类型
 		errVal := results[1].Interface()
 		if errVal != nil {
 			rv := reflect.ValueOf(errVal)
-			if rv.Kind() == reflect.Ptr && rv.IsNil() {
-				errVal = nil // typed-nil 归一化为 nil，走成功路径
-			} else {
+			switch rv.Kind() {
+			case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+				if rv.IsNil() {
+					errVal = nil // typed-nil 归一化为 nil，走成功路径
+				}
+			}
+			if errVal != nil {
 				return errVal.(error)
 			}
 		}

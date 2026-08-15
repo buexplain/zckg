@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -72,6 +73,52 @@ NO_QUOTE=hello world
 	// 不存在的 key，返回默认值
 	if v := Env("NOT_EXIST", 12345); v != 12345 {
 		t.Errorf("期望默认值 12345，实际 %d", v)
+	}
+}
+
+// 超长单行（70KB，超过 bufio.Scanner 默认 64KB 上限）应能正常加载，
+// 调大后的缓冲区（上限 1MB）避免 bufio.ErrTooLong 导致整体加载失败。
+func TestLoadEnv_LongLine(t *testing.T) {
+	reset()
+	longVal := strings.Repeat("a", 70*1024)
+	path := writeTestFile(t, "LONG_KEY="+longVal+"\n")
+	if err := LoadEnv(path); err != nil {
+		t.Fatalf("70KB 单行 LoadEnv 失败: %v", err)
+	}
+
+	if v := Env("LONG_KEY", "fallback"); v != longVal {
+		t.Errorf("期望长值完整读回（长度 %d），实际长度 %d", len(longVal), len(v))
+	}
+}
+
+// export 前缀识别：大小写不敏感，兼容多个空格/Tab；无空白分隔的 "exportKEY=v" 不受影响。
+func TestLoadEnv_ExportPrefixVariants(t *testing.T) {
+	reset()
+	content := "EXPORT KEY=v1\nexport  KEY2=v2\nexport\tKEY3=v3\nExPoRt   KEY4=v4\nexportKEY=v5\n"
+	path := writeTestFile(t, content)
+	if err := LoadEnv(path); err != nil {
+		t.Fatalf("LoadEnv 失败: %v", err)
+	}
+
+	// 大小写不敏感
+	if v := Env("KEY", "fallback"); v != "v1" {
+		t.Errorf("EXPORT KEY=v 期望 'v1'，实际 %q", v)
+	}
+	// 多个空格
+	if v := Env("KEY2", "fallback"); v != "v2" {
+		t.Errorf("export  KEY2=v 期望 'v2'，实际 %q", v)
+	}
+	// Tab 分隔
+	if v := Env("KEY3", "fallback"); v != "v3" {
+		t.Errorf("export\\tKEY3=v 期望 'v3'，实际 %q", v)
+	}
+	// 混合大小写 + 多空格
+	if v := Env("KEY4", "fallback"); v != "v4" {
+		t.Errorf("ExPoRt   KEY4=v 期望 'v4'，实际 %q", v)
+	}
+	// 无空白分隔：exportKEY 是普通 key，不触发前缀剥离
+	if v := Env("exportKEY", "fallback"); v != "v5" {
+		t.Errorf("exportKEY=v 期望 'v5'，实际 %q", v)
 	}
 }
 

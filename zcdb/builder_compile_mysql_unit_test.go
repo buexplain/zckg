@@ -31,3 +31,10 @@ func TestBug_ToUpdateWithJoin_MySQL(t *testing.T) {
 	// 绑定应为 3 个：[99, "x", 1]
 	assertArgs(t, []any{99, "x", 1}, args)
 }
+
+// TestMySQLCompile_InsertUsingColumnMismatch 验证 MySQL 方言 InsertUsing 列数校验
+// （详见 assertInsertUsingColumnMismatch：不一致报 ErrInsertUsingColumnMismatch，
+// 一致/通配符/默认 SELECT * 时通过编译，后两者由数据库运行时校验）。
+func TestMySQLCompile_InsertUsingColumnMismatch(t *testing.T) {
+	assertInsertUsingColumnMismatch(t, NewMySQLGrammar())
+}

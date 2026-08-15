@@ -5,7 +5,9 @@ package zcdb
 import (
 	"context"
 	_ "github.com/go-sql-driver/mysql"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestMySQLInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行读取所有数据。
@@ -259,5 +261,62 @@ func TestMySQLInteg_Bug_CursorByCtxCancel(t *testing.T) {
 	}
 	if lastErr == nil {
 		t.Fatalf("ctx 取消后 CursorBy 静默结束（收到 %d 行），预期 yield 错误", count)
+	}
+}
+
+// TestMySQLInteg_CursorBy_ExactPageBoundary 验证 MySQL 下数据量恰为 chunkSize 整数倍时，
+// 末批通过多取一条探测判断结束（探测行不丢、不重），不再执行一次返回 0 行的空查询。
+func TestMySQLInteg_CursorBy_ExactPageBoundary(t *testing.T) {
+	openMySQLTestDB(t) // 确保测试库存在并完成清理
+
+	var sqlCount int32
+	pool, err := NewPool(PoolConfig{
+		DriverName: "mysql",
+		DSN:        "root:root@tcp(127.0.0.1:3306)/zckg_test_integ?charset=utf8mb4&parseTime=true&loc=Local",
+	})
+	if err != nil {
+		t.Fatalf("failed to open mysql: %v", err)
+	}
+	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		atomic.AddInt32(&sqlCount, 1)
+	}, "")
+	if err != nil {
+		t.Fatalf("failed to create dao: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.Close() })
+
+	// 6 行数据（6 = 2 × 3，整页边界场景）
+	mustExec(t, dao, `DROP TABLE IF EXISTS cursor_items`)
+	mustExec(t, dao, `CREATE TABLE cursor_items (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(64) NOT NULL
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	mustExec(t, dao, `INSERT INTO cursor_items (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f')`)
+	atomic.StoreInt32(&sqlCount, 0)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var item row
+	var names []string
+	for err := range dao.Builder().Table("cursor_items").Select("id", "name").CursorBy(context.Background(), &item, 3, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, item.Name)
+	}
+	if len(names) != 6 {
+		t.Fatalf("expected 6 rows, got %d: %v", len(names), names)
+	}
+	want := []string{"a", "b", "c", "d", "e", "f"}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("names[%d]: expected %q, got %q", i, want[i], names[i])
+		}
+	}
+	// 旧实现：3+3+0 共 3 次查询（末尾一次空查询）；修复后：每批多取一条探测，共 2 次查询
+	if got := atomic.LoadInt32(&sqlCount); got != 2 {
+		t.Errorf("expected 2 queries for exact page boundary, got %d", got)
 	}
 }

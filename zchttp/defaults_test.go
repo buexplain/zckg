@@ -1955,3 +1955,86 @@ func TestApplyDefaults_EmptySliceDefaultE2E(t *testing.T) {
 		t.Fatalf("explicit tags should be kept, got %v", res.Tags)
 	}
 }
+
+// ========== Interface（any）字段分支测试（Minor-2） ==========
+// 配套修复：hasRefFields / deepCopyDefaults 补 reflect.Interface 分支，
+// 消除“default 白名单不放开 any”的隐式约定
+
+// TestHasRefFields_NonNilInterface 验证 any 字段动态值为非 nil 指针时返回 true
+func TestHasRefFields_NonNilInterface(t *testing.T) {
+	type withAny struct {
+		V any
+	}
+	n := 1
+	v := reflect.ValueOf(withAny{V: &n})
+	if !hasRefFields(v) {
+		t.Fatal("struct with non-nil pointer inside any field should return true")
+	}
+}
+
+// TestHasRefFields_NilInterface 验证 nil 的 any 字段返回 false
+func TestHasRefFields_NilInterface(t *testing.T) {
+	type withAny struct {
+		V any
+	}
+	v := reflect.ValueOf(withAny{})
+	if hasRefFields(v) {
+		t.Fatal("struct with nil any field should return false")
+	}
+}
+
+// TestHasRefFields_InterfaceNestedRef 验证 any 字段动态值为结构体且内含非 nil 引用时返回 true
+func TestHasRefFields_InterfaceNestedRef(t *testing.T) {
+	type inner struct {
+		Ref *int
+	}
+	type withAny struct {
+		V any
+	}
+	n := 1
+	v := reflect.ValueOf(withAny{V: inner{Ref: &n}})
+	if !hasRefFields(v) {
+		t.Fatal("struct with non-nil ref nested in any field should return true")
+	}
+}
+
+// TestDeepCopyDefaults_InterfaceNotShared 验证 any 字段动态指针经深拷贝后与原值断开共享
+func TestDeepCopyDefaults_InterfaceNotShared(t *testing.T) {
+	type withAny struct {
+		V any
+	}
+	inner := &deepCopyInner{Name: "orig", Age: 10}
+	v := reflect.ValueOf(&withAny{V: inner}).Elem()
+
+	origAddr := v.FieldByName("V").Elem().Pointer()
+
+	deepCopyDefaults(v)
+
+	// 动态指针已断开共享：地址不同
+	dyn := v.FieldByName("V").Elem()
+	if dyn.Pointer() == origAddr {
+		t.Fatal("any dynamic pointer still shared after deepCopyDefaults")
+	}
+	// 内容一致
+	copied := dyn.Interface().(*deepCopyInner)
+	if copied.Name != "orig" || copied.Age != 10 {
+		t.Fatalf("content mismatch after deep copy: %+v", copied)
+	}
+	// 修改拷贝不影响原值（共享已断开）
+	copied.Name = "mutated"
+	if inner.Name != "orig" {
+		t.Fatal("modifying deep-copied dynamic value affected the original")
+	}
+}
+
+// TestDeepCopyDefaults_NilInterface 验证 nil 的 any 字段深拷贝不 panic、保持 nil
+func TestDeepCopyDefaults_NilInterface(t *testing.T) {
+	type withAny struct {
+		V any
+	}
+	v := reflect.ValueOf(&withAny{}).Elem()
+	deepCopyDefaults(v)
+	if !v.FieldByName("V").IsNil() {
+		t.Fatal("nil any field should remain nil after deepCopyDefaults")
+	}
+}

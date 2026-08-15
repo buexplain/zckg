@@ -86,3 +86,10 @@ func TestNewApi_SQLiteCompileForms(t *testing.T) {
 		})
 	}
 }
+
+// TestSQLiteCompile_InsertUsingColumnMismatch 验证 SQLite 方言 InsertUsing 列数校验
+// （详见 assertInsertUsingColumnMismatch：不一致报 ErrInsertUsingColumnMismatch，
+// 一致/通配符/默认 SELECT * 时通过编译，后两者由数据库运行时校验）。
+func TestSQLiteCompile_InsertUsingColumnMismatch(t *testing.T) {
+	assertInsertUsingColumnMismatch(t, NewSQLiteGrammar())
+}

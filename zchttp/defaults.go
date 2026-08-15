@@ -297,6 +297,8 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 // 在 ServeHTTP 中，模板浅拷贝后调用此函数完成深拷贝。
 // 注意：本函数的容器分支必须与 applyDefaultsWithVisiting 的容器分支保持对齐（Struct/Ptr/Slice/Map/Array）。
 // 若 applyDefaults 支持新容器类型（如数组），必须同步在本函数补充对应分支，否则并发请求间会共享引用导致数据污染。
+// Interface 分支为防御性处理：applyDefaults 不穿透接口字段，但深拷贝需断开 any 动态值中的引用，
+// 避免未来 default 白名单放开容器/any 后静默漏判。
 func deepCopyDefaults(v reflect.Value) {
 	switch v.Kind() {
 	case reflect.Struct:
@@ -339,6 +341,15 @@ func deepCopyDefaults(v reflect.Value) {
 		for i := 0; i < v.Len(); i++ {
 			deepCopyDefaults(v.Index(i))
 		}
+	case reflect.Interface:
+		// 接口（any）字段：非 nil 时复制动态值到可寻址变量，递归深拷贝后回写接口字段。
+		// 与 hasRefFields 的 Interface 分支对齐，消除“白名单不放开 any”的隐式约定
+		if !v.IsNil() {
+			newVal := reflect.New(v.Elem().Type()).Elem()
+			newVal.Set(v.Elem())
+			deepCopyDefaults(newVal)
+			v.Set(newVal)
+		}
 	default:
 		return
 	}
@@ -373,6 +384,13 @@ func hasRefFields(v reflect.Value) bool {
 			}
 		}
 		return false
+	case reflect.Interface:
+		// 接口（any）字段：非 nil 时递归扫描动态值（与 deepCopyDefaults 的 Interface 分支对齐），
+		// 消除“白名单不放开 any”的隐式约定
+		if v.IsNil() {
+			return false
+		}
+		return hasRefFields(v.Elem())
 	default:
 		return false
 	}

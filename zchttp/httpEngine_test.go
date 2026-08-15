@@ -955,3 +955,133 @@ func TestTypedNilErrorNonNilStillPropagates(t *testing.T) {
 		t.Fatalf("non-nil typed error should propagate: expected 500, got %d, body: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// ======== n10①扩展: 非指针 nilable 类型 typed-nil 归一化（Minor-3） ========
+
+// mapTypedNilErr / sliceTypedNilErr：以 map/slice 实现 error 的罕见自定义类型，
+// handler 返回其 nil 值时接口非 nil，应归一化为 nil 走成功路径
+
+type mapTypedNilErr map[string]string
+
+func (e mapTypedNilErr) Error() string { return "map typed nil" }
+
+type sliceTypedNilErr []string
+
+func (e sliceTypedNilErr) Error() string { return "slice typed nil" }
+
+// TestTypedNilMapErrorNormalized 验证 handler 返回 mapTypedNilErr(nil) 时归一化为 nil 错误（200）
+func TestTypedNilMapErrorNormalized(t *testing.T) {
+	router := NewRouter()
+	router.GET("/map-nil", func(_ context.Context, _ engineReq) (engineRes, mapTypedNilErr) {
+		var err mapTypedNilErr
+		return engineRes{Message: "success via map typed-nil"}, err
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/map-nil", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("map typed-nil error should be normalized to nil: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res engineRes
+	decodeData(t, rec, &res)
+	if res.Message != "success via map typed-nil" {
+		t.Fatalf("message = %q, want 'success via map typed-nil'", res.Message)
+	}
+}
+
+// TestTypedNilSliceErrorNormalized 验证 handler 返回 sliceTypedNilErr(nil) 时归一化为 nil 错误（200）
+func TestTypedNilSliceErrorNormalized(t *testing.T) {
+	router := NewRouter()
+	router.GET("/slice-nil", func(_ context.Context, _ engineReq) (engineRes, sliceTypedNilErr) {
+		var err sliceTypedNilErr
+		return engineRes{Message: "success via slice typed-nil"}, err
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slice-nil", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("slice typed-nil error should be normalized to nil: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res engineRes
+	decodeData(t, rec, &res)
+	if res.Message != "success via slice typed-nil" {
+		t.Fatalf("message = %q, want 'success via slice typed-nil'", res.Message)
+	}
+}
+
+// TestTypedNilMapErrorNonNilStillPropagates 对照组：非 nil 的 map 类型错误仍走错误通道（500）
+func TestTypedNilMapErrorNonNilStillPropagates(t *testing.T) {
+	router := NewRouter()
+	router.GET("/map-err", func(_ context.Context, _ engineReq) (engineRes, mapTypedNilErr) {
+		return engineRes{}, mapTypedNilErr{"k": "v"}
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/map-err", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("non-nil map error should propagate: expected 500, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ======== Minor-4: OnPanic 自身 panic 时包装器仍归还池 ========
+
+// TestOnPanicPanicStillReleasesWriter 验证 OnPanic 回调自身 panic 时：
+// ① OnPanic 的 panic 向外传播（由上层 net/http 兜底）；
+// ② 传播路径上归还 defer 必然执行——捕获的包装器已被重置（底层 writer 置 nil）；
+// ③ 后续请求不受影响（同一全局池可正常复用，无污染）。
+func TestOnPanicPanicStillReleasesWriter(t *testing.T) {
+	var captured *responseWriter
+	router := NewRouter()
+	router.GET("/boom", func(_ context.Context, _ engineReq) (engineRes, error) {
+		panic("handler boom")
+	})
+
+	engine := NewEngine()
+	engine.Router = router
+	engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
+		if recovered != "handler boom" {
+			t.Fatalf("recovered = %v, want 'handler boom'", recovered)
+		}
+		captured = baseResponseWriter(w)
+		panic("OnPanic boom")
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != "OnPanic boom" {
+				t.Fatalf("expected OnPanic panic to propagate, got %v", r)
+			}
+		}()
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/boom", nil))
+	}()
+
+	if captured == nil {
+		t.Fatal("OnPanic was not called")
+	}
+	// 归还 defer 在 OnPanic 的 panic 展开路径上执行：底层 writer 已置 nil，包装器已回池
+	if captured.ResponseWriter != nil || captured.written {
+		t.Fatal("responseWriter was not released after OnPanic panic (pool leak)")
+	}
+
+	// 后续请求正常：另一 engine 复用同一全局池，行为不受影响
+	okRouter := NewRouter()
+	okRouter.GET("/ok", func(_ context.Context, _ engineReq) (engineRes, error) {
+		return engineRes{Message: "alive"}, nil
+	})
+	okEngine := NewEngine()
+	okEngine.Router = okRouter
+	rec := httptest.NewRecorder()
+	okEngine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pool not reusable: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}

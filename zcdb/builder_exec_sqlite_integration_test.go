@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	_ "modernc.org/sqlite"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -896,6 +898,136 @@ func TestSQLiteInteg_TruncateResetSequence(t *testing.T) {
 	}
 	if id != 1 {
 		t.Errorf("expected id=1 after truncate (sequence reset), got %d", id)
+	}
+}
+
+// TestSQLiteInteg_Truncate_NoSequenceTable 验证表从未使用 AUTOINCREMENT 时
+// （sqlite_sequence 不存在）Truncate 通过 sqlite_master 预查询跳过序列清理、正常完成。
+func TestSQLiteInteg_Truncate_NoSequenceTable(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	// 无 AUTOINCREMENT 的普通表：写入数据不会创建 sqlite_sequence
+	mustExec(t, db, `CREATE TABLE plain (
+		id INTEGER PRIMARY KEY,
+		name TEXT
+	)`)
+	mustExec(t, db, `INSERT INTO plain (id, name) VALUES (1, 'a'), (2, 'b')`)
+
+	// 前置条件：确认 sqlite_sequence 确实不存在，保证测试场景成立
+	var cnt int
+	rows, err := db.Query(context.Background(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")
+	if err != nil {
+		t.Fatalf("query sqlite_master failed: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("sqlite_master query returned no row")
+	}
+	if err := rows.Scan(&cnt); err != nil {
+		t.Fatalf("scan sqlite_master count failed: %v", err)
+	}
+	_ = rows.Close()
+	if cnt != 0 {
+		t.Fatalf("precondition violated: sqlite_sequence exists (count=%d)", cnt)
+	}
+
+	if err := db.Builder().Table("plain").Truncate(context.Background()); err != nil {
+		t.Fatalf("Truncate error: %v", err)
+	}
+	count, err := db.Builder().Table("plain").Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 rows after truncate, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_Truncate_NoSequenceSkipsDelete 验证 sqlite_sequence 不存在时
+// Truncate 通过 sqlite_master 预查询跳过序列清理：不执行注定失败的 DELETE FROM sqlite_sequence。
+// 旧实现直接执行该 DELETE 并依赖错误文案 "no such table" 吞错（驱动文案变化或其它真实错误
+// 恰好含相同子串即误判），本测试通过 SQL 回调捕获断言不再发出这条语句。
+func TestSQLiteInteg_Truncate_NoSequenceSkipsDelete(t *testing.T) {
+	var mu sync.Mutex
+	var executed []string
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		mu.Lock()
+		executed = append(executed, sqlStr)
+		mu.Unlock()
+	}, "")
+	if err != nil {
+		t.Fatalf("failed to create dao: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.Close() })
+
+	// 无 AUTOINCREMENT 表：sqlite_sequence 不存在
+	mustExec(t, dao, `CREATE TABLE plain (
+		id INTEGER PRIMARY KEY,
+		name TEXT
+	)`)
+	mustExec(t, dao, `INSERT INTO plain (id, name) VALUES (1, 'a')`)
+	mu.Lock()
+	executed = executed[:0]
+	mu.Unlock()
+
+	if err := dao.Builder().Table("plain").Truncate(context.Background()); err != nil {
+		t.Fatalf("Truncate error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// 不得发出序列清理 DELETE（旧实现会执行并吞掉 "no such table" 错误）
+	for _, s := range executed {
+		if strings.Contains(s, "DELETE FROM sqlite_sequence") {
+			t.Errorf("sqlite_sequence 不存在时不应执行序列清理 DELETE，实际执行: %s", s)
+		}
+	}
+	// 预查询 sqlite_master 必须发生（新路径的判定依据）
+	found := false
+	for _, s := range executed {
+		if strings.Contains(s, "sqlite_master") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected sqlite_master pre-check, executed: %v", executed)
+	}
+}
+
+// TestSQLiteInteg_Truncate_ReadOnlyDB 验证只读库上 Truncate 的真实错误如实上报（不被吞掉）。
+func TestSQLiteInteg_Truncate_ReadOnlyDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "readonly.db")
+
+	// 先以读写方式建库并写入数据
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: "file:" + path})
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	dao, err := NewDBDao(pool, "sqlite", nil, "")
+	if err != nil {
+		t.Fatalf("create dao failed: %v", err)
+	}
+	mustExec(t, dao, `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)`)
+	mustExec(t, dao, `INSERT INTO users (name) VALUES ('alice')`)
+	_ = dao.Close()
+
+	// 以只读模式重新打开：主语句 DELETE 即失败，Truncate 必须返回该真实错误
+	roPool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: "file:" + path + "?mode=ro"})
+	if err != nil {
+		t.Fatalf("open readonly sqlite failed: %v", err)
+	}
+	roDAO, err := NewDBDao(roPool, "sqlite", nil, "")
+	if err != nil {
+		t.Fatalf("create readonly dao failed: %v", err)
+	}
+	t.Cleanup(func() { _ = roDAO.Close() })
+
+	err = roDAO.Builder().Table("users").Truncate(context.Background())
+	if err == nil {
+		t.Fatalf("expected readonly database error, got nil")
 	}
 }
 

@@ -94,9 +94,9 @@ zcconfig/
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `LoadEnv` | `func LoadEnv(path string) error` | 读取 `.env` 文件，解析键值对存入 env 存储。值自动推断类型（int / float64 / bool / string），支持注释行、`export` 前缀、引号去除。多次调用合并数据，后加载覆盖先前。 |
+| `LoadEnv` | `func LoadEnv(path string) error` | 读取 `.env` 文件，解析键值对存入 env 存储。值自动推断类型（int / float64 / bool / string），支持注释行、`export` 前缀（大小写不敏感，兼容多空格/Tab）、引号去除。单行上限 1MB（超出返回错误）。多次调用合并数据，后加载覆盖先前。 |
 | `Env` | `func Env[T any](key string, def T) T` | 按 key 查找 env 值并转换为 T 类型。查找顺序：先查 `LoadEnv` 加载的数据，再回退 OS 环境变量。未找到或转换失败时返回默认值 `def`。 |
-| `EnvAll` | `func EnvAll() map[string]any` | 返回内部 env 存储的直接引用（零拷贝，不含 OS 环境变量）。仅限只读场景（调试输出、配置导出等）；写操作会污染全局配置并与并发读取产生数据竞争。 |
+| `EnvAll` | `func EnvAll() map[string]any` | 返回内部 env 存储的直接引用（零拷贝，不含 OS 环境变量）。**仅限只读场景**：写操作会污染全局配置并与并发读取产生数据竞争，详见[架构约定](#架构约定)。 |
 
 ### Config 通道
 
@@ -104,13 +104,13 @@ zcconfig/
 |------|------|------|
 | `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。约定：`fn` 返回的 map 在 Register 之后不得再被修改（zcconfig 不拷贝返回值，直接存储引用）；若 `key` 路径中间层级已存在标量值，注册子节点会覆盖原标量为 map。 |
 | `Config` | `func Config[T any](key string, def T) T` | 按 `.` 分隔的 key 递归查找嵌套 `map[string]any{}`，找到后转换为 T 类型返回。路径不存在或中间层级非 map 时返回默认值 `def`。纯读操作，使用 `RLock`。 |
-| `ConfigAll` | `func ConfigAll() map[string]any` | 返回内部配置存储的直接引用（零拷贝）。仅限只读场景（调试输出、配置导出等）；写操作会污染全局配置并与并发读取产生数据竞争。 |
+| `ConfigAll` | `func ConfigAll() map[string]any` | 返回内部配置存储的直接引用（零拷贝）。**仅限只读场景**：写操作会污染全局配置并与并发读取产生数据竞争，详见[架构约定](#架构约定)。 |
 
 ### 辅助方法
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `Reset` | `func Reset()` | 清空所有 env 数据和 config 数据，同时重置配置树。主要用于测试场景。 |
+| `reset` | `func reset()` | 清空所有 env 数据和 config 数据（**小写未导出**，仅测试场景内部使用）。 |
 
 ## 类型转换引擎 cast
 
@@ -141,6 +141,8 @@ zcconfig/
 | `"-1"` | `uint` | `strconv.ParseUint` | 返回 `def`（负数无法转 uint） |
 | `"3.14"` | `float64` | `strconv.ParseFloat` | `3.14` |
 | `"100"` | `float64` | `strconv.ParseFloat` | `100.0` |
+| `"NaN"` / `"Inf"` / `"-Inf"` | `float64` | `strconv.ParseFloat` | 返回 `def`（NaN/Inf 视为非法配置值） |
+| `"1e999"` | `float64` | `strconv.ParseFloat` | 返回 `def`（溢出为 Inf，带范围错误） |
 | `"true"` | `bool` | `strconv.ParseBool` | `true` |
 | `"1"` | `bool` | `strconv.ParseBool` | `true` |
 | `"0"` | `bool` | `strconv.ParseBool` | `false` |
@@ -180,10 +182,11 @@ NO_QUOTE=hello world
 **解析规则**：
 - `#` 开头的行跳过
 - 空行跳过
-- `export` 前缀自动去除
+- `export` 前缀自动去除（**大小写不敏感**，`export` 后跟任意数量的空格/Tab 均可识别；无空白分隔的 `exportKEY=v` 视为普通 key）
 - `=` 左侧为 key（去除首尾空格）
 - `=` 右侧为 value（去除首尾空格，再去除配对的单/双引号）
-- 值自动推断类型：`ParseInt` → `int`，`ParseFloat` → `float64`，`ParseBool` → `bool`，均失败 → `string`
+- 值自动推断类型：`ParseInt`（按平台 int 位宽，超出范围保持 string）→ `int`，`ParseFloat`（仅含 `.eE` 的值尝试）→ `float64`，`ParseBool` → `bool`，均失败 → `string`
+- **单行上限 1MB**：超过上限的文件加载失败并返回错误（默认 `bufio.Scanner` 上限仅 64KB，zcconfig 已调大缓冲区以支持内联证书、长密钥等超长配置值）
 
 ## 线程安全
 
@@ -193,7 +196,14 @@ NO_QUOTE=hello world
 
 ## 架构约定
 
-- **零拷贝**：`ConfigAll` / `EnvAll` 返回内部存储的直接引用（不做任何拷贝），仅限只读场景（调试输出、配置导出等）。任何写操作都会污染全局配置，并与并发读取（`Config` / `Env` / `Register` / `LoadEnv`）产生数据竞争，可能导致程序崩溃。
+- **零拷贝**：`ConfigAll` / `EnvAll` 返回内部存储的**直接引用**（不做任何拷贝），**仅限只读场景**（调试输出、配置导出等）。任何写操作都会污染全局配置，并与并发读取（`Config` / `Env` / `Register` / `LoadEnv`）产生数据竞争，可能导致程序崩溃。例如：
+
+  ```go
+  all := zcconfig.ConfigAll()
+  all["app"].(map[string]any)["name"] = "modified" // ❌ 危险：写穿内部存储
+  ```
+
+  返回值的生命周期与内部存储一致——外部保存的引用在后续 `Register` / `LoadEnv` 合并后仍指向同一底层数据（深合并不替换 map 根节点），**不要在返回值上做任何写操作**。
 - **启动期注册、运行期只读**：`Register` / `LoadEnv` 仅允许在启动阶段调用，运行期配置只读。
 - **注册后不可变**：`Register` 的 `fn` 返回的 map 及其嵌套结构在 Register 之后不得再被修改；zcconfig 不拷贝返回值，直接存储引用。
 - 模块选择不引入任何拷贝（浅拷贝或深拷贝）的原因：`map[string]any` 的 value 可为任意 Go 类型，部分拷贝（无论深浅）无法覆盖 slice/指针/chan/func 等全部引用类型，反而制造虚假安全感。
@@ -271,7 +281,7 @@ func main() {
     // 不存在的路径返回默认值
     missing := zcconfig.Config("app.notexist", "fallback")    // string
 
-    // 获取完整配置树副本
+    // 获取内部配置存储的直接引用（零拷贝，仅限只读场景，详见"架构约定"）
     all := zcconfig.ConfigAll()
     _ = all
 }

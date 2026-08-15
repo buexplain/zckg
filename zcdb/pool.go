@@ -103,23 +103,35 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 // AddSlave 动态添加从库连接。可在运行期调用，热加载从库。
 // 内部使用 sync.RWMutex 保护 slaves 切片，并发安全。
 // 新添加的从库同样应用 MaxOpenConns / MaxIdleConns / ConnMaxLifetimeSecond 配置。
+// sql.Open + Ping（网络往返，可达数秒）在写锁之外执行：先取驱动名与池参数快照，
+// 连接验证成功后才短暂持锁 append——运行期 AddSlave 失败不影响已建连接，
+// 且不阻塞 PickReadDB/Ping 的读锁；Ping 失败时 Close 新连接防止泄漏。
 func (p *Pool) AddSlave(dsn string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	db, err := sql.Open(p.driverName, dsn)
+	// 锁外取参数快照，避免在网络 IO 期间持有写锁
+	p.mu.RLock()
+	driverName := p.driverName
+	maxOpenConns := p.maxOpenConns
+	maxIdleConns := p.maxIdleConns
+	connMaxLifetimeSecond := p.connMaxLifetimeSecond
+	p.mu.RUnlock()
+
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return fmt.Errorf("open slave db: %w", err)
 	}
-	db.SetMaxOpenConns(p.maxOpenConns)
-	db.SetMaxIdleConns(p.maxIdleConns)
-	db.SetConnMaxLifetime(time.Duration(p.connMaxLifetimeSecond) * time.Second)
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxLifetime(time.Duration(connMaxLifetimeSecond) * time.Second)
 
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return fmt.Errorf("ping slave db: %w", err)
 	}
 
+	// 验证成功后短暂持写锁追加
+	p.mu.Lock()
 	p.slaves = append(p.slaves, db)
+	p.mu.Unlock()
 	return nil
 }
 

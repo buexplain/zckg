@@ -1,5 +1,10 @@
 package zcdb
 
+import (
+	"fmt"
+	"strings"
+)
+
 // 本文件包含 Builder 的 ToXxx 编译系列（只生成 SQL 与绑定参数、不执行）：
 // ToSelect/ToInsert/ToUpdate/ToDelete/ToCount/ToAggregate 等，
 // 以及配套的绑定参数收集内部方法（collectXxxBindings）。
@@ -277,6 +282,13 @@ func (b *Builder) ToInsertUsing(columns []string, callback func(*Builder)) (stri
 		return "", nil, ErrEmptyTable
 	}
 
+	// 列数校验：子查询显式 Select/AddSelect 指定列且不含通配符时，
+	// 编译期校验目标列数与子查询列数一致，不一致直接报错（早于数据库执行期发现）；
+	// 无法静态判定（SELECT * 或未显式指定列）时由数据库在运行时校验
+	if subCols, ok := countSubSelectColumns(sub); ok && len(columns) != subCols {
+		return "", nil, fmt.Errorf("%w: insert columns=%d, subquery select columns=%d", ErrInsertUsingColumnMismatch, len(columns), subCols)
+	}
+
 	sql := b.grammar.CompileInsertUsing(b, columns, sub)
 	args := sub.collectSelectBindings()
 
@@ -321,10 +333,30 @@ func (b *Builder) ToInsertOrIgnoreUsing(columns []string, callback func(*Builder
 		return "", nil, ErrEmptyTable
 	}
 
+	// 列数校验：同 ToInsertUsing，子查询列数可静态判定且与目标列数不一致时直接报错
+	if subCols, ok := countSubSelectColumns(sub); ok && len(columns) != subCols {
+		return "", nil, fmt.Errorf("%w: insert columns=%d, subquery select columns=%d", ErrInsertUsingColumnMismatch, len(columns), subCols)
+	}
+
 	sql := b.grammar.CompileInsertOrIgnoreUsing(b, columns, sub)
 	args := sub.collectSelectBindings()
 
 	return sql, args, nil
+}
+
+// countSubSelectColumns 统计子查询 SELECT 的列数（Select/AddSelect/SelectRaw 列 + SelectSub 子查询列）。
+// 未显式指定列（默认 SELECT *）或列值含通配符 * 时无法静态判定列数，返回 ok=false，
+// 此时列数一致性交由数据库在运行时校验。
+func countSubSelectColumns(sub *Builder) (count int, ok bool) {
+	if len(sub.columns) == 0 && len(sub.selectSubs) == 0 {
+		return 0, false // 默认 SELECT *，列数未知
+	}
+	for _, col := range sub.columns {
+		if strings.Contains(col.Value, "*") {
+			return 0, false // 通配符列（如 *、t.*）列数未知
+		}
+	}
+	return len(sub.columns) + len(sub.selectSubs), true
 }
 
 // ToUpdate 编译 UPDATE 语句。

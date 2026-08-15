@@ -32,7 +32,7 @@ GET /search?keyword=go&page=3
 
 > `Content-Type` 会先去除 `; charset=utf-8` 等参数部分，仅保留主类型再匹配。
 >
-> `multipart/form-data` 的内存缓冲上限由 `defaultMaxMemory` 定义，默认 **32 MB**，超出部分由标准库写入临时文件。
+> `multipart/form-data` 的内存缓冲上限由引擎字段 `MultipartFormMaxMemory` 定义，`NewEngine` 默认 **32 MB**，超出部分由标准库写入临时文件；按需调整示例：`engine.MultipartFormMaxMemory = 64 << 20`。
 
 ### 3. 路由路径参数（所有 method）
 

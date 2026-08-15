@@ -77,12 +77,18 @@ var structMetaCache sync.Map
 
 // cachedStructMeta 返回类型 t 的 structMeta，优先命中缓存，未命中时构建并写入缓存。
 // 请求阶段的嵌套类型元信息获取必须走本函数，避免每请求重复构建。
+// 写入用 LoadOrStore：并发首次构建同一类型时所有 goroutine 返回同一份缓存实例
+// （structMeta 为值类型、构建后只读，可安全共享；构建结果确定性相同，
+// 竞态窗口内的重复构建仅浪费少量反射开销，无正确性问题）。
 func cachedStructMeta(t reflect.Type) structMeta {
 	if v, ok := structMetaCache.Load(t); ok {
 		return v.(structMeta)
 	}
 	m := buildStructMeta(t)
-	structMetaCache.Store(t, m)
+	if actual, loaded := structMetaCache.LoadOrStore(t, m); loaded {
+		// 并发 goroutine 已抢先写入，统一返回缓存中的实例
+		m = actual.(structMeta)
+	}
 	return m
 }
 

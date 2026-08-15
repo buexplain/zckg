@@ -72,6 +72,8 @@ func WantHtml(r *http.Request) bool
 - 若命中 `*ValidationError`（参数校验失败，来自 `nonzero` 非零值校验或 `Validate()` 业务校验）→ 交由 `OnValidationError`（默认 400）。
 - 其余错误 → 交由 `OnError`（默认 500，客户端仅收到通用 `"internal server error"` 消息，err 详情写入服务端日志）。
 
+> `OnValidationError` 有意回显校验细节（字段名、类型名、路径参数原始值）以便调用方修正请求，且信息仅来自请求侧、敏感度低；如需脱敏请自定义该回调。
+
 > `*BindingError` 的定义及参数绑定细节详见 `parameter-binding.md`；`*ValidationError` 的定义及参数校验规则详见 `parameter-validate.md`。
 
 ## 四、panic 恢复

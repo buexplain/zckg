@@ -54,6 +54,9 @@ var (
 	// ErrIncrementColumns Increment/Decrement 的 extra 参数必须成对（column, amount, ...）
 	ErrIncrementColumns = errors.New("zcdb: Increment/Decrement extra args must be paired as (column, amount)")
 
+	// ErrInsertUsingColumnMismatch InsertUsing/InsertOrIgnoreUsing 的目标列数与子查询 SELECT 列数不一致
+	ErrInsertUsingColumnMismatch = errors.New("zcdb: InsertUsing columns count does not match subquery select columns count")
+
 	// ErrDeleteJoinNoJoin DeleteJoin 要求至少一个 JOIN
 	ErrDeleteJoinNoJoin = errors.New("zcdb: DeleteJoin requires at least one JOIN")
 )

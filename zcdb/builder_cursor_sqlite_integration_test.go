@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	_ "modernc.org/sqlite"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestSQLiteInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行扫描，break 时自动释放连接。
@@ -430,5 +432,100 @@ func TestSQLiteInteg_Bug_CursorByCtxCancel(t *testing.T) {
 	}
 	if !errors.Is(lastErr, context.Canceled) {
 		t.Logf("yield 错误为 %v（非 context.Canceled 包装也可接受，关键是错误未静默）", lastErr)
+	}
+}
+
+// TestSQLiteInteg_Cursor_InvalidDestNoQuery 验证非法 dest 在发起查询前即被拒绝：
+// 通过 SQL 回调计数断言未执行任何查询（旧实现先执行完整查询再校验 dest，白白浪费一次往返）。
+func TestSQLiteInteg_Cursor_InvalidDestNoQuery(t *testing.T) {
+	var sqlCount int32
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		atomic.AddInt32(&sqlCount, 1)
+	}, "")
+	if err != nil {
+		t.Fatalf("failed to create dao: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.Close() })
+	setupSQLiteUsersTable(t, dao)
+
+	// 清零：建表/预填数据产生的 SQL 不计入断言
+	atomic.StoreInt32(&sqlCount, 0)
+
+	// 非指针 dest（结构体值）
+	for err := range dao.Builder().Table("users").Cursor(context.Background(), struct {
+		Name string `db:"name"`
+	}{}) {
+		if !errors.Is(err, ErrNotPointer) {
+			t.Errorf("expected ErrNotPointer, got %v", err)
+		}
+		break
+	}
+	// 非结构体指针 dest（*int）
+	var num int
+	for err := range dao.Builder().Table("users").Cursor(context.Background(), &num) {
+		if !errors.Is(err, ErrNotStruct) {
+			t.Errorf("expected ErrNotStruct, got %v", err)
+		}
+		break
+	}
+
+	if got := atomic.LoadInt32(&sqlCount); got != 0 {
+		t.Errorf("非法 dest 不应发起查询，实际执行了 %d 条 SQL", got)
+	}
+}
+
+// TestSQLiteInteg_CursorBy_ExactPageBoundary 验证数据量恰为 chunkSize 整数倍时，
+// 末批通过多取一条探测判断结束（探测行不丢、不重），不再执行一次返回 0 行的空查询。
+func TestSQLiteInteg_CursorBy_ExactPageBoundary(t *testing.T) {
+	var sqlCount int32
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:"})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		atomic.AddInt32(&sqlCount, 1)
+	}, "")
+	if err != nil {
+		t.Fatalf("failed to create dao: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.Close() })
+
+	// 6 行数据（6 = 2 × 3，整页边界场景）
+	mustExec(t, dao, `CREATE TABLE items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT
+	)`)
+	mustExec(t, dao, `INSERT INTO items (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f')`)
+	atomic.StoreInt32(&sqlCount, 0)
+
+	type row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	var item row
+	var names []string
+	for err := range dao.Builder().Table("items").Select("id", "name").CursorBy(context.Background(), &item, 3, "id") {
+		if err != nil {
+			t.Fatalf("CursorBy error: %v", err)
+		}
+		names = append(names, item.Name)
+	}
+	// 6 行全部取出且顺序正确（探测行不丢数据、不重复）
+	if len(names) != 6 {
+		t.Fatalf("expected 6 rows, got %d: %v", len(names), names)
+	}
+	want := []string{"a", "b", "c", "d", "e", "f"}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("names[%d]: expected %q, got %q", i, want[i], names[i])
+		}
+	}
+	// 旧实现：3+3+0 共 3 次查询（末尾一次空查询）；修复后：每批多取一条探测，共 2 次查询
+	if got := atomic.LoadInt32(&sqlCount); got != 2 {
+		t.Errorf("expected 2 queries for exact page boundary, got %d", got)
 	}
 }

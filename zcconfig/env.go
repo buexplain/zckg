@@ -35,15 +35,20 @@ func LoadEnv(path string) error {
 
 	parsed := make(map[string]any)
 	scanner := bufio.NewScanner(f)
+	// 调大缓冲区（默认单行上限 64KB）：内联证书、长密钥等超长配置值很常见，
+	// 超限会触发 bufio.ErrTooLong 导致整个文件加载失败。上限 1MB。
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		// 跳过空行和注释行
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// 去除可选的 "export " 前缀
-		line = strings.TrimPrefix(line, "export ")
-		line = strings.TrimPrefix(line, "export\t")
+		// 去除可选的 "export " 前缀：不区分大小写，兼容多个空格/Tab。
+		// 仅当 export 后跟空白字符才视为前缀，"exportKEY=v" 这类普通 key 不受影响。
+		if len(line) > 6 && strings.EqualFold(line[:6], "export") && (line[6] == ' ' || line[6] == '\t') {
+			line = strings.TrimLeft(line[6:], " \t")
+		}
 
 		idx := strings.Index(line, "=")
 		if idx < 0 {
@@ -86,8 +91,9 @@ func unquote(value string) string {
 // parseValue 尝试将字符串值推断为具体类型。
 // 依次尝试 int、float64、bool，均失败时返回原始字符串。
 func parseValue(value string) any {
-	// 尝试解析为 int
-	if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+	// 尝试解析为 int：按平台 int 位宽（strconv.IntSize）解析，
+	// 32 位平台上超出 int 范围的值解析失败、保持 string，避免静默截断。
+	if n, err := strconv.ParseInt(value, 10, strconv.IntSize); err == nil {
 		return int(n)
 	}
 	// 仅当值包含小数点或指数标记时才尝试 float64，

@@ -12,6 +12,7 @@ import (
 
 // resetState 在每个测试前重置包级可变状态，使测试可重复执行。
 // 测试直接调用 executeShutdown（不依赖幂等标记）以绕过全局状态；shutdownStarted 同步重置。
+// stopListenCh 不重建：通道由包初始化创建一次、此后只读，executeShutdown 以幂等方式关闭。
 // listenOnce 不重置：listen goroutine 全局仅启动一次，依赖完整退出路径（Shutdown/Listen）的
 // 用例统一放在文件末尾的 TestShutdown_FullFlow 中。
 func resetState() {
@@ -19,7 +20,6 @@ func resetState() {
 	signalHandlerMap = map[int][]SigHandler{}
 	signalHandlerMux = sync.RWMutex{}
 	waitChan = make(chan struct{})
-	newStopListenCh()
 	shutdownStarted.Store(false)
 }
 

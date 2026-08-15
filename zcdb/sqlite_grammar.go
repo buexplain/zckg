@@ -63,8 +63,8 @@ func (g *SQLiteGrammar) WrapColumn(column string) string {
 
 // WrapTable 使用双引号引用表名
 func (g *SQLiteGrammar) WrapTable(table string) string {
-	if strings.Contains(table, " as ") || strings.Contains(table, " AS ") {
-		idx := strings.Index(strings.ToLower(table), " as ")
+	// 对 ToLower 后的表名统一做 " as " 判定（大小写不敏感，避免 "orders As o" 等混合大小写漏判）
+	if idx := strings.Index(strings.ToLower(table), " as "); idx != -1 {
 		name := table[:idx]
 		alias := table[idx+4:]
 		return g.wrapValue(strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))

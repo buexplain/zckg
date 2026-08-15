@@ -122,11 +122,12 @@ func BenchmarkServeHTTP_Nested_Nonzero(b *testing.B) {
 	}
 }
 
-// 参数路由基数树匹配路径
+// 参数路由基数树匹配路径：与 ExactRoute_GET 使用相同的 handler 形状（benchSimpleHandler，
+// 仅路径注册方式不同），使基准真正隔离路由匹配开销（含路径参数绑定）
 func BenchmarkServeHTTP_ParamRoute(b *testing.B) {
 	e := NewEngine()
-	e.Router.GET("/api/user/{userId}/profile", benchPathParamHandler)
-	req := httptest.NewRequest(http.MethodGet, "/api/user/12345/profile", nil)
+	e.Router.GET("/api/{name}", benchSimpleHandler)
+	req := httptest.NewRequest(http.MethodGet, "/api/alice?age=18", nil)
 	benchExpectOK(b, e, req)
 	w := httptest.NewRecorder()
 	b.ReportAllocs()

@@ -35,6 +35,19 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 			return
 		}
 
+		// dest 类型校验放在查询执行之前（与 CursorBy 对齐）：
+		// 非法 dest 直接报错，不浪费一次完整查询
+		destVal := reflect.ValueOf(dest)
+		if destVal.Kind() != reflect.Ptr {
+			yield(ErrNotPointer)
+			return
+		}
+		destElem := destVal.Elem()
+		if destElem.Kind() != reflect.Struct {
+			yield(ErrNotStruct)
+			return
+		}
+
 		rows, err := b.query(ctx, sqlStr, args...)
 		if err != nil {
 			yield(err)
@@ -47,17 +60,6 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 		columns, err := rows.Columns()
 		if err != nil {
 			yield(err)
-			return
-		}
-
-		destVal := reflect.ValueOf(dest)
-		if destVal.Kind() != reflect.Ptr {
-			yield(ErrNotPointer)
-			return
-		}
-		destElem := destVal.Elem()
-		if destElem.Kind() != reflect.Struct {
-			yield(ErrNotStruct)
 			return
 		}
 
@@ -102,10 +104,13 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 //     if err != nil { log.Fatal(err) }
 //     fmt.Println(user.Name)
 //     }
-//     // 每批 SQL 形如: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 100（首批无 WHERE 游标条件）
+//     // 每批 SQL 形如: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 101（首批无 WHERE 游标条件）
 //
 // chunkSize 为 0 时直接返回、不执行任何查询；小于 0 时使用默认值 100。
 // 游标列值为 NULL 时报 ErrCursorColumnNull 终止（否则条件恒假会无限重复同一批）。
+// 每批多取一条（LIMIT chunkSize+1）探测是否还有下一页：探测行不 yield 给调用方，
+// 由下一批从本批最后一行的游标值继续取回——避免数据量恰为 chunkSize 整数倍时
+// 多执行一次返回 0 行的空查询。
 func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorColumn string, desc ...bool) iter.Seq[error] {
 	by := len(desc) > 0 && desc[0]
 	return func(yield func(error) bool) {
@@ -164,9 +169,13 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 		var lastCursorValue any
 
 		for {
-			// 克隆构造器，避免修改原始状态
+			// 克隆构造器，避免修改原始状态。
+			// 每批多取一条（chunkSize+1）探测是否还有下一页：整页边界（数据量恰为
+			// chunkSize 整数倍）时若只取 chunkSize 条无法判断是否结束，会再执行一次
+			// 返回 0 行的空查询才收尾；多取的探测行不 yield、不更新游标值，
+			// 下一批从本批最后一行的游标值继续取回该行，不丢数据。
 			clone := b.Clone()
-			clone.limit = chunkSize
+			clone.limit = chunkSize + 1
 			clone.orders = nil // 清空已有排序，确保游标列是唯一排序依据
 
 			// 添加游标条件：cursorColumn > lastValue（倒序为 <）
@@ -197,7 +206,13 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 			}
 
 			count := 0
+			more := false
 			for rows.Next() {
+				// 超出 chunkSize 的探测行：说明还有下一页，不扫描、不 yield
+				if count == chunkSize {
+					more = true
+					break
+				}
 				values := makeScanValues(columns, fieldInfo, destElem)
 				if err := rows.Scan(values...); err != nil {
 					_ = rows.Close()
@@ -237,8 +252,8 @@ func (b *Builder) CursorBy(ctx context.Context, dest any, chunkSize int, cursorC
 				return
 			}
 
-			// 不足一批，说明已迭代完毕
-			if count < chunkSize {
+			// 本批未取满（未发现探测行），说明已迭代完毕
+			if !more {
 				return
 			}
 		}

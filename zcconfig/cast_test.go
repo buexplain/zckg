@@ -1,6 +1,7 @@
 package zcconfig
 
 import (
+	"strconv"
 	"testing"
 	"time"
 )
@@ -171,6 +172,26 @@ func TestCast_StringToFloatInvalid(t *testing.T) {
 	}
 }
 
+func TestCast_StringToFloatNaNInf(t *testing.T) {
+	// NaN/Inf 字面量可被 ParseFloat 接受，但配置场景应视为非法输入返回 def
+	if v := cast("NaN", 0.0); v != 0.0 {
+		t.Errorf("'NaN' 转 float64 期望默认值 0.0，实际 %f", v)
+	}
+	if v := cast("Inf", 1.5); v != 1.5 {
+		t.Errorf("'Inf' 转 float64 期望默认值 1.5，实际 %f", v)
+	}
+	if v := cast("-Inf", 2.5); v != 2.5 {
+		t.Errorf("'-Inf' 转 float64 期望默认值 2.5，实际 %f", v)
+	}
+	if v := cast("NaN", float32(0)); v != float32(0) {
+		t.Errorf("'NaN' 转 float32 期望默认值 0，实际 %f", v)
+	}
+	// 溢出为 Inf 的指数（ParseFloat 返回 +Inf 且带 ErrRange 错误）同样返回 def
+	if v := cast("1e999", 3.5); v != 3.5 {
+		t.Errorf("'1e999' 转 float64 期望默认值 3.5，实际 %f", v)
+	}
+}
+
 // --- string -> bool ---
 
 func TestCast_StringToBool(t *testing.T) {
@@ -316,6 +337,36 @@ func TestParseValue_LargeInteger(t *testing.T) {
 	}
 	if f := parseValue("1e100"); f != 1e100 {
 		t.Errorf("parseValue(\"1e100\") 期望 1e100，实际 %v", f)
+	}
+}
+
+// TestParseValue_IntBoundary 验证整型推断按平台 int 位宽（strconv.IntSize）解析：
+// 平台范围内的最大值解析为 int；超出范围的值保持 string，不静默截断。
+// 测试按 strconv.IntSize 动态取边界，在 32 位/64 位平台上均可通过。
+func TestParseValue_IntBoundary(t *testing.T) {
+	var maxIntStr, overflowStr string
+	if strconv.IntSize == 64 {
+		maxIntStr = "9223372036854775807"
+		overflowStr = "9223372036854775808"
+	} else {
+		maxIntStr = "2147483647"
+		overflowStr = "2147483648"
+	}
+
+	// 平台 int 最大值：解析为 int 且无截断
+	v := parseValue(maxIntStr)
+	n, ok := v.(int)
+	if !ok {
+		t.Fatalf("parseValue(%q) 期望解析为 int，实际类型 %T", maxIntStr, v)
+	}
+	if strconv.FormatInt(int64(n), 10) != maxIntStr {
+		t.Errorf("parseValue(%q) 期望 %s，实际 %d（截断）", maxIntStr, maxIntStr, n)
+	}
+
+	// 超出平台 int 范围：保持 string（32 位平台不截断为负值/零值）
+	v = parseValue(overflowStr)
+	if _, ok := v.(string); !ok {
+		t.Errorf("parseValue(%q) 期望保持 string，实际类型 %T（发生了截断）", overflowStr, v)
 	}
 }
 

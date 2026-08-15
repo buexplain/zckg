@@ -79,30 +79,37 @@ func acquireResponseWriter(w http.ResponseWriter) http.ResponseWriter {
 	}
 }
 
+// baseResponseWriter 提取任意组合包装变体的基础包装器；非本包装器类型返回 nil
+func baseResponseWriter(rw http.ResponseWriter) *responseWriter {
+	switch v := rw.(type) {
+	case *responseWriterFHP:
+		return v.responseWriter
+	case *responseWriterFH:
+		return v.responseWriter
+	case *responseWriterFP:
+		return v.responseWriter
+	case *responseWriterHP:
+		return v.responseWriter
+	case *responseWriterF:
+		return v.responseWriter
+	case *responseWriterH:
+		return v.responseWriter
+	case *responseWriterP:
+		return v.responseWriter
+	case *responseWriter:
+		return v
+	default:
+		return nil // 非本包装器类型（防御性处理，理论上不会发生）
+	}
+}
+
 // releaseResponseWriter 重置状态并归还基础包装器；必须在请求处理完全结束后调用
 // （含 panic 处理完成后），并清空对底层 writer 的引用避免经池长时间持有。
 // 组合类型均嵌入 *responseWriter，此处按类型还原基础包装器后归还唯一的池
 func releaseResponseWriter(rw http.ResponseWriter) {
-	var base *responseWriter
-	switch v := rw.(type) {
-	case *responseWriterFHP:
-		base = v.responseWriter
-	case *responseWriterFH:
-		base = v.responseWriter
-	case *responseWriterFP:
-		base = v.responseWriter
-	case *responseWriterHP:
-		base = v.responseWriter
-	case *responseWriterF:
-		base = v.responseWriter
-	case *responseWriterH:
-		base = v.responseWriter
-	case *responseWriterP:
-		base = v.responseWriter
-	case *responseWriter:
-		base = v
-	default:
-		return // 非本包装器类型（防御性处理，理论上不会发生）
+	base := baseResponseWriter(rw)
+	if base == nil {
+		return
 	}
 	base.ResponseWriter = nil
 	base.written = false

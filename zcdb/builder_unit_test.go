@@ -1567,6 +1567,50 @@ func assertArgs(t *testing.T, expected []any, actual []any) {
 	}
 }
 
+// assertInsertUsingColumnMismatch 验证给定方言下 ToInsertUsing/ToInsertOrIgnoreUsing 的列数校验：
+// 子查询显式 Select 且不含 * 时列数必须与目标列数一致，不一致返回 ErrInsertUsingColumnMismatch；
+// 列数一致、SELECT *、未显式 Select（默认 *）时通过编译，后两者由数据库运行时校验。
+func assertInsertUsingColumnMismatch(t *testing.T, g Grammar) {
+	t.Helper()
+	checkUsing := func(columns []string, subFn func(*Builder)) error {
+		b := NewBuilder(g, nil).Table("archive")
+		_, _, err := b.ToInsertUsing(columns, subFn)
+		return err
+	}
+	// 列数不一致 → 哨兵错误
+	if err := checkUsing([]string{"name", "age"}, func(sub *Builder) {
+		sub.Table("users").Select("name")
+	}); !errors.Is(err, ErrInsertUsingColumnMismatch) {
+		t.Errorf("ToInsertUsing 列数不一致: expected ErrInsertUsingColumnMismatch, got %v", err)
+	}
+	// 列数一致 → 无错误
+	if err := checkUsing([]string{"name"}, func(sub *Builder) {
+		sub.Table("users").Select("name")
+	}); err != nil {
+		t.Errorf("ToInsertUsing 列数一致: unexpected error %v", err)
+	}
+	// SELECT * → 无法静态判定，不报错（运行时校验）
+	if err := checkUsing([]string{"name"}, func(sub *Builder) {
+		sub.Table("users").Select("*")
+	}); err != nil {
+		t.Errorf("ToInsertUsing SELECT *: unexpected error %v", err)
+	}
+	// 未显式 Select → 默认 SELECT *，不报错（运行时校验）
+	if err := checkUsing([]string{"name"}, func(sub *Builder) {
+		sub.Table("users")
+	}); err != nil {
+		t.Errorf("ToInsertUsing 默认列: unexpected error %v", err)
+	}
+	// ToInsertOrIgnoreUsing 同样校验
+	b := NewBuilder(g, nil).Table("archive")
+	_, _, err := b.ToInsertOrIgnoreUsing([]string{"name", "age"}, func(sub *Builder) {
+		sub.Table("users").Select("name")
+	})
+	if !errors.Is(err, ErrInsertUsingColumnMismatch) {
+		t.Errorf("ToInsertOrIgnoreUsing 列数不一致: expected ErrInsertUsingColumnMismatch, got %v", err)
+	}
+}
+
 func containsStr(s, substr string) bool {
 	return len(s) >= len(substr) && searchStr(s, substr)
 }
