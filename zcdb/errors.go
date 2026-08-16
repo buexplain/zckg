@@ -3,10 +3,14 @@ package zcdb
 import "errors"
 
 var (
-	ErrEmptyData     = errors.New("zcdb: data is empty")
+	// ErrEmptyData 插入数据为空切片
+	ErrEmptyData = errors.New("zcdb: data is empty")
+	// ErrInvalidStruct 数据不是结构体/结构体指针（或它们的切片）
 	ErrInvalidStruct = errors.New("zcdb: expected a struct or struct pointer")
-	ErrNoFields      = errors.New("zcdb: struct has no exportable fields")
-	ErrEmptyTable    = errors.New("zcdb: table name is required")
+	// ErrNoFields 结构体无可参与写入的字段（全部为 nil 或不可用）
+	ErrNoFields = errors.New("zcdb: struct has no exportable fields")
+	// ErrEmptyTable 未设置数据源表名
+	ErrEmptyTable = errors.New("zcdb: table name is required")
 
 	// ErrPluckDest Pluck 目标必须是切片指针或 map 指针
 	ErrPluckDest = errors.New("zcdb: Pluck dest must be a pointer to a non-nil slice or map")
@@ -51,7 +55,7 @@ var (
 	// ErrInvalidAggregate ToAggregate 的聚合函数非法（仅支持 MAX/MIN/SUM/AVG）
 	ErrInvalidAggregate = errors.New("zcdb: aggregate must be one of MAX, MIN, SUM, AVG")
 
-	// ErrIncrementColumns Increment/Decrement 的 extra 参数必须成对（column, amount, ...）
+	// ErrIncrementColumns Increment/Decrement 的列/增量参数非法（extra 不成对、列名非 string、columns 与 amounts 不等长或为空）
 	ErrIncrementColumns = errors.New("zcdb: Increment/Decrement extra args must be paired as (column, amount)")
 
 	// ErrInsertUsingColumnMismatch InsertUsing/InsertOrIgnoreUsing 的目标列数与子查询 SELECT 列数不一致

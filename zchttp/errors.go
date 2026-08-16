@@ -16,6 +16,8 @@ func NewValidationError(Field string, Message string, Err error) *ValidationErro
 	return &ValidationError{Field: Field, Message: Message, Err: Err}
 }
 
+// Error 实现 error 接口：包装了底层错误（Err 非 nil）时直接返回底层错误文案
+// （不叠加 Field/Message 前缀）；否则返回 "field \"<Field>\" <Message>" 形式。
 func (e *ValidationError) Error() string {
 	if e.Err != nil {
 		return e.Err.Error()
@@ -39,6 +41,7 @@ func NewBindingError(err error) *BindingError {
 	return &BindingError{Message: err.Error(), Err: err}
 }
 
+// Error 实现 error 接口：包装了底层错误（Err 非 nil）时直接返回底层错误文案；否则返回 Message。
 func (e *BindingError) Error() string {
 	if e.Err != nil {
 		return e.Err.Error()

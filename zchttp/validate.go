@@ -82,6 +82,18 @@ func validateNonzero(reqPtr reflect.Value, meta structMeta) error {
 // visiting 用于检测自引用循环，防止无限递归。
 func hasNonzeroInTree(t reflect.Type, visiting map[reflect.Type]bool) bool {
 	t = derefType(t)
+	// 防环检查必须先于 Slice/Map 穿透：自引用容器类型（type S []S / type M map[string]M）
+	// 的穿透 t.Elem() 恒返回自身，若不在此登记将永远无法到达 struct 分支的防环
+	// （修复 REC-03，与 hasRequestPhaseDefaults 的 REC-02 修复同构同步）
+	if visiting == nil {
+		visiting = make(map[reflect.Type]bool)
+	}
+	if visiting[t] {
+		return false // 自引用循环，停止递归
+	}
+	visiting[t] = true
+	defer delete(visiting, t)
+
 	switch t.Kind() {
 	case reflect.Slice, reflect.Array:
 		return hasNonzeroInTree(t.Elem(), visiting)
@@ -92,14 +104,6 @@ func hasNonzeroInTree(t reflect.Type, visiting map[reflect.Type]bool) bool {
 	if t.Kind() != reflect.Struct {
 		return false
 	}
-	if visiting == nil {
-		visiting = make(map[reflect.Type]bool)
-	}
-	if visiting[t] {
-		return false // 自引用循环，停止递归
-	}
-	visiting[t] = true
-	defer delete(visiting, t)
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
@@ -155,8 +159,8 @@ func releaseVisitMap(m map[visitKey]bool) {
 // validateNonzeroWalk 递归遍历结构体树，校验每个结构体的 nonzero 字段。
 // 规则：
 //   - 若字段 nonzero 且零值 → 报错
-//   - 若字段 nonzero 且非零 → 校验通过，若为嵌套结构体/指针/结构体切片/map 则递归进入
-//   - 若字段非 nonzero 但为嵌套结构体/指针且非零值 → 不报本级，但递归进入子字段校验
+//   - 若字段 nonzero 且非零 → 校验通过，若为嵌套结构体/指针/结构体切片/结构体数组/map 则递归进入
+//   - 若字段非 nonzero 但为嵌套结构体/指针/结构体切片/结构体数组/map 且非零值 → 不报本级，但递归进入子字段校验
 //
 // prefix 为嵌套路径前缀（如 "company."），顶层调用时传空字符串。
 // 报错时 Field 为 prefix + 字段绑定名，如 "company.name"，与 API 命名一致，便于客户端定位。

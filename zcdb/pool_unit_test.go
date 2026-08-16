@@ -139,3 +139,104 @@ func TestPool_AddSlaveDoesNotBlockPickReadDB(t *testing.T) {
 		t.Errorf("expected PickReadDB to return the newly added slave")
 	}
 }
+
+// TestPool_NewPoolConnectTimeout 验证 NewPool 的主库 Ping 受 ConnectTimeout 限时（ZCDB-03 回归锁定：
+// 修复前 Ping 无超时，不可达主机静默丢包时启动长时间挂起）。
+// 采用单元测试的原因：超时行为依赖“阻塞式 Ping”模拟（静默丢包主机在集成环境无法稳定复现），
+// 复用包内 blockingPingDriver 可确定性验证。
+func TestPool_NewPoolConnectTimeout(t *testing.T) {
+	registerBlockingPingDriver()
+	release := make(chan struct{}) // 永不关闭：模拟不可达主机的静默丢包
+	pingStarted := make(chan struct{})
+	testBlockingPingDriver.reset(release, pingStarted)
+
+	start := time.Now()
+	_, err := NewPool(PoolConfig{
+		DriverName:     "zcdb_test_blocking_ping_driver",
+		DSN:            "master",
+		ConnectTimeout: 100 * time.Millisecond,
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Ping 超时时 NewPool 应返回错误")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("NewPool 未在超时内返回（耗时 %v），主库 Ping 未受 ConnectTimeout 限时", elapsed)
+	}
+}
+
+// TestPool_AddSlaveConnectTimeout 验证 AddSlave 的 Ping 受池的 connectTimeout 限时（ZCDB-03），
+// 且超时失败后不追加从库、读路由回退主库。
+func TestPool_AddSlaveConnectTimeout(t *testing.T) {
+	registerBlockingPingDriver()
+	release := make(chan struct{}) // 永不关闭：模拟不可达从库
+	pingStarted := make(chan struct{})
+	testBlockingPingDriver.reset(release, pingStarted)
+
+	master, err := sql.Open("zcdb_test_blocking_ping_driver", "master")
+	if err != nil {
+		t.Fatalf("open master failed: %v", err)
+	}
+	t.Cleanup(func() { _ = master.Close() })
+	pool := &Pool{
+		master:                master,
+		driverName:            "zcdb_test_blocking_ping_driver",
+		slaveStrategy:         &RandomStrategy{},
+		maxOpenConns:          50,
+		maxIdleConns:          50,
+		connMaxLifetimeSecond: 600,
+		connectTimeout:        100 * time.Millisecond,
+	}
+
+	start := time.Now()
+	err = pool.AddSlave("slave1")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Ping 超时时 AddSlave 应返回错误")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("AddSlave 未在超时内返回（耗时 %v），从库 Ping 未受限", elapsed)
+	}
+	if got := pool.PickReadDB(); got != pool.master {
+		t.Errorf("超时失败后无从库，PickReadDB 应回退主库")
+	}
+}
+
+// TestPool_CloseIdempotentAndAddSlaveAfterClose 验证 Close 幂等与关闭后拒绝新增从库
+// （ZCDB-04 回归锁定：修复前 Close 非幂等语义未定义，关闭后 AddSlave 仍能成功追加从库）。
+func TestPool_CloseIdempotentAndAddSlaveAfterClose(t *testing.T) {
+	registerBlockingPingDriver()
+	release := make(chan struct{})
+	close(release) // Ping 立即通过
+	pingStarted := make(chan struct{})
+	testBlockingPingDriver.reset(release, pingStarted)
+
+	master, err := sql.Open("zcdb_test_blocking_ping_driver", "master")
+	if err != nil {
+		t.Fatalf("open master failed: %v", err)
+	}
+	pool := &Pool{
+		master:                master,
+		driverName:            "zcdb_test_blocking_ping_driver",
+		slaveStrategy:         &RandomStrategy{},
+		maxOpenConns:          50,
+		maxIdleConns:          50,
+		connMaxLifetimeSecond: 600,
+		connectTimeout:        time.Second,
+	}
+
+	// 首次 Close 执行实际清理
+	if err := pool.Close(); err != nil {
+		t.Fatalf("首次 Close 不应报错: %v", err)
+	}
+	// 重复 Close 幂等返回 nil
+	if err := pool.Close(); err != nil {
+		t.Errorf("重复 Close 应幂等返回 nil，实际: %v", err)
+	}
+	// Close 后 AddSlave 快速失败，不形成“池已关闭但持有活从库”的不一致状态
+	if err := pool.AddSlave("slave1"); !errors.Is(err, errPoolClosed) {
+		t.Errorf("Close 后 AddSlave 应返回 errPoolClosed，实际: %v", err)
+	}
+}

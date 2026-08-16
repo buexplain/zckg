@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -855,7 +856,7 @@ func maxBodyHandler(_ context.Context, req maxBodyReq) (maxBodyRes, error) {
 }
 
 // TestMaxBodyBytesLimit 验证 MaxBodyBytes 超限请求绑定失败并映射为 400，
-// 未超限请求正常绑定；0（默认）表示不限制
+// 未超限请求正常绑定；0 表示不限制（NewEngine 默认 32MB，见 TestNewEngineDefaultMaxBodyBytes）
 func TestMaxBodyBytesLimit(t *testing.T) {
 	router := NewRouter()
 	router.POST("/body", maxBodyHandler)
@@ -888,14 +889,16 @@ func TestMaxBodyBytesLimit(t *testing.T) {
 	}
 }
 
-// TestMaxBodyBytesDisabled 验证 MaxBodyBytes 为 0（默认）时不限制请求体大小
+// TestMaxBodyBytesDisabled 验证 MaxBodyBytes 显式置 0 时不限制请求体大小。
+// 注意：NewEngine 默认已为 32MB（ZCH-01），此处需显式置 0 才能还原"不限制"语义。
 func TestMaxBodyBytesDisabled(t *testing.T) {
 	router := NewRouter()
 	router.POST("/body", maxBodyHandler)
 
 	engine := NewEngine()
 	engine.Router = router
-	// MaxBodyBytes 保持默认 0
+	// 显式置 0：关闭请求体大小限制（默认 32MB 已被覆盖）
+	engine.MaxBodyBytes = 0
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/body", strings.NewReader(`{"body":"unlimited"}`))
@@ -903,6 +906,69 @@ func TestMaxBodyBytesDisabled(t *testing.T) {
 	engine.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestNewEngineDefaultMaxBodyBytes 锁定 ZCH-01 修复：NewEngine 默认设置 MaxBodyBytes=32MB
+// （修复前默认 0=不限制，默认配置下无请求体大小 DoS 防护），并端到端验证默认配置下
+// 超限请求体被拒绝（400 *BindingError）。
+func TestNewEngineDefaultMaxBodyBytes(t *testing.T) {
+	engine := NewEngine()
+	// 默认值断言：与 MultipartFormMaxMemory 对齐为 32MB
+	if engine.MaxBodyBytes != 32<<20 {
+		t.Fatalf("NewEngine default MaxBodyBytes = %d, want %d (32MB)", engine.MaxBodyBytes, int64(32<<20))
+	}
+
+	router := NewRouter()
+	router.POST("/body", maxBodyHandler)
+	engine.Router = router
+
+	// 端到端：默认配置下发送超过 32MB 的请求体，应返回 400
+	largeBody := `{"body":"` + strings.Repeat("a", 32<<20+1024) + `"}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/body", strings.NewReader(largeBody))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized body under default config: expected 400, got %d", rec.Code)
+	}
+
+	// 未超限请求在默认配置下仍正常绑定（200）
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/body", strings.NewReader(`{"body":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("small body under default config: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestEncodeJSON_LargeBufferNotPooled 锁定 ZCH-03 修复：单次超大响应抬升的编码器缓冲
+// 超过阈值（1MB）时不入池（交 GC 回收），避免大缓冲长期驻留固化内存峰值。
+// 采用单元测试的原因：这是纯对象池内部行为（归还决策），无法经 HTTP 集成层观察。
+func TestEncodeJSON_LargeBufferNotPooled(t *testing.T) {
+	// 重置编码器池为全新且 New 逻辑一致的实例，确保归还行为可确定性观察
+	jsonEncoderPool = sync.Pool{
+		New: func() any {
+			jb := &jsonBufEncoder{}
+			jb.enc = json.NewEncoder(&jb.buf)
+			jb.enc.SetEscapeHTML(false)
+			return jb
+		},
+	}
+
+	// 构造超过 maxPooledJSONBufCap（1MB）的超大响应，使编码器缓冲扩容超阈值
+	largeData := strings.Repeat("x", maxPooledJSONBufCap+1024)
+	var out bytes.Buffer
+	if err := encodeJSON(&out, map[string]string{"data": largeData}); err != nil {
+		t.Fatalf("encodeJSON large payload: %v", err)
+	}
+
+	// 再次取出编码器：正确实现下超大缓冲不入池，Get 得到全新小缓冲编码器；
+	// 若修复缺失（大缓冲被归还），Get 将拿到 Cap>阈值 的编码器，测试失败
+	jb := jsonEncoderPool.Get().(*jsonBufEncoder)
+	if jb.buf.Cap() > maxPooledJSONBufCap {
+		t.Errorf("oversized buffer (cap=%d) was returned to pool, want discarded (cap<=%d)", jb.buf.Cap(), maxPooledJSONBufCap)
 	}
 }
 

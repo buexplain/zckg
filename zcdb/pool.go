@@ -6,21 +6,32 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// errPoolClosed 连接池已关闭后拒绝新增从库时返回。
+var errPoolClosed = errors.New("zcdb: pool is closed")
+
+// defaultConnectTimeout 创建主库/从库连接时 Ping 验证的默认超时。
+const defaultConnectTimeout = 5 * time.Second
+
 // Pool 数据库连接池，封装主从 *sql.DB 的创建和配置。
+// 生命周期约定：Close 幂等（重复调用返回 nil）；Close 后 AddSlave 返回 errPoolClosed；
+// Close 后 Pick 仍返回已关闭的连接（后续查询报 sql: database is closed），详见 docs/connection.md。
 type Pool struct {
 	mu            sync.RWMutex  // 保护 slaves 切片的并发读写
 	master        *sql.DB       // 主库连接（写操作 + 事务）
 	slaves        []*sql.DB     // 从库连接列表（读操作，可为空）
 	slaveStrategy SlaveStrategy // 从库选择策略
 	driverName    string        // 驱动名称
+	closed        atomic.Bool   // 关闭标记：Close 置位后 AddSlave 快速失败
 
 	// 连接池配置（用于热加载从库时复用）
 	maxOpenConns          int
 	maxIdleConns          int
 	connMaxLifetimeSecond int
+	connectTimeout        time.Duration
 }
 
 // PoolConfig 连接池配置。
@@ -31,6 +42,7 @@ type PoolConfig struct {
 	MaxOpenConns          int           // 最大打开连接数，默认 50（主库和每个从库独立应用）
 	MaxIdleConns          int           // 最大空闲连接数，默认 50（主库和每个从库独立应用）
 	ConnMaxLifetimeSecond int           // 连接最大存活秒数，默认 600（主库和每个从库独立应用）
+	ConnectTimeout        time.Duration // 创建主库/从库时 Ping 验证的超时，默认 5s（防不可达主机导致启动长时间挂起）；<=0 取默认值
 	SlaveStrategy         SlaveStrategy // 从库选择策略，默认 RandomStrategy
 }
 
@@ -58,6 +70,10 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	if connMaxLifetimeSecond <= 0 {
 		connMaxLifetimeSecond = 600
 	}
+	connectTimeout := cfg.ConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = defaultConnectTimeout
+	}
 
 	// 打开主库
 	master, err := sql.Open(cfg.DriverName, cfg.DSN)
@@ -68,8 +84,11 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	master.SetMaxIdleConns(maxIdleConns)
 	master.SetConnMaxLifetime(time.Duration(connMaxLifetimeSecond) * time.Second)
 
-	// 验证主库连接
-	if err := master.Ping(); err != nil {
+	// 验证主库连接（带超时：不可达主机静默丢包时防止启动长时间挂起）
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), connectTimeout)
+	err = master.PingContext(pingCtx)
+	pingCancel()
+	if err != nil {
 		_ = master.Close()
 		return nil, fmt.Errorf("zcdb: ping master failed: %w", err)
 	}
@@ -80,6 +99,7 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 		maxOpenConns:          maxOpenConns,
 		maxIdleConns:          maxIdleConns,
 		connMaxLifetimeSecond: connMaxLifetimeSecond,
+		connectTimeout:        connectTimeout,
 	}
 
 	// 从库选择策略
@@ -107,13 +127,23 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 // 连接验证成功后才短暂持锁 append——运行期 AddSlave 失败不影响已建连接，
 // 且不阻塞 PickReadDB/Ping 的读锁；Ping 失败时 Close 新连接防止泄漏。
 func (p *Pool) AddSlave(dsn string) error {
+	// 已关闭的池拒绝新增从库，避免形成“池已关闭但持有活从库”的不一致状态
+	if p.closed.Load() {
+		return errPoolClosed
+	}
+
 	// 锁外取参数快照，避免在网络 IO 期间持有写锁
 	p.mu.RLock()
 	driverName := p.driverName
 	maxOpenConns := p.maxOpenConns
 	maxIdleConns := p.maxIdleConns
 	connMaxLifetimeSecond := p.connMaxLifetimeSecond
+	connectTimeout := p.connectTimeout
 	p.mu.RUnlock()
+
+	if connectTimeout <= 0 {
+		connectTimeout = defaultConnectTimeout
+	}
 
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
@@ -123,7 +153,11 @@ func (p *Pool) AddSlave(dsn string) error {
 	db.SetMaxIdleConns(maxIdleConns)
 	db.SetConnMaxLifetime(time.Duration(connMaxLifetimeSecond) * time.Second)
 
-	if err := db.Ping(); err != nil {
+	// 带超时的 Ping：不可达主机静默丢包时防止热加载长时间挂起
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), connectTimeout)
+	err = db.PingContext(pingCtx)
+	pingCancel()
+	if err != nil {
 		_ = db.Close()
 		return fmt.Errorf("ping slave db: %w", err)
 	}
@@ -135,6 +169,8 @@ func (p *Pool) AddSlave(dsn string) error {
 	return nil
 }
 
+// Ping 依次验证主库与全部从库的连通性：先 Ping 主库，成功后逐个 Ping 从库，
+// 任一失败立即返回该错误；无从库时仅验证主库。使用调用方 ctx 控制超时与取消。
 func (p *Pool) Ping(ctx context.Context) error {
 	err := p.master.PingContext(ctx)
 	if err != nil {
@@ -155,7 +191,14 @@ func (p *Pool) Ping(ctx context.Context) error {
 }
 
 // Close 关闭连接池（主库 + 所有从库）。
+// 幂等：首次关闭执行实际清理并置位 closed 标记，重复调用直接返回 nil。
+// Close 后 AddSlave 返回 errPoolClosed；Pick 仍返回已关闭连接（后续查询报
+// sql: database is closed，签名所限不做快速失败），调用方应确保 Close 后不再使用池。
 func (p *Pool) Close() error {
+	if !p.closed.CompareAndSwap(false, true) {
+		return nil // 已关闭，幂等返回
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

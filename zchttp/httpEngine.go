@@ -26,6 +26,14 @@ type Response struct {
 // 超出则不再排空（连接由 net/http 关闭而非复用），防止超大未读请求体拖慢服务端 IO
 const maxBodyDrainBytes = 2 << 10 // 2 KB
 
+// defaultMaxBodyBytes NewEngine 默认的请求体大小上限（32 MB，与 MultipartFormMaxMemory 对齐）；
+// 需要更大请求体的场景（如文件服务）由调用方显式调大或置 0（不限制）
+const defaultMaxBodyBytes int64 = 32 << 20 // 32 MB
+
+// maxPooledJSONBufCap JSON 编码器归还池前允许的缓冲容量上限（1 MB）；
+// 单次超大响应抬升的缓冲超过该值时不再入池（交由 GC 回收），防止大缓冲长期驻留池内固化内存峰值
+const maxPooledJSONBufCap = 1 << 20 // 1 MB
+
 // jsonBufEncoder 将编码器与其专属缓冲绑定一同池化（json.Encoder 不支持重定向
 // 目标 Writer，故先写入缓冲再拷到响应），避免每响应新建编码器。
 // API 响应无需嵌入 HTML，关闭 HTML 转义（< > & 不再转义为 \uXXXX）以降低编码开销
@@ -43,7 +51,9 @@ var jsonEncoderPool = sync.Pool{
 	},
 }
 
-// encodeJSON 从池中取出编码器将 v 编码为 JSON 写入 w，用完归还
+// encodeJSON 从池中取出编码器将 v 编码为 JSON 写入 w，用完归还。
+// 归还前检查缓冲容量：单次超大响应抬升的缓冲超过 maxPooledJSONBufCap 时不入池
+// （交 GC 回收），避免大缓冲长期驻留池内固化内存峰值
 func encodeJSON(w io.Writer, v any) error {
 	jb := jsonEncoderPool.Get().(*jsonBufEncoder)
 	err := jb.enc.Encode(v)
@@ -51,6 +61,9 @@ func encodeJSON(w io.Writer, v any) error {
 		_, err = w.Write(jb.buf.Bytes())
 	}
 	jb.buf.Reset()
+	if jb.buf.Cap() > maxPooledJSONBufCap {
+		return err
+	}
 	jsonEncoderPool.Put(jb)
 	return err
 }
@@ -73,21 +86,27 @@ type HttpEngine struct {
 	OnPanic           PanicHandler                                 // panic 恢复回调，默认 DefaultPanicHandler
 	// MaxBodyBytes 请求体整体大小上限（字节），绑定前用 http.MaxBytesReader 包装 r.Body，
 	// 超限时绑定失败并映射为 400；0 表示不限制。对 JSON/表单/multipart 等所有请求体统一生效，
-	// 防止超大请求体造成的内存/磁盘 DoS。
+	// 防止超大请求体造成的内存/磁盘 DoS。NewEngine 默认 32 MB（defaultMaxBodyBytes），
+	// 需要更大请求体的场景（如文件服务）由调用方显式调大或置 0
 	MaxBodyBytes int64
 	// MultipartFormMaxMemory multipart/form-data 解析的内存缓冲上限（字节），
 	// 超出部分写入临时文件；默认 32 MB。
 	MultipartFormMaxMemory int64
 }
 
+// NewEngine 创建带有全部默认回调的 HttpEngine：OnNotFound/OnResponse/OnError/
+// OnValidationError/OnPanic 分别指向对应的 Default* 处理器；
+// MaxBodyBytes 默认 32 MB（defaultMaxBodyBytes），MultipartFormMaxMemory 默认 32 MB。
 func NewEngine() *HttpEngine {
 	return &HttpEngine{
-		Router:                 NewRouter(),
-		OnNotFound:             DefaultNotFoundHandler,
-		OnResponse:             DefaultResponseHandler,
-		OnError:                DefaultErrorHandler,
-		OnValidationError:      DefaultValidationErrorHandler,
-		OnPanic:                DefaultPanicHandler,
+		Router:            NewRouter(),
+		OnNotFound:        DefaultNotFoundHandler,
+		OnResponse:        DefaultResponseHandler,
+		OnError:           DefaultErrorHandler,
+		OnValidationError: DefaultValidationErrorHandler,
+		OnPanic:           DefaultPanicHandler,
+		// 默认请求体上限 32 MB：防止默认配置下超大 JSON/表单请求体造成内存耗尽型 DoS
+		MaxBodyBytes:           defaultMaxBodyBytes,
 		MultipartFormMaxMemory: 32 << 20, // 32 MB
 	}
 }
@@ -136,7 +155,9 @@ func DefaultErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // DefaultValidationErrorHandler 默认参数校验失败响应：若响应已写入则跳过；
-// 否则根据 WantHtml 决定返回 HTML 或统一 JSON 结构，状态码统一为 400
+// 否则根据 WantHtml 决定返回 HTML 或统一 JSON 结构，状态码统一为 400。
+// 与 DefaultErrorHandler 的隐藏策略不同：校验/绑定错误属客户端可修正错误，
+// 错误详情（err.Error()）直接透出给客户端
 func DefaultValidationErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	if IsResponseWritten(w) {
 		return
@@ -199,6 +220,13 @@ func DefaultNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ServeHTTP 实现 http.Handler，是请求处理的总入口：
+//  1. MaxBodyBytes > 0 时以 http.MaxBytesReader 包裹请求体（超限绑定失败映射为 400）；
+//  2. 路由查找：精确路由表优先，未命中回退参数路由基数树（末尾斜杠归一化）；
+//  3. 构造 Req 并绑定 query/body/路径参数与请求阶段默认值（绑定失败不提前返回，
+//     错误随中间件链穿透到 core 层）；
+//  4. 执行洋葱模型中间件链；*BindingError/*ValidationError 路由到 OnValidationError
+//     （默认 400），其余错误路由到 OnError（默认 500）；panic 由 recover 捕获后交 OnPanic。
 func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 整体请求体大小限制（MaxBodyBytes > 0 时生效）：超限请求在绑定阶段收到
 	// *http.MaxBytesError 并映射为 400，防止超大请求体造成内存/磁盘 DoS
@@ -255,7 +283,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// 3. 命中路由后立即构造 Req 并绑定请求数据（不做参数校验），
+	// 2. 命中路由后立即构造 Req 并绑定请求数据（不做参数校验），
 	//    使中间件可通过 BoundReqFromContext 提前检查请求数据
 	//    使用注册阶段预计算的 reqElemType 与 reqMeta，始终创建指向结构体的指针用于参数绑定
 	var reqPtr reflect.Value
@@ -286,11 +314,11 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		applyDefaults(reqPtr, entry.reqMeta, true)
 	}
 
-	// 4. 将解析后的 Req 存入状态，供中间件与 core 层通过 BoundReqFromContext 获取
+	// 3. 将解析后的 Req 存入状态，供中间件与 core 层通过 BoundReqFromContext 获取
 	//    （即使绑定失败也存入，中间件可通过 BoundReqFromContext 拿到错误）
 	st.boundReq = reqPtr.Interface()
 
-	// 5. 洋葱模型核心层：参数校验 + 反射调用 handler
+	// 4. 洋葱模型核心层：参数校验 + 反射调用 handler
 	//    直接使用闭包捕获的 reqPtr（绑定阶段产物），避免再从 ctx 取值并重复反射
 	core := func() error {
 		// 绑定阶段失败时不提前返回，错误随中间件链穿透到 core 层再统一处理
@@ -331,6 +359,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if rv.IsNil() {
 					errVal = nil // typed-nil 归一化为 nil，走成功路径
 				}
+			default:
 			}
 			if errVal != nil {
 				return errVal.(error)
@@ -345,7 +374,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 
-	// 6. 构建洋葱模型中间件链并执行，错误传播到最外层时交由错误回调处理；
+	// 5. 构建洋葱模型中间件链并执行，错误传播到最外层时交由错误回调处理；
 	// 绑定错误（*BindingError）与参数校验错误（*ValidationError）路由到 OnValidationError，
 	// 其余错误路由到 OnError
 	if err := runChain(entry.middlewares, ctx, rw, r, core); err != nil {
@@ -359,6 +388,8 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Run 将引擎设置为 server 的 Handler 并调用 ListenAndServe 启动监听。
+// 不包含优雅关闭逻辑；需要时由调用方自行管理所传入的 *http.Server（如 Shutdown）。
 func (e *HttpEngine) Run(server *http.Server) error {
 	server.Handler = e
 	return server.ListenAndServe()

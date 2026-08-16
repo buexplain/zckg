@@ -30,6 +30,7 @@ type Builder struct {
 	unions     []UnionClause
 	lockClause string
 	force      bool  // 允许执行无 WHERE 条件的 Delete/Update（全表操作）
+	usePrimary bool  // 强制读查询走写（主库）连接（写后读场景），仅影响执行层路由、不影响 SQL 编译
 	err        error // 累积错误（如无效运算符）
 }
 
@@ -95,7 +96,7 @@ func toUpperASCII(s string) string {
 
 // Force 标记允许执行无 WHERE 条件的 Delete/Update（全表操作）。
 // Update/Increment/Decrement/Delete/DeleteJoin 默认拒绝无 WHERE 条件，防止误操作清空/更新整张表；
-// 确需全表操作时显式调用 Force 表示已知意图，或使用 Where("1=1") 作为逃生口。
+// 确需全表操作时显式调用 Force 表示已知意图，或使用 WhereRaw("1=1") 作为逃生口。
 // 该标记仅影响执行层保护逻辑，不影响 SQL 编译结果。
 //
 //	affected, err := db.Builder().Table("users").Force().Delete(ctx)
@@ -106,10 +107,23 @@ func (b *Builder) Force() *Builder {
 	return b
 }
 
+// Primary 标记本次读查询强制走写（主库）连接，不加任何锁。
+// 典型场景：写后立即读（如订单写入后立刻查询回读），从库可能因复制延迟尚无数据；
+// 与 LockForUpdate 的区别：Primary 不改变编译出的 SQL（无锁子句），仅影响连接路由。
+// 该标记经 Clone 保留，First/Value/Paginate 等内部克隆的终端方法同样生效。
+//
+//	var order Order
+//	err := db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &order)
+//	// SQL: SELECT * FROM `orders` WHERE `id` = ? LIMIT 1（与不加 Primary 完全一致，但强制命中主库）
+func (b *Builder) Primary() *Builder {
+	b.usePrimary = true
+	return b
+}
+
 // Clone 克隆当前 Builder，返回一个独立副本。
 // 深拷贝全部查询状态：列、FROM 子查询、JOIN（含派生表与嵌套 join 组）、
 // WHERE（含 Values/Bindings 切片与嵌套子查询）、GROUP BY、HAVING、ORDER BY、
-// UNION 与锁子句；副本上继续链式修改不会影响原 Builder，反之亦然。
+// UNION、锁子句与强制主库标记；副本上继续链式修改不会影响原 Builder，反之亦然。
 // First/Value/Paginate/CursorBy 等终端方法内部即用 Clone 避免污染调用方的 Builder。
 //
 //	base := db.Builder().Table("users").Where("status", "active")
@@ -127,6 +141,7 @@ func (b *Builder) Clone() *Builder {
 		lockClause: b.lockClause,
 		tableAlias: b.tableAlias,
 		force:      b.force,
+		usePrimary: b.usePrimary,
 		err:        b.err,
 	}
 	// FROM 子查询深拷贝

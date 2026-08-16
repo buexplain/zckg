@@ -10,7 +10,13 @@ import (
 // cast 将任意类型的值转换为 T 类型。
 // 优先使用直接类型断言，若不匹配则尝试通过 reflect 进行类型转换，
 // 对于 string 到数值类型的场景使用 strconv 做转换，
-// 对于 string 到 time.Duration 的场景使用 time.ParseDuration 做转换，
+// 对于 string 到 time.Duration 的场景使用 time.ParseDuration 做转换。
+// 此外包含两个特判分支：
+//   - 数值 → bool：C 语言惯例，零值为 false、非零为 true
+//     （解决 .env 中 "1"/"0" 被推断为 int 后无法转 bool 的问题）；
+//   - 数值 → string：直接返回 def，防止 Go 中 int -> string 的
+//     Unicode 码点语义（65 -> "A"）陷阱。
+//
 // 均失败时返回默认值 def。
 func cast[T any](v any, def T) T {
 	if v == nil {
@@ -85,7 +91,11 @@ func cast[T any](v any, def T) T {
 		return def
 	}
 
-	// 通过 reflect 做通用类型转换
+	// 通过 reflect 做通用类型转换。
+	// 注意：此处采用 Go 原生类型转换语义，float -> int 向零截断（99.99 -> 99），
+	// 大位宽 -> 小位宽（如 32 位平台上 int64 -> int）可能溢出；
+	// 该截断语义已在 docs/zcconfig.md 中显式声明，调用方应保证
+	// 默认值类型与存储的配置值类型匹配。
 	if rv.IsValid() && rv.Type().ConvertibleTo(rt) {
 		return rv.Convert(rt).Interface().(T)
 	}

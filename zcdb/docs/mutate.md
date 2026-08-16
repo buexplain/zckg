@@ -197,11 +197,12 @@ affected, err := db.Builder().Table("users").
 
 ```go
 err := db.Builder().Table("users").Truncate(ctx)
-// MySQL/PG SQL: TRUNCATE TABLE `users`
-// SQLite SQL:   DELETE FROM "users"
+// MySQL SQL:  TRUNCATE TABLE `users`
+// PG SQL:     TRUNCATE TABLE "users" RESTART IDENTITY（重置自增序列）
+// SQLite SQL: DELETE FROM "users"
 ```
 
-SQLite 特殊处理：`DELETE FROM` 不会重置 AUTOINCREMENT 序列，`Truncate` 会额外清空 `sqlite_sequence` 中该表的记录使自增主键从头开始（表从未使用 AUTOINCREMENT 时忽略该错误）。
+SQLite 特殊处理：`DELETE FROM` 不会重置 AUTOINCREMENT 序列，`Truncate` 会额外清空 `sqlite_sequence` 中该表的记录使自增主键从头开始。`DELETE`、`sqlite_sequence` 存在性预查询与序列清理三步包在**同一事务**中执行（调用方 ctx 已携带事务时自动并入外层事务），避免“数据已删但序列未重置”的中间状态；表从未使用 AUTOINCREMENT 时（`sqlite_sequence` 不存在，经 `sqlite_master` 预查询确认）跳过清理；清理失败如实返回错误。
 
 ## 破坏性操作保护
 

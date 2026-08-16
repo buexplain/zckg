@@ -93,3 +93,26 @@ func TestNormalizeColumnTypeMatchesMap(t *testing.T) {
 		})
 	}
 }
+
+// TestFormatStructFieldType 验证列类型映射入口：已知类型命中映射表，
+// 未知方言返回空串（由 Generate 兜底为 string）。
+func TestFormatStructFieldType(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect Dialect
+		colType string
+		want    string
+	}{
+		{"MySQL bigint", DialectMysql, "bigint(20)", "int64"},
+		{"Postgres timestamptz", DialectPostgres, "timestamp with time zone", "time.Time"},
+		{"SQLite blob", DialectSqlite, "blob", "[]byte"},
+		{"未知方言无映射表", Dialect("oracle"), "bigint", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatStructFieldType(tt.dialect, tt.colType); got != tt.want {
+				t.Errorf("formatStructFieldType(%q, %q) = %q, want %q", tt.dialect, tt.colType, got, tt.want)
+			}
+		})
+	}
+}

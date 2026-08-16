@@ -101,7 +101,7 @@ func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int, tag
 //	rows, err := db.Query(ctx, sqlStr, args...)
 //	if err != nil { ... }
 //	defer rows.Close()
-//	err := zcdb.ScanStruct(rows, &users)
+//	err = zcdb.ScanStruct(rows, &users)
 func ScanStruct(rows *sql.Rows, dest any, tagName ...string) error {
 	tag := pickTagName(tagName)
 	destValue := reflect.ValueOf(dest)
@@ -207,6 +207,7 @@ func makeScanValues(columns []string, info *scanFieldInfo, structValue reflect.V
 // discard 实现 sql.Scanner，用于忽略不需要的列。
 type discard struct{}
 
+// Scan 实现 sql.Scanner：无条件丢弃扫描值（用于未匹配列与不可用字段）。
 func (d *discard) Scan(_ any) error {
 	return nil
 }
@@ -217,6 +218,8 @@ type nullSafeField struct {
 	field reflect.Value
 }
 
+// Scan 实现 sql.Scanner：将 src 按目标字段类型转换后写入包裹的结构体字段；
+// NULL 时指针字段置 nil、非指针字段置零值（不报错），转换规则见函数体分支。
 func (n *nullSafeField) Scan(src any) error {
 	// NULL 值处理：设为零值（指针类型为 nil，非指针类型为零值）
 	if src == nil {
@@ -287,14 +290,16 @@ func (n *nullSafeField) Scan(src any) error {
 			setFinalValue(dst.Elem())
 			return nil
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			i, err := strconv.ParseInt(string(val.Bytes()), 10, 64)
+			// 按目标类型位宽解析，溢出时 ParseInt 直接报错，避免 Convert 静默截断（如 "300" → int8）
+			i, err := strconv.ParseInt(string(val.Bytes()), 10, targetType.Bits())
 			if err != nil {
 				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(i).Convert(targetType))
 			return nil
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			u, err := strconv.ParseUint(string(val.Bytes()), 10, 64)
+			// 按目标类型位宽解析，溢出时 ParseUint 直接报错，避免 Convert 静默截断
+			u, err := strconv.ParseUint(string(val.Bytes()), 10, targetType.Bits())
 			if err != nil {
 				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
 			}
@@ -389,14 +394,16 @@ func (n *nullSafeField) Scan(src any) error {
 			setFinalValue(reflect.ValueOf(b))
 			return nil
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			i, err := strconv.ParseInt(val.String(), 10, 64)
+			// 按目标类型位宽解析，溢出时 ParseInt 直接报错，避免 Convert 静默截断（如 "300" → int8）
+			i, err := strconv.ParseInt(val.String(), 10, targetType.Bits())
 			if err != nil {
 				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(i).Convert(targetType))
 			return nil
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			u, err := strconv.ParseUint(val.String(), 10, 64)
+			// 按目标类型位宽解析，溢出时 ParseUint 直接报错，避免 Convert 静默截断
+			u, err := strconv.ParseUint(val.String(), 10, targetType.Bits())
 			if err != nil {
 				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
 			}

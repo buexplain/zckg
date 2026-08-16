@@ -18,9 +18,9 @@
 | 本级字段 | 零值 | 行为 |
 |---------|------|------|
 | `nonzero:"true"` | 是 | 报错 `"is required"`（嵌套字段带绑定名路径，如 `"company.name"`），不递归 |
-| `nonzero:"true"` | 否 | 校验通过，若为嵌套结构体/指针则递归进入子字段 |
+| `nonzero:"true"` | 否 | 校验通过，若为嵌套结构体/指针/单层容器元素（切片/数组/map）则递归进入子字段 |
 | 未标注 `nonzero` | 是 | 跳过，不报错，不递归 |
-| 未标注 `nonzero` | 否 | 不报本级，但若为嵌套结构体/指针则递归进入子字段 |
+| 未标注 `nonzero` | 否 | 不报本级，但若为嵌套结构体/指针/单层容器元素（切片/数组/map）则递归进入子字段 |
 
 典型场景——收货地址必填，发票选填但填了就必须校验抬头和金额：
 
@@ -95,7 +95,7 @@ func (r CreateEventReq) Validate() error {
 `Validate()` 返回值处理：
 
 - 返回 `nil` → 校验通过；
-- 返回 `*ValidationError` → 直接透传（可携带 `Field` 等结构化信息）；
+- 返回 `*ValidationError` → 直接透传（可携带 `Field` 等结构化信息，可用 `NewValidationError(Field, Message, Err)` 构造或直接结构体字面量）；
 - 返回其他普通 `error` → 自动兜底包装为 `*ValidationError`（保留原始错误链，`errors.Is/As` 可穿透）。
 
 > `Validate()` 是运行时任意 Go 代码，不会被反射提取为 OpenAPI schema 约束，因此不影响生成的文档。
@@ -118,7 +118,7 @@ func (r CreateEventReq) Validate() error {
 validateNonzero → validateCustom(Validate)
 ```
 
-所有中间件执行完毕后，core 层从 `ctx` 取出已绑定的 Req 进行校验。
+所有中间件执行完毕后，core 层对绑定阶段产出的 Req 进行校验（直接使用闭包捕获的 `reqPtr`，不再从 ctx 取值）。
 
 任一校验失败都会产生 `*ValidationError`：
 
@@ -130,7 +130,7 @@ type ValidationError struct {
 }
 ```
 
-`*BindingError`（绑定失败）与 `*ValidationError`（校验失败）在 `ServeHTTP` 中通过 `errors.As` 被识别，统一路由到 `OnValidationError` 回调（默认 `DefaultValidationErrorHandler`，返回 **400**）；其余非校验错误走 `OnError`（默认 **500**）。回调的自定义方式见 `http-engine-callback.md`。
+`*BindingError`（绑定失败，由引擎经 `NewBindingError(err)` 包装底层错误构造，`Error()` 直接返回底层错误文案）与 `*ValidationError`（校验失败，`Err` 为 nil 时 `Error()` 返回 `field "<Field>" <Message>` 形式）在 `ServeHTTP` 中通过 `errors.As` 被识别，统一路由到 `OnValidationError` 回调（默认 `DefaultValidationErrorHandler`，返回 **400**）；其余非校验错误走 `OnError`（默认 **500**）。回调的自定义方式见 `http-engine-callback.md`。
 
 ## 四、相关文档
 

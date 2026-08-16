@@ -25,6 +25,7 @@ type paramRouteEntry struct {
 	entry  *routeEntry
 }
 
+// NewRouter 创建空路由表，并预初始化 9 个标准 HTTP 方法的精确路由表与参数路由基数树根节点。
 func NewRouter() *Router {
 	r := &Router{
 		routes:     make(map[string]map[string]*routeEntry),
@@ -177,38 +178,47 @@ func parseRoutePath(path string) ([]routeSegment, error) {
 	return segments, nil
 }
 
+// GET 注册处理 GET 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) GET(path string, handler any) {
 	r.register(http.MethodGet, path, handler, nil)
 }
 
+// POST 注册处理 POST 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) POST(path string, handler any) {
 	r.register(http.MethodPost, path, handler, nil)
 }
 
+// PUT 注册处理 PUT 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) PUT(path string, handler any) {
 	r.register(http.MethodPut, path, handler, nil)
 }
 
+// DELETE 注册处理 DELETE 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) DELETE(path string, handler any) {
 	r.register(http.MethodDelete, path, handler, nil)
 }
 
+// PATCH 注册处理 PATCH 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) PATCH(path string, handler any) {
 	r.register(http.MethodPatch, path, handler, nil)
 }
 
+// HEAD 注册处理 HEAD 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) HEAD(path string, handler any) {
 	r.register(http.MethodHead, path, handler, nil)
 }
 
+// OPTIONS 注册处理 OPTIONS 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) OPTIONS(path string, handler any) {
 	r.register(http.MethodOptions, path, handler, nil)
 }
 
+// CONNECT 注册处理 CONNECT 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) CONNECT(path string, handler any) {
 	r.register(http.MethodConnect, path, handler, nil)
 }
 
+// TRACE 注册处理 TRACE 方法的路由；handler 签名非法或路由冲突时 panic。
 func (r *Router) TRACE(path string, handler any) {
 	r.register(http.MethodTrace, path, handler, nil)
 }
@@ -240,38 +250,56 @@ func (g *RouterGroup) Group(prefix string, middlewares ...MiddlewareHandler) *Ro
 	return sub
 }
 
+// GET 在分组内注册 GET 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) GET(path string, handler any) {
 	g.router.register(http.MethodGet, g.prefix+path, handler, g.middlewares)
 }
 
+// POST 在分组内注册 POST 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) POST(path string, handler any) {
 	g.router.register(http.MethodPost, g.prefix+path, handler, g.middlewares)
 }
 
+// PUT 在分组内注册 PUT 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) PUT(path string, handler any) {
 	g.router.register(http.MethodPut, g.prefix+path, handler, g.middlewares)
 }
 
+// DELETE 在分组内注册 DELETE 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) DELETE(path string, handler any) {
 	g.router.register(http.MethodDelete, g.prefix+path, handler, g.middlewares)
 }
 
+// PATCH 在分组内注册 PATCH 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) PATCH(path string, handler any) {
 	g.router.register(http.MethodPatch, g.prefix+path, handler, g.middlewares)
 }
 
+// HEAD 在分组内注册 HEAD 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) HEAD(path string, handler any) {
 	g.router.register(http.MethodHead, g.prefix+path, handler, g.middlewares)
 }
 
+// OPTIONS 在分组内注册 OPTIONS 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) OPTIONS(path string, handler any) {
 	g.router.register(http.MethodOptions, g.prefix+path, handler, g.middlewares)
 }
 
+// CONNECT 在分组内注册 CONNECT 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) CONNECT(path string, handler any) {
 	g.router.register(http.MethodConnect, g.prefix+path, handler, g.middlewares)
 }
 
+// TRACE 在分组内注册 TRACE 方法路由：完整路径为分组前缀 + path，中间件链为
+// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
 func (g *RouterGroup) TRACE(path string, handler any) {
 	g.router.register(http.MethodTrace, g.prefix+path, handler, g.middlewares)
 }

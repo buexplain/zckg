@@ -2,7 +2,7 @@ package zcdb
 
 // 本文件包含 Builder 的 SELECT 查询执行方法（终端方法）：
 // First/Find/Pluck/Paginate/Count/Exists/Value 与聚合 Max/Min/Sum/Avg，
-// 以及内部统一查询入口 query（带锁查询强制走写连接）。
+// 以及内部统一查询入口 query（带锁查询与 Primary 标记强制走写连接）。
 
 import (
 	"context"
@@ -12,10 +12,11 @@ import (
 )
 
 // query 执行 SELECT 查询的内部统一入口：
-// 带锁查询（lockClause 非空）强制走写（主库）连接，
-// 读写分离下锁查询打到从库会报错或锁不生效；无锁查询正常路由读库。
+// 带锁查询（lockClause 非空）与 Primary 标记（usePrimary）强制走写（主库）连接——
+// 读写分离下锁查询打到从库会报错或锁不生效；写后读场景从库可能因复制延迟无数据。
+// 其余无锁查询正常路由读库。
 func (b *Builder) query(ctx context.Context, sqlStr string, args ...any) (*sql.Rows, error) {
-	if b.lockClause != "" {
+	if b.lockClause != "" || b.usePrimary {
 		return b.dao.QueryPrimary(ctx, sqlStr, args...)
 	}
 	return b.dao.Query(ctx, sqlStr, args...)
@@ -23,7 +24,7 @@ func (b *Builder) query(ctx context.Context, sqlStr string, args ...any) (*sql.R
 
 // First 查询第一条记录，扫描到 dest。
 // dest 必须是结构体指针（*struct），字段按列映射标签（默认 db，可由 NewDBDao 的 tagName 参数自定义）匹配列名；未找到记录时返回 sql.ErrNoRows。
-// 内部克隆并强制 LIMIT 1，不修改原 Builder。
+// 内部按需克隆并强制 LIMIT 1（limit 已为 1 时跳过克隆），不修改原 Builder。
 //
 //	var user User
 //	err := db.Builder().Table("users").Where("id", "=", 1).First(ctx, &user)
@@ -106,7 +107,7 @@ func (b *Builder) Pluck(ctx context.Context, dest any, columns ...string) error 
 			destValue.Set(reflect.MakeMap(destValue.Type()))
 		}
 		// map 值类型为结构体/结构体指针时进入键列模式（keyBy）：
-		// 唯一列参数作为键列，整行数据按 db tag 扫描进结构体
+		// 唯一列参数作为键列，整行数据按列映射标签（默认 db）扫描进结构体
 		valType := destValue.Type().Elem()
 		if valType.Kind() == reflect.Ptr {
 			valType = valType.Elem()
@@ -161,7 +162,7 @@ func (b *Builder) Pluck(ctx context.Context, dest any, columns ...string) error 
 }
 
 // pluckKeyBy 键列模式（keyBy）：map 值为结构体/结构体指针时，columns 唯一元素作为键列，
-// 整行数据按 db tag 扫描进结构体后以键列值作为 map 键。
+// 整行数据按列映射标签（默认 db）扫描进结构体后以键列值作为 map 键。
 // 键列若已在结构体字段中则不重复 SELECT，直接复用字段扫描值；否则追加为 SELECT 最后一列。
 func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColumn string) error {
 	valType := destMap.Type().Elem()
@@ -395,7 +396,7 @@ func (b *Builder) aggregate(ctx context.Context, fn string, column string) (floa
 
 // Value 查询单个标量值，扫描到 dest。
 // dest 必须是基本类型指针（如 *string、*int、*int64）或 nil 指针（如 **string 用于区分 NULL）。
-// 未找到记录时返回 sql.ErrNoRows；内部克隆并强制 LIMIT 1，不修改原 Builder。
+// 未找到记录时返回 sql.ErrNoRows；内部按需克隆并强制 LIMIT 1（limit 已为 1 时跳过克隆），不修改原 Builder。
 //
 //	var name string
 //	err := db.Builder().Table("users").Select("name").Where("id", "=", 1).Value(ctx, &name)

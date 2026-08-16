@@ -31,6 +31,8 @@ zcmodel/
     └── zcmodel.md          # 本文档
 ```
 
+> docs 目录下另有审查产物（`code-review-plan.md`、`code-review-report.md`、`docs-code-deviation-review-plan.md`、`docs-code-deviation-review-report.md`），不属于功能文档，故不列入上树。
+
 ## 生成流程
 
 ```
@@ -38,24 +40,37 @@ zcmodel/
                     │      Generate(input)     │  唯一入口
                     └────────────┬─────────────┘
                                  │
-      ① 校验 Dialect / JsonTagValueCase
+      ① 校验 Dialect
                                  │
-      ② 补全每列的 StructFieldInfo
-         ├─ JsonTagValue 为空 → formatJSONTag（按 NameCase 转换）
+      ② 校验表名（防路径穿越与非法标识符）
+         ├─ 拒绝空名、"." / ".."、路径分隔符（/、\）与 Windows 非法字符（<>:"|?*）
+         └─ 首字符须为 ASCII 字母或下划线（保证推导的结构体名是合法 Go 标识符）
+                                 │
+      ③ 补全每列的 StructFieldInfo（只作用于副本，不修改调用方数据）
+         ├─ 校验 JsonTagValueCase（非空且非法 → 报错）
+         ├─ JsonTagValue 为空且 JsonTagValueCase 非空 → formatJSONTag（按 NameCase 转换）
          ├─ Name 为空        → toPascalCase（列名转 PascalCase）
          ├─ Type 为空        → formatStructFieldType（方言映射，未命中兜底 string）
          └─ Type 为 time.Time 且 Import 为空 → Import = "time"
                                  │
-      ③ 生成代码字符串
+      ④ 字段名检测（避免产出无法编译的代码）
+         ├─ 字段名为空 → 报错（附列名）
+         ├─ 字段名非合法 Go 标识符（如数字开头列名）→ 报错（附列名）
+         └─ 字段名重复（如 user_id 与 userId 同表）→ 报错
+                                 │
+      ⑤ 生成代码字符串
          ├─ buildStruct：Entity（具体类型）/ DO（any 类型）
          ├─ buildToDOMethod / buildToEntityMethod：互转方法
          └─ 注释：表注释生成到结构体上方的 // 注释
                                  │
-      ④ 写文件 {OutputDir}/{TableName}.go
+      ⑥ 写文件 {OutputDir}/{TableName}.go
+         ├─ 自动创建输出目录，并二次校验输出路径不逃逸输出目录
          └─ writeOrReplaceStruct
             ├─ 文件不存在 → 直接创建（package + imports + 生成代码）
-            └─ 文件已存在 → AST 解析：移除旧生成代码，
-               保留用户代码并重新组织布局，缺失 import 自动补齐
+            ├─ 文件已存在 → AST 解析：移除旧生成代码，
+            │  保留用户代码并重新组织布局，缺失 import 自动补齐
+            └─ 落盘前 go/format 全量语法自校验 + 临时文件原子写入，
+               任何语法非法产物都不落盘（见“落盘安全三重防线”）
 ```
 
 ## 对外 API
@@ -71,22 +86,32 @@ func Generate(input Input) error
 | 错误信息 | 触发场景 |
 |---|---|
 | `不支持的数据库方言: xxx` | `Dialect` 不是 mysql / postgres / sqlite |
+| `表名为空` | `TableName` 为空字符串 |
+| `表名非法: xxx` | `TableName` 为 `.` 或 `..` |
+| `表名包含非法字符: xxx` | `TableName` 含路径分隔符（`/`、`\`）或 Windows 非法文件名字符（`< > : " | ? *`） |
+| `表名首字符必须为 ASCII 字母或下划线: xxx` | `TableName` 首字符为数字或非 ASCII 字符（如中文表名），会推导出无法编译的结构体名 |
 | `invalid json tag value case` | `JsonTagValueCase` 非空但不是合法的 `NameCase` 枚举值 |
+| `列 xxx 转换后的字段名为空` | 列名经 `toPascalCase` 转换后为空（如纯分隔符列名） |
+| `列 xxx 转换后的字段名 xxx 不是合法的 Go 标识符` | 转换后字段名数字开头等（如列名 `2fa_code`）；请在 `StructFieldInfo.Name` 显式指定合法名称 |
+| `列 xxx 与 xxx 转换后的字段名重复: xxx` | 不同列转换后字段名相同（如 `user_id` 与 `userId`） |
 | `创建输出目录失败: ...` | `OutputDir` 无法创建 |
-| `生成结构体失败: ...` | 目标文件存在但无法被 `go/parser` 解析（用户代码有语法错误）等写文件失败场景 |
+| `输出文件路径逃逸输出目录: xxx` | 输出路径经清理后不在 `OutputDir` 内（防御性二次校验） |
+| `生成结构体失败: ...` | 目标文件存在但无法被 `go/parser` 解析（用户代码有语法错误）、生成产物未通过落盘前语法自校验等写文件失败场景；内部错误（`解析文件失败` / `创建临时文件失败` / `写入临时文件失败` / `设置文件权限失败` / `关闭临时文件失败` / `替换目标文件失败` / `生成代码存在语法错误` / `保留用户类型声明失败`）均统一包裹为该错误 |
+
+> 上表错误文本中的列名与字段名以 `%q` 格式输出（带双引号，如 `列 "2fa_code" …`），表名以原样输出。
 
 ### Input
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `OutputDir` | `string` | 输出目录，不存在时自动创建。**目录名须为合法 Go 包名**（包名取目录名，无法推导时回退 `main`） |
+| `OutputDir` | `string` | 输出目录，不存在时自动创建。**目录名须为合法 Go 包名**（仅新建文件时包名取目录名，无法推导时回退 `main`；存量文件再生成时尊重原 package 声明） |
 | `Database` | `string` | 数据库名，仅用于生成结构体的注释 |
 | `Dialect` | `Dialect` | 数据库方言，决定列类型映射表 |
 | `TableName` | `string` | 表名。原样用作输出文件名（`{TableName}.go`），转 PascalCase 后推导结构体名 |
 | `TableComment` | `string` | 表注释，生成到结构体注释中；为空时使用"表" |
 | `ColumnTagName` | `string` | 列映射 tag 的名称（如 `"column"`、`"db"`），与 zcdb 的列映射标签对应 |
 | `JsonTagValueCase` | `NameCase` | JSON tag 的命名风格；**空值表示不生成 json tag** |
-| `Columns` | `[]*Column` | 表的所有字段 |
+| `Columns` | `[]*Column` | 表的所有字段；为空时生成仅含空结构体与互转方法的文件 |
 
 ### Column / StructFieldInfo
 
@@ -142,7 +167,8 @@ JSON tag 值的命名风格枚举，`IsValid()` 判断合法性：
 文件最终布局（增量再生成时同样遵守）：
 
 ```
-package {OutputDir 目录名}
+原文件头（build tags、文件级注释，存量文件按原文保留；新建文件无）
+package 行（存量文件尊重原声明；新建文件取 OutputDir 目录名）
 
 imports（原有 import + 缺失的生成代码所需 import）
 
@@ -158,7 +184,7 @@ imports（原有 import + 缺失的生成代码所需 import）
 ### Entity 与 DO 结构体
 
 - tag 顺序固定为：**json → {ColumnTagName} → description**；
-- `json` tag 仅在 `JsonTagValue` 非空时生成；`description` tag 仅在列注释非空时生成；
+- `json` tag 仅在 `JsonTagValue` 非空时生成；`{ColumnTagName}` tag 仅在 `ColumnTagName` 非空时生成（避免产生空 tag 名 `:"colname"`）；`description` tag 仅在列注释非空时生成；
 - 字段名与类型按 gofmt 风格对齐（宽度取最长者）；
 - DO 的字段类型统一为 `any`，tag 与 Entity 完全一致。
 
@@ -272,17 +298,24 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 目标文件已存在时，`writeOrReplaceStruct` 的工作方式：
 
 1. **AST 解析**整个现有文件（`parser.ParseComments`），解析失败则报错返回，绝不覆盖；
-2. **识别并移除旧的生成代码**（`isGenerated`）：
-   - 名为 `{EntityName}` / `{DOName}` 的 type 声明；
-   - Entity 上的 `ToDO` 方法、DO 上的 `ToEntity` 方法；
+2. **识别并移除旧的生成代码**（内部由 `isGeneratedTypeSpec` / `isGeneratedMethod` 判定）：
+   - 名为 `{EntityName}` / `{DOName}` 的 type 声明（混合 type 声明块按 Spec 粒度过滤：仅剔除生成的类型，同块中的用户类型保留）；
+   - Entity 上的 `ToDO` 方法、DO 上的 `ToEntity` 方法（含值接收者版本，避免同名方法共存导致编译失败）；
 3. **分类保留用户代码**：
    - Entity 上的自定义方法 → 紧随 Entity 生成代码之后；
    - DO 上的自定义方法 → 紧随 DO 生成代码之后；
    - 其他声明（import 单独收集）→ 放在文件末尾；
-4. **补齐 import**：生成代码所需的包（如 `time`）若文件中缺失，自动补充到 import 区；
-5. 按固定布局重写整个文件。
+4. **补齐 import**：生成代码所需的包（如 `time`）若文件中缺失，自动补充到 import 区；存量文件以**别名导入**（含 `_`、`.` 导入）所需包时不视为已存在，仍会补充默认导入（生成代码引用默认包名，两种导入可合法共存）；
+5. 按固定布局重写整个文件；
+6. **落盘保障**：全部处理成功后，对完整内容执行 `go/format.Source` 语法自校验，再经同目录临时文件 + rename 原子替换目标文件（见下方“落盘安全三重防线”）。
 
-特殊情形：文件不存在或内容为空白时，按新建处理（包名取输出目录名，无法推导时回退 `main`）。
+特殊情形：文件不存在或内容为空白时，按新建处理（包名取输出目录名，无法推导时回退 `main`）。存量文件再生成时：package 声明之前的原文（build tags、文件级注释）与原 package 行按原文前置保留，包名不强制改为目录推导值。
+
+### 落盘安全三重防线
+
+1. **落盘前语法自校验**：`writeGeneratedFile` 在写出前对完整文件内容执行 `go/format.Source`（内部含 `go/parser` 解析），任何语法非法的产物都直接报错、不落盘；
+2. **原子写入**：`writeFileAtomic` 在同目录创建临时文件写入后 rename 覆盖目标（Windows 上 rename 可直接覆盖已存在文件），进程中断/磁盘满不留半文件，且保留目标文件原权限位；
+3. **存量文件解析失败不覆盖**：已有文件无法被 `go/parser` 解析时直接报错返回，绝不覆盖用户代码。
 
 ### 注释净化（sanitizeTagValue）
 
@@ -407,11 +440,13 @@ columns := []*zcmodel.Column{
 
 ## 注意事项
 
-1. **输出目录名即包名**：`OutputDir` 的最后一级目录名被用作生成文件的 `package` 名，请保证它是合法的 Go 包名（如 `model`）；无法推导时回退为 `main`。
-2. **文件名直接使用表名**：输出文件名为 `{TableName}.go`，不做大小写转换；表名含非法文件名字符时由操作系统报错。结构体名则始终经 `toPascalCase` 推导。
+1. **输出目录名即包名（仅新建文件）**：新建生成文件时，`OutputDir` 的最后一级目录名被用作 `package` 名，请保证它是合法的 Go 包名（如 `model`），无法推导时回退为 `main`；存量文件再生成时尊重原 package 声明，不受目录名影响。
+2. **表名经主动校验**：输出文件名为 `{TableName}.go`，不做大小写转换；`Generate` 会主动校验表名——拒绝空名、`.` / `..`、路径分隔符与 Windows 非法文件名字符，且首字符必须为 ASCII 字母或下划线（保证推导出的结构体名是合法 Go 标识符），非法时返回明确错误（而非依赖操作系统报错）。结构体名则始终经 `toPascalCase` 推导。
 3. **未知列类型兜底为 string**：映射表未覆盖的列类型（如 PG 的自定义类型）默认映射为 `string`，避免生成非法代码；需要精确类型时请显式指定 `StructFieldInfo.Type` 与 `Import`。
 4. **MySQL 的 BOOL 实际是 TINYINT(1)**：从真实 MySQL 读到的 BOOL/BOOLEAN 列，其存储类型为 `tinyint`，映射结果为 `int` 而非 `bool`。
-5. **SQLite 不支持字段注释**：SQLite 元数据中没有列注释，生成的 `description` tag 恒为空。
+5. **SQLite 不支持字段注释**：SQLite 元数据中没有列注释，通过 zcdb Schema 读取时 `Comment` 恒为空，因此生成的 `description` tag 也恒为空；若手工构造 SQLite 方言的列并填写 `Comment`，仍会正常生成该 tag。
 6. **存量文件必须语法正确**：增量再生成依赖 `go/parser` 解析现有文件，若用户代码存在语法错误，`Generate` 报错返回且不会覆盖文件。
 7. **ToEntity 的类型断言语义**：DO 字段为 `any`，断言失败（值为 nil 或类型不符）时该字段被跳过，Entity 保留原值；不会返回错误。
 8. **json tag 可选**：`JsonTagValueCase` 传空串则不生成任何 json tag；单列也可通过显式指定 `StructFieldInfo.JsonTagValue` 覆盖全局风格。
+9. **生成代码按名称识别**：增量再生成按名称匹配 Entity/DO 类型与 ToDO/ToEntity 方法，请勿在同一文件中定义与它们同名的其他类型，否则再生成时会被一并移除。
+10. **列名须能推导出合法标识符**：数字开头的列名（如 `2fa_code`）会报“不是合法的 Go 标识符”错误，请通过 `StructFieldInfo.Name` 显式指定合法字段名；中文列名是合法 Go 标识符，可正常生成。

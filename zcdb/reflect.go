@@ -116,7 +116,7 @@ func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int, tagN
 //   - 结构体切片：[]User{{Name: "alice"}, {Name: "bob"}}
 //   - 结构体指针切片：[]*User{&u1, &u2}
 //
-// 非结构体/切片类型返回 ErrInvalidStruct；所有字段均为 nil 返回 ErrNoFields。
+// 非结构体/切片类型返回 ErrInvalidStruct；空切片返回 ErrEmptyData；所有字段均为 nil 返回 ErrNoFields。
 //
 // 字段值处理规则（单结构体 & 切片首行）：
 //   - any(interface{}) 字段：nil → 该列被跳过；非 nil → fv.Elem().Interface()

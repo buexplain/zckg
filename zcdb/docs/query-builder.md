@@ -312,7 +312,7 @@ sql, _, _ = db.Builder().Table("stores").CrossJoin("months").ToSelect() // 笛�
 // SQL: SELECT * FROM `stores` CROSS JOIN `months`
 ```
 
-`RightJoin`：SQLite 3.39 以下不支持 RIGHT JOIN。
+`RightJoin`：SQLite 3.39 以下不支持 RIGHT JOIN。框架编译层不做版本检测、直接输出 `RIGHT JOIN`，低版本 SQLite 会在数据库层面报错。
 
 `CrossJoinOn`（带 ON 条件的 CROSS JOIN）：PG 的 CROSS JOIN 不接受 ON，编译层自动转为 `INNER JOIN ... ON`（语义等价）：
 
@@ -465,7 +465,7 @@ sql, _, _ = db.Builder().Table("users").InRandomOrder().ToSelect()
 
 ### Limit / Offset / ForPage
 
-`n <= 0` 时不输出对应子句；`ForPage(page, perPage)` 中 page 从 1 开始（< 1 时修正为 1）：
+`n <= 0` 时不输出对应子句；`ForPage(page, perPage)` 中 page 从 1 开始（< 1 时修正为 1），`perPage <= 0` 时 limit/offset 均 <= 0，等同不分页：
 
 ```go
 sql, _, _ := db.Builder().Table("users").Limit(10).Offset(20).ToSelect()
@@ -477,7 +477,7 @@ sql, _, _ = db.Builder().Table("users").ForPage(2, 20).ToSelect()
 
 ## UNION
 
-`Union` / `UnionAll` 可链式多次调用追加，编译时各查询加括号包裹，绑定按主查询 → 各 UNION 查询顺序合并：
+`Union` / `UnionAll` 可链式多次调用追加，编译时各查询加括号包裹（**SQLite 方言不加括号**，SQLite 不允许 UNION 子查询显式括号），绑定按主查询 → 各 UNION 查询顺序合并：
 
 ```go
 admins := db.Builder().Table("admins").Select("name")
@@ -517,9 +517,21 @@ sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).SharedLock().ToS
 // SQLite: 编译报错 ErrSQLiteLockNotSupported（SQLite 不支持锁子句）
 ```
 
+## Primary（强制主库读）
+
+`Primary()` 标记本次读查询强制走写（主库）连接，**不加任何锁、不改变编译出的 SQL**，仅影响连接路由（见[连接文档](connection.md)的读写分离路由表）：
+
+```go
+// 写后读：订单写入后立刻回读，从库可能因复制延迟尚无数据
+var order Order
+err := db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &order)
+```
+
+与 `LockForUpdate`/`SharedLock` 相同，`Primary()` 标记经 Clone 保留，First/Value/Paginate 等内部克隆的终端方法同样生效。
+
 ## Clone（查询复用）
 
-`Clone` 深拷贝 Builder 的全部查询状态（列、子查询、JOIN 含嵌套组、WHERE 含嵌套与切片、GROUP/HAVING、ORDER、UNION、锁与 force 标记），副本与原 Builder 完全隔离。适合基于公共条件派生多个查询：
+`Clone` 深拷贝 Builder 的全部查询状态（列、子查询、JOIN 含嵌套组、WHERE 含嵌套与切片、GROUP/HAVING、ORDER、UNION、锁、force 标记与强制主库标记），副本与原 Builder 完全隔离。适合基于公共条件派生多个查询：
 
 ```go
 base := db.Builder().Table("users").Where("status", "active")

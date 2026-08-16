@@ -1,6 +1,8 @@
 package zcconfig
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -495,5 +497,101 @@ func TestReset_ThenRead(t *testing.T) {
 	}
 	if all := EnvAll(); len(all) != 0 {
 		t.Errorf("Reset 后 EnvAll 期望空 map，实际 %v", all)
+	}
+}
+
+// ZCC-03/04：加载不存在的文件应返回错误，且错误信息包含文件路径
+func TestLoadEnv_FileNotFound(t *testing.T) {
+	reset()
+	path := filepath.Join(t.TempDir(), "not_exist.env")
+	err := LoadEnv(path)
+	if err == nil {
+		t.Fatalf("加载不存在的文件期望返回错误")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("错误信息期望包含文件路径 %q，实际 %q", path, err.Error())
+	}
+}
+
+// ZCC-03/04：单行超过 1MB 上限应返回 bufio.ErrTooLong，且错误信息包含文件路径
+func TestLoadEnv_LineTooLong(t *testing.T) {
+	reset()
+	longVal := strings.Repeat("a", 1024*1024+1)
+	path := writeTestFile(t, "LONG_KEY="+longVal+"\n")
+	err := LoadEnv(path)
+	if err == nil {
+		t.Fatalf("单行超过 1MB 期望返回错误")
+	}
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("期望 errors.Is(err, bufio.ErrTooLong)，实际 %v", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("错误信息期望包含文件路径 %q，实际 %q", path, err.Error())
+	}
+}
+
+// ZCC-04：加载失败不污染已有数据：先加载合法文件，再加载超限行文件失败后，
+// 先前 key 仍可读，失败文件的局部解析结果不得泄漏
+func TestLoadEnv_FailureDoesNotPollute(t *testing.T) {
+	reset()
+	goodPath := writeTestFile(t, "GOOD_KEY=good_value\n")
+	if err := LoadEnv(goodPath); err != nil {
+		t.Fatalf("LoadEnv 合法文件失败: %v", err)
+	}
+
+	longVal := strings.Repeat("a", 1024*1024+1)
+	badPath := writeTestFile(t, "BAD_KEY="+longVal+"\n")
+	if err := LoadEnv(badPath); err == nil {
+		t.Fatalf("LoadEnv 超限行文件期望返回错误")
+	}
+
+	// 先前加载的 key 完好
+	if v := Env("GOOD_KEY", "fallback"); v != "good_value" {
+		t.Errorf("加载失败后期望先前 key 仍可读 'good_value'，实际 %q", v)
+	}
+	// 失败文件的局部解析结果不得泄漏
+	if v := Env("BAD_KEY", "fallback"); v != "fallback" {
+		t.Errorf("加载失败后期望 BAD_KEY 回退默认值，实际 %q", v)
+	}
+}
+
+// ZCC-06：无 "=" 的行与空 key 行被静默跳过，且不影响其他行解析
+func TestLoadEnv_SkipsInvalidLines(t *testing.T) {
+	reset()
+	content := `
+PORT 8080
+=value_without_key
+   =also_skipped
+VALID_KEY=value
+`
+	path := writeTestFile(t, content)
+	if err := LoadEnv(path); err != nil {
+		t.Fatalf("LoadEnv 失败: %v", err)
+	}
+
+	if v := Env("VALID_KEY", "fallback"); v != "value" {
+		t.Errorf("期望 'value'，实际 %q", v)
+	}
+	// 仅剩 VALID_KEY 一个 key：无 = 行与空 key 行均未入库
+	if all := EnvAll(); len(all) != 1 {
+		t.Errorf("期望仅 1 个 key，实际 %d：%v", len(all), all)
+	}
+}
+
+// ZCC-07：首行 UTF-8 BOM 被剥离，首行 key 可正常读取
+func TestLoadEnv_Utf8Bom(t *testing.T) {
+	reset()
+	path := writeTestFile(t, "\ufeffAPP_NAME=bom_app\nOTHER_KEY=v\n")
+	if err := LoadEnv(path); err != nil {
+		t.Fatalf("LoadEnv 失败: %v", err)
+	}
+
+	// BOM 剥离后首行 key 不带 \ufeff 前缀
+	if v := Env("APP_NAME", "default"); v != "bom_app" {
+		t.Errorf("期望 'bom_app'，实际 %q", v)
+	}
+	// 后续行不受影响
+	if v := Env("OTHER_KEY", "default"); v != "v" {
+		t.Errorf("期望 'v'，实际 %q", v)
 	}
 }

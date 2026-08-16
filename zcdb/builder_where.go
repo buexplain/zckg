@@ -547,12 +547,14 @@ func (b *Builder) WhereNotInSub(column string, callback func(*Builder)) *Builder
 //
 //   - SQLite:     column GLOB ?（通配符为 * / ?，非 % / _）
 //
-//     sql, args, _ := db.Builder().Table("users").WhereLike("name", "%alice%").ToSelect()
-//     // SQL:  SELECT * FROM `users` WHERE `name` LIKE ?
-//     // args: [%alice%]
+// 示例：
 //
-//     sql, args, _ = db.Builder().Table("users").WhereLike("name", "a%", true).ToSelect()
-//     // MySQL SQL: SELECT * FROM `users` WHERE BINARY `name` LIKE ?
+//	sql, args, _ := db.Builder().Table("users").WhereLike("name", "%alice%").ToSelect()
+//	// SQL:  SELECT * FROM `users` WHERE `name` LIKE ?
+//	// args: [%alice%]
+//
+//	sql, args, _ = db.Builder().Table("users").WhereLike("name", "a%", true).ToSelect()
+//	// MySQL SQL: SELECT * FROM `users` WHERE BINARY `name` LIKE ?
 func (b *Builder) WhereLike(column string, value any, caseSensitive ...bool) *Builder {
 	return b.addWhereLike(column, value, "AND", caseSensitive)
 }
@@ -616,9 +618,11 @@ func (b *Builder) WhereNotLike(column string, value any) *Builder {
 //
 //   - SQLite:     column IS ?
 //
-//     sql, args, _ := db.Builder().Table("users").WhereNullSafeEquals("remark", nil).ToSelect()
-//     // MySQL SQL: SELECT * FROM `users` WHERE `remark` <=> ?
-//     // args:      [<nil>]
+// 示例：
+//
+//	sql, args, _ := db.Builder().Table("users").WhereNullSafeEquals("remark", nil).ToSelect()
+//	// MySQL SQL: SELECT * FROM `users` WHERE `remark` <=> ?
+//	// args:      [<nil>]
 func (b *Builder) WhereNullSafeEquals(column string, value any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeNullSafe,
@@ -638,9 +642,11 @@ func (b *Builder) WhereNullSafeEquals(column string, value any) *Builder {
 //
 //   - SQLite:     column IS NOT ?
 //
-//     sql, args, _ := db.Builder().Table("users").WhereNullSafeNotEquals("remark", "x").ToSelect()
-//     // MySQL SQL: SELECT * FROM `users` WHERE NOT `remark` <=> ?
-//     // args:      [x]
+// 示例：
+//
+//	sql, args, _ := db.Builder().Table("users").WhereNullSafeNotEquals("remark", "x").ToSelect()
+//	// MySQL SQL: SELECT * FROM `users` WHERE NOT `remark` <=> ?
+//	// args:      [x]
 func (b *Builder) WhereNullSafeNotEquals(column string, value any) *Builder {
 	b.wheres = append(b.wheres, WhereClause{
 		Type:    WhereTypeNullSafeNot,

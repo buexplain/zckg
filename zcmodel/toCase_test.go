@@ -57,6 +57,29 @@ func TestToPascalCase(t *testing.T) {
 	}
 }
 
+// TestLowerFirst 验证 lowerFirst 按 rune 语义小写首字符（ZCM-02）：
+// ASCII 首字符正常小写；多字节字符（如中文）首字符完整保留，不被按字节截断产生残缺字节。
+func TestLowerFirst(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"UserInfoDO", "userInfoDO"},
+		{"UserInfoEntity", "userInfoEntity"},
+		{"ID", "iD"},
+		{"A", "a"},
+		{"", ""},
+		// 中文首字符按 rune 完整保留，不产生残缺字节导致非法标识符
+		{"订单DO", "订单DO"},
+		{"订单Entity", "订单Entity"},
+	}
+	for _, tt := range tests {
+		if got := lowerFirst(tt.in); got != tt.want {
+			t.Errorf("lowerFirst(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // TestSplitWords 验证 splitWords 的拆分规则：分隔符、小写到大写边界、连续大写后接小写边界
 func TestSplitWords(t *testing.T) {
 	tests := []struct {

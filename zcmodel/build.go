@@ -19,7 +19,8 @@ import (
 // 支持传入已有 DO 实例进行复用；Entity 字段为值类型，直接赋给 DO 的 any 字段，无需 nil 判断。
 func buildToDOMethod(entityName, doName string, columns []Column) string {
 	var buf bytes.Buffer
-	lowerDO := strings.ToLower(doName[:1]) + doName[1:]
+	// 首字符按 rune 小写（lowerFirst），避免多字节字符被按字节截断产生非法参数名
+	lowerDO := lowerFirst(doName)
 	buf.WriteString(fmt.Sprintf("func (e *%s) ToDO(%s ...*%s) *%s {\n", entityName, lowerDO, doName, doName))
 	buf.WriteString("\tvar d *" + doName + "\n")
 	buf.WriteString(fmt.Sprintf("\tif len(%s) > 0 && %s[0] != nil {\n", lowerDO, lowerDO))
@@ -39,7 +40,7 @@ func buildToDOMethod(entityName, doName string, columns []Column) string {
 // 支持传入已有 Entity 实例进行复用；DO 字段为 any 类型，通过类型断言还原为具体类型并赋值，断言失败则跳过该字段。
 func buildToEntityMethod(entityName, doName string, columns []Column) string {
 	var buf bytes.Buffer
-	lowerEnt := strings.ToLower(entityName[:1]) + entityName[1:]
+	lowerEnt := lowerFirst(entityName)
 	buf.WriteString(fmt.Sprintf("func (d *%s) ToEntity(%s ...*%s) *%s {\n", doName, lowerEnt, entityName, entityName))
 	buf.WriteString("\tvar e *" + entityName + "\n")
 	buf.WriteString(fmt.Sprintf("\tif len(%s) > 0 && %s[0] != nil {\n", lowerEnt, lowerEnt))
@@ -216,7 +217,8 @@ func writeGeneratedFile(filePath string, content []byte) error {
 // 显式前置保留，已有文件的包名尊重原文件，仅新建文件使用目录推导包名。
 // type 声明块按 Spec 粒度过滤：块中混有用户类型时仅剔除生成的类型，用户类型（含注释）保留。
 // 最终产物统一经 go/format 格式化并原子写入，保留原文件权限位。
-// neededImports 为生成代码引用的包（如 time.Time 需要 time），写入时若文件缺少对应 import 会自动补上。
+// neededImports 为生成代码引用的包（如 time.Time 需要 time），写入时若文件缺少对应 import 会自动补上；
+// 存量文件以别名（含 _、. 导入）引入所需包时不视为已存在，仍会补充默认导入，保证生成代码可编译。
 // filePath: 输出文件路径
 // entityName: Entity 结构体名
 // entityCode: Entity 结构体及 ToDO 方法的生成代码
@@ -325,10 +327,16 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
 				importDecls = append(importDecls, getDeclSource(decl))
-				// 记录现有文件已导入的包路径，供 neededImports 校验缺失时补充
+				// 记录现有文件已导入的包路径，供 neededImports 校验缺失时补充。
+				// 仅统计无别名的导入：别名导入（含 _ 与 . 导入）绑定的是非默认包名，
+				// 生成代码引用的默认包名（如 time.Time 的 time）仍不可用，
+				// 不记入已存在，允许补充标准导入（两种导入可合法共存）。
 				for _, spec := range d.Specs {
 					impSpec, ok := spec.(*ast.ImportSpec)
 					if !ok {
+						continue
+					}
+					if impSpec.Name != nil {
 						continue
 					}
 					if path, err := strconv.Unquote(impSpec.Path.Value); err == nil {

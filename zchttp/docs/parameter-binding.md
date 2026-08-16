@@ -3,7 +3,7 @@
 本框架会根据请求的方法（method）与内容类型（Content-Type），自动将请求参数绑定到 handler 的 `Req` 结构体。绑定相关实现位于 `binding.go`，校验相关实现位于 `validate.go`。
 
 绑定与校验分为两个独立函数：
-- `bindRequestData(r, reqPtr, meta)`：仅执行数据绑定（query/body），在路由命中后立即调用。
+- `bindRequestData(r, reqPtr, meta, multipartMaxMemory)`：仅执行数据绑定（query/body），在路由命中后立即调用（`multipartMaxMemory` 为 multipart 解析的内存缓冲上限，取自引擎的 `MultipartFormMaxMemory`）。
 - `bindPathParams(reqPtr, params, values)`：仅执行路由路径参数绑定，在 `bindRequestData` 之后调用（仅参数路由触发，路径参数覆盖同名 query/body 值）。
 - `validateRequest(reqPtr, meta, needsNonzero)`：仅执行参数校验（nonzero + Validator），在洋葱模型 core 层调用；`needsNonzero` 为注册期预计算的传递性标记，全树无 nonzero 字段时跳过遍历（详见 `parameter-validate.md`）。
 
@@ -21,7 +21,11 @@ GET /search?keyword=go&page=3
 
 ### 2. POST / PUT / PATCH 等带请求体的方法
 
-按 `Content-Type` 选择绑定方式：
+采用**合并绑定**：先绑定 URL query 参数，再按 `Content-Type` 绑定请求体，**body 中出现的字段覆盖 query 已绑定的同名字段**，body 中缺失的字段保留 query 绑定值（兼容 REST 常见的"query 放控制参数 + body 放资源数据"混合传参风格，如 `POST /orders/batch?dryRun=true` + JSON 资源体）。
+
+> ⚠️ **行为变更提示（breaking change）**：早期版本中这类方法仅绑定 body、query 参数被静默忽略；当前版本 query 参数会生效。若你的接口依赖"query 被忽略"的旧行为（如同名参数刻意只认 body），升级后需确认 query 传参不会意外影响字段值。
+
+请求体按 `Content-Type` 选择绑定方式：
 
 | Content-Type | 绑定方式 |
 | --- | --- |
@@ -30,16 +34,45 @@ GET /search?keyword=go&page=3
 | `multipart/form-data` | `r.ParseMultipartForm(32MB)` 后绑定表单字段与上传文件 |
 | 其他（有请求体时） | 回退按 JSON 解析 |
 
+**body 覆盖 query 的粒度由解码器语义决定**（以 JSON 为例）：
+
+| body 中的情况 | 对同名字段的影响 |
+| --- | --- |
+| 显式出现（含显式零值，如 `"page": 0`、`"source": ""`） | 覆盖 query 值 |
+| `null`，目标字段为非指针类型 | JSON 解码 no-op，**保留 query 值** |
+| `null`，目标字段为指针类型 | 标准库语义置 `nil`，覆盖 query 值 |
+| 未出现 | 保留 query 值 |
+
+表单（`x-www-form-urlencoded` / `multipart`）同理：body 中出现的字段覆盖同名 query 值，未出现则保留。
+
 > `Content-Type` 会先去除 `; charset=utf-8` 等参数部分，仅保留主类型再匹配。
 >
 > `multipart/form-data` 的内存缓冲上限由引擎字段 `MultipartFormMaxMemory` 定义，`NewEngine` 默认 **32 MB**，超出部分由标准库写入临时文件；按需调整示例：`engine.MultipartFormMaxMemory = 64 << 20`。
+
+### 2.1 请求体大小限制（MaxBodyBytes）
+
+所有带请求体的方法在绑定前统一受引擎字段 `MaxBodyBytes` 限制（`http.MaxBytesReader` 包裹 `r.Body`，对 JSON/表单/multipart 等所有 Content-Type 生效）：
+
+| 配置 | 行为 |
+| --- | --- |
+| `NewEngine()` 默认 **32 MB** | 超限请求在绑定阶段失败，映射为 `BindingError` 返回 **400** |
+| 显式调大（如 `engine.MaxBodyBytes = 64 << 20`） | 适用于合法的大请求体场景 |
+| 显式置 `0` | 不限制（需自行评估超大请求体导致的内存/磁盘 DoS 风险） |
+
+两个字段的关系：`MaxBodyBytes` 是请求体的**整体入口上限**（先于任何解析生效）；`MultipartFormMaxMemory` 仅控制 multipart 解析时的**内存缓冲上限**（超出部分写入临时文件，仍受 `MaxBodyBytes` 总量约束）。需要大文件上传时两者需同步调大。
+
+```go
+engine := zchttp.NewEngine()
+engine.MaxBodyBytes = 64 << 20          // 请求体整体上限 64 MB
+engine.MultipartFormMaxMemory = 32 << 20 // multipart 内存缓冲上限，超出落盘
+```
 
 ### 3. 路由路径参数（所有 method）
 
 若路由注册时使用了 `{name}` / `{name?}` 路径参数（详见 `routing.md` 中“路由参数”章节），参数值在 query/body 绑定**之后**由 `bindPathParams` 写入 Req，规则如下：
 
 - **参数名即字段绑定名**：按 form > json > 字段名优先级解析，注册阶段预计算绑定关系，参数名无对应字段时注册即 panic。
-- **覆盖语义**：路径参数覆盖同名 query/body 值（路径参数是更精确的意图）。
+- **覆盖语义**：三级覆盖链 **path > body > query**（路径参数是更精确的意图，优先级最高；带 body 方法内部为 body > query，见上节）。
 - **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（`time_format`/`time_location` 标签同样生效）。
 - **失败语义区别于尽力绑定**：单个参数转换失败立即返回错误（包装为 `BindingError` 返回 400），而非跳过。
 - **可选参数省略**：`{name?}` 未出现在请求路径中时不写入字段，保留模板 `default` 值或零值。
@@ -173,6 +206,8 @@ func upload(ctx context.Context, req UploadReq) (Res, error) {
 - 标量：`string`、`bool`、`int/uint` 全系列、`float32`/`float64`
 - 标量指针：`*string`、`*int`、`*bool` 等
 - 标量切片：`[]string`、`[]int`、`[]*int` 等
+
+> ⚠️ **误用检测为告警级（非阻断）**：`default` 写在上述范围之外（如 `time.Time`、`map`、`struct`）或写在请求阶段永不可达的路径上时，注册期仅输出 `slog.Warn` 告警（含路由与 handler 位置），**不会 panic 或拒绝注册**，误用字段将"永不填充默认值"。生产环境若将日志级别调至 Error 则该提示不可见，请保持启动期日志可见并及时关注 Warn 输出。
 
 ### 两阶段填充规则
 

@@ -399,7 +399,7 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 			"name":     fm.name,
 			"in":       "query",
 			"required": fm.nonzero && !fm.hasDefault,
-			"schema":   g.typeToSchema(f.Type, f),
+			"schema":   g.typeToSchema(f.Type, f, 0),
 		})
 	}
 	return params
@@ -427,7 +427,7 @@ func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta
 			"name":     fm.name,
 			"in":       "path",
 			"required": !optionalParams[fm.name],
-			"schema":   g.typeToSchema(f.Type, f),
+			"schema":   g.typeToSchema(f.Type, f, 0),
 		})
 	}
 	return params
@@ -527,7 +527,7 @@ func (g *openAPIGenerator) buildWrapperProperties(dataSchema map[string]any) map
 		if f.Type.Kind() == reflect.Interface {
 			props[jsonName] = dataSchema
 		} else {
-			props[jsonName] = g.typeToSchema(f.Type, f)
+			props[jsonName] = g.typeToSchema(f.Type, f, 0)
 		}
 	}
 	return map[string]any{
@@ -578,7 +578,7 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta)
 		if isIgnored(f) {
 			continue
 		}
-		props[fm.name] = g.typeToSchema(f.Type, f)
+		props[fm.name] = g.typeToSchema(f.Type, f, 0)
 		if fm.nonzero && !fm.hasDefault {
 			required = append(required, fm.name)
 		}
@@ -590,13 +590,21 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta)
 	return refSchema(name)
 }
 
-// typeToSchema 将 Go 类型映射为 JSON Schema；field 提供 default/example/description/time_format 等信息
-func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructField) map[string]any {
+// typeToSchema 将 Go 类型映射为 JSON Schema；field 提供 default/example/description/time_format 等信息。
+// depth 为 Ptr/Slice/Map 链的累计嵌套深度：防自引用命名类型（type S []S / type P *P /
+// type A *B 与 type B *A 等）在容器/指针分支无限递归，超限退化为空 schema（与
+// default 分支一致）；上限复用 maxPtrDerefDepth，与 derefType/isDefaultSupportedDepth/
+// setScalar 的防环哲学一致（修复 REC-04）。Struct 分支经 registerStructSchema
+// 占位机制防环，不消耗 depth。
+func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructField, depth int) map[string]any {
+	if depth > maxPtrDerefDepth {
+		return map[string]any{}
+	}
 	if t.Kind() == reflect.Ptr {
 		if t == fileHeaderPtrType {
 			return map[string]any{"type": "string", "format": "binary"}
 		}
-		inner := g.typeToSchema(t.Elem(), field)
+		inner := g.typeToSchema(t.Elem(), field, depth+1)
 		if _, isRef := inner["$ref"]; isRef {
 			return g.decorate(map[string]any{"nullable": true, "allOf": []any{inner}}, field)
 		}
@@ -632,12 +640,12 @@ func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructFiel
 		}
 		return g.decorate(map[string]any{
 			"type":  "array",
-			"items": g.typeToSchema(t.Elem(), emptyField),
+			"items": g.typeToSchema(t.Elem(), emptyField, depth+1),
 		}, field)
 	case reflect.Struct:
 		return g.decorate(g.registerStructSchema(t, buildStructMeta(t)), field)
 	case reflect.Map:
-		valueSchema := g.typeToSchema(t.Elem(), emptyField)
+		valueSchema := g.typeToSchema(t.Elem(), emptyField, depth+1)
 		schema := map[string]any{
 			"type":                 "object",
 			"additionalProperties": valueSchema,

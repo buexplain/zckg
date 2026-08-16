@@ -104,8 +104,8 @@ func (g *PostgresGrammar) WrapColumn(column string) string {
 
 // WrapTable 使用双引号引用表名
 func (g *PostgresGrammar) WrapTable(table string) string {
-	if strings.Contains(table, " as ") || strings.Contains(table, " AS ") {
-		idx := strings.Index(strings.ToLower(table), " as ")
+	// 对 ToLower 后的表名统一做 " as " 判定（大小写不敏感，避免 "orders As o" 等混合大小写漏判）
+	if idx := strings.Index(strings.ToLower(table), " as "); idx != -1 {
 		name := table[:idx]
 		alias := table[idx+4:]
 		return g.wrapValue(strings.TrimSpace(name)) + " AS " + g.wrapValue(strings.TrimSpace(alias))
@@ -126,6 +126,9 @@ func (g *PostgresGrammar) CompileSelect(b *Builder, columns []SelectColumn) stri
 	return g.cloneForCompile().compileSelectInner(b, columns)
 }
 
+// compileSelectInner SELECT 编译的无克隆内部实现：按
+// SELECT → FROM → JOIN → WHERE → GROUP BY → HAVING → UNION → ORDER/LIMIT/OFFSET → LOCK
+// 顺序组装，嵌套子查询复用当前 g.paramCount，保证 $N 编号全局递增不重复。
 func (g *PostgresGrammar) compileSelectInner(b *Builder, columns []SelectColumn) string {
 	var sql strings.Builder
 
@@ -658,6 +661,9 @@ func (g *PostgresGrammar) compileWheres(b *Builder) string {
 	return strings.Join(parts, " ")
 }
 
+// compileWhereBasic 编译 basic 条件（column op value）。
+// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，防止永假的 = NULL；
+// Expression 直接内嵌，其余值生成 $N 占位符。
 func (g *PostgresGrammar) compileWhereBasic(w WhereClause) string {
 	// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，防止永假的 = NULL
 	if w.Value == nil {
@@ -674,6 +680,7 @@ func (g *PostgresGrammar) compileWhereBasic(w WhereClause) string {
 	return g.WrapColumn(w.Column) + " " + w.Operator + " " + g.nextParam()
 }
 
+// compileWhereIn 编译 IN 条件；空值列表编译为 0 = 1（恒假）。
 func (g *PostgresGrammar) compileWhereIn(w WhereClause) string {
 	if len(w.Values) == 0 {
 		return "0 = 1"
@@ -685,6 +692,7 @@ func (g *PostgresGrammar) compileWhereIn(w WhereClause) string {
 	return g.WrapColumn(w.Column) + " IN (" + strings.Join(placeholders, ", ") + ")"
 }
 
+// compileWhereNotIn 编译 NOT IN 条件；空值列表编译为 1 = 1（恒真）。
 func (g *PostgresGrammar) compileWhereNotIn(w WhereClause) string {
 	if len(w.Values) == 0 {
 		return "1 = 1"

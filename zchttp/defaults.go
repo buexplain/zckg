@@ -16,6 +16,9 @@ import (
 //     非"默认值可达"（即 applyDefaults 递归无法穿透的路径，如 map 值类型为切片），
 //     请求阶段永不填充。
 //
+// 误用仅以 slog.Warn 告警（非阻断：不 panic、不拒绝注册），误用字段"永不填充默认值"
+// 会成为静默行为——生产环境若将日志级别调至 Error 则提示不可见，请保持启动期日志可见
+// （详见 docs/parameter-binding.md 默认值章节）。
 // viaValue 表示当前 struct 是否通过纯值类型链可达（含义同 walkTypeUsage），
 // 顶层 Req/Res 为 true。
 // viaDefaults 表示当前 struct 是否可被 applyDefaults 递归到达（与 viaValue 不同：
@@ -85,7 +88,8 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 		// 递归进入嵌套结构体：viaValue/viaDefaults 传播规则：
 		// - Ptr：viaValue=false，viaDefaults 不变（applyDefaults 可跟随非 nil 指针）
 		// - Struct：两者均不变
-		// - Slice/Array：viaValue=false，viaDefaults 不变（applyDefaults 可遍历切片元素）
+		// - Slice/Array：viaValue=false，viaDefaults 不变（applyDefaults 可遍历切片元素）；
+		//   元素仍为容器（[][]Struct 等多层嵌套）时 viaDefaults=false（applyDefaults 无法穿透）
 		// - Map：viaValue=false，viaDefaults 仅当值类型为 Struct 或 *Struct 时不变，
 		//   若值类型为 Slice/Array 则 viaDefaults=false（applyDefaults 无法穿透）
 		ft := f.Type
@@ -102,8 +106,10 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 			if elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array || elem.Kind() == reflect.Map {
 				// 多层容器（[][]Struct、[]map[K]Struct、[]map[K][]Struct 等）：元素仍为容器，
 				// applyDefaults 无法穿透，继续下探直到 struct 元素并传递 viaDefaults=false，
-				// 使其中带 default 的字段触发启动期警告（与 map 分支的警告行为对齐）
-				for elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array || elem.Kind() == reflect.Map {
+				// 使其中带 default 的字段触发启动期警告（与 map 分支的警告行为对齐）。
+				// 展开循环带迭代上限：防自引用命名容器类型（如 type S []S，elem.Elem() 恒返回
+				// 自身）导致死循环；超限后以当前 elem 继续递归，到达非 struct 即返回（修复 REC-05）
+				for i := 0; i < maxPtrDerefDepth && (elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array || elem.Kind() == reflect.Map); i++ {
 					elem = elem.Elem()
 					if elem.Kind() == reflect.Ptr {
 						elem = elem.Elem()
@@ -136,8 +142,9 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 
 // applyDefaults 递归遍历结构体树，为带 default 标签的字段初始化默认值。
 // 注册阶段（requestPhase=false）：对模板中的所有零值字段填充默认值。
-// 请求阶段（requestPhase=true）：仅递归进入动态创建的子元素（切片/数组/map/nested ptr），
-// 并仅对 nil 指针字段填充默认值（值类型如 int/string 不填充，避免覆盖用户显式传入的零值）。
+// 请求阶段（requestPhase=true）：递归范围不变，但仅对 nil 指针字段填充默认值
+// （值类型如 int/string 不填充，避免覆盖用户显式传入的零值），
+// 用于补填 JSON/表单绑定后动态创建的子元素（切片/数组/map/nested ptr）中的默认值。
 // meta 为注册阶段预计算的 structMeta，直接遍历其 fields 避免请求阶段反射。
 func applyDefaults(reqPtr reflect.Value, meta structMeta, requestPhase ...bool) {
 	rp := len(requestPhase) > 0 && requestPhase[0]
@@ -296,14 +303,28 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 // deepCopyDefaults 递归深拷贝结构体树中所有指针/切片/map 字段，确保并发请求间不共享底层内存。
 // 在 ServeHTTP 中，模板浅拷贝后调用此函数完成深拷贝。
 // 注意：本函数的容器分支必须与 applyDefaultsWithVisiting 的容器分支保持对齐（Struct/Ptr/Slice/Map/Array）。
-// 若 applyDefaults 支持新容器类型（如数组），必须同步在本函数补充对应分支，否则并发请求间会共享引用导致数据污染。
+// 若 applyDefaults 未来支持新的容器类型，必须同步在本函数补充对应分支，否则并发请求间会共享引用导致数据污染。
 // Interface 分支为防御性处理：applyDefaults 不穿透接口字段，但深拷贝需断开 any 动态值中的引用，
 // 避免未来 default 白名单放开容器/any 后静默漏判。
 func deepCopyDefaults(v reflect.Value) {
+	deepCopyDefaultsDepth(v, 0)
+}
+
+// deepCopyDefaultsDepth 是 deepCopyDefaults 的内部实现，携带深度计数：
+// 防环状运行时数据（a.Next = &a、map 自引用等）导致无限递归，深度超过
+// maxPtrDerefDepth 后停止下探（该深度的引用保持浅拷贝）。
+// 选择深度上限而非地址记忆：既有语义为“每处出现独立新副本、不保留源数据共享”
+// （见 TestDeepCopyDefaults_ArrayElemNotShared），地址记忆会将共享引入副本从而改变该语义；
+// 上限值与 derefType/isDefaultSupportedDepth/setScalar/typeToSchema 四处防环一致（修复 REC-06；
+// 当前模板数据恒无环，属预防性加固）。
+func deepCopyDefaultsDepth(v reflect.Value, depth int) {
+	if depth > maxPtrDerefDepth {
+		return
+	}
 	switch v.Kind() {
 	case reflect.Struct:
 		for i := 0; i < v.NumField(); i++ {
-			deepCopyDefaults(v.Field(i))
+			deepCopyDefaultsDepth(v.Field(i), depth)
 		}
 	case reflect.Ptr:
 		if !v.IsNil() {
@@ -311,7 +332,7 @@ func deepCopyDefaults(v reflect.Value) {
 			newPtr.Elem().Set(v.Elem())
 			v.Set(newPtr)
 			// 递归拷贝指针指向的元素（struct/slice/map），而非指针本身，避免无限递归
-			deepCopyDefaults(v.Elem())
+			deepCopyDefaultsDepth(v.Elem(), depth+1)
 		}
 	case reflect.Slice:
 		if !v.IsNil() {
@@ -319,7 +340,7 @@ func deepCopyDefaults(v reflect.Value) {
 			reflect.Copy(newSlice, v)
 			v.Set(newSlice)
 			for i := 0; i < v.Len(); i++ {
-				deepCopyDefaults(v.Index(i))
+				deepCopyDefaultsDepth(v.Index(i), depth+1)
 			}
 		}
 	case reflect.Map:
@@ -330,7 +351,7 @@ func deepCopyDefaults(v reflect.Value) {
 				// 对 map 值进行深拷贝：复制到可寻址变量后递归处理
 				valCopy := reflect.New(origVal.Type()).Elem()
 				valCopy.Set(origVal)
-				deepCopyDefaults(valCopy)
+				deepCopyDefaultsDepth(valCopy, depth+1)
 				newMap.SetMapIndex(key, valCopy)
 			}
 			v.Set(newMap)
@@ -339,7 +360,7 @@ func deepCopyDefaults(v reflect.Value) {
 		// 数组容器：与切片相同处理，递归深拷贝每个元素内的引用字段。
 		// 数组本身是值类型无需新建，但元素内的指针/切片/map 需断开共享。
 		for i := 0; i < v.Len(); i++ {
-			deepCopyDefaults(v.Index(i))
+			deepCopyDefaultsDepth(v.Index(i), depth)
 		}
 	case reflect.Interface:
 		// 接口（any）字段：非 nil 时复制动态值到可寻址变量，递归深拷贝后回写接口字段。
@@ -347,7 +368,7 @@ func deepCopyDefaults(v reflect.Value) {
 		if !v.IsNil() {
 			newVal := reflect.New(v.Elem().Type()).Elem()
 			newVal.Set(v.Elem())
-			deepCopyDefaults(newVal)
+			deepCopyDefaultsDepth(newVal, depth+1)
 			v.Set(newVal)
 		}
 	default:
@@ -355,7 +376,8 @@ func deepCopyDefaults(v reflect.Value) {
 	}
 }
 
-// hasRefFields 扫描结构体树，判断是否存在非 nil 的指针、切片或 map 字段。
+// hasRefFields 扫描结构体树，判断是否存在非 nil 的指针、切片或 map 字段
+// （含数组元素与 interface 动态值内部的引用字段）。
 // 用于注册阶段预计算 needsDeepCopy：若 defaultReq 中存在非 nil 引用字段，
 // 则请求阶段需要深拷贝以断开共享。string/int 等不可变值类型不触发。
 func hasRefFields(v reflect.Value) bool {
@@ -408,6 +430,17 @@ func hasRefFields(v reflect.Value) bool {
 //   - Map：值由 JSON 绑定动态创建，可能含 nil 指针字段，递归进入值类型
 func hasRequestPhaseDefaults(t reflect.Type, visiting map[reflect.Type]bool) bool {
 	t = derefType(t)
+	// 防环检查必须先于 Slice/Map 穿透：自引用容器类型（type S []S / type M map[string]M）
+	// 的穿透 t.Elem() 恒返回自身，若不在此登记将永远无法到达 struct 分支的防环（修复 REC-02）
+	if visiting == nil {
+		visiting = make(map[reflect.Type]bool)
+	}
+	if visiting[t] {
+		return false // 自引用循环，停止递归
+	}
+	visiting[t] = true
+	defer delete(visiting, t)
+
 	// 顶层或经指针递归到达的切片/map：穿透到元素/值类型继续检测
 	switch t.Kind() {
 	case reflect.Slice, reflect.Array:
@@ -419,14 +452,6 @@ func hasRequestPhaseDefaults(t reflect.Type, visiting map[reflect.Type]bool) boo
 	if t.Kind() != reflect.Struct {
 		return false
 	}
-	if visiting == nil {
-		visiting = make(map[reflect.Type]bool)
-	}
-	if visiting[t] {
-		return false // 自引用循环，停止递归
-	}
-	visiting[t] = true
-	defer delete(visiting, t)
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
@@ -472,7 +497,7 @@ func hasRequestPhaseDefaults(t reflect.Type, visiting map[reflect.Type]bool) boo
 	return false
 }
 
-// isDefaultSupported 判定字段类型是否支持 default 标签：仅标量类型及其切片支持
+// isDefaultSupported 判定字段类型是否支持 default 标签：仅标量类型、标量的指针及其切片支持（Slice/Ptr 递归判定）
 func isDefaultSupported(t reflect.Type) bool {
 	return isDefaultSupportedDepth(t, 0)
 }

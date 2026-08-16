@@ -133,7 +133,7 @@ func (b *Builder) InsertOrIgnore(ctx context.Context, data any) (int64, error) {
 
 // Upsert 插入或更新数据。
 // data 支持类型同 Insert：struct{}、*struct{}、[]struct{}、[]*struct{}。
-// uniqueBy 为唯一索引列名，updateColumns 为冲突时要更新的列名（为空时更新全部插入列）。
+// uniqueBy 为唯一索引列名，updateColumns 为冲突时要更新的列名（为空时更新全部插入列，排除 uniqueBy 列）。
 // 方言差异见 ToUpsert；PostgreSQL/SQLite 下 uniqueBy 为空报错。
 //
 //	affected, err := db.Builder().Table("users").Upsert(ctx, &user, []string{"email"}, []string{"name", "age"})
@@ -161,7 +161,7 @@ func (b *Builder) Upsert(ctx context.Context, data any, uniqueBy []string, updat
 //	affected, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, &user)
 //	// SQL: UPDATE `users` SET `name` = ?, `age` = ? WHERE `id` = ?
 func (b *Builder) Update(ctx context.Context, data any) (int64, error) {
-	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 Where("1=1")
+	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 WhereRaw("1=1")
 	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
 		return 0, ErrUpdateWithoutWhere
 	}
@@ -238,7 +238,7 @@ func (b *Builder) Decrement(ctx context.Context, column string, amount any, extr
 
 // parseIncDecArgs 解析 Increment/Decrement 参数：
 // 首个 (column, amount) 加上 extra 交替传入的 (column, amount) 对，
-// extra 长度为奇数（不成对）时返回 ErrIncrementColumns。
+// extra 长度为奇数（不成对）或 extra 中列名位置元素非 string 类型时返回 ErrIncrementColumns。
 func parseIncDecArgs(column string, amount any, extra []any) ([]string, []any, error) {
 	if len(extra)%2 != 0 {
 		return nil, nil, ErrIncrementColumns
@@ -265,7 +265,7 @@ func parseIncDecArgs(column string, amount any, extra []any) ([]string, []any, e
 //	affected, err := db.Builder().Table("users").Where("id", "=", 1).Delete(ctx)
 //	// SQL: DELETE FROM `users` WHERE `id` = ?
 func (b *Builder) Delete(ctx context.Context) (int64, error) {
-	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 Where("1=1")
+	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 WhereRaw("1=1")
 	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
 		return 0, ErrDeleteWithoutWhere
 	}
@@ -354,36 +354,42 @@ func (b *Builder) hasEffectiveJoin() bool {
 // 经 sqlite_master 预查询确认后跳过清理）。
 //
 //	err := db.Builder().Table("users").Truncate(ctx)
-//	// MySQL/PG SQL: TRUNCATE TABLE `users`
-//	// SQLite SQL:   DELETE FROM "users"
+//	// MySQL SQL: TRUNCATE TABLE `users`
+//	// PG SQL:    TRUNCATE TABLE "users" RESTART IDENTITY
+//	// SQLite SQL: DELETE FROM "users"
 func (b *Builder) Truncate(ctx context.Context) error {
 	sqlStr, err := b.ToTruncate()
 	if err != nil {
 		return err
 	}
 
-	if _, err = b.dao.Exec(ctx, sqlStr); err != nil {
-		return err
-	}
-
-	// SQLite 方言：DELETE FROM 不会重置 AUTOINCREMENT 序列，
-	// 数据删除成功后再清空 sqlite_sequence 使自增主键从头开始（顺序不可颠倒，
-	// 否则主语句失败时序列已被清空、状态不一致）。
+	// SQLite 方言：DELETE FROM 不会重置 AUTOINCREMENT 序列，需额外清空 sqlite_sequence。
+	// 两步（含预查询共三步）包进同一事务，避免“数据已删但序列未重置”的中间状态；
+	// 调用方 ctx 已携带事务时经 Transaction 嵌套传播自动并入外层事务。
+	// 顺序不可颠倒：先清序列则主语句失败时序列已丢、状态不一致；
 	// 清理前先查 sqlite_master 确认 sqlite_sequence 存在：表从未使用 AUTOINCREMENT 时
 	// 该表不存在，直接跳过清理——不依赖驱动错误文案（错误文案随驱动版本变化，
 	// 且其它真实错误可能恰好含相同子串而被误吞）；清理失败是真实错误，必须如实上报。
 	if _, ok := b.grammar.(*SQLiteGrammar); ok {
-		exists, err := b.sqliteSequenceExists(ctx)
-		if err != nil {
-			return err
-		}
-		if exists {
-			if _, err := b.dao.Exec(ctx, "DELETE FROM sqlite_sequence WHERE name = ?", b.table); err != nil {
+		return b.dao.Transaction(ctx, func(txCtx context.Context) error {
+			if _, err := b.dao.Exec(txCtx, sqlStr); err != nil {
 				return err
 			}
-		}
+			exists, err := b.sqliteSequenceExists(txCtx)
+			if err != nil {
+				return err
+			}
+			if exists {
+				if _, err := b.dao.Exec(txCtx, "DELETE FROM sqlite_sequence WHERE name = ?", b.table); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	}
-	return nil
+
+	_, err = b.dao.Exec(ctx, sqlStr)
+	return err
 }
 
 // sqliteSequenceExists 查询 sqlite_master 判断 sqlite_sequence 表是否存在。

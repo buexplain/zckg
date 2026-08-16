@@ -18,6 +18,7 @@ func TestGenerate(t *testing.T) {
 		Database:         "test_db",
 		Dialect:          DialectMysql,
 		TableName:        "user_info",
+		TableComment:     "用户信息表",
 		ColumnTagName:    "db",
 		JsonTagValueCase: NameCaseLowerCamel,
 		Columns: []*Column{
@@ -38,7 +39,8 @@ func TestGenerate(t *testing.T) {
 	want := []string{
 		"package model",
 		"import \"time\"", // datetime 列映射为 time.Time，必须自动引入 time 包
-		"// UserInfoEntity test_db.user_info 表，entity结构体，常用于数据库读取操作。",
+		// TableComment 非空时拼入结构体注释（空时回退“表”）
+		"// UserInfoEntity test_db.user_info 用户信息表，entity结构体，常用于数据库读取操作。",
 		"type UserInfoEntity struct {",
 		"`json:\"id\" db:\"id\" description:\"主键\"`",
 		"`json:\"userName\" db:\"user_name\" description:\"用户名\"`",
@@ -280,7 +282,8 @@ func TestGenerate_CustomTypeImport(t *testing.T) {
 	}
 }
 
-// TestGenerate_TableNameEscape 验证 TableName 含路径穿越/非法字符时拒绝生成，且输出目录外无文件逃逸。
+// TestGenerate_TableNameEscape 验证 TableName 含路径穿越/非法字符/非法首字符（含中文表名）时
+// 拒绝生成并给出明确错误，且输出目录外无文件逃逸。
 func TestGenerate_TableNameEscape(t *testing.T) {
 	base := t.TempDir()
 	escapeDir := filepath.Join(base, "escape_target")
@@ -290,14 +293,18 @@ func TestGenerate_TableNameEscape(t *testing.T) {
 	tests := []struct {
 		name      string
 		tableName string
+		wantErr   string
 	}{
-		{"相对路径穿越", "../escaped"},
-		{"绝对路径", filepath.Join(base, "escaped_abs")},
-		{"Windows非法字符冒号", "user:info"},
-		{"Windows非法字符星号", "user*info"},
-		{"点", "."},
-		{"双点", ".."},
-		{"空表名", ""},
+		{"相对路径穿越", "../escaped", "表名包含非法字符"},
+		{"绝对路径", filepath.Join(base, "escaped_abs"), "表名包含非法字符"},
+		{"Windows非法字符冒号", "user:info", "表名包含非法字符"},
+		{"Windows非法字符星号", "user*info", "表名包含非法字符"},
+		{"点", ".", "表名非法"},
+		{"双点", "..", "表名非法"},
+		{"空表名", "", "表名为空"},
+		// 非 ASCII 首字符（中文表名）与数字开头会推导出无法编译的标识符，须前置报明确错误（ZCM-02）
+		{"中文表名", "订单", "表名首字符必须为 ASCII 字母或下划线"},
+		{"数字开头表名", "2_order", "表名首字符必须为 ASCII 字母或下划线"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -313,12 +320,35 @@ func TestGenerate_TableNameEscape(t *testing.T) {
 			if err == nil {
 				t.Fatalf("TableName=%q 期望返回错误，实际为 nil", tt.tableName)
 			}
+			// 错误信息须可直接定位根因，而非兜底的“生成代码存在语法错误”
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("TableName=%q 错误信息应包含 %q，实际: %v", tt.tableName, tt.wantErr, err)
+			}
 			// 输出目录之外不得出现新文件
 			after := snapshotFiles(t, base)
 			if !reflect.DeepEqual(after, before) {
 				t.Errorf("TableName=%q 生成产生了文件逃逸\nbefore: %v\nafter:  %v", tt.tableName, before, after)
 			}
 		})
+	}
+}
+
+// TestGenerate_UnderscoreTableName 验证下划线开头的表名合法（首字符校验允许下划线），可正常生成。
+func TestGenerate_UnderscoreTableName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	input := Input{
+		OutputDir:     dir,
+		Database:      "test_db",
+		Dialect:       DialectMysql,
+		TableName:     "_user",
+		ColumnTagName: "db",
+		Columns:       []*Column{{Name: "id", Type: "bigint"}},
+	}
+	if err := Generate(input); err != nil {
+		t.Fatalf("下划线开头表名应合法，Generate() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "_user.go")); err != nil {
+		t.Errorf("应生成 _user.go: %v", err)
 	}
 }
 
@@ -342,13 +372,14 @@ func snapshotFiles(t *testing.T, root string) map[string]bool {
 }
 
 // TestGenerate_InvalidColumnNames 验证数字开头/纯数字列名转换出非法 Go 标识符时，
-// Generate 报错且不写出非法文件（go/parser 自校验兜底）。
+// Generate 前置报错（错误信息含列名与标识符上下文）且不写出文件（ZCM-02）。
 func TestGenerate_InvalidColumnNames(t *testing.T) {
 	tests := []struct {
 		name    string
 		colName string
 	}{
-		{"数字开头", "1st_place"},
+		{"数字开头", "2fa_code"},
+		{"数字开头带后缀", "1st_place"},
 		{"纯数字", "123"},
 	}
 	for _, tt := range tests {
@@ -366,10 +397,156 @@ func TestGenerate_InvalidColumnNames(t *testing.T) {
 			if err == nil {
 				t.Fatalf("列名 %q 生成非法标识符应报错，实际为 nil", tt.colName)
 			}
+			// 错误信息须包含列名与标识符说明，直接定位根因，而非兜底的“生成代码存在语法错误”
+			if !strings.Contains(err.Error(), tt.colName) || !strings.Contains(err.Error(), "不是合法的 Go 标识符") {
+				t.Errorf("错误信息应包含列名与标识符说明，实际: %v", err)
+			}
 			if _, statErr := os.Stat(filepath.Join(dir, "user_info.go")); !os.IsNotExist(statErr) {
 				t.Errorf("生成失败时不应写出文件: %v", statErr)
 			}
 		})
+	}
+}
+
+// TestGenerate_EmptyColumns 固化空 Columns 输入的行为：生成仅含空结构体与互转方法的合法文件。
+func TestGenerate_EmptyColumns(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	input := Input{
+		OutputDir:     dir,
+		Database:      "test_db",
+		Dialect:       DialectMysql,
+		TableName:     "user_info",
+		ColumnTagName: "db",
+		Columns:       nil,
+	}
+	if err := Generate(input); err != nil {
+		t.Fatalf("空 Columns 应生成空结构体，Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	got := string(content)
+	for _, s := range []string{
+		"type UserInfoEntity struct {",
+		"type UserInfoDO struct {",
+		"func (e *UserInfoEntity) ToDO(userInfoDO ...*UserInfoDO) *UserInfoDO {",
+		"func (d *UserInfoDO) ToEntity(userInfoEntity ...*UserInfoEntity) *UserInfoEntity {",
+	} {
+		if !strings.Contains(got, s) {
+			t.Errorf("空 Columns 生成内容缺少: %s\n%s", s, got)
+		}
+	}
+	// 产物必须是可解析的合法 Go 代码
+	if _, err := format.Source(content); err != nil {
+		t.Errorf("空 Columns 生成产物无法通过 gofmt: %v", err)
+	}
+}
+
+// TestGenerate_UnknownColumnTypeFallback 验证映射表未覆盖的列类型兜底为 string，避免生成非法代码。
+func TestGenerate_UnknownColumnTypeFallback(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	input := Input{
+		OutputDir:     dir,
+		Database:      "test_db",
+		Dialect:       DialectMysql,
+		TableName:     "user_info",
+		ColumnTagName: "db",
+		Columns:       []*Column{{Name: "extra", Type: "some_custom_type"}},
+	}
+	if err := Generate(input); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	if !regexp.MustCompile(`Extra\s+string`).Match(content) {
+		t.Errorf("未知列类型应兜底为 string:\n%s", content)
+	}
+}
+
+// TestGenerate_EmptyFieldName 验证列名转换后字段名为空（如纯分隔符列名）时报错，
+// 错误信息含列名上下文。
+func TestGenerate_EmptyFieldName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	input := Input{
+		OutputDir:     dir,
+		Database:      "test_db",
+		Dialect:       DialectMysql,
+		TableName:     "user_info",
+		ColumnTagName: "db",
+		Columns:       []*Column{{Name: "_", Type: "text"}},
+	}
+	err := Generate(input)
+	if err == nil {
+		t.Fatalf("列名转换后字段名为空应报错，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "字段名为空") {
+		t.Errorf("错误信息应说明字段名为空，实际: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "user_info.go")); !os.IsNotExist(statErr) {
+		t.Errorf("生成失败时不应写出文件: %v", statErr)
+	}
+}
+
+// TestGenerate_MkdirFail 验证输出目录无法创建时返回明确错误。
+func TestGenerate_MkdirFail(t *testing.T) {
+	base := t.TempDir()
+	// 用普通文件占据目录位置，MkdirAll 必失败
+	blocker := filepath.Join(base, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
+		t.Fatalf("创建占位文件失败: %v", err)
+	}
+	input := Input{
+		OutputDir: filepath.Join(blocker, "model"),
+		Database:  "test_db",
+		Dialect:   DialectMysql,
+		TableName: "user_info",
+		Columns:   []*Column{{Name: "id", Type: "bigint"}},
+	}
+	err := Generate(input)
+	if err == nil {
+		t.Fatalf("输出目录无法创建应报错，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "创建输出目录失败") {
+		t.Errorf("错误信息应为创建目录失败，实际: %v", err)
+	}
+}
+
+// TestGenerate_ExistingFileSyntaxError 验证存量文件语法错误时报错且不覆盖原文件（用户代码保护红线）。
+func TestGenerate_ExistingFileSyntaxError(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	filePath := filepath.Join(dir, "user_info.go")
+	broken := "package model\n\nfunc broken( {\n"
+	if err := os.WriteFile(filePath, []byte(broken), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+	input := Input{
+		OutputDir:     dir,
+		Database:      "test_db",
+		Dialect:       DialectMysql,
+		TableName:     "user_info",
+		ColumnTagName: "db",
+		Columns:       []*Column{{Name: "id", Type: "bigint"}},
+	}
+	err := Generate(input)
+	if err == nil {
+		t.Fatalf("存量文件语法错误时应报错，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "生成结构体失败") {
+		t.Errorf("错误信息应包含生成结构体失败，实际: %v", err)
+	}
+	// 原文件内容不得被修改
+	content, readErr := os.ReadFile(filePath)
+	if readErr != nil {
+		t.Fatalf("读取文件失败: %v", readErr)
+	}
+	if string(content) != broken {
+		t.Errorf("存量文件语法错误时不得覆盖原文件\nwant:\n%s\ngot:\n%s", broken, content)
 	}
 }
 
@@ -509,5 +686,63 @@ func TestGenerate_KeepBuildTags(t *testing.T) {
 	}
 	if !strings.Contains(got, "type UserInfoEntity struct {") {
 		t.Errorf("生成代码缺失:\n%s", got)
+	}
+}
+
+// TestGenerate_RegenerateWithAliasImport 验证存量文件以别名导入生成代码所需包（如 import mytime "time"）时，
+// 再生成不被判重误判为已存在：补充标准导入，别名导入与用户代码完整保留，产物可编译（ZCM-03）。
+func TestGenerate_RegenerateWithAliasImport(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	input := Input{
+		OutputDir:     dir,
+		Database:      "test_db",
+		Dialect:       DialectMysql,
+		TableName:     "user_info",
+		ColumnTagName: "db",
+		Columns:       []*Column{{Name: "id", Type: "bigint"}},
+	}
+	if err := Generate(input); err != nil {
+		t.Fatalf("第一次 Generate() error = %v", err)
+	}
+	// 模拟用户改造存量文件：把 time 改为别名导入，并新增依赖该别名的自定义方法
+	filePath := filepath.Join(dir, "user_info.go")
+	userCode := `package model
+
+import (
+	mytime "time"
+)
+
+type UserInfoEntity struct {
+	ID int64
+}
+
+func (e *UserInfoEntity) Now() mytime.Time {
+	return mytime.Now()
+}
+`
+	if err := os.WriteFile(filePath, []byte(userCode), 0644); err != nil {
+		t.Fatalf("写入存量文件失败: %v", err)
+	}
+	// 再生成：新增 datetime 列，生成代码引用默认包名 time.Time
+	input.Columns = append(input.Columns, &Column{Name: "created_at", Type: "datetime"})
+	if err := Generate(input); err != nil {
+		t.Fatalf("别名导入存量文件再生成应成功，Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	got := string(content)
+	if !strings.Contains(got, "mytime \"time\"") {
+		t.Errorf("用户别名导入应保留:\n%s", got)
+	}
+	if !strings.Contains(got, "import \"time\"") {
+		t.Errorf("别名导入不满足生成代码需要，应补充标准导入 import \"time\":\n%s", got)
+	}
+	if !strings.Contains(got, "func (e *UserInfoEntity) Now() mytime.Time {") {
+		t.Errorf("用户自定义方法应保留:\n%s", got)
+	}
+	if !regexp.MustCompile(`CreatedAt\s+time\.Time`).MatchString(got) {
+		t.Errorf("新增列 CreatedAt 生成错误:\n%s", got)
 	}
 }

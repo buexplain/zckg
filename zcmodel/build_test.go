@@ -335,6 +335,69 @@ var Extra = 1
 	}
 }
 
+// TestWriteOrReplaceStruct_ExistingFile_UserTypeBlock 验证存量文件中仅含用户类型的 type 声明块
+// （不含任何生成类型）再生成时整体原样保留。
+func TestWriteOrReplaceStruct_ExistingFile_UserTypeBlock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	filePath := filepath.Join(dir, "user.go")
+	orig := `package model
+
+type UserEntity struct {
+	ID int
+}
+
+// 用户自定义类型块
+type (
+	Status int
+	Level  int
+)
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	got := string(content)
+	for _, s := range []string{"type (", "Status int", "Level  int", "// 用户自定义类型块"} {
+		if !strings.Contains(got, s) {
+			t.Errorf("用户类型块应完整保留，缺少: %s\n输出:\n%s", s, got)
+		}
+	}
+	if !regexp.MustCompile(`ID\s+int64`).MatchString(got) {
+		t.Errorf("新生成代码未生效:\n%s", got)
+	}
+}
+
+// TestWriteGeneratedFile_SyntaxError 验证落盘前语法自校验：非法产物直接报错且不写出任何文件，
+// 锁定 fail-safe 红线（用户代码保护与落盘安全的最后一道防线）。
+func TestWriteGeneratedFile_SyntaxError(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	filePath := filepath.Join(dir, "broken.go")
+	err := writeGeneratedFile(filePath, []byte("package model\n\nfunc broken( {\n"))
+	if err == nil {
+		t.Fatalf("语法非法内容应报错，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "生成代码存在语法错误") {
+		t.Errorf("错误信息应为语法自校验报错，实际: %v", err)
+	}
+	if _, statErr := os.Stat(filePath); !os.IsNotExist(statErr) {
+		t.Errorf("语法非法产物不应落盘: %v", statErr)
+	}
+}
+
 // TestWriteOrReplaceStruct_NewFile_NeededImports 验证生成代码需要 import 时，新建文件自动引入 import "time"
 func TestWriteOrReplaceStruct_NewFile_NeededImports(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "model")
@@ -437,6 +500,78 @@ type UserEntity struct {
 	got := string(content)
 	if strings.Count(got, `import "time"`) != 1 {
 		t.Errorf("已导入 time 时不应重复添加:\n%s", got)
+	}
+}
+
+// TestWriteOrReplaceStruct_ExistingFile_AliasImport 验证存量文件以别名/空白导入所需包时（ZCM-03），
+// 判重不视为已存在：补充标准导入使生成代码（引用默认包名）可编译，别名导入与用户代码完整保留。
+func TestWriteOrReplaceStruct_ExistingFile_AliasImport(t *testing.T) {
+	tests := []struct {
+		name       string
+		orig       string
+		keepImport string
+	}{
+		{
+			name: "别名导入",
+			orig: `package model
+
+import mytime "time"
+
+type UserEntity struct {
+	ID int
+}
+
+func (e *UserEntity) Now() mytime.Time {
+	return mytime.Now()
+}
+`,
+			keepImport: `mytime "time"`,
+		},
+		{
+			name: "空白导入",
+			orig: `package model
+
+import _ "time"
+
+type UserEntity struct {
+	ID int
+}
+`,
+			keepImport: `_ "time"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "model")
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatalf("创建目录失败: %v", err)
+			}
+			filePath := filepath.Join(dir, "user.go")
+			if err := os.WriteFile(filePath, []byte(tt.orig), 0644); err != nil {
+				t.Fatalf("写入初始文件失败: %v", err)
+			}
+			entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
+			doCode := "type UserDO struct {\n\tCreatedAt any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
+			if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
+				t.Fatalf("writeOrReplaceStruct() error = %v", err)
+			}
+			content, err := os.ReadFile(filePath)
+			if err != nil {
+				t.Fatalf("读取文件失败: %v", err)
+			}
+			got := string(content)
+			// 别名/空白导入不满足生成代码对默认包名的引用，必须补充标准导入
+			if !strings.Contains(got, "import \"time\"") {
+				t.Errorf("存量文件为%s时不应视为已导入，应补充标准导入 import \"time\":\n%s", tt.name, got)
+			}
+			// 用户原有的别名/空白导入完整保留（与标准导入合法共存）
+			if !strings.Contains(got, tt.keepImport) {
+				t.Errorf("用户原有导入 %s 应保留:\n%s", tt.keepImport, got)
+			}
+			if !strings.Contains(got, "type UserEntity struct {") {
+				t.Errorf("生成代码缺失:\n%s", got)
+			}
+		})
 	}
 }
 

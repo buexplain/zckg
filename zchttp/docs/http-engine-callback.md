@@ -25,10 +25,20 @@ type HttpEngine struct {
     OnError           ErrorHandler                                 // 错误响应回调，默认 DefaultErrorHandler
     OnValidationError ErrorHandler                                 // 参数校验/绑定失败回调，默认 DefaultValidationErrorHandler
     OnPanic           PanicHandler                                 // panic 恢复回调，默认 DefaultPanicHandler
+    MaxBodyBytes           int64 // 请求体整体大小上限（字节），0 表示不限制；NewEngine 默认 32 MB
+    MultipartFormMaxMemory int64 // multipart/form-data 解析的内存缓冲上限（字节），超出部分写入临时文件；NewEngine 默认 32 MB
 }
 ```
 
-`HttpEngine` 必须通过 `NewEngine()` 构造，它会自动装配全部默认回调。不允许直接使用 `HttpEngine{}` 字面量构造，因此 `ServeHTTP` 不再对回调做 nil 判断。
+`HttpEngine` 必须通过 `NewEngine()` 构造，它会自动装配全部默认回调，并将 `MaxBodyBytes` 与 `MultipartFormMaxMemory` 均默认置为 **32 MB**。不允许直接使用 `HttpEngine{}` 字面量构造，因此 `ServeHTTP` 不再对回调做 nil 判断。
+
+启动监听可使用 `Run` 方法：
+
+```go
+// 将引擎设置为 server 的 Handler 并调用 ListenAndServe 启动监听；
+// 不包含优雅关闭逻辑，需要时由调用方自行管理所传入的 *http.Server（如 Shutdown）
+func (e *HttpEngine) Run(server *http.Server) error
+```
 
 ## 二、统一 JSON 结构与默认回调
 
@@ -96,7 +106,7 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
 
 ## 五、"是否已写入"的判定
 
-引擎用 `responseWriter` 包装原始 `http.ResponseWriter`，记录 `WriteHeader` / `Write` / `Flush` / `Hijack` 是否被调用过（`Written()`）。`Push` 推送的是独立流（HTTP/2 server push），**不影响本响应的 written 状态**——即使中间件调用过 `Push`，后续仍可按正常流程写入响应。`IsResponseWritten` 通过接口断言判定：
+引擎用 `responseWriter` 包装原始 `http.ResponseWriter`，记录 `WriteHeader` / `Write` / `ReadFrom` / `Flush` / `Hijack` 是否被调用过（`Written()`；`ReadFrom` 为 `io.Copy(w, file)` 等零拷贝写入路径）。`Push` 推送的是独立流（HTTP/2 server push），**不影响本响应的 written 状态**——即使中间件调用过 `Push`，后续仍可按正常流程写入响应。`IsResponseWritten` 通过接口断言判定：
 
 ```go
 func IsResponseWritten(w http.ResponseWriter) bool {
@@ -184,17 +194,18 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 
 ## 七、执行流程（全链路）
 
-1. **路由匹配**：`ServeHTTP` 按 method → normalizePath 查找路由条目，未命中 → `OnNotFound`。
-2. **panic 保护**：`defer recover` 包裹全流程，捕获 panic → `OnPanic`（`slog.Error` + 堆栈）。
-3. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body，再执行 `applyDefaults(requestPhase=true)` 为 JSON/表单绑定后动态创建的子元素（切片/数组/map/nested ptr）补填 nil 指针的默认值；绑定错误（`*BindingError`）随 Req 注入 ctx。
-4. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；各中间件可通过 `BoundReqFromContext[T]` 获取已绑定的 Req。
-5. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateNonzero` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
-6. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler，成功 → `OnResponse(w, r, res)`，Res 同时注入 ctx 供后置中间件通过 `BoundResFromContext[T]` 获取。
-7. **错误分发**：任一环节返回 error，按类型分发：
+1. **请求体限制**：`MaxBodyBytes > 0` 时以 `http.MaxBytesReader` 包裹 `r.Body`（`NewEngine` 默认 **32 MB**，置 0 不限制），超限在绑定阶段失败并映射为 400（详见 `parameter-binding.md`）。
+2. **路由匹配**：`ServeHTTP` 按 method → normalizePath 查找路由条目，未命中 → `OnNotFound`。
+3. **panic 保护**：`defer recover` 包裹全流程，捕获 panic → `OnPanic`（`slog.Error` + 堆栈）。
+4. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body（POST 等带 body 方法为先 query 后 body 的合并绑定）；参数路由再由 `bindPathParams` 绑定路径参数（覆盖同名 query/body 值）；若注册期预计算 `needsRequestPhaseDefaults` 为 true，执行 `applyDefaults(requestPhase=true)` 为绑定后动态创建的子元素（切片/数组/map/nested ptr）补填 nil 指针的默认值；绑定错误（`*BindingError`，由 `NewBindingError` 包装底层错误构造）随 Req 注入 ctx。
+5. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；各中间件可通过 `BoundReqFromContext[T]` 获取已绑定的 Req。
+6. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateNonzero` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
+7. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler，成功 → `OnResponse(w, r, res)`，Res 同时注入 ctx 供后置中间件通过 `BoundResFromContext[T]` 获取。
+8. **错误分发**：任一环节返回 error，按类型分发：
     - `*BindingError` / `*ValidationError` → `OnValidationError`（默认 400）
     - 其余 → `OnError`（默认 500）
-8. 各回调收到的 `w` 均为带 `Written()` 追踪能力的包装对象，已写入则跳过默认响应。
-9. **请求收尾**：请求处理结束后限量排空剩余未读请求体（上限 `maxBodyDrainBytes` = 2 KB）以复用 keep-alive 连接；超出上限不再排空，连接由 net/http 关闭。
+9. 各回调收到的 `w` 均为带 `Written()` 追踪能力的包装对象，已写入则跳过默认响应。
+10. **请求收尾**：请求处理结束后限量排空剩余未读请求体（上限 `maxBodyDrainBytes` = 2 KB）以复用 keep-alive 连接；超出上限不再排空，连接由 net/http 关闭。
 
 ## 八、在 handler 与中间件中获取上下文资源
 
@@ -213,7 +224,7 @@ func BoundResFromContext[T any](ctx context.Context) (T, error)
 | `RequestFromContext` | 获取 `*http.Request` |
 | `ResponseWriterFromContext` | 获取包装后的 `http.ResponseWriter`（带 `Written()` 追踪） |
 | `EngineFromContext` | 获取 `*HttpEngine` |
-| `BoundReqFromContext[T]` | 获取已绑定的 Req（绑定阶段出错则 err 为非 nil） |
-| `BoundResFromContext[T]` | 获取 handler 的 Res（仅在 `next()` 返回后可用） |
+| `BoundReqFromContext[T]` | 获取已绑定的 Req（绑定阶段出错则 err 为非 nil 的 `*BindingError`；ctx 中不存在 Req 时返回 `ErrBoundReqNotFound`） |
+| `BoundResFromContext[T]` | 获取 handler 的 Res（仅在 `next()` 返回后可用；ctx 中不存在或类型不符时返回 `ErrBoundResNotFound`） |
 
 > 注入的 `ResponseWriter` 是带 `Written()` 追踪能力的包装对象。因此 handler 内若直接通过它写响应（如文件流），默认响应回调会自动跳过 JSON 编码。

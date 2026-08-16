@@ -16,8 +16,9 @@ zcconfig/
 ├── cast.go            # 泛型类型转换引擎（内部）
 ├── env.go             # .env 文件加载与 Env 泛型读取
 ├── config.go          # 业务配置注册与 Config 泛型读取
-├── dbConfig.go        # 数据库连接配置结构体（DBConfig / DBSlaveConfig）
+├── dbConfig.go        # 数据库连接配置与 DSN 生成（DBConfig / DBSlaveConfig）
 ├── cast_test.go       # cast 函数测试
+├── dbConfig_test.go   # DBConfig DSN 组装测试
 └── zcconfig_test.go   # env 与 config 集成测试
 ```
 
@@ -81,8 +82,10 @@ zcconfig/
 │  │    2. 直接类型断言 v.(T)             │           │
 │  │    3. string → time.ParseDuration    │           │
 │  │    4. string → strconv 精确解析      │           │
-│  │    5. reflect ConvertibleTo 通用转换  │           │
-│  │    6. 均失败 → 返回 def              │           │
+│  │    5. 数值→bool 特判（非零为 true）   │           │
+│  │    6. 数值→string 防护（返回 def）    │           │
+│  │    7. reflect ConvertibleTo 通用转换  │           │
+│  │    8. 均失败 → 返回 def              │           │
 │  │                                      │           │
 │  └──────────────────────────────────────┘           │
 └──────────────────────────────────────────────────────┘
@@ -94,7 +97,7 @@ zcconfig/
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `LoadEnv` | `func LoadEnv(path string) error` | 读取 `.env` 文件，解析键值对存入 env 存储。值自动推断类型（int / float64 / bool / string），支持注释行、`export` 前缀（大小写不敏感，兼容多空格/Tab）、引号去除。单行上限 1MB（超出返回错误）。多次调用合并数据，后加载覆盖先前。 |
+| `LoadEnv` | `func LoadEnv(path string) error` | 读取 `.env` 文件，解析键值对存入 env 存储。值自动推断类型（int / float64 / bool / string），支持注释行、`export` 前缀（大小写不敏感，兼容多空格/Tab）、引号去除，首行 UTF-8 BOM 自动剥离。单行上限 1MB（超出返回错误），打开/读取失败的错误信息均包含文件路径。先解析到局部 map，全部成功后才合并，加载失败不修改已有数据。多次调用合并数据，后加载覆盖先前。 |
 | `Env` | `func Env[T any](key string, def T) T` | 按 key 查找 env 值并转换为 T 类型。查找顺序：先查 `LoadEnv` 加载的数据，再回退 OS 环境变量。未找到或转换失败时返回默认值 `def`。 |
 | `EnvAll` | `func EnvAll() map[string]any` | 返回内部 env 存储的直接引用（零拷贝，不含 OS 环境变量）。**仅限只读场景**：写操作会污染全局配置并与并发读取产生数据竞争，详见[架构约定](#架构约定)。 |
 
@@ -102,8 +105,8 @@ zcconfig/
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。约定：`fn` 返回的 map 在 Register 之后不得再被修改（zcconfig 不拷贝返回值，直接存储引用）；若 `key` 路径中间层级已存在标量值，注册子节点会覆盖原标量为 map。 |
-| `Config` | `func Config[T any](key string, def T) T` | 按 `.` 分隔的 key 递归查找嵌套 `map[string]any{}`，找到后转换为 T 类型返回。路径不存在或中间层级非 map 时返回默认值 `def`。纯读操作，使用 `RLock`。 |
+| `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树；`fn` 返回 nil 时静默忽略（不合并任何数据）。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。约定：`fn` 返回的 map 在 Register 之后不得再被修改（zcconfig 不拷贝返回值，直接存储引用）；若 `key` 路径中间层级已存在标量值，注册子节点会覆盖原标量为 map。 |
+| `Config` | `func Config[T any](key string, def T) T` | 按 `.` 分隔的 key 递归查找嵌套 `map[string]any{}`，找到后转换为 T 类型返回。路径不存在或中间层级非 map 时返回默认值 `def`。`key` 为空字符串时查找根层的 `""` 键（`Register` 的根级合并不创建该键，通常返回 `def`）。纯读操作，使用 `RLock`。 |
 | `ConfigAll` | `func ConfigAll() map[string]any` | 返回内部配置存储的直接引用（零拷贝）。**仅限只读场景**：写操作会污染全局配置并与并发读取产生数据竞争，详见[架构约定](#架构约定)。 |
 
 ### 辅助方法
@@ -111,6 +114,49 @@ zcconfig/
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `reset` | `func reset()` | 清空所有 env 数据和 config 数据（**小写未导出**，仅测试场景内部使用）。 |
+
+## 数据库连接配置（DBConfig）
+
+`DBConfig` 承载数据库连接所需的各项参数，注册到 Config 通道读取后，通过 `GetMasterDSN` / `GetSlaveDSN` 生成主从库连接字符串（DSN），可直接对接 `zcdb.NewPool`。DSN 格式按 `Driver` 选择（`Driver` 为空时回退 `Dialect`）：
+
+| 驱动 | 格式 | 说明 |
+|------|------|------|
+| `mysql` | `user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local` | `Charset` 为空默认 `utf8mb4`，`Loc` 为空默认 `Local`，`parseTime` 恒为 true（保证 `time.Time` 字段可直接扫描） |
+| `postgres` | `host=... port=... user=... password=... dbname=... sslmode=disable` | 键值对格式，密码无需转义；`password` / `dbname` 为空时省略对应键，`host` / `port` / `user` 恒输出（空 username 也输出 `user=`），`sslmode` 恒为 disable |
+| `sqlite` | `Database` 原样返回 | 连接串即文件路径，如 `:memory:` 或 `file:/path/to.db` |
+
+除上表三种标准驱动名外，`buildDSN` 还接受别名：`sqlite3` 等同 `sqlite`，`postgresql` / `pgsql` 等同 `postgres`。未知驱动返回空字符串，由调用方（如 `zcdb.NewPool`）校验报错。从库复用主库的 `Database` / `Charset` / `Loc`，仅 `Host` / `Port` / `Username` / `Password` 取自各自的 `DBSlaveConfig`；`Slaves` 为空时 `GetSlaveDSN` 返回 nil。
+
+```go
+zcconfig.Register("database", func() map[string]any {
+    return map[string]any{
+        "test_db": zcconfig.DBConfig{
+            Driver:   zcconfig.Env("DB_DRIVER", "mysql"),
+            Dialect:  zcconfig.Env("DB_DIALECT", "mysql"),
+            Host:     zcconfig.Env("DB_HOST", "127.0.0.1"),
+            Port:     zcconfig.Env("DB_PORT", 3306),
+            Username: zcconfig.Env("DB_USERNAME", "root"),
+            Password: zcconfig.Env("DB_PASSWORD", "root"),
+            Database: zcconfig.Env("DB_DATABASE", "test_db"),
+            Charset:  zcconfig.Env("DB_CHARSET", "utf8mb4"),
+            Loc:      zcconfig.Env("DB_LOC", "Local"),
+            Slaves: []zcconfig.DBSlaveConfig{
+                {Host: "127.0.0.1", Port: 3307, Username: "root", Password: "root"},
+            },
+        },
+    }
+})
+
+testDB := zcconfig.Config("database.test_db", zcconfig.DBConfig{})
+
+pool, err := zcdb.NewPool(zcdb.PoolConfig{
+    DriverName: testDB.Driver,
+    DSN:        testDB.GetMasterDSN(),
+    SlaveDSNs:  testDB.GetSlaveDSN(),
+})
+// 主库 DSN:   root:root@tcp(127.0.0.1:3306)/test_db?charset=utf8mb4&parseTime=true&loc=Local
+// 从库 DSN:   []string{"root:root@tcp(127.0.0.1:3307)/test_db?charset=utf8mb4&parseTime=true&loc=Local"}
+```
 
 ## 类型转换引擎 cast
 
@@ -123,8 +169,13 @@ zcconfig/
 2. v.(T) 直接断言        → 命中则返回
 3. string → time.Duration → time.ParseDuration（如 "10s"、"1h30m"）
 4. string → strconv      → ParseInt / ParseUint / ParseFloat / ParseBool
-5. reflect 转换          → ConvertibleTo 检查（如 int→float64, int64→int）
-6. 全部失败               → 返回 def
+5. 数值 → bool 特判      → 零值为 false、非零为 true（C 语言惯例；
+                            兼容 .env 中 "1"/"0" 被 parseValue 推断为 int
+                            后仍需按 bool 读取的场景）
+6. 数值 → string 防护    → 直接返回 def（防止 Go 中 int→string 的 Unicode
+                            码点语义，如 65→"A" 陷阱）
+7. reflect 转换          → ConvertibleTo 检查（如 int→float64, int64→int）
+8. 全部失败               → 返回 def
 ```
 
 > **time.Duration 特殊处理**：`time.Duration` 底层为 `int64`，若不特殊处理会走 `strconv.ParseInt` 路径，但 `"10s"` 等格式无法被 `ParseInt` 解析。因此在 strconv 分支之前优先用 `time.ParseDuration` 解析，解析失败直接返回 `def`，不回退到 `ParseInt`。`Env` 和 `Config` 共用同一个 `cast`，所以两者都自动支持 `time.Duration`。
@@ -162,9 +213,12 @@ zcconfig/
 | `42` (int) | `float64` | `reflect.ConvertibleTo` | `42.0` |
 | `int64(100)` | `int` | `reflect.ConvertibleTo` | `100` |
 | `3.14` (float64) | `float32` | `reflect.ConvertibleTo` | `float32(3.14)` |
-| `42` (int) | `bool` | 不可转换 | 返回 `def` |
+| `42` (int) | `bool` | 数值→bool 特判 | `true`（非零为 true，零为 false，见优先级第 5 步；特判对全部数值类型生效，含 float 源，如 `99.99 (float64) → bool` 得 `true`） |
+| `99.99` (float64) | `int` | `reflect.ConvertibleTo` | `99`（向零截断，见下方截断语义声明） |
 | `true` (bool) | `int` | 不可转换 | 返回 `def` |
 | `42` (int) | `int` | 直接类型断言 | `42` |
+
+> **reflect 兜底截断语义声明**：优先级第 7 步的 reflect 兜底转换采用 Go 原生类型转换语义：`float→int` 向零截断（如 `99.99→99`、`-99.99→-99`），大位宽→小位宽（如 32 位平台上 `int64→int`、`float64→float32`）可能溢出或损失精度。典型触发链：`.env` 中 `PRICE=99.99` 被推断为 float64，调用方 `Env("PRICE", 0)`（int 默认值）将静默得到 `99`。**调用方应保证默认值类型与存储的配置值类型匹配**。
 
 ## .env 文件格式
 
@@ -185,8 +239,10 @@ NO_QUOTE=hello world
 - `export` 前缀自动去除（**大小写不敏感**，`export` 后跟任意数量的空格/Tab 均可识别；无空白分隔的 `exportKEY=v` 视为普通 key）
 - `=` 左侧为 key（去除首尾空格）
 - `=` 右侧为 value（去除首尾空格，再去除配对的单/双引号）
+- 无 `=` 的行（如拼写错误的 `PORT 8080`）与空 key 行（`=value`）被静默跳过，不影响其他行的解析
+- 首行的 UTF-8 BOM（`\uFEFF`）自动剥离（兼容 Windows 记事本等带 BOM 保存的文件，避免首行 key 带上 BOM 前缀而静默查不到）
 - 值自动推断类型：`ParseInt`（按平台 int 位宽，超出范围保持 string）→ `int`，`ParseFloat`（仅含 `.eE` 的值尝试）→ `float64`，`ParseBool` → `bool`，均失败 → `string`
-- **单行上限 1MB**：超过上限的文件加载失败并返回错误（默认 `bufio.Scanner` 上限仅 64KB，zcconfig 已调大缓冲区以支持内联证书、长密钥等超长配置值）
+- **单行上限 1MB**：超过上限的文件加载失败并返回错误（默认 `bufio.Scanner` 上限仅 64KB，zcconfig 已调大缓冲区以支持内联证书、长密钥等超长配置值）。注意：扫描缓冲区需容纳行结束符，单行恰好达到 1MB 时也会报错，实际可加载的单行长度略小于 1MB
 
 ## 线程安全
 

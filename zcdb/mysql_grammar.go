@@ -57,6 +57,7 @@ func (g *MySQLGrammar) WrapTable(table string) string {
 	return g.wrapValue(table)
 }
 
+// wrapValue 反引号包裹标识符，内部反引号加倍转义；"*" 原样返回。
 func (g *MySQLGrammar) wrapValue(value string) string {
 	if value == "*" {
 		return value
@@ -631,6 +632,9 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 	return strings.Join(parts, " ")
 }
 
+// compileWhereBasic 编译 basic 条件（column op value）。
+// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，防止永假的 = NULL；
+// Expression 直接内嵌，其余值生成 ? 占位符。
 func (g *MySQLGrammar) compileWhereBasic(w WhereClause) string {
 	// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，防止永假的 = NULL
 	if w.Value == nil {
@@ -647,6 +651,7 @@ func (g *MySQLGrammar) compileWhereBasic(w WhereClause) string {
 	return g.WrapColumn(w.Column) + " " + w.Operator + " ?"
 }
 
+// compileWhereIn 编译 IN 条件；空值列表编译为 0 = 1（恒假）。
 func (g *MySQLGrammar) compileWhereIn(w WhereClause) string {
 	if len(w.Values) == 0 {
 		return "0 = 1" // 空 IN 等价于 false
@@ -658,6 +663,7 @@ func (g *MySQLGrammar) compileWhereIn(w WhereClause) string {
 	return g.WrapColumn(w.Column) + " IN (" + strings.Join(placeholders, ", ") + ")"
 }
 
+// compileWhereNotIn 编译 NOT IN 条件；空值列表编译为 1 = 1（恒真）。
 func (g *MySQLGrammar) compileWhereNotIn(w WhereClause) string {
 	if len(w.Values) == 0 {
 		return "1 = 1" // 空 NOT IN 等价于 true

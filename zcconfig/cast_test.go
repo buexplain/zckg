@@ -286,6 +286,24 @@ func TestCast_Float64ToFloat32(t *testing.T) {
 	}
 }
 
+// ZCC-02：reflect 兜底采用 Go 原生类型转换语义，float -> int 向零截断。
+// 该截断语义已在 docs/zcconfig.md 显式声明，本测试固化截断行为：
+// 典型触发链为 .env 中 PRICE=99.99 被推断为 float64，调用方 Env("PRICE", 0) 得到 99。
+func TestCast_Float64ToIntTruncation(t *testing.T) {
+	if v := cast(99.99, 0); v != 99 {
+		t.Errorf("float64(99.99) -> int 期望向零截断为 99，实际 %d", v)
+	}
+	if v := cast(-99.99, 0); v != -99 {
+		t.Errorf("float64(-99.99) -> int 期望向零截断为 -99，实际 %d", v)
+	}
+	if v := cast(100.0, 0); v != 100 {
+		t.Errorf("float64(100.0) -> int 期望 100，实际 %d", v)
+	}
+	if v := cast(1.5, int8(0)); v != int8(1) {
+		t.Errorf("float64(1.5) -> int8 期望向零截断为 1，实际 %d", v)
+	}
+}
+
 func TestCast_IntToBool(t *testing.T) {
 	// 数值类型 -> bool 特判：C 语言惯例，零值为 false，非零为 true。
 	// 此特判解决 .env 中 "1"/"0" 被 parseValue 推断为 int 后无法转 bool 的问题。

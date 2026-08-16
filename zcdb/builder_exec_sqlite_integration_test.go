@@ -941,6 +941,43 @@ func TestSQLiteInteg_Truncate_NoSequenceTable(t *testing.T) {
 	}
 }
 
+// TestSQLiteInteg_TruncateInOuterTransactionRollback 验证 SQLite Truncate 已并入
+// 调用方外层事务（ZCDB-05 回归锁定：修复前 DELETE 与清 sqlite_sequence 两步独立执行，
+// 存在“数据已删但序列未重置”的中间窗口；事务化后外层回滚时数据应完整保留）。
+func TestSQLiteInteg_TruncateInOuterTransactionRollback(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	rollbackErr := errors.New("force rollback")
+	err := db.Transaction(context.Background(), func(txCtx context.Context) error {
+		// Truncate 应经嵌套传播并入当前事务（而非另开新事务）
+		if err := db.Builder().Table("users").Truncate(txCtx); err != nil {
+			return err
+		}
+		// 事务内确认数据已清空
+		count, err := db.Builder().Table("users").Count(txCtx)
+		if err != nil {
+			return err
+		}
+		if count != 0 {
+			t.Fatalf("事务内 Truncate 后应为 0 行，实际 %d", count)
+		}
+		return rollbackErr
+	})
+	if !errors.Is(err, rollbackErr) {
+		t.Fatalf("expected rollbackErr, got %v", err)
+	}
+
+	// 外层回滚后数据应完整保留（事务原子性：DELETE 与序列清理一同回滚）
+	count, err := db.Builder().Table("users").Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count error: %v", err)
+	}
+	if count != 5 {
+		t.Errorf("回滚后数据应保留: expected 5 rows, got %d", count)
+	}
+}
+
 // TestSQLiteInteg_Truncate_NoSequenceSkipsDelete 验证 sqlite_sequence 不存在时
 // Truncate 通过 sqlite_master 预查询跳过序列清理：不执行注定失败的 DELETE FROM sqlite_sequence。
 // 旧实现直接执行该 DELETE 并依赖错误文案 "no such table" 吞错（驱动文案变化或其它真实错误

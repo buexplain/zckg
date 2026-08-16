@@ -135,6 +135,17 @@ func toUpperKebab(words []string) string {
 	return strings.Join(parts, "-")
 }
 
+// lowerFirst 将名称首字符转为小写，用于由结构体名推导互转方法的参数名。
+// 首字符按 []rune 处理，避免多字节字符（如中文）被按字节截断产生残缺字节。
+func lowerFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	runes := []rune(s)
+	runes[0] = unicode.ToLower(runes[0])
+	return string(runes)
+}
+
 // splitWords 将任意风格的字符串拆分为单词列表。
 // 支持的输入风格包括：snake_case、camelCase、PascalCase、kebab-case、UPPER_SNAKE 等混合风格。
 // 拆分规则：

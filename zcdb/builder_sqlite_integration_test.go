@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	_ "modernc.org/sqlite"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -691,6 +692,67 @@ func TestSQLiteInteg_QueryRoutingLockToWrite(t *testing.T) {
 	}
 }
 
+// TestSQLiteInteg_QueryRoutingPrimaryToWrite 验证 Builder.Primary 的强制主库路由（写后读场景）：
+// SQLite :memory: 每个连接库独立，表仅建在主库、从库无此表——模拟写后读时从库尚无数据：
+// 普通查询打到从库应报 no such table，Primary() 查询打到主库应成功，
+// 且 Primary 不改变编译出的 SQL（不引入锁子句）。
+func TestSQLiteInteg_QueryRoutingPrimaryToWrite(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	if err := db.Pool().AddSlave(":memory:"); err != nil {
+		t.Fatalf("AddSlave error: %v", err)
+	}
+	// 表仅存在于主（写）库，从库无此表
+	mustExec(t, db, `CREATE TABLE route_primary_t (id INTEGER PRIMARY KEY, name TEXT)`)
+
+	ctx := context.Background()
+	type order struct {
+		ID   int64  `db:"id"`
+		Name string `db:"name"`
+	}
+
+	// 写入（写操作必走主库）后立即回读
+	if _, err := db.Builder().Table("route_primary_t").Insert(ctx, order{ID: 1, Name: "a"}); err != nil {
+		t.Fatalf("Insert error: %v", err)
+	}
+
+	// 无 Primary：路由读连接（从库无表 → 报错）
+	var plain order
+	if err := db.Builder().Table("route_primary_t").Where("id", "=", 1).First(ctx, &plain); err == nil {
+		t.Errorf("无 Primary 查询期望打到从库报 no such table，实际无错误")
+	}
+
+	// Primary：强制路由写连接（First 内部克隆，验证标记经 Clone 保留）
+	var got order
+	if err := db.Builder().Table("route_primary_t").Where("id", "=", 1).Primary().First(ctx, &got); err != nil {
+		t.Fatalf("Primary 查询期望打到主库成功，实际报错: %v", err)
+	}
+	if got.ID != 1 || got.Name != "a" {
+		t.Errorf("Primary 查询结果不符，got %+v", got)
+	}
+
+	// Count/Exists/Value 同样强制主库
+	if n, err := db.Builder().Table("route_primary_t").Primary().Count(ctx); err != nil || n != 1 {
+		t.Errorf("Primary Count 期望 (1, nil)，got (%d, %v)", n, err)
+	}
+	if ok, err := db.Builder().Table("route_primary_t").Primary().Exists(ctx); err != nil || !ok {
+		t.Errorf("Primary Exists 期望 (true, nil)，got (%v, %v)", ok, err)
+	}
+	var name string
+	if err := db.Builder().Table("route_primary_t").Select("name").Where("id", "=", 1).Primary().Value(ctx, &name); err != nil || name != "a" {
+		t.Errorf("Primary Value 期望 (a, nil)，got (%q, %v)", name, err)
+	}
+
+	// Primary 不改变编译 SQL（不引入锁子句）
+	sqlStr, _, err := db.Builder().Table("route_primary_t").Primary().ToSelect()
+	if err != nil {
+		t.Fatalf("ToSelect error: %v", err)
+	}
+	upper := strings.ToUpper(sqlStr)
+	if strings.Contains(upper, "FOR UPDATE") || strings.Contains(upper, "LOCK IN SHARE MODE") {
+		t.Errorf("Primary 不应引入锁子句，实际 SQL: %s", sqlStr)
+	}
+}
+
 // TestSQLiteInteg_NullSafeField_IntTypes 验证各种整数类型的 NULL 安全扫描。
 func TestSQLiteInteg_NullSafeField_IntTypes(t *testing.T) {
 	db := openSQLiteTestDB(t)
@@ -1137,4 +1199,81 @@ func setupSQLiteColorsTable(t *testing.T, db *DBDao) {
 		name TEXT NOT NULL
 	)`)
 	mustExec(t, db, `INSERT INTO colors (id, name) VALUES (1, 'red'), (2, 'blue')`)
+}
+
+// TestSQLiteInteg_TableMixedCaseAlias 验证混合大小写表别名（"users As u"）
+// 能被正确编译为 "users" AS "u" 并在真实数据库上执行（ZCDB-01 回归锁定：
+// 修复前 PostgreSQL 方言漏判混合大小写，编译出单个含空格的错误标识符；
+// SQLite 实现本就正确，本用例在真实执行层固化三方言一致的别名语义）。
+func TestSQLiteInteg_TableMixedCaseAlias(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	// 混合大小写别名 + 别名列引用，端到端执行
+	// （预置 5 行中 eve 的 age 为 NULL，age > 0 命中 4 行）
+	count, err := db.Builder().Table("users As u").Where("u.age", ">", 0).Count(context.Background())
+	if err != nil {
+		t.Fatalf("mixed-case alias query failed: %v", err)
+	}
+	if count != 4 {
+		t.Errorf("expected 4 rows via alias query, got %d", count)
+	}
+
+	// 编译产物断言：别名被拆分包裹而非整体包裹
+	sqlStr, _, err := db.Builder().Table("users As u").ToSelect()
+	if err != nil {
+		t.Fatalf("ToSelect failed: %v", err)
+	}
+	if !strings.Contains(sqlStr, `"users" AS "u"`) {
+		t.Errorf("expected %q in SQL, got: %s", `"users" AS "u"`, sqlStr)
+	}
+}
+
+// TestSQLiteInteg_ScanTextToInt8Overflow 验证文本存储的数字扫入小位宽整型字段时
+// 溢出直接报错而非静默截断（ZCDB-08 回归锁定：修复前 "300" 扫入 int8 被 Convert
+// 静默截断为 44）。采用集成测试：真实数据库 TEXT 列 → 扫描链路端到端验证。
+func TestSQLiteInteg_ScanTextToInt8Overflow(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	mustExec(t, db, `CREATE TABLE metrics (
+		id  INTEGER PRIMARY KEY,
+		val TEXT
+	)`)
+	mustExec(t, db, `INSERT INTO metrics (id, val) VALUES (1, '300'), (2, '42'), (3, '-1')`)
+
+	// 位宽范围内：正常扫描
+	type rowOK struct {
+		ID  int  `db:"id"`
+		Val int8 `db:"val"`
+	}
+	var ok rowOK
+	if err := db.Builder().Table("metrics").Where("id", "=", 2).First(context.Background(), &ok); err != nil {
+		t.Fatalf("in-range scan failed: %v", err)
+	}
+	if ok.Val != 42 {
+		t.Errorf("expected val=42, got %d", ok.Val)
+	}
+
+	// int8 溢出（300 > 127）：应报错而非静默截断为 44
+	var overflow rowOK
+	err := db.Builder().Table("metrics").Where("id", "=", 1).First(context.Background(), &overflow)
+	if err == nil {
+		t.Fatalf("overflow scan 应报错，实际静默截断为 val=%d", overflow.Val)
+	}
+	if !strings.Contains(err.Error(), "cannot convert") {
+		t.Errorf("expected 'cannot convert' in error, got: %v", err)
+	}
+
+	// uint8 负数（-1 不可转 uint）：同样报错
+	type rowUint struct {
+		ID  int   `db:"id"`
+		Val uint8 `db:"val"`
+	}
+	var neg rowUint
+	err = db.Builder().Table("metrics").Where("id", "=", 3).First(context.Background(), &neg)
+	if err == nil {
+		t.Fatalf("negative-to-uint scan 应报错，实际静默截断为 val=%d", neg.Val)
+	}
+	if !strings.Contains(err.Error(), "cannot convert") {
+		t.Errorf("expected 'cannot convert' in error, got: %v", err)
+	}
 }

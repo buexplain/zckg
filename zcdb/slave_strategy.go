@@ -8,7 +8,7 @@ import (
 
 // SlaveStrategy 从库选择策略接口。
 // 注意：Pick 方法应尽量避免返回 nil。如果所有从库不可用且无法降级，可返回 nil，
-// pickReadDB 会将 nil 兜底降级到主库。
+// PickReadDB 会将 nil 兜底降级到主库。
 type SlaveStrategy interface {
 	// Pick 从 slaves 中选择一个可用的从库连接。尽量避免返回 nil。
 	Pick(slaves []*sql.DB) *sql.DB
@@ -25,7 +25,7 @@ func (s *RandomStrategy) Pick(slaves []*sql.DB) *sql.DB {
 	return slaves[rand.Intn(len(slaves))]
 }
 
-// RoundRobinStrategy 轮询选择从库。
+// RoundRobinStrategy 轮询选择从库（计数器为 atomic.Uint64，并发安全）。
 type RoundRobinStrategy struct {
 	counter atomic.Uint64
 }

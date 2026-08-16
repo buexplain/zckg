@@ -2,7 +2,7 @@
 
 本文介绍 Builder 的终端查询方法：`Find/First/Value`、`Count/Exists`、聚合、`Pluck`、`Paginate`、游标迭代（`Cursor/CursorBy`）以及原始 Rows 扫描工具（`ScanStruct/ScanStructClose`）。
 
-所有读操作默认路由到从库（见[连接文档](connection.md)）；带锁查询（`LockForUpdate`/`SharedLock`）强制走主库。以下示例统一给出 MySQL 形态 SQL。
+所有读操作默认路由到从库（见[连接文档](connection.md)）；带锁查询（`LockForUpdate`/`SharedLock`）与 `Primary()` 标记强制走主库——前者因锁在从库不生效，后者用于写后读场景（从库可能因复制延迟无数据）。以下示例统一给出 MySQL 形态 SQL。
 
 ## Find / First / Value
 
@@ -14,7 +14,7 @@
 | `First` | `*struct` | 返回 `sql.ErrNoRows` |
 | `Value` | 基本类型指针（`*string`、`*int64`…）或二级指针 | 返回 `sql.ErrNoRows` |
 
-`First` 与 `Value` 内部会克隆 Builder 并强制附加 `LIMIT 1`，不修改原对象。
+`First` 与 `Value` 内部按需克隆并强制附加 `LIMIT 1`（limit 已为 1 时跳过克隆），不修改原对象。
 
 ```go
 // Find：多条记录
@@ -165,25 +165,26 @@ for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
 	}
 	process(user)
 }
-// 首批 SQL: SELECT * FROM `users` ORDER BY `id` ASC LIMIT 100
-// 后续批次: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 100   args: [上批最后一行的 id]
+// 首批 SQL: SELECT * FROM `users` ORDER BY `id` ASC LIMIT 101
+// 后续批次: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 101   args: [上批最后一行的 id]
 ```
 
 参数与规则：
 
 - `cursorColumn` 必须是**有序且唯一**的列（通常为主键），结构体必须包含该列对应的字段；
 - `chunkSize` 为 0 时直接返回（不执行任何查询），小于 0 时使用默认值 100；
+- 每批实际取 `chunkSize + 1` 条（SQL 中为 `LIMIT chunkSize+1`），多取的一条用于探测是否还有下一页：探测行不产出给调用方，下一批从本批最后一行的游标值继续取回该行，不丢数据；这避免了数据量恰为 chunkSize 整数倍时多执行一次返回 0 行的空查询；
 - **忽略**已设置的 ORDER BY，强制按游标列排序；
 - 变参 `desc` 为 true 时倒序分批（条件变为 `<`、排序 `DESC`）：
 
 ```go
 for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id", true) {
-	// 首批 SQL: SELECT * FROM `users` ORDER BY `id` DESC LIMIT 100
-	// 后续批次: SELECT * FROM `users` WHERE `id` < ? ORDER BY `id` DESC LIMIT 100
+	// 首批 SQL: SELECT * FROM `users` ORDER BY `id` DESC LIMIT 101
+	// 后续批次: SELECT * FROM `users` WHERE `id` < ? ORDER BY `id` DESC LIMIT 101
 }
 ```
 
-错误终止：游标列值为 NULL 时报 `ErrCursorColumnNull`（否则条件 `col > NULL` 恒假会无限重复同一批）；结构体找不到游标列字段时报 `ErrCursorFieldNotFound`。
+错误终止：游标列值为 NULL 时报 `ErrCursorColumnNull`（否则条件 `col > NULL` 恒假会无限重复同一批）；结构体找不到游标列字段时报 `ErrCursorFieldNotFound`；游标列字段不可用（如 nil 嵌入指针结构体）时报 `ErrCursorFieldUnavailable`。
 
 ## ScanStruct / ScanStructClose
 
@@ -223,3 +224,5 @@ err = zcdb.ScanStructClose(rows, &user) // 扫描完成后自动 rows.Close()，
 |---|---|
 | `*struct` | 扫描第一行，未找到返回 `sql.ErrNoRows` |
 | `*[]struct` / `*[]*struct` | 扫描所有行，无结果时为空切片 |
+
+扫描转换说明：未匹配的列被忽略；NULL 扫描为零值（指针字段置 nil）；数值文本（驱动以字符串/[]byte 返回的数值列）按目标字段类型位宽解析，**溢出时报错**（如 `"300"` 扫入 int8），不静默截断；时间列扫入 string 字段时格式化为 RFC3339。

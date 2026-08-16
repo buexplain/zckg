@@ -52,10 +52,10 @@ Name string `json:"name" nonzero:"true"`
 | `description`   | ✅   | ✅   | 字段描述                                                                     |
 | `example`       | ✅   | ✅   | 字段示例值（按字段类型自动转换为对应 JSON 类型：整数→`int64`、浮点→`float64`、布尔→`bool`，无法转换时保留字符串） |
 | `ignore:"true"` | ✅   | ✅   | 从文档中**排除**该字段（不影响绑定与校验）                                                  |
-| `default`       | ✅   | ❌   | 为字段设置默认值（仅 Req 有效）。受类型限制、分两阶段填充，且文档展示有额外约束——详见 [default 文档展示规则](#default-文档展示规则仅-req)。    |
-| `nonzero`       | ✅   | ❌   | 标记字段为非零值必填（仅 Req 有效），影响运行时校验和 required 推断——详见 [required 推断规则](#required-推断规则)。       |
+| `default`       | ✅   | 仅文档 | Req 上设置默认值，受类型限制、分两阶段填充，且文档展示有额外约束——详见 [default 文档展示规则](#default-文档展示规则仅-req)；Res 上无运行时效果，仅在文档中展示。    |
+| `nonzero`       | ✅   | 仅文档 | Req 上标记非零值必填，影响运行时校验和 required 推断——详见 [required 推断规则](#required-推断规则仅-req)；Res 上无运行时校验，仅参与 required 推断。       |
 
-> Res 结构体上的 `default` 和 `nonzero` 标签会被忽略：Res 不参与参数绑定与校验，`applyDefaults` 和 `validateNonzero` 均仅作用于 Req。
+> Res 结构体上的 `default` 和 `nonzero` 标签**没有运行时语义**：Res 不参与参数绑定与校验，`applyDefaults` 和 `validateNonzero` 均仅作用于 Req。但它们**参与文档生成**：Res 的 `default` 按与 Req 相同的展示规则在 schema 中展示，Res 的 `nonzero:"true"` 且无 `default` 同样推断为 `required`（用于描述响应结构约束）。
 
 字段名沿用绑定规则：优先 `form` 标签，其次 `json` 标签，最后使用字段名。
 
@@ -89,7 +89,7 @@ Name string `json:"name" nonzero:"true"`
 
 Req 字段在 OpenAPI 文档中是否标记为 `required`，按以下规则判定：
 
-1. 字段带 `nonzero:"true"` 且**没有** `default` 标签 → **必填**。
+1. 字段带 `nonzero:"true"` 且**没有** `default` 标签 → **必填**（Req 与 Res 的 schema 生成均适用）。
 2. 其它情况（有 `default`、或 `nonzero:"false"`、或未标注 `nonzero`）→ **可选**。
 
 > `nonzero` 标签与 `default` 标签独立解析：带 `default` 的 `nonzero:"true"` 字段在运行时**仍然会校验零值**

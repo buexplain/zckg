@@ -2,10 +2,10 @@
 
 ## 概述
 
-zcquit 是一个轻量级优雅退出（Graceful Shutdown）模块，提供两套相互配合的退出机制：
+zcquit 是一个轻量级优雅退出（Graceful Shutdown）模块，提供两套相互配合的退出机制（全局上下文 + 信号监听与分级清理），并提供 `Shutdown()` 作为主动触发入口：
 
 - **全局可取消上下文（通过 `GetCtx()` 获取）**：任意协程通过监听 `GetCtx().Done()` 感知退出信号，实现协程级联关闭。
-- **操作系统信号监听 + 分级清理 handler**：自动监听 SIGTERM / SIGINT / SIGQUIT 信号。信号到达时先取消上下文通知业务协程收尾，再按 level 升序分批执行 handler（同级别内并发、级别间串行）完成资源清理。
+- **操作系统信号监听 + 分级清理 handler**：自动监听 SIGTERM / SIGINT / SIGQUIT 信号（另监听 SIGHUP 但忽略，不触发退出，见注意事项 5）。信号到达时先取消上下文通知业务协程收尾，再按 level 升序分批执行 handler（同级别内并发、级别间串行）完成资源清理。
 - **主动退出（Shutdown）**：提供 `Shutdown()` 函数，支持在代码中主动触发退出（如健康检查失败）。
 
 `Listen()` 是阻塞调用，应放在 `main()` 末尾，等待信号触发退出流程。`AddSigHandler(level, handler...)` 按级别注册清理逻辑，退出时低级别优先执行。
@@ -19,6 +19,8 @@ zcquit/
 └── docs/
     └── zcquit.md  # 本文档
 ```
+
+> docs 目录下另有审查产物（`code-review-plan.md`、`code-review-report.md`、`docs-code-deviation-review-plan.md`、`docs-code-deviation-review-report.md`），不属于功能文档，故不列入上树。
 
 ## 架构设计
 
@@ -91,8 +93,8 @@ zcquit/
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `Listen` | `func Listen()` | **阻塞调用**，等待操作系统信号并触发退出流程。内部通过 `sync.Once` 保证信号监听只启动一次。收到非 SIGHUP 信号后，先取消上下文，再并发执行所有 handler，最后返回。应放在 `main()` 末尾。 |
-| `Shutdown` | `func Shutdown()` | 主动触发退出流程，效果等同于收到操作系统终止信号。取消全局上下文，触发 handler 并发执行，并使 `Listen` 返回。可安全多次调用，仅首次生效。适用于健康检查失败、管理接口关闭等场景。 |
+| `Listen` | `func Listen()` | **阻塞调用**，等待操作系统信号并触发退出流程。内部通过 `sync.Once` 保证信号监听只启动一次。收到非 SIGHUP 信号后，先取消上下文，再按 level 升序分批执行所有 handler（同级别内并发、级别间串行），最后返回。应放在 `main()` 末尾。若 `Shutdown()` 先于 `Listen()` 完成，则 `Listen()` 立即返回。 |
+| `Shutdown` | `func Shutdown()` | 主动触发退出流程，效果等同于收到操作系统终止信号。取消全局上下文，触发 handler 按 level 升序分批执行（同级别内并发、级别间串行），并使 `Listen` 返回。可安全多次调用，仅首次生效。适用于健康检查失败、管理接口关闭等场景。 |
 | `AddSigHandler` | `func AddSigHandler(level int, handler ...SigHandler)` | 注册一个或多个信号处理函数到指定级别。退出时按 level 升序分批执行（同级别内并发，级别间串行）。首次调用隐式触发信号监听启动（`sync.Once`），后续调用仅追加 handler。每个 handler 独立 goroutine，带 panic 恢复。传入 nil handler 将直接 panic。 |
 | `GetCtx` | `func GetCtx() context.Context` | 返回全局可取消上下文。协程通过 `<-GetCtx().Done()` 感知退出信号。信号到达或 `Shutdown()` 调用后取消。以函数形式提供，避免导出变量被外部意外覆盖。 |
 
@@ -100,7 +102,7 @@ zcquit/
 
 | 名称 | 类型 | 说明 |
 |------|------|------|
-| `SigHandler` | `func(sig os.Signal)` | 信号处理函数类型。参数 `sig` 为实际接收到的操作系统信号（SIGTERM / SIGINT / SIGQUIT 之一）；通过 [Shutdown] 触发时 `sig` 为 `nil`。 |
+| `SigHandler` | `func(sig os.Signal)` | 信号处理函数类型。参数 `sig` 为实际接收到的操作系统信号（SIGTERM / SIGINT / SIGQUIT 之一）；通过 [Shutdown] 触发时 `sig` 为 `nil`。注意：信号与 `Shutdown()` 并发触发时 handler 也可能收到 `nil`（见注意事项 7），handler 不应假设 `sig` 非 nil。 |
 
 ## 内部机制
 
@@ -241,6 +243,7 @@ import (
     "context"
     "log/slog"
     "net/http"
+    "os"
     "time"
 
     "github.com/buexplain/zckg/zcquit"
@@ -304,15 +307,15 @@ func main() {
 
 3. **handler panic 隔离**：每个 handler 有独立的 `recover`，单个 panic 会被 `slog.Error` 记录（含所在 level），不影响同级别或后续级别的 handler 执行，也不影响 `Listen` 最终返回。
 
-4. **handler 中可安全调用 `AddSigHandler`**：`executeShutdown` 在执行前已快照 handler map 并释放锁，因此 handler 中调用 `AddSigHandler` 不会死锁。但新增的 handler **不会被本次退出执行**（本次快照已固化），且退出流程不可逆（见注意事项 8），因此新增的 handler **不会被执行**。handler 注册应在任何退出触发（信号或 `Shutdown()`）之前完成。
+4. **handler 中可安全调用 `AddSigHandler`**：`executeShutdown` 在执行前已快照 handler map 并释放锁，因此 handler 中调用 `AddSigHandler` 不会死锁。但新增的 handler **不会被执行**：本次快照已固化，且退出流程不可逆、仅发生一次（见注意事项 8）。handler 注册应在任何退出触发（信号或 `Shutdown()`）之前完成。
 
 5. **SIGHUP 被忽略**：SIGHUP 通常由终端会话断开触发，不代表程序需要终止。如需响应 SIGHUP（如重新加载配置），可自行扩展。
 
-6. **`Shutdown` 可多次调用**：内部通过原子幂等标记（CAS）保证退出流程仅执行一次，未抢到的调用方立即返回（不等待流程完成），`cancel` 函数本身也支持多次调用，后续调用为 no-op。
+6. **`Shutdown` 可多次调用**：内部通过原子幂等标记（CAS）保证退出流程仅执行一次，未抢到的调用方立即返回（不等待流程完成），`cancel` 函数本身也支持多次调用，后续调用为 no-op。若 `Shutdown()` 先于 `Listen()` 调用并已完成退出流程，则 `Listen()` 会因 `waitChan` 已关闭而立即返回。
 
 7. **`Shutdown` 与信号并发触发时退出流程仅执行一次**：两条路径收敛到同一个 CAS 入口。若二者几乎同时到达，监听 goroutine 的 select 可能随机选中停止通知分支，此时信号被丢弃，**handler 观察到的 `sig` 可能为 nil**（与 `Shutdown()` 主动触发等价）；handler 不应假设 `sig` 非 nil 才能执行清理，应通过 `sig == nil` 区分触发来源。
 
-8. **退出流程不可逆**：信号监听 goroutine 在收到第一个非 SIGHUP 信号后退出循环，不会再响应后续信号。`waitChan` 关闭后不可重用。
+8. **退出流程不可逆**：信号监听 goroutine 在收到第一个非 SIGHUP 信号后退出循环，不会再响应后续信号；退出触发后会取消信号注册（`signal.Stop`），后续相同信号恢复操作系统默认行为（如再次 Ctrl+C 立即终止进程）。`waitChan` 关闭后不可重用。
 
 9. **handler 应自行控制超时**：退出流程会等待所有 handler 执行完毕（`wg.Wait()`），单个 handler 卡死会导致整个退出流程永久阻塞、进程无法退出。handler 内部应使用带超时的操作（如 `context.WithTimeout`，参考上文 HTTP 服务器集成示例中的 `srv.Shutdown(ctx)`）。
 

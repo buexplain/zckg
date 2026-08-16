@@ -16,21 +16,40 @@ pool, err := zcdb.NewPool(zcdb.PoolConfig{
 	MaxOpenConns:          50,  // 最大打开连接数（主库与每个从库独立应用），默认 50
 	MaxIdleConns:          50,  // 最大空闲连接数，默认 50
 	ConnMaxLifetimeSecond: 600, // 连接最大存活秒数，默认 600
+	ConnectTimeout:        5 * time.Second, // 主库/从库 Ping 验证超时，默认 5s
 	SlaveStrategy:         &zcdb.RandomStrategy{}, // 从库选择策略，默认 RandomStrategy
 })
 ```
 
 说明：
 
-- `DriverName` 与 `DSN` 必填，缺失分别返回错误 `DriverName is required` / `DSN is required`；
+- `DriverName` 与 `DSN` 必填，缺失分别返回错误 `zcdb: DriverName is required` / `zcdb: DSN is required`；
 - 每个从库 DSN 都会创建独立的 `*sql.DB` 并 Ping 验证，任一失败则整体回滚关闭；
+- 主库与从库的 Ping 验证均受 `ConnectTimeout` 限时（默认 5s，`<=0` 取默认值），防止不可达主机静默丢包时启动/热加载长时间挂起；
 - 从库选择策略内置两种：`RandomStrategy`（随机，默认）与 `RoundRobinStrategy`（轮询）；也可实现 `SlaveStrategy` 接口自定义（`Pick` 返回 nil 时自动降级到主库）。
+
+DSN 可手写，也可由 `zcconfig.DBConfig` 按驱动自动组装（`GetMasterDSN` / `GetSlaveDSN`，见 zcconfig 文档）：
+
+```go
+testDB := zcconfig.Config("database.test_db", zcconfig.DBConfig{})
+pool, err := zcdb.NewPool(zcdb.PoolConfig{
+    DriverName: testDB.Driver,
+    DSN:        testDB.GetMasterDSN(),
+    SlaveDSNs:  testDB.GetSlaveDSN(),
+})
+```
 
 运行期可热加载从库（并发安全）：
 
 ```go
 err := pool.AddSlave("user:pass@tcp(127.0.0.1:3308)/test?parseTime=true")
 ```
+
+### 连接池生命周期约定
+
+- **Close 幂等**：首次调用执行实际清理（关闭主库与全部从库），重复调用直接返回 nil；
+- **Close 后不得再使用池**：`AddSlave` 在池关闭后返回 `zcdb: pool is closed` 错误；`PickReadDB`/`PickWriteDB` 仍会返回已关闭的连接（返回值签名所限不做快速失败），后续在其上执行的查询将报 `sql: database is closed`，调用方应自行保证 Close 后不再发起请求；
+- 推荐的关闭时机：进程退出流程（如 zcquit 的高级别清理 handler）中调用一次 `pool.Close()` 或 `db.Close()`（DAO 的 Close 委托给池）。
 
 ## 创建 DAO
 
@@ -46,6 +65,8 @@ defer db.Close()
 ```
 
 第三个参数为慢 SQL 回调（见下文），第四个参数为列映射标签名（见下节，传空串使用默认 `db` 标签）。`dialect` 为空返回 `ErrDialectRequired`，未知方言返回 `ErrUnknownDialect`，`pool` 为 nil 返回 `ErrPoolRequired`。
+
+`db.Pool()` 返回 DAO 持有的底层连接池，供调用方直接管理生命周期（`AddSlave`/`Ping`/`Close`）或获取 `*sql.DB`；`db.Close()` 即委托给该池的 `Close`。
 
 ## 自定义列映射标签
 
@@ -82,6 +103,7 @@ _ = zcdb.ScanStruct(rows, &users, "zc") // 第三个参数指定标签名，缺�
 |---|---|
 | SELECT（Find/First/Count/Cursor 等） | 从库（按策略选择；无从库时降级主库） |
 | SELECT + 锁（LockForUpdate/SharedLock） | **强制主库**（锁在从库不生效） |
+| SELECT + `Primary()` | **强制主库**（不加锁，写后读场景：从库可能因复制延迟无数据） |
 | INSERT/UPDATE/DELETE/TRUNCATE | 主库 |
 | 事务内的一切操作 | 事务连接（主库开启） |
 
@@ -142,6 +164,13 @@ if err := zcdb.ScanStruct(rows, &users); err != nil { // 按 db 标签扫描到�
 
 // QueryPrimary：强制走写（主库）连接，用于手写带锁查询
 rows, err = db.QueryPrimary(ctx, "SELECT * FROM users WHERE id = ? FOR UPDATE", 1)
+```
+
+Builder 链式查询需要强制主库时（如订单写入后立刻回读，从库可能尚未同步），用 `Primary()` 标记，不加锁、不改变编译 SQL：
+
+```go
+var order Order
+err = db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &order)
 ```
 
 `ScanStruct` 不关闭 rows（调用方负责），`ScanStructClose` 扫描完成后自动关闭，详见[查询执行文档](query-exec.md)。

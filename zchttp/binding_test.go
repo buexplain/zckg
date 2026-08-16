@@ -435,6 +435,187 @@ func TestDeleteHeadBindQuery(t *testing.T) {
 	}
 }
 
+// mergeBindReq/mergeBindRes 合并绑定测试用结构体，覆盖 string/int/指针字段
+type mergeBindReq struct {
+	Source string  `json:"source" form:"source"`
+	Name   string  `json:"name" form:"name"`
+	Page   int     `json:"page" form:"page"`
+	Mode   *string `json:"mode" form:"mode"`
+}
+
+type mergeBindRes struct {
+	Source string  `json:"source"`
+	Name   string  `json:"name"`
+	Page   int     `json:"page"`
+	Mode   *string `json:"mode"`
+}
+
+func mergeBindHandler(_ context.Context, req mergeBindReq) (mergeBindRes, error) {
+	return mergeBindRes{Source: req.Source, Name: req.Name, Page: req.Page, Mode: req.Mode}, nil
+}
+
+// TestPostQueryBodyMergedBinding 锁定带 body 方法（POST/PUT/PATCH）的合并绑定语义
+// （ZCH-02 增强实现：替代旧语义"query 不参与绑定"，原 TestPostQueryParamsNotBound 已废弃）：
+// 先绑 query 再绑 body，body 覆盖同名字段，body 缺失的字段保留 query 值。
+// 属行为变更（breaking change）：依赖"query 被忽略"的旧行为将改变。
+func TestPostQueryBodyMergedBinding(t *testing.T) {
+	router := NewRouter()
+	router.POST("/merge", mergeBindHandler)
+	router.PUT("/merge", mergeBindHandler)
+	router.PATCH("/merge", mergeBindHandler)
+	engine := NewEngine()
+	engine.Router = router
+
+	do := func(t *testing.T, method, target, body, contentType string) mergeBindRes {
+		t.Helper()
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, target, reader)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s: expected 200, got %d, body: %s", method, target, rec.Code, rec.Body.String())
+		}
+		var res mergeBindRes
+		decodeData(t, rec, &res)
+		return res
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
+		t.Run(method+"_query_only", func(t *testing.T) {
+			// a. 仅传 query（无 body）：query 参数正常绑定
+			res := do(t, method, "/merge?source=web&page=3", "", "")
+			if res.Source != "web" || res.Page != 3 {
+				t.Fatalf("query-only binding: got %+v, want Source=web Page=3", res)
+			}
+		})
+		t.Run(method+"_body_only", func(t *testing.T) {
+			// b. 仅传 body（无 query）：行为与变更前一致
+			res := do(t, method, "/merge", `{"source":"api","name":"alice","page":9}`, "application/json")
+			if res.Source != "api" || res.Name != "alice" || res.Page != 9 {
+				t.Fatalf("body-only binding: got %+v", res)
+			}
+		})
+		t.Run(method+"_merge_distinct", func(t *testing.T) {
+			// c. query 与 body 传不同字段：合并，均被绑定
+			res := do(t, method, "/merge?source=web&page=3", `{"name":"alice"}`, "application/json")
+			if res.Source != "web" || res.Page != 3 || res.Name != "alice" {
+				t.Fatalf("merged distinct fields: got %+v, want Source=web Page=3 Name=alice", res)
+			}
+		})
+		t.Run(method+"_body_overrides_query", func(t *testing.T) {
+			// d. 同名字段：body 值覆盖 query 值
+			res := do(t, method, "/merge?source=web&name=bob", `{"source":"api"}`, "application/json")
+			if res.Source != "api" {
+				t.Fatalf("body should override query: Source=%q, want 'api'", res.Source)
+			}
+			if res.Name != "bob" {
+				t.Fatalf("query-only field should be kept: Name=%q, want 'bob'", res.Name)
+			}
+		})
+		t.Run(method+"_form_merge", func(t *testing.T) {
+			// 表单 body 同样参与合并：query + x-www-form-urlencoded
+			res := do(t, method, "/merge?source=web", "name=alice&page=7", "application/x-www-form-urlencoded")
+			if res.Source != "web" || res.Name != "alice" || res.Page != 7 {
+				t.Fatalf("form merged binding: got %+v", res)
+			}
+		})
+	}
+}
+
+// TestMergedBinding_JSONNullAndZero 锁定合并绑定中 body 覆盖粒度（由 JSON 解码语义决定）：
+// 1. body 显式传入的零值（如 "page": 0）覆盖 query 值——JSON 解码对显式出现的字段一律写入；
+// 2. body 中 JSON null 对非指针字段为 no-op，保留 query 值；
+// 3. body 中 JSON null 对指针字段置 nil（标准库语义），覆盖 query 已绑定的值。
+func TestMergedBinding_JSONNullAndZero(t *testing.T) {
+	router := NewRouter()
+	router.POST("/merge", mergeBindHandler)
+	engine := NewEngine()
+	engine.Router = router
+
+	do := func(t *testing.T, target, body string) mergeBindRes {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+		}
+		var res mergeBindRes
+		decodeData(t, rec, &res)
+		return res
+	}
+
+	// 1. 显式零值覆盖：query page=5 被 body "page": 0 覆盖为 0
+	res := do(t, "/merge?page=5", `{"page":0}`)
+	if res.Page != 0 {
+		t.Fatalf("explicit zero should override query: Page=%d, want 0", res.Page)
+	}
+
+	// 2. null 对非指针字段 no-op：query source=web 在 body "source": null 后保留
+	res = do(t, "/merge?source=web", `{"source":null}`)
+	if res.Source != "web" {
+		t.Fatalf("null on value field should keep query value: Source=%q, want 'web'", res.Source)
+	}
+
+	// 3. null 对指针字段置 nil：query mode=fast 已绑定，body "mode": null 覆盖为 nil
+	res = do(t, "/merge?mode=fast", `{"mode":null}`)
+	if res.Mode != nil {
+		t.Fatalf("null on pointer field should reset to nil: Mode=%v", *res.Mode)
+	}
+
+	// 对照：body 未提及指针字段时保留 query 值
+	res = do(t, "/merge?mode=fast", `{"name":"x"}`)
+	if res.Mode == nil || *res.Mode != "fast" {
+		t.Fatalf("absent field should keep query value: Mode=%v, want &fast", res.Mode)
+	}
+}
+
+// TestMergedBinding_PathParamPriority 锁定三级覆盖链：path > body > query
+// （路径参数在 ServeHTTP 中于 bindRequestData 之后绑定，优先级最高保持不变）
+func TestMergedBinding_PathParamPriority(t *testing.T) {
+	router := NewRouter()
+	router.POST("/merge/{source}", mergeBindHandler)
+	engine := NewEngine()
+	engine.Router = router
+
+	// 三者同名全传：path 最终胜出
+	req := httptest.NewRequest(http.MethodPost, "/merge/from-path?source=from-query",
+		strings.NewReader(`{"source":"from-body","name":"alice"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res mergeBindRes
+	decodeData(t, rec, &res)
+	if res.Source != "from-path" {
+		t.Fatalf("path param should win: Source=%q, want 'from-path'", res.Source)
+	}
+	if res.Name != "alice" {
+		t.Fatalf("non-conflicting body field should be bound: Name=%q", res.Name)
+	}
+
+	// body 未传同名字段时：path 仍覆盖 query
+	req = httptest.NewRequest(http.MethodPost, "/merge/from-path?source=from-query",
+		strings.NewReader(`{"name":"bob"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	var res2 mergeBindRes
+	decodeData(t, rec, &res2)
+	if res2.Source != "from-path" {
+		t.Fatalf("path param should override query: Source=%q, want 'from-path'", res2.Source)
+	}
+}
+
 // ========== P1 测试 ==========
 
 // TestTimeLocationTag 验证 time_location 标签指定时区解析

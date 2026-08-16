@@ -3,6 +3,7 @@ package zcmodel
 import (
 	"errors"
 	"fmt"
+	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,7 +16,7 @@ import (
 //  1. 校验数据库方言、表名（防路径穿越）和 JSON tag 命名风格；
 //  2. 复制列信息，为副本中未显式指定的字段补充字段名（toPascalCase）、字段类型（formatStructFieldType）
 //     和 JSON tag 值（formatJSONTag），不改动调用方传入的数据；
-//  3. 检测转换后字段名重复/为空的列并报错，避免产出无法编译的代码；
+//  3. 检测转换后字段名为空/非法标识符/重复的列并报错，避免产出无法编译的代码；
 //  4. 生成 Entity（值类型字段）和 DO（any 类型字段）结构体及互转方法；
 //  5. 将生成代码写入 {OutputDir}/{TableName}.go，已存在的文件通过 AST 解析保留用户自定义代码，
 //     落盘前对完整内容做 go/parser 自校验，非法产物直接报错不写文件。
@@ -66,11 +67,16 @@ func Generate(input Input) error {
 		}
 	}
 
-	// 字段名合法性检测：空字段名与转换后重名都会产出无法编译的代码，直接报错
+	// 字段名合法性检测：空字段名、非法标识符（如数字开头）与转换后重名都会产出无法编译的代码，直接报错
 	seenNames := make(map[string]string, len(columns))
 	for _, c := range columns {
 		if c.StructFieldInfo.Name == "" {
 			return fmt.Errorf("列 %q 转换后的字段名为空", c.Name)
+		}
+		// 前置拦截非法标识符（如数字开头列名转换出的 2faCode），
+		// 给出带列名上下文的明确错误，避免依赖落盘语法自校验兜底导致根因难定位
+		if !token.IsIdentifier(c.StructFieldInfo.Name) {
+			return fmt.Errorf("列 %q 转换后的字段名 %q 不是合法的 Go 标识符", c.Name, c.StructFieldInfo.Name)
 		}
 		if prev, ok := seenNames[c.StructFieldInfo.Name]; ok {
 			return fmt.Errorf("列 %q 与 %q 转换后的字段名重复: %s", prev, c.Name, c.StructFieldInfo.Name)
@@ -120,7 +126,9 @@ func Generate(input Input) error {
 }
 
 // validateTableName 校验表名可直接安全用作文件名：
-// 不得为空、不得为 "." / ".."、不得含路径分隔符（/、\）与 Windows 非法文件名字符（<>:"|?*）。
+// 不得为空、不得为 "." / ".."、不得含路径分隔符（/、\）与 Windows 非法文件名字符（<>:"|?*），
+// 且首字符须为 ASCII 字母或下划线——表名将推导结构体名，非 ASCII（如中文）或数字开头
+// 会推导出无法编译的标识符，前置报错给出明确根因。
 func validateTableName(name string) error {
 	if name == "" {
 		return errors.New("表名为空")
@@ -130,6 +138,11 @@ func validateTableName(name string) error {
 	}
 	if strings.ContainsAny(name, `/\<>:"|?*`) {
 		return fmt.Errorf("表名包含非法字符: %s", name)
+	}
+	// 首字符按 rune 取，多字节字符（如中文）整体落入非法分支，不会被按字节截断漏检
+	first := []rune(name)[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_') {
+		return fmt.Errorf("表名首字符必须为 ASCII 字母或下划线: %s", name)
 	}
 	return nil
 }

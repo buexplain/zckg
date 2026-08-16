@@ -224,12 +224,12 @@ type Req struct {
 
 ##### 启动期警告
 
-当检测到多层容器中的字段带有 `default` 标签时，框架会在启动时输出警告日志：
+当检测到多层容器中的字段带有 `default` 标签时，框架会在启动时输出警告日志（`handler` 字段输出 handler 的定义位置 `文件:行号`，闭包 handler 降级为函数名）：
 
 ```
 WARN default tag on pointer field in non-defaults-reachable struct, never applied
   route=POST /api/create
-  handler=main.CreateHandler
+  handler=/app/main.go:20
   struct=MultiItem
   field=IsActive
   type=*bool

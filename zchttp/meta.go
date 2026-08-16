@@ -95,11 +95,26 @@ func cachedStructMeta(t reflect.Type) structMeta {
 // buildStructMeta 通过反射遍历结构体字段，预计算 structMeta 与 fieldMeta 列表。
 // 注册阶段一次性完成，请求阶段直接复用 meta 避免重复反射。
 // 预计算内容包括：字段名解析、文件字段判定、nonzero/hasDefault 判定、时间格式预解析。
+// 自引用嵌入（如 type E1 struct{ *E1 }）经 visiting 防环：首次命中环时展开为空 meta，
+// 结果与入口路径无关（确定性），可安全缓存（修复 REC-01）。
 func buildStructMeta(t reflect.Type) structMeta {
+	return buildStructMetaWithVisiting(t, map[reflect.Type]bool{})
+}
+
+// buildStructMetaWithVisiting 是 buildStructMeta 的内部实现，携带 visiting（嵌入展开路径上的类型集）
+// 检测自引用嵌入环。环上的嵌入字段被跳过并告警（不阻断注册），
+// 确保合法但病态的自引用嵌入类型不会导致栈溢出。
+func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool) structMeta {
 	meta := structMeta{}
 	if t.Kind() != reflect.Struct {
 		return meta
 	}
+	if visiting[t] {
+		// 自引用嵌入环：该类型的展开已由路径上更早的帧负责，此处返回空 meta 断开环
+		return meta
+	}
+	visiting[t] = true
+	defer delete(visiting, t)
 
 	// 判断 *T 是否实现 Validator（值接收者和指针接收者均可）
 	meta.implementsValidator = reflect.PointerTo(t).Implements(validatorType)
@@ -122,12 +137,18 @@ func buildStructMeta(t reflect.Type) structMeta {
 
 		// 匿名嵌入的 struct/指针指向 struct：对齐 encoding/json 扁平语义，递归展开其导出字段
 		if f.Anonymous && isStructLike(f.Type) {
-			embeddedType := f.Type
-			for embeddedType.Kind() == reflect.Ptr {
-				embeddedType = embeddedType.Elem()
-			}
+			// 复用带上限的 derefType，防自引用指针类型（修复 REC-07）
+			embeddedType := derefType(f.Type)
 			if embeddedType.Kind() == reflect.Struct {
-				subMeta := buildStructMeta(embeddedType)
+				if visiting[embeddedType] {
+					slog.Warn("recursive embedded struct detected, embedding skipped",
+						"struct", t.Name(),
+						"field", f.Name,
+						"embedded", embeddedType.String(),
+					)
+					continue
+				}
+				subMeta := buildStructMetaWithVisiting(embeddedType, visiting)
 				for _, subFm := range subMeta.fields {
 					if subFm.name == "" || subFm.name == "-" {
 						continue
@@ -162,7 +183,8 @@ func buildStructMeta(t reflect.Type) structMeta {
 		}
 
 		// default 与 nonzero 标签独立解析，两者不互斥。
-		// default 仅影响文档生成阶段的 required 判定，不影响 nonzero 校验。
+		// hasDefault 同时驱动运行时默认值填充（applyDefaults）与 OpenAPI required 判定；
+		// nonzero 校验不受 default 影响。
 		if _, ok := f.Tag.Lookup("default"); ok && isDefaultSupported(f.Type) {
 			fm.hasDefault = true
 			fm.defaultVal = f.Tag.Get("default")
@@ -219,9 +241,8 @@ func isStructPtr(t reflect.Type) bool {
 
 // isStructLike 判断类型是否为 struct 或指向 struct 的指针（含多级指针）。
 // 用于判定匿名嵌入字段是否应被展开（对齐 encoding/json 语义）。
+// 复用带上限的 derefType，防自引用指针类型死循环（修复 REC-07；该触发路径实际
+// 被编译器封死——嵌入 *T 要求 T 非指针，此处为预防性加固）。
 func isStructLike(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	return t.Kind() == reflect.Struct
+	return derefType(t).Kind() == reflect.Struct
 }

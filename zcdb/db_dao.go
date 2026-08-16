@@ -48,9 +48,9 @@ type DBDao struct {
 // NewDBDao 创建数据库访问对象。
 // dialect 用于推导 Grammar 编译器：
 //
-//	"mysql"      → MySQLGrammar
-//	"postgresql" → PostgresGrammar
-//	"sqlite"     → SQLiteGrammar
+//	"mysql"                          → MySQLGrammar
+//	"postgresql"/"postgres"/"pgsql"  → PostgresGrammar
+//	"sqlite"/"sqlite3"               → SQLiteGrammar
 //
 // onSQL 为 SQL 回调（常用于慢 SQL 检测）：非 nil 时每条经 DAO 执行的 SQL 都会回调，
 // 传入执行耗时、SQL 文本与绑定参数，阈值判断由回调内部自行决定；为 nil 时不计时（零开销）。
@@ -87,6 +87,7 @@ func (d *DBDao) Schema() (SchemaInspector, error) {
 	return NewSchemaInspector(d)
 }
 
+// Pool 返回 DAO 持有的底层连接池，供调用方直接管理生命周期或获取 *sql.DB。
 func (d *DBDao) Pool() *Pool {
 	return d.pool
 }

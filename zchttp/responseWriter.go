@@ -8,7 +8,8 @@ import (
 	"sync"
 )
 
-// IsResponseWritten 判断响应是否已经写入（WriteHeader 或 Write 被调用过）
+// IsResponseWritten 判断响应是否已经写入：WriteHeader/Write/ReadFrom/Flush/Hijack
+// 任一被调用过即算已写入（Push 推送独立流，不影响 written 状态）
 func IsResponseWritten(w http.ResponseWriter) bool {
 	rw, ok := w.(interface{ Written() bool })
 	return ok && rw.Written()
@@ -116,11 +117,13 @@ func releaseResponseWriter(rw http.ResponseWriter) {
 	responseWriterPool.Put(base)
 }
 
+// WriteHeader 实现 http.ResponseWriter：标记响应已写入，再透传底层 WriteHeader。
 func (w *responseWriter) WriteHeader(statusCode int) {
 	w.written = true
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
+// Write 实现 http.ResponseWriter：标记响应已写入（0 字节写入同样标记），再透传底层 Write。
 func (w *responseWriter) Write(b []byte) (int, error) {
 	w.written = true
 	return w.ResponseWriter.Write(b)

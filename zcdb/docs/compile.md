@@ -134,8 +134,9 @@ sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToDelete()
 // args: [1]
 
 sql, err := db.Builder().Table("users").ToTruncate()
-// MySQL/PG: TRUNCATE TABLE `users`
-// SQLite:   DELETE FROM "users"
+// MySQL:  TRUNCATE TABLE `users`
+// PG:     TRUNCATE TABLE "users" RESTART IDENTITY
+// SQLite: DELETE FROM "users"
 ```
 
 `ToDeleteJoin` 要求至少一个 JOIN（否则 `ErrDeleteJoinNoJoin`），绑定顺序三方言一致：JOIN 条件 → WHERE 条件。
@@ -182,3 +183,5 @@ sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).
 ```
 
 > Expression 内容**不会被参数化、不做标识符包裹、不做任何转义**，直接拼接进 SQL。请勿将用户输入拼入 Expression，防 SQL 注入。
+>
+> 占位符边界：请勿在 Expression 内容中使用 `?` 占位符——它没有任何配对的绑定参数：INSERT VALUES 与 Raw 子句中 `?` 会原样保留（PostgreSQL 方言下成为非法占位符），PostgreSQL 的 UPDATE SET 路径还会把 `?` 转为 `$N` 并占用占位符编号（仅框架内部自增/自减编译依赖该机制）。

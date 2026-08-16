@@ -23,11 +23,17 @@ var (
 //   - 空行（跳过）
 //
 // 值两端的引号（单引号或双引号）会被去除。
+// 无 "=" 的行与空 key 行（=value）会被静默跳过，不影响其他行的解析。
+// 首行的 UTF-8 BOM（\uFEFF）会被自动剥离，兼容 Windows 记事本等带 BOM 保存的文件。
 // 多次调用 LoadEnv 会合并数据，后加载的同名 key 会覆盖先前的值。
+//
+// 先解析到局部 map，整个文件解析成功后才加锁合并到全局存储，
+// 因此加载失败（文件不存在、单行超过 1MB 等）不会修改已有数据。
+// 打开/读取失败的错误信息均包含文件路径，便于多文件加载场景定位问题。
 func LoadEnv(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("打开 .env 文件失败: %w", err)
+		return fmt.Errorf("打开 .env 文件失败: %s: %w", path, err)
 	}
 	defer func(f *os.File) {
 		_ = f.Close()
@@ -38,8 +44,15 @@ func LoadEnv(path string) error {
 	// 调大缓冲区（默认单行上限 64KB）：内联证书、长密钥等超长配置值很常见，
 	// 超限会触发 bufio.ErrTooLong 导致整个文件加载失败。上限 1MB。
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	firstLine := true
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		// 剥离首行的 UTF-8 BOM：Windows 记事本默认带 BOM 保存，
+		// 不剥离会导致首行 key 带上 \ufeff 前缀而静默查不到
+		if firstLine {
+			line = strings.TrimPrefix(line, "\ufeff")
+			firstLine = false
+		}
 		// 跳过空行和注释行
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -52,18 +65,20 @@ func LoadEnv(path string) error {
 
 		idx := strings.Index(line, "=")
 		if idx < 0 {
+			// 无 "=" 的行（如拼写错误的 "PORT 8080"）静默跳过，宽松解析
 			continue
 		}
 		key := strings.TrimSpace(line[:idx])
 		value := strings.TrimSpace(line[idx+1:])
 		if key == "" {
+			// 空 key 行（=value）同样静默跳过
 			continue
 		}
 		value = unquote(value)
 		parsed[key] = parseValue(value)
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("读取 .env 文件失败: %w", err)
+		return fmt.Errorf("读取 .env 文件失败: %s: %w", path, err)
 	}
 
 	envMu.Lock()

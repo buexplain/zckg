@@ -5,7 +5,9 @@ package zcdb
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -396,6 +398,68 @@ func TestBug_ToCountPanicSafety(t *testing.T) {
 	}
 }
 
+// TestBug_ToCountUnionPanicSafety 验证 ToCount 的 UNION 分支在编译/收集绑定 panic 时
+// 临时修改的分页/排序/锁状态也能经 defer 完整恢复（ZCDB-06 回归锁定：
+// 修复前 UNION/GROUP BY/DISTINCT 分支手动恢复状态，panic 时残留污染）。
+func TestBug_ToCountUnionPanicSafety(t *testing.T) {
+	g := NewMySQLGrammar()
+	sub := NewBuilder(g, nil).Table("admins").Select("name")
+	b := NewBuilder(g, nil).Table("users").Select("name").Union(sub)
+	b.limit = 10
+	b.offset = 5
+	b.orders = []OrderClause{{Column: "id", Direction: "ASC"}}
+	b.lockClause = "FOR UPDATE"
+
+	// 添加一个会导致 collectWhereBindings panic 的 WHERE 条件（不支持的 WhereType）
+	b.wheres = append(b.wheres, WhereClause{Type: WhereType(999)})
+
+	func() {
+		defer func() { recover() }()
+		_, _, _ = b.ToCount()
+	}()
+
+	// panic 后 UNION 分支临时清空的状态应已全部恢复
+	if b.limit != 10 || b.offset != 5 {
+		t.Errorf("ToCount(UNION) panic 后分页未恢复: expected limit=10 offset=5, got limit=%d offset=%d", b.limit, b.offset)
+	}
+	if len(b.orders) != 1 || b.orders[0].Column != "id" {
+		t.Errorf("ToCount(UNION) panic 后 orders 未恢复: got %v", b.orders)
+	}
+	if b.lockClause != "FOR UPDATE" {
+		t.Errorf("ToCount(UNION) panic 后 lockClause 未恢复: got %q", b.lockClause)
+	}
+	if len(b.columns) != 1 || b.columns[0].Value != "name" {
+		t.Errorf("ToCount(UNION) panic 后 columns 未恢复: got %v", b.columns)
+	}
+}
+
+// TestBug_ToAggregateUnionPanicSafety 验证 ToAggregate 的 UNION 分支 panic 时
+// 临时状态同样经 defer 完整恢复（ZCDB-06 回归锁定）。
+func TestBug_ToAggregateUnionPanicSafety(t *testing.T) {
+	g := NewMySQLGrammar()
+	sub := NewBuilder(g, nil).Table("admins").Select("age")
+	b := NewBuilder(g, nil).Table("users").Select("age").Union(sub)
+	b.limit = 20
+	b.orders = []OrderClause{{Column: "age", Direction: "DESC"}}
+
+	b.wheres = append(b.wheres, WhereClause{Type: WhereType(999)})
+
+	func() {
+		defer func() { recover() }()
+		_, _, _ = b.ToAggregate("MAX", "age")
+	}()
+
+	if b.limit != 20 {
+		t.Errorf("ToAggregate(UNION) panic 后 limit 未恢复: expected 20, got %d", b.limit)
+	}
+	if len(b.orders) != 1 || b.orders[0].Direction != "DESC" {
+		t.Errorf("ToAggregate(UNION) panic 后 orders 未恢复: got %v", b.orders)
+	}
+	if len(b.columns) != 1 || b.columns[0].Value != "age" {
+		t.Errorf("ToAggregate(UNION) panic 后 columns 未恢复: got %v", b.columns)
+	}
+}
+
 // BaseModel 用于测试嵌入结构体
 type BaseModel struct {
 	ID   int    `db:"id"`
@@ -555,10 +619,16 @@ func TestGrammar_WrapTable(t *testing.T) {
 		{"MySQL_simple", &MySQLGrammar{}, "users", "`users`"},
 		{"MySQL_alias", &MySQLGrammar{}, "users as u", "`users` AS `u`"},
 		{"MySQL_ALIAS", &MySQLGrammar{}, "users AS u", "`users` AS `u`"},
+		{"MySQL_MixedCase", &MySQLGrammar{}, "users As u", "`users` AS `u`"},
 		{"Postgres_simple", &PostgresGrammar{}, "users", `"users"`},
 		{"Postgres_alias", &PostgresGrammar{}, "users as u", `"users" AS "u"`},
+		{"Postgres_ALIAS", &PostgresGrammar{}, "users AS u", `"users" AS "u"`},
+		// ZCDB-01 回归锁定：修复前 PG 混合大小写别名漏判，整体包裹为 `"users As u"`
+		{"Postgres_MixedCase", &PostgresGrammar{}, "users As u", `"users" AS "u"`},
+		{"Postgres_MixedCase2", &PostgresGrammar{}, "users aS u", `"users" AS "u"`},
 		{"SQLite_simple", &SQLiteGrammar{}, "users", `"users"`},
 		{"SQLite_alias", &SQLiteGrammar{}, "users as u", `"users" AS "u"`},
+		{"SQLite_MixedCase", &SQLiteGrammar{}, "users As u", `"users" AS "u"`},
 	}
 
 	for _, tt := range tests {
@@ -757,6 +827,44 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 	}
 }
 
+// TestBuilder_PrimaryFlag 验证 Primary 强制主库标记的行为：
+// 1. 仅设置执行层路由标记，不改变编译出的 SQL（与 LockForUpdate 的本质区别）；
+// 2. Clone 保留该标记（First/Value/Paginate 等内部克隆的终端方法依赖此性质）；
+// 3. 副本与原 Builder 标记相互独立。
+func TestBuilder_PrimaryFlag(t *testing.T) {
+	g := NewMySQLGrammar()
+
+	withPrimary := NewBuilder(g, nil).Table("users").Where("id", "=", 1).Primary()
+	plain := NewBuilder(g, nil).Table("users").Where("id", "=", 1)
+
+	if !withPrimary.usePrimary {
+		t.Fatal("Primary() 应置位 usePrimary 标记")
+	}
+
+	// 编译中立：加不加 Primary，SQL 与绑定参数完全一致（不引入锁子句）
+	sql1, args1, err1 := withPrimary.ToSelect()
+	assertNoError(t, err1)
+	sql2, args2, err2 := plain.ToSelect()
+	assertNoError(t, err2)
+	if sql1 != sql2 {
+		t.Errorf("Primary 不应改变编译 SQL: %q vs %q", sql1, sql2)
+	}
+	if len(args1) != len(args2) {
+		t.Errorf("Primary 不应改变绑定参数: %v vs %v", args1, args2)
+	}
+
+	// Clone 保留标记
+	clone := withPrimary.Clone()
+	if !clone.usePrimary {
+		t.Error("BUG: Clone 丢失 usePrimary 标记")
+	}
+	// 副本独立：清除副本标记不影响原 Builder
+	clone.usePrimary = false
+	if !withPrimary.usePrimary {
+		t.Error("BUG: 修改副本 usePrimary 影响了原 Builder")
+	}
+}
+
 // TestBug_CloneJoinDeepNesting 审查复现用例：
 // JoinBuilder.JoinOn 可递归构造任意深度嵌套 join 组，但 Clone 只深拷贝两层，
 // 第三层嵌套的 Conditions/Sub 切片与原 Builder 共享底层数组，违反深拷贝契约。
@@ -851,6 +959,15 @@ func TestIntToStr(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("intToStr(%d) = %q, want %q", tt.input, result, tt.expected)
 		}
+	}
+
+	// ZCDB-02 回归锁定：修复前手写实现对 MinInt 取负溢出仍为负，负分支无限写 '-' 死循环；
+	// 期望值用 strconv.Itoa 生成（intToStr 已委托 strconv.Itoa，两者必须一致），同时锁定 MaxInt 上界。
+	if got := intToStr(math.MinInt); got != strconv.Itoa(math.MinInt) {
+		t.Errorf("intToStr(math.MinInt) = %q, want %q", got, strconv.Itoa(math.MinInt))
+	}
+	if got := intToStr(math.MaxInt); got != strconv.Itoa(math.MaxInt) {
+		t.Errorf("intToStr(math.MaxInt) = %q, want %q", got, strconv.Itoa(math.MaxInt))
 	}
 }
 

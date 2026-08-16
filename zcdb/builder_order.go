@@ -62,7 +62,8 @@ func (b *Builder) Offset(n int) *Builder {
 }
 
 // ForPage 设置分页（page 从 1 开始，page<1 时修正为 1），
-// 等价 Limit(perPage).Offset((page-1)*perPage)。
+// 等价 Limit(perPage).Offset((page-1)*perPage)；
+// perPage<=0 时 limit/offset 均<=0，编译时不输出 LIMIT 与 OFFSET（等同不分页）。
 //
 //	sql, _, _ := db.Builder().Table("users").ForPage(2, 20).ToSelect()
 //	// SQL: SELECT * FROM `users` LIMIT 20 OFFSET 20
@@ -78,7 +79,7 @@ func (b *Builder) ForPage(page, perPage int) *Builder {
 // ==================== UNION ====================
 
 // Union 添加一个 UNION 查询（去重合并），可链式多次调用追加。
-// 编译时各查询加括号包裹，绑定按主查询 → 各 UNION 查询顺序合并。
+// 编译时各查询加括号包裹（SQLite 方言不加括号），绑定按主查询 → 各 UNION 查询顺序合并。
 //
 //	admins := db.Builder().Table("admins").Select("name")
 //	sql, _, _ := db.Builder().Table("users").Select("name").Union(admins).ToSelect()

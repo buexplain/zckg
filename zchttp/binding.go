@@ -35,6 +35,14 @@ var defaultTimeLayouts = []string{
 // 默认值已在 ServeHTTP 阶段通过预计算模板深拷贝完成，此处不再重复执行 applyDefaults。
 // 用于提前解析 Req 的场景（如路由命中后立即绑定，将结果注入 ctx，
 // 后续在 core 层再做校验）。
+// 按 method 分流：GET/DELETE/HEAD 仅绑定 query；其余方法（POST/PUT/PATCH 等）
+// 采用合并绑定——先绑定 query 参数，再绑定请求体，body 中出现的字段覆盖
+// query 已绑定的同名字段，body 中缺失的字段保留 query 绑定值
+// （兼容 REST 常见的"query 放控制参数 + body 放资源数据"混合传参风格）。
+// 路径参数在 ServeHTTP 中于本函数之后绑定，覆盖同名 query/body 值（path > body > query）。
+// body 覆盖粒度由解码器语义决定：JSON 中显式出现的字段（含显式零值如 "page": 0）
+// 覆盖 query 值；JSON null 对非指针字段为 no-op（保留 query 值）、对指针字段置 nil。
+// 详见 docs/parameter-binding.md。
 // meta 为注册阶段预计算的 structMeta，避免请求阶段重复反射解析。
 // multipartMaxMemory 为 multipart/form-data 解析的内存缓冲上限（字节）。
 func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartMaxMemory int64) error {
@@ -42,6 +50,11 @@ func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta, mul
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
 		return bindValues(reqPtr, r.URL.Query(), nil, meta)
 	default:
+		// 合并绑定：先绑 query 再绑 body，body 覆盖同名字段。
+		// bindValues 为尽力绑定恒返回 nil，错误仅可能来自 bindBody（如 JSON 解析失败）
+		if err := bindValues(reqPtr, r.URL.Query(), nil, meta); err != nil {
+			return err
+		}
 		return bindBody(r, reqPtr, meta, multipartMaxMemory)
 	}
 }
@@ -212,7 +225,8 @@ func setFieldValue(fieldValue reflect.Value, values []string, timeFormat string,
 	return setScalar(fieldValue, values[0], timeFormat, loc)
 }
 
-// setScalar 将单个字符串转换并写入标量字段，支持指针、字符串、布尔、整型、浮点型、time.Time
+// setScalar 将单个字符串转换并写入标量字段，支持指针、字符串、布尔、有符号/无符号整型、
+// 浮点型、time.Time；不支持的类型静默跳过（尽力绑定语义，不返回错误）
 func setScalar(fieldValue reflect.Value, value string, timeFormat string, loc *time.Location) error {
 	// 逐层解指针（带深度上限，防自引用指针类型无限分配）
 	for depth := 0; fieldValue.Kind() == reflect.Ptr; depth++ {

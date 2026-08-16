@@ -521,8 +521,9 @@ func (b *Builder) ToDeleteJoin() (string, []any, error) {
 // 示例：
 //
 //	sql, err := NewBuilder(g).Table("users").ToTruncate()
-//	// MySQL/PG SQL: TRUNCATE TABLE `users`
-//	// SQLite SQL:   DELETE FROM "users"
+//	// MySQL SQL: TRUNCATE TABLE `users`
+//	// PG SQL:    TRUNCATE TABLE "users" RESTART IDENTITY
+//	// SQLite SQL: DELETE FROM "users"
 //
 // 返回 (SQL, 错误)
 func (b *Builder) ToTruncate() (string, error) {
@@ -533,6 +534,24 @@ func (b *Builder) ToTruncate() (string, error) {
 		return "", ErrEmptyTable
 	}
 	return b.grammar.CompileTruncate(b), nil
+}
+
+// saveTransientState 保存 Builder 编译期临时变动的状态（分页/排序/锁/列），
+// 返回的恢复函数须以 defer 配对调用：即使 CompileSelect/collectSelectBindings
+// 在临时修改期间 panic，状态也能完整恢复，各分支行为一致。
+func (b *Builder) saveTransientState() func() {
+	origLimit, origOffset := b.limit, b.offset
+	origOrders := b.orders
+	origLock := b.lockClause
+	origColumns := b.columns
+	origSelectSubs := b.selectSubs
+	return func() {
+		b.limit, b.offset = origLimit, origOffset
+		b.orders = origOrders
+		b.lockClause = origLock
+		b.columns = origColumns
+		b.selectSubs = origSelectSubs
+	}
 }
 
 // ToCount 编译 COUNT 查询。
@@ -559,20 +578,15 @@ func (b *Builder) ToCount() (string, []any, error) {
 
 	// UNION 查询：将整个 UNION 作为子查询包裹后计数
 	if len(b.unions) > 0 {
-		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
-		origLimit, origOffset := b.limit, b.offset
-		origOrders := b.orders
-		origLock := b.lockClause
+		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询；
+		// defer 恢复确保 panic 时状态也能完整还原
+		defer b.saveTransientState()()
 		b.limit, b.offset = 0, 0
 		b.orders = nil
 		b.lockClause = ""
 
 		unionSQL := b.grammar.CompileSelect(b, b.columns)
 		args := b.collectSelectBindings()
-
-		b.limit, b.offset = origLimit, origOffset
-		b.orders = origOrders
-		b.lockClause = origLock
 
 		countSQL := "SELECT COUNT(*) FROM (" + unionSQL + ") AS " + b.grammar.WrapTable("t")
 		return countSQL, args, nil
@@ -581,28 +595,20 @@ func (b *Builder) ToCount() (string, []any, error) {
 	// GROUP BY 查询：COUNT(*) 与分组列组合时返回每组一行，
 	// 执行端只取第一行会得到错误结果，因此将查询包裹为子查询再计数，
 	// 返回分组数量。
-	if len(b.groups) > 0 { // 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
-		origLimit, origOffset := b.limit, b.offset
-		origOrders := b.orders
-		origLock := b.lockClause
+	if len(b.groups) > 0 {
+		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询；
+		// defer 恢复确保 panic 时状态也能完整还原
+		defer b.saveTransientState()()
 		b.limit, b.offset = 0, 0
 		b.orders = nil
 		b.lockClause = ""
 
 		// 将列替换为常量，避免 SELECT * 与 GROUP BY 在严格模式下冲突
-		origColumns := b.columns
-		origSelectSubs := b.selectSubs
 		b.columns = []SelectColumn{{Value: "1", Raw: true}}
 		b.selectSubs = nil
 
 		subSQL := b.grammar.CompileSelect(b, b.columns)
 		args := b.collectSelectBindings()
-
-		b.limit, b.offset = origLimit, origOffset
-		b.orders = origOrders
-		b.lockClause = origLock
-		b.columns = origColumns
-		b.selectSubs = origSelectSubs
 
 		countSQL := "SELECT COUNT(*) FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t")
 		return countSQL, args, nil
@@ -611,10 +617,9 @@ func (b *Builder) ToCount() (string, []any, error) {
 	// DISTINCT 查询：SELECT DISTINCT COUNT(*) 中 DISTINCT 对聚合结果无效，
 	// 会丢失去重语义返回总行数，因此将查询包裹为子查询再计数。
 	if b.distinct {
-		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询
-		origLimit, origOffset := b.limit, b.offset
-		origOrders := b.orders
-		origLock := b.lockClause
+		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询；
+		// defer 恢复确保 panic 时状态也能完整还原
+		defer b.saveTransientState()()
 		b.limit, b.offset = 0, 0
 		b.orders = nil
 		b.lockClause = ""
@@ -622,27 +627,17 @@ func (b *Builder) ToCount() (string, []any, error) {
 		subSQL := b.grammar.CompileSelect(b, b.columns)
 		args := b.collectSelectBindings()
 
-		b.limit, b.offset = origLimit, origOffset
-		b.orders = origOrders
-		b.lockClause = origLock
-
 		countSQL := "SELECT COUNT(*) FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t")
 		return countSQL, args, nil
 	}
 
-	// 保存原始列并设置为 COUNT(*)，清除 SELECT 子查询
-	origColumns := b.columns
-	origSelectSubs := b.selectSubs
-	// 使用 defer 确保 panic 时也能恢复状态
-	defer func() {
-		b.columns = origColumns
-		b.selectSubs = origSelectSubs
-	}()
+	// 普通分支：列替换为 COUNT(*)；defer 恢复确保 panic 时状态也能完整还原
+	defer b.saveTransientState()()
 	b.columns = []SelectColumn{{Value: "COUNT(*)", Raw: true}}
 	b.selectSubs = nil
 
 	sqlStr := b.grammar.CompileSelect(b, b.columns)
-	// collectSelectBindings 会收集 SELECT_SUB → FROM_SUB → JOIN → WHERE → HAVING → UNION 的绑定参数
+	// collectSelectBindings 会收集 SELECT_SUB → FROM_SUB → JOIN → WHERE → GROUP BY → HAVING → UNION 的绑定参数
 	// 由于 selectSubs 已清空，不会包含 SELECT 子查询的参数
 	args := b.collectSelectBindings()
 
@@ -723,10 +718,9 @@ func (b *Builder) ToAggregate(aggregate string, column string) (string, []any, e
 
 	// UNION 查询：将整个 UNION 作为子查询包裹后聚合
 	if len(b.unions) > 0 {
-		// 保存并清除分页/排序/锁，这些对聚合无意义且可能干扰子查询
-		origLimit, origOffset := b.limit, b.offset
-		origOrders := b.orders
-		origLock := b.lockClause
+		// 保存并清除分页/排序/锁，这些对聚合无意义且可能干扰子查询；
+		// defer 恢复确保 panic 时状态也能完整还原
+		defer b.saveTransientState()()
 		b.limit, b.offset = 0, 0
 		b.orders = nil
 		b.lockClause = ""
@@ -734,27 +728,12 @@ func (b *Builder) ToAggregate(aggregate string, column string) (string, []any, e
 		unionSQL := b.grammar.CompileSelect(b, b.columns)
 		args := b.collectSelectBindings()
 
-		b.limit, b.offset = origLimit, origOffset
-		b.orders = origOrders
-		b.lockClause = origLock
-
 		return "SELECT " + aggExpr + " FROM (" + unionSQL + ") AS " + b.grammar.WrapTable("t"), args, nil
 	}
 
-	// 保存原始状态并替换为聚合列；清除分页/排序/锁/SELECT 子查询
-	origColumns := b.columns
-	origSelectSubs := b.selectSubs
-	origLimit, origOffset := b.limit, b.offset
-	origOrders := b.orders
-	origLock := b.lockClause
-	// 使用 defer 确保 panic 时也能恢复状态
-	defer func() {
-		b.columns = origColumns
-		b.selectSubs = origSelectSubs
-		b.limit, b.offset = origLimit, origOffset
-		b.orders = origOrders
-		b.lockClause = origLock
-	}()
+	// 替换为聚合列并清除分页/排序/锁/SELECT 子查询；
+	// defer 恢复确保 panic 时状态也能完整还原
+	defer b.saveTransientState()()
 	b.columns = []SelectColumn{{Value: aggExpr, Raw: true}}
 	b.selectSubs = nil
 	b.limit, b.offset = 0, 0
@@ -832,7 +811,7 @@ func (b *Builder) toIncDec(columns []string, amounts []any, op string) (string, 
 
 // collectSelectBindings 收集 SELECT 查询的所有绑定参数。
 // 顺序与 CompileSelect 生成占位符的顺序一致：
-// SELECT_SUB → FROM_SUB → JOIN → WHERE → HAVING → UNION
+// SELECT_SUB → FROM_SUB → JOIN → WHERE → GROUP BY → HAVING → UNION
 func (b *Builder) collectSelectBindings() []any {
 	var args []any
 	// SELECT sub 的绑定参数（编译时先于 FROM 出现）
