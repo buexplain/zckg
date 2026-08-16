@@ -24,22 +24,24 @@ go get github.com/buexplain/zckg
 
 ## 快速上手
 
-以下示例展示五个模块组合成一个最小可运行的 HTTP + 数据库应用（以 MySQL 为例）：
+以下示例展示五个模块组合成一个最小可运行的 HTTP + 数据库应用（以 Sqlite 为例）：
 
 ```go
 package main
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
-	"github.com/buexplain/zckg/zcconfig"
 	"github.com/buexplain/zckg/zcdb"
 	"github.com/buexplain/zckg/zchttp"
 	"github.com/buexplain/zckg/zcquit"
-	_ "github.com/go-sql-driver/mysql" // 注册 mysql 驱动
+	_ "modernc.org/sqlite" // 注册 sqlite 驱动（纯 Go 实现，无需 CGO）
 )
 
 type User struct {
@@ -49,28 +51,46 @@ type User struct {
 }
 
 func main() {
-	// 1. 配置：从 .env 读取数据库地址，泛型读取带默认值
-	_ = zcconfig.LoadEnv(".env")
-	host := zcconfig.Env[string]("DB_HOST", "127.0.0.1")
-	port := zcconfig.Env[int]("DB_PORT", 3306)
-
-	// 2. 数据库：创建主从连接池 + DAO（方言决定 SQL 形态）
+	// 1. 数据库：内存 SQLite。":memory:" 的每个连接是独立的内存库，
+	// 连接池限制为单连接，保证所有查询共享同一份数据
 	pool, err := zcdb.NewPool(zcdb.PoolConfig{
-		DriverName: "mysql",
-		DSN:        "root:root@tcp(" + host + ":" + fmt.Sprint(port) + ")/test?parseTime=true",
+		DriverName:   "sqlite",
+		DSN:          ":memory:",
+		MaxOpenConns: 1,
 	})
 	if err != nil {
 		panic(err)
 	}
-	db, err := zcdb.NewDBDao(pool, "mysql", nil, "")
+	db, err := zcdb.NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		slog.Default().Info(sqlStr, "args", args)
+	}, "")
 	if err != nil {
 		panic(err)
 	}
 	zcquit.AddSigHandler(10, func(sig os.Signal) { _ = db.Close() }) // 退出时关闭连接池
 
+	// 2. 初始化：建表 + 写入示例数据
+	if _, err := db.Exec(context.Background(), `
+CREATE TABLE users (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    age  INTEGER NOT NULL
+)`); err != nil {
+		panic(err)
+	}
+	if _, err := db.Builder().Table("users").Insert(context.Background(), []User{
+		{Id: 1, Name: "张三", Age: 16},
+		{Id: 2, Name: "alice", Age: 20},
+		{Id: 3, Name: "bob", Age: 25},
+		{Id: 4, Name: "carol", Age: 30},
+	}); err != nil {
+		panic(err)
+	}
+
 	// 3. HTTP：路由 + 参数绑定 + 统一响应
 	type ListReq struct {
-		MinAge int `form:"min_age"`
+		zchttp.OpenAPIMeta `tags:"用户" summary:"用户列表" description:"按最小年龄查询用户列表"`
+		MinAge             int `form:"min_age" description:"最小年龄" example:"18"`
 	}
 	type ListRes struct {
 		Users []User `json:"users"`
@@ -83,17 +103,43 @@ func main() {
 			Find(ctx, &res.Users)
 		return res, err
 	})
+
+	// 4. /doc 接口：业务路由注册完成后生成一次 OpenAPI 3.0 文档（/doc 自身不参与生成）
+	doc := zchttp.GenerateOpenAPI(router, zchttp.OpenAPIInfo{
+		Title:       "testGo API",
+		Description: "示例服务接口文档",
+		Version:     "1.0.0",
+		Servers:     []zchttp.OpenAPIServer{{URL: "http://127.0.0.1:8080"}},
+	})
+	openapiJSON, err := json.Marshal(doc)
+	if err != nil {
+		panic(err)
+	}
+	type DocReq struct{}
+	type DocRes struct{}
+	router.GET("/doc", func(ctx context.Context, req DocReq) (DocRes, error) {
+		// 直接写原始 JSON（框架检测到响应已写入会跳过默认的 Response 包装）
+		w, _ := zchttp.ResponseWriterFromContext(ctx)
+		if r, ok := zchttp.RequestFromContext(ctx); ok && r.URL.Query().Has("download") {
+			// 带 download 参数时以附件形式返回，便于导出成 openapi.json 文件
+			w.Header().Set("Content-Disposition", `attachment; filename="openapi.json"`)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write(openapiJSON)
+		return DocRes{}, err
+	})
+
 	engine := zchttp.NewEngine()
 	engine.Router = router
 
-	// 4. 启动服务（Run 不含优雅关闭，可改为自行管理 *http.Server）
+	// 5. 启动服务（Run 不含优雅关闭，可改为自行管理 *http.Server）
 	go func() {
-		if err := engine.Run(&http.Server{Addr: ":8080"}); err != nil && err != http.ErrServerClosed {
+		if err := engine.Run(&http.Server{Addr: ":8080"}); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			zcquit.Shutdown() // 启动失败主动触发退出
 		}
 	}()
 
-	// 5. 阻塞等待退出信号（SIGTERM/SIGINT/SIGQUIT），按级别执行清理 handler
+	// 6. 阻塞等待退出信号（SIGTERM/SIGINT/SIGQUIT），按级别执行清理 handler
 	zcquit.Listen()
 }
 ```
