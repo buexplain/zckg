@@ -1,11 +1,10 @@
 package zchttp
 
-// 本文件是递归审查（docs/recursion-review-plan.md / recursion-review-report.md）
-// 修复闭环的回归锁死测试：REC-01~REC-07 修复后，所有对抗用例（U1–U9）必须
+// 本文件是递归相关修复的回归锁死测试：所有对抗用例（U1–U9）必须
 // 在进程内正常完成并满足后验断言。若修复回退，本文件中的用例将以
 // 栈溢出（测试进程崩溃）或 -timeout 挂起的形式失败。
 //
-// 对抗类型定义沿用审查阶段实证过的合法 Go 递归类型（计划 3.3 节）。
+// 对抗类型为合法 Go 递归类型。
 
 import (
 	"context"

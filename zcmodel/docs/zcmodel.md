@@ -31,8 +31,6 @@ zcmodel/
     └── zcmodel.md          # 本文档
 ```
 
-> docs 目录下另有审查产物（`code-review-plan.md`、`code-review-report.md`、`docs-code-deviation-review-plan.md`、`docs-code-deviation-review-report.md`），不属于功能文档，故不列入上树。
-
 ## 生成流程
 
 ```

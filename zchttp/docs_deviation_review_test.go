@@ -1,7 +1,7 @@
 package zchttp
 
-// 文档-代码偏离审查（docs/docs-code-deviation-review-report.md）的回归锁死测试：
-// 将审查中经 httptest 实测确认的关键行为固化为包内测试，防止后续代码修改
+// 文档-代码一致性的回归锁死测试：
+// 将经 httptest 实测确认的关键行为固化为包内测试，防止后续代码修改
 // 使行为再次偏离文档描述。涉及 DEV-01（ReadFrom 标记 written）、
 // DEV-02/DEV-03（NewEngine 默认值）、DEV-04（Res 标签参与文档生成）、
 // 合并绑定粒度表与容器嵌套深度矩阵。
@@ -34,7 +34,7 @@ func docReviewDoJSON(t *testing.T, h http.Handler, method, target, body string) 
 }
 
 // DEV-02/DEV-03：NewEngine 默认 MaxBodyBytes 与 MultipartFormMaxMemory 均为 32 MB
-//（parameter-binding.md 2.1 节、http-engine-callback.md 第一节/第七步）。
+// （parameter-binding.md 2.1 节、http-engine-callback.md 第一节/第七步）。
 func TestDocReview_NewEngineDefaults(t *testing.T) {
 	e := NewEngine()
 	// 直接断言文档声称的 32 MB（而非引用常量），常量被改动时本测试能暴露文档偏离
@@ -50,7 +50,7 @@ func TestDocReview_NewEngineDefaults(t *testing.T) {
 }
 
 // DEV-01：ReadFrom 标记 written（io.Copy(w, reader) 走零拷贝路径后默认 JSON 响应跳过）
-//（http-engine-callback.md 第五节 written 判定清单）。
+// （http-engine-callback.md 第五节 written 判定清单）。
 type drReadFromReq struct{}
 type drReadFromRes struct{ OK bool }
 
