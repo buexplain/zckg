@@ -106,7 +106,7 @@ func ScanStruct(rows *sql.Rows, dest any, tagName ...string) error {
 	tag := pickTagName(tagName)
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr {
-		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer, got %T", dest)
+		return fmt.Errorf("%w, got %T", ErrNotPointer, dest)
 	}
 	destValue = destValue.Elem()
 
@@ -121,7 +121,7 @@ func ScanStruct(rows *sql.Rows, dest any, tagName ...string) error {
 	case reflect.Slice:
 		return scanAllRows(rows, columns, destValue, tag)
 	default:
-		return fmt.Errorf("zcdb: ScanStruct dest must be a pointer to struct or slice, got *%s", destValue.Kind())
+		return fmt.Errorf("%w, got *%s", ErrScanDest, destValue.Kind())
 	}
 }
 
@@ -160,7 +160,7 @@ func scanAllRows(rows *sql.Rows, columns []string, dest reflect.Value, tagName s
 		elemType = elemType.Elem()
 	}
 	if elemType.Kind() != reflect.Struct {
-		return fmt.Errorf("zcdb: slice element must be struct or *struct, got %s", dest.Type().Elem())
+		return fmt.Errorf("%w: slice element must be struct or *struct, got %s", ErrInvalidStruct, dest.Type().Elem())
 	}
 
 	fieldInfo := getScanFieldInfo(elemType, tagName)
@@ -267,7 +267,7 @@ func (n *nullSafeField) Scan(src any) error {
 			// 直接 reflect.Copy 会因元素类型不匹配而 panic，故走 JSON 反序列化
 			dst := reflect.New(targetType)
 			if err := json.Unmarshal(val.Bytes(), dst.Interface()); err != nil {
-				return fmt.Errorf("zcdb: cannot unmarshal JSON to %v: %w", targetType, err)
+				return fmt.Errorf("%w: cannot unmarshal JSON to %v: %w", ErrScanConvert, targetType, err)
 			}
 			setFinalValue(dst.Elem())
 			return nil
@@ -276,7 +276,7 @@ func (n *nullSafeField) Scan(src any) error {
 			if targetType.Key().Kind() == reflect.String {
 				m := reflect.New(targetType).Interface()
 				if err := json.Unmarshal(val.Bytes(), m.(any)); err != nil {
-					return fmt.Errorf("zcdb: cannot unmarshal JSON to map: %w", err)
+					return fmt.Errorf("%w: cannot unmarshal JSON to map: %w", ErrScanConvert, err)
 				}
 				setFinalValue(reflect.ValueOf(m).Elem())
 				return nil
@@ -285,7 +285,7 @@ func (n *nullSafeField) Scan(src any) error {
 			// []byte → 自定义结构体（JSON 反序列化）
 			dst := reflect.New(targetType)
 			if err := json.Unmarshal(val.Bytes(), dst.Interface()); err != nil {
-				return fmt.Errorf("zcdb: cannot unmarshal JSON to struct: %w", err)
+				return fmt.Errorf("%w: cannot unmarshal JSON to struct: %w", ErrScanConvert, err)
 			}
 			setFinalValue(dst.Elem())
 			return nil
@@ -293,7 +293,7 @@ func (n *nullSafeField) Scan(src any) error {
 			// 按目标类型位宽解析，溢出时 ParseInt 直接报错，避免 Convert 静默截断（如 "300" → int8）
 			i, err := strconv.ParseInt(string(val.Bytes()), 10, targetType.Bits())
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
+				return fmt.Errorf("%w: cannot convert %q to %s", ErrScanConvert, string(val.Bytes()), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(i).Convert(targetType))
 			return nil
@@ -301,21 +301,21 @@ func (n *nullSafeField) Scan(src any) error {
 			// 按目标类型位宽解析，溢出时 ParseUint 直接报错，避免 Convert 静默截断
 			u, err := strconv.ParseUint(string(val.Bytes()), 10, targetType.Bits())
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
+				return fmt.Errorf("%w: cannot convert %q to %s", ErrScanConvert, string(val.Bytes()), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(u).Convert(targetType))
 			return nil
 		case reflect.Float32, reflect.Float64:
 			f, err := strconv.ParseFloat(string(val.Bytes()), 64)
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to %s", string(val.Bytes()), targetKind)
+				return fmt.Errorf("%w: cannot convert %q to %s", ErrScanConvert, string(val.Bytes()), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(f).Convert(targetType))
 			return nil
 		case reflect.Bool:
 			b, err := strconv.ParseBool(string(val.Bytes()))
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to bool", string(val.Bytes()))
+				return fmt.Errorf("%w: cannot convert %q to bool", ErrScanConvert, string(val.Bytes()))
 			}
 			setFinalValue(reflect.ValueOf(b))
 			return nil
@@ -363,7 +363,7 @@ func (n *nullSafeField) Scan(src any) error {
 			// string → 其它切片类型（如 []int、[]string）：数据库通常以 JSON 文本存储
 			dst := reflect.New(targetType)
 			if err := json.Unmarshal([]byte(val.String()), dst.Interface()); err != nil {
-				return fmt.Errorf("zcdb: cannot unmarshal JSON to %v: %w", targetType, err)
+				return fmt.Errorf("%w: cannot unmarshal JSON to %v: %w", ErrScanConvert, targetType, err)
 			}
 			setFinalValue(dst.Elem())
 			return nil
@@ -373,7 +373,7 @@ func (n *nullSafeField) Scan(src any) error {
 			if targetType.Key().Kind() == reflect.String {
 				m := reflect.New(targetType).Interface()
 				if err := json.Unmarshal([]byte(val.String()), m.(any)); err != nil {
-					return fmt.Errorf("zcdb: cannot unmarshal JSON to map: %w", err)
+					return fmt.Errorf("%w: cannot unmarshal JSON to map: %w", ErrScanConvert, err)
 				}
 				setFinalValue(reflect.ValueOf(m).Elem())
 				return nil
@@ -382,14 +382,14 @@ func (n *nullSafeField) Scan(src any) error {
 			// string → 自定义结构体（JSON 反序列化，与 []byte→struct 分支对称）
 			dst := reflect.New(targetType)
 			if err := json.Unmarshal([]byte(val.String()), dst.Interface()); err != nil {
-				return fmt.Errorf("zcdb: cannot unmarshal JSON to struct: %w", err)
+				return fmt.Errorf("%w: cannot unmarshal JSON to struct: %w", ErrScanConvert, err)
 			}
 			setFinalValue(dst.Elem())
 			return nil
 		case reflect.Bool:
 			b, err := strconv.ParseBool(val.String())
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to bool", val.String())
+				return fmt.Errorf("%w: cannot convert %q to bool", ErrScanConvert, val.String())
 			}
 			setFinalValue(reflect.ValueOf(b))
 			return nil
@@ -397,7 +397,7 @@ func (n *nullSafeField) Scan(src any) error {
 			// 按目标类型位宽解析，溢出时 ParseInt 直接报错，避免 Convert 静默截断（如 "300" → int8）
 			i, err := strconv.ParseInt(val.String(), 10, targetType.Bits())
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
+				return fmt.Errorf("%w: cannot convert %q to %s", ErrScanConvert, val.String(), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(i).Convert(targetType))
 			return nil
@@ -405,14 +405,14 @@ func (n *nullSafeField) Scan(src any) error {
 			// 按目标类型位宽解析，溢出时 ParseUint 直接报错，避免 Convert 静默截断
 			u, err := strconv.ParseUint(val.String(), 10, targetType.Bits())
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
+				return fmt.Errorf("%w: cannot convert %q to %s", ErrScanConvert, val.String(), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(u).Convert(targetType))
 			return nil
 		case reflect.Float32, reflect.Float64:
 			f, err := strconv.ParseFloat(val.String(), 64)
 			if err != nil {
-				return fmt.Errorf("zcdb: cannot convert %q to %s", val.String(), targetKind)
+				return fmt.Errorf("%w: cannot convert %q to %s", ErrScanConvert, val.String(), targetKind)
 			}
 			setFinalValue(reflect.ValueOf(f).Convert(targetType))
 			return nil
@@ -444,5 +444,5 @@ func (n *nullSafeField) Scan(src any) error {
 		return nil
 	}
 
-	return fmt.Errorf("zcdb: cannot convert %T to %s", src, targetType)
+	return fmt.Errorf("%w: cannot convert %T to %s", ErrScanConvert, src, targetType)
 }

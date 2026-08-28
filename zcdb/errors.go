@@ -63,4 +63,10 @@ var (
 
 	// ErrDeleteJoinNoJoin DeleteJoin 要求至少一个 JOIN
 	ErrDeleteJoinNoJoin = errors.New("zcdb: DeleteJoin requires at least one JOIN")
+
+	// ErrScanDest ScanStruct 的 dest 是指针但指向的类型非法（必须是 *struct 或 *[]struct / *[]*struct）
+	ErrScanDest = errors.New("zcdb: dest must be a pointer to struct or slice")
+
+	// ErrScanConvert 列值转换为目标字段类型失败（数值解析、JSON 反序列化、类型不可转换等）
+	ErrScanConvert = errors.New("zcdb: scan value conversion failed")
 )

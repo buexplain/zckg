@@ -5,21 +5,22 @@
 ## 一、中间件签名
 
 ```go
-type NextFunc func() error
+type NextFunc func(w http.ResponseWriter, r *http.Request) error
 
 type MiddlewareHandler func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error
 ```
 
 - `next` 调用**之前**的逻辑为「前置」处理。
-- `next()` 返回**之后**的逻辑为「后置」处理。
+- `next(w, r)` 返回**之后**的逻辑为「后置」处理。
 - 返回值 `error` 会向上层中间件传播。
+- `next` 接收的 `w` 和 `r` 将传递给下游；若无需替换，原样传入当前收到的 `w` 和 `r` 即可。
 
 标准写法：
 
 ```go
 func myMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     // 前置逻辑
-    err := next()
+    err := next(w, r)
     // 后置逻辑
     return err
 }
@@ -58,10 +59,41 @@ Middleware A ── 前置逻辑
 实现上不为每层构造闭包：执行状态由池化的 `chainRunner` 对象承载，各层 `next()` 是否已调用以 `uint64` 位图按层号记录（热路径零闭包分配）；仅当中间件层数超过 64 层（极罕见场景）时回退为递归实现（`runChainRecursive`），语义与防重规则完全一致。
 
 > **并发约束**：`next()` 必须在中间件所属的 goroutine 内调用，不得另起 goroutine 调用 `next()`。内部调用状态标记（位图 / bool）未做并发安全保护。
->
-> **已知边界**：中间件无法替换下游的 `http.ResponseWriter`。`NextFunc` 无参且链上的 `w` 在请求开始时已固定，gzip 等需要包装下游 `ResponseWriter` 的中间件模式无法实现。这是中间件签名的架构决策；若需支持，需修改 `NextFunc` 签名（破坏性变更），当前版本不支持。
 
-## 三、短路控制
+## 三、替换 ResponseWriter 与 Request
+
+中间件可通过 `next(w, r)` 向下游传递替换的 `http.ResponseWriter` 或 `*http.Request`。典型场景包括 gzip 压缩、响应体捕获、请求头注入等：
+
+```go
+// gzip 压缩中间件
+func gzipMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+    gz := gzip.NewWriter(w)
+    wrapped := &gzipResponseWriter{Writer: gz, ResponseWriter: w}
+    err := next(wrapped, r)   // 下游拿到的是 wrapped
+    gz.Close()
+    return err
+}
+```
+
+多层中间件可各自替换，每层收到的是上一层传入的版本：
+
+```go
+// 外层替换 w 为 w2，内层收到 w2 并进一步替换为 w3
+// handler 和 finalHandler 最终收到 w3
+```
+
+若无需替换，原样透传即可：
+
+```go
+func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+    start := time.Now()
+    err := next(w, r)   // 原样传递，不替换
+    log.Printf("%s %s cost=%s", r.Method, r.URL.Path, time.Since(start))
+    return err
+}
+```
+
+## 四、短路控制
 
 中间件**不调用 `next()`** 即可短路，后续中间件与 handler 都不会执行：
 
@@ -71,7 +103,7 @@ func authMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request,
         w.WriteHeader(http.StatusUnauthorized)
         return nil          // 不调用 next，直接短路
     }
-    return next()
+    return next(w, r)
 }
 ```
 
@@ -84,13 +116,13 @@ func authMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request,
     req, err := zchttp.BoundReqFromContext[LoginReq](ctx)
     if err != nil {
         // 绑定阶段出错（如 JSON 格式错误），交由 core 层路由到 OnValidationError
-        return next()
+        return next(w, r)
     }
     if req.Token == "" {
         w.WriteHeader(http.StatusUnauthorized)
         return nil
     }
-    return next()
+    return next(w, r)
 }
 ```
 
@@ -102,7 +134,7 @@ handler 执行完毕后（`next()` 返回），可通过 `BoundResFromContext` �
 
 ```go
 func responseLogger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-    err := next()
+    err := next(w, r)
     // 后置逻辑：获取 handler 的 Res
     res, resErr := zchttp.BoundResFromContext[MyRes](ctx)
     if resErr == nil {
@@ -112,7 +144,7 @@ func responseLogger(ctx context.Context, w http.ResponseWriter, r *http.Request,
 }
 ```
 
-## 四、错误传播
+## 五、错误传播
 
 - handler 返回的 `error` 会作为 `next()` 的返回值向上传播。
 - 每层中间件都能捕获、包装或拦截该错误。
@@ -120,7 +152,7 @@ func responseLogger(ctx context.Context, w http.ResponseWriter, r *http.Request,
 
 ```go
 func recoverError(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-    err := next()
+    err := next(w, r)
     if err != nil {
         log.Printf("handler error: %v", err)
         // 可选择返回 nil 拦截错误，或继续向上返回 err
@@ -129,7 +161,7 @@ func recoverError(ctx context.Context, w http.ResponseWriter, r *http.Request, n
 }
 ```
 
-## 五、panic 恢复
+## 六、panic 恢复
 
 `HttpEngine.ServeHTTP` 内置 `defer recover`，捕获 handler 或中间件中的 panic，交由 `OnPanic` 回调处理（默认 `DefaultPanicHandler`）。中间件无需自行处理 panic，引擎层已覆盖：
 
@@ -148,7 +180,7 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 }
 ```
 
-## 六、注册方式
+## 七、注册方式
 
 中间件通过 `Use(...)` 注册，分为全局与分组两级：
 
@@ -168,12 +200,12 @@ api.GET("/users", listUsers)
 
 > 注册与快照的细节详见 `routing.md`。
 
-## 七、完整示例
+## 八、完整示例
 
 ```go
 func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     start := time.Now()
-    err := next()
+    err := next(w, r)
     log.Printf("%s %s cost=%s", r.Method, r.URL.Path, time.Since(start))
     return err
 }

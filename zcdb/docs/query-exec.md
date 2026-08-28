@@ -226,3 +226,28 @@ err = zcdb.ScanStructClose(rows, &user) // 扫描完成后自动 rows.Close()，
 | `*[]struct` / `*[]*struct` | 扫描所有行，无结果时为空切片 |
 
 扫描转换说明：未匹配的列被忽略；NULL 扫描为零值（指针字段置 nil）；数值文本（驱动以字符串/[]byte 返回的数值列）按目标字段类型位宽解析，**溢出时报错**（如 `"300"` 扫入 int8），不静默截断；时间列扫入 string 字段时格式化为 RFC3339。
+
+### 错误语义
+
+ScanStruct 系列可能返回以下哨兵错误（均可用 `errors.Is` 匹配）：
+
+| 错误 | 含义 |
+|------|------|
+| `ErrNotPointer` | dest 不是指针 |
+| `ErrScanDest` | dest 是指针但指向的类型非法（必须是 `*struct` 或 `*[]struct` / `*[]*struct`） |
+| `ErrInvalidStruct` | 切片元素不是结构体/结构体指针 |
+| `ErrScanConvert` | 列值转换为目标字段类型失败（数值溢出、JSON 反序列化失败、类型不可转换等） |
+| `sql.ErrNoRows` | `*struct` 模式下查询结果为空 |
+
+示例：
+
+```go
+if err := zcdb.ScanStruct(rows, &user); err != nil {
+    if errors.Is(err, zcdb.ErrScanConvert) {
+        log.Printf("数据转换失败: %v", err)
+    }
+    if errors.Is(err, sql.ErrNoRows) {
+        log.Println("未找到记录")
+    }
+}
+```

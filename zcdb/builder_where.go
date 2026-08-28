@@ -1,5 +1,7 @@
 package zcdb
 
+import "time"
+
 // 本文件包含 Builder 的 WHERE 查询条件构造方法（Where/OrWhere 全系列）：
 // 基本比较、IN/NULL/BETWEEN、LIKE/空安全、嵌套逻辑组（Not/All/Any/None）、子查询条件。
 
@@ -86,6 +88,9 @@ func (b *Builder) addWhereBasic(column string, op any, value []any, boolean stri
 //	// MySQL SQL: SELECT * FROM `users` WHERE date(`created_at`) = ?
 //	// args:      [2026-08-08]
 func (b *Builder) WhereDate(column string, value any) *Builder {
+	if t, ok := value.(time.Time); ok {
+		value = t.Format("2006-01-02")
+	}
 	return b.WhereRaw(b.grammar.CompileWhereDate(column)+" = ?", value)
 }
 

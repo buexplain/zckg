@@ -76,12 +76,12 @@ func benchPathParamHandler(_ context.Context, req *benchPathParamReq) (benchPath
 func BenchmarkServeHTTP_StaticRoute_GET(b *testing.B) {
 	e := NewEngine()
 	e.Router.GET("/api/user", benchSimpleHandler)
-	req := httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil)
-	benchExpectOK(b, e, req)
+	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil))
 	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil)
 		e.ServeHTTP(w, req)
 	}
 }
@@ -127,12 +127,12 @@ func BenchmarkServeHTTP_Nested_Nonzero(b *testing.B) {
 func BenchmarkServeHTTP_ParamRoute(b *testing.B) {
 	e := NewEngine()
 	e.Router.GET("/api/{name}", benchSimpleHandler)
-	req := httptest.NewRequest(http.MethodGet, "/api/alice?age=18", nil)
-	benchExpectOK(b, e, req)
+	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/api/alice?age=18", nil))
 	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/alice?age=18", nil)
 		e.ServeHTTP(w, req)
 	}
 }
@@ -141,16 +141,16 @@ func BenchmarkServeHTTP_ParamRoute(b *testing.B) {
 func BenchmarkServeHTTP_WithMiddlewares(b *testing.B) {
 	e := NewEngine()
 	noop := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		return next()
+		return next(w, r)
 	}
 	e.Router.Use(noop, noop, noop)
 	e.Router.GET("/api/user", benchSimpleHandler)
-	req := httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil)
-	benchExpectOK(b, e, req)
+	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil))
 	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil)
 		e.ServeHTTP(w, req)
 	}
 }
@@ -162,11 +162,11 @@ func BenchmarkServeHTTP_LargeFileDownload(b *testing.B) {
 	const fileSize = 4 << 20 // 4MB
 	payload := strings.Repeat("f", fileSize)
 	e := NewEngine()
-	e.Router.GET("/file", func(ctx context.Context, _ benchSimpleReq) (any, error) {
+	e.Router.GET("/file", func(ctx context.Context, _ benchSimpleReq) (benchSimpleRes, error) {
 		w, _ := ResponseWriterFromContext(ctx)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, err := io.Copy(w, strings.NewReader(payload))
-		return nil, err
+		return benchSimpleRes{}, err
 	})
 	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/file", nil))
 	b.ReportAllocs()

@@ -87,7 +87,7 @@ func TestBoundResFromContext(t *testing.T) {
 
 	router := NewRouter()
 	router.Use(func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		err := next()
+		err := next(w, r)
 		// 后置阶段获取 Res
 		res, resErr := BoundResFromContext[engineRes](ctx)
 		if resErr != nil {
@@ -154,7 +154,7 @@ func TestBoundReqFromContext_ValueAndPointer(t *testing.T) {
 		ptrReq, ptrErr = BoundReqFromContext[*engineReq](ctx)
 		// 用值类型获取（内部自动解引用）
 		valReq, valErr = BoundReqFromContext[engineReq](ctx)
-		return next()
+		return next(w, r)
 	})
 	router.GET("/bound-req", func(_ context.Context, req engineReq) (engineRes, error) {
 		return engineRes{Message: req.Name}, nil

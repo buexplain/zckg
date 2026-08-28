@@ -4,6 +4,7 @@ package zcdb
 
 import (
 	"testing"
+	"time"
 )
 
 // TestBug_UpdateJoin_SQLite_DropsValueCondition 验证 SQLite UPDATE + JOIN 编译时
@@ -51,6 +52,9 @@ func TestNewApi_SQLiteCompileForms(t *testing.T) {
 		}, `SELECT * FROM "users" WHERE "age" IS NOT NULL`, nil},
 		{"WhereDate", func() *Builder {
 			return NewBuilder(g, nil).Table("events").WhereDate("happened_at", "2024-06-15")
+		}, `SELECT * FROM "events" WHERE strftime('%Y-%m-%d', "happened_at") = ?`, []any{"2024-06-15"}},
+		{"WhereDate_Time", func() *Builder {
+			return NewBuilder(g, nil).Table("events").WhereDate("happened_at", time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC))
 		}, `SELECT * FROM "events" WHERE strftime('%Y-%m-%d', "happened_at") = ?`, []any{"2024-06-15"}},
 		{"NullSafeEquals", func() *Builder {
 			return NewBuilder(g, nil).Table("users").WhereNullSafeEquals("age", 25)

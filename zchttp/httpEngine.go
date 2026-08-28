@@ -313,7 +313,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 4. 洋葱模型核心层：参数校验 + 反射调用 handler
 	//    直接使用闭包捕获的 reqPtr（绑定阶段产物），避免再从 ctx 取值并重复反射
-	core := func() error {
+	core := func(w http.ResponseWriter, r *http.Request) error {
 		// 绑定阶段失败时不提前返回，错误随中间件链穿透到 core 层再统一处理
 		if st.bindingErr != nil {
 			return st.bindingErr
@@ -363,7 +363,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Interface() 仅装箱一次复用，避免重复装箱分配
 		res := results[0].Interface()
 		st.res = res
-		e.OnResponse(rw, r, res)
+		e.OnResponse(w, r, res)
 		return nil
 	}
 

@@ -162,4 +162,6 @@ func main() {
 | `ErrCursorFieldNotFound` | 游标列在目标结构体中找不到对应字段 |
 | `ErrCursorFieldUnavailable` | 游标列字段不可用（nil 嵌入指针） |
 | `ErrCursorColumnNull` | 游标列值为 NULL，无法继续分页 |
+| `ErrScanDest` | Scan 目标类型非法（必须是结构体或切片指针） |
+| `ErrScanConvert` | Scan 结果值类型转换失败 |
 | `ErrDialectRequired` / `ErrUnknownDialect` / `ErrPoolRequired` | DAO 创建参数错误 |

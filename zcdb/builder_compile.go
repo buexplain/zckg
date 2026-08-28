@@ -631,8 +631,12 @@ func (b *Builder) ToCount() (string, []any, error) {
 		return countSQL, args, nil
 	}
 
-	// 普通分支：列替换为 COUNT(*)；defer 恢复确保 panic 时状态也能完整还原
+	// 普通分支：列替换为 COUNT(*)，清除分页/排序/锁（对计数无意义）；
+	// defer 恢复确保 panic 时状态也能完整还原
 	defer b.saveTransientState()()
+	b.limit, b.offset = 0, 0
+	b.orders = nil
+	b.lockClause = ""
 	b.columns = []SelectColumn{{Value: "COUNT(*)", Raw: true}}
 	b.selectSubs = nil
 

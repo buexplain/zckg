@@ -7,6 +7,7 @@ import (
 	"errors"
 	_ "github.com/go-sql-driver/mysql"
 	"testing"
+	"time"
 )
 
 // TestMySQLInteg_SelectWhereBasic 验证基础 WHERE 等值条件。
@@ -1140,6 +1141,26 @@ func TestMySQLInteg_NewApi_WhereDate(t *testing.T) {
 	assertNoError(t, err)
 	if count != 2 {
 		t.Errorf("WhereDate: expected 2, got %d", count)
+	}
+}
+
+// TestMySQLInteg_NewApi_WhereDate_Time 验证 WhereDate 传 time.Time 时在 MySQL 上编译与执行均正确。
+func TestMySQLInteg_NewApi_WhereDate_Time(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLNewApiTables(t, db)
+	setupMySQLEventsTable(t, db)
+
+	dt := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	sqlStr, args, err := db.Builder().Table("events").WhereDate("happened_at", dt).ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, "SELECT * FROM `events` WHERE date(`happened_at`) = ?", sqlStr)
+	assertArgs(t, []any{"2024-06-15"}, args)
+
+	count, err := db.Builder().Table("events").WhereDate("happened_at", dt).Count(context.Background())
+	assertNoError(t, err)
+	if count != 2 {
+		t.Errorf("WhereDate(time.Time): expected 2, got %d", count)
 	}
 }
 

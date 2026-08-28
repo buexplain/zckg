@@ -13,13 +13,15 @@ import (
 var ErrNextCalledMultipleTimes = errors.New("middleware next() called multiple times")
 
 // NextFunc 调用后继续执行下一层中间件，若当前已是最后一层则执行路由 handler
+// 传入的 w 和 r 将替代当前层的值传递给下游，中间件可借此替换 ResponseWriter（如 gzip 包装）
+// 或修改 Request（如注入 Header）；若无需替换，原样传入当前收到的 w 和 r 即可
 // 返回值 error 为下游（后续中间件或 handler）产生的错误
 // 若不调用，则后续中间件与 handler 均不会执行（短路）
 //
 // 约束：next 必须在所属中间件执行期间的同一 goroutine 内同步调用。
 // 跨 goroutine 调用会与位图防重标记与层号记录产生 data race，且层号错配
 // 可能导致下游重复执行，行为未定义。
-type NextFunc func() error
+type NextFunc func(w http.ResponseWriter, r *http.Request) error
 
 // MiddlewareHandler 洋葱模型中间件函数签名
 // next 调用之前的逻辑为"前置"，next() 返回后的逻辑为"后置"
@@ -29,7 +31,7 @@ type NextFunc func() error
 //
 //	func(ctx, w, r, next) error {
 //	    // 前置逻辑
-//	    err := next()
+//	    err := next(w, r)
 //	    // 后置逻辑
 //	    return err
 //	}
@@ -42,13 +44,15 @@ const maxBitmaskMiddlewares = 64
 
 // chainRunner 承载中间件链执行状态：所有层共享同一个 next 函数值（创建池对象时
 // 一次性绑定），用位图记录各层 next() 是否已被调用，避免递归实现中每层
-// 都分配一个捕获 called 标记的闭包（热路径优化）
+// 都分配一个捕获 called 标记的闭包（热路径优化）。
+// w 和 r 为可变状态：每层中间件可通过 next(w, r) 传入替换值，advance 将其
+// 写入 c.w / c.r，使下一层中间件与 finalHandler 拿到替换后的版本。
 type chainRunner struct {
 	middlewares []MiddlewareHandler
 	ctx         context.Context
 	w           http.ResponseWriter
 	r           *http.Request
-	final       func() error
+	final       func(w http.ResponseWriter, r *http.Request) error
 	nextFunc    NextFunc // 池对象创建时绑定 c.advance，此后不再重新分配
 	calledBits  uint64   // 第 i 层 next() 已调用标记（位 i）
 	current     int      // 当前正在执行的中间件层号
@@ -67,9 +71,9 @@ var chainRunnerPool = sync.Pool{
 // 这构成了洋葱模型：middlewares[0] 在最外层，finalHandler 在最内层。
 // 每层的 next 仅允许调用一次，重复调用返回 ErrNextCalledMultipleTimes，
 // 防止下游中间件与 handler 被重复执行。
-func runChain(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler func() error) error {
+func runChain(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler func(w http.ResponseWriter, r *http.Request) error) error {
 	if len(middlewares) == 0 {
-		return finalHandler()
+		return finalHandler(w, r)
 	}
 	if len(middlewares) > maxBitmaskMiddlewares {
 		return runChainRecursive(middlewares, ctx, w, r, finalHandler)
@@ -97,7 +101,7 @@ func runChain(middlewares []MiddlewareHandler, ctx context.Context, w http.Respo
 // 进入前记录并切换 current，退出时恢复，保证 next() 总能定位到调用者所在层
 func (c *chainRunner) exec(level int) error {
 	if level == len(c.middlewares) {
-		return c.final()
+		return c.final(c.w, c.r)
 	}
 	prev := c.current
 	c.current = level
@@ -106,24 +110,26 @@ func (c *chainRunner) exec(level int) error {
 	return err
 }
 
-// advance 是所有层共享的 next 实现：按调用者层号做防重标记，再执行下一层
-func (c *chainRunner) advance() error {
+// advance 是所有层共享的 next 实现：按调用者层号做防重标记，更新 w/r 后执行下一层
+func (c *chainRunner) advance(w http.ResponseWriter, r *http.Request) error {
 	bit := uint64(1) << c.current
 	if c.calledBits&bit != 0 {
 		return ErrNextCalledMultipleTimes
 	}
 	c.calledBits |= bit
+	c.w = w
+	c.r = r
 	return c.exec(c.current + 1)
 }
 
 // runChainRecursive 是递归实现，作为中间件层数超过位图上限时的回退路径；
-// 每层分配一个捕获 called 标记的 next 闭包
-func runChainRecursive(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler func() error) error {
+// 每层分配一个捕获 called 标记的 next 闭包，闭包接收 w/r 以支持下游替换
+func runChainRecursive(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler func(w http.ResponseWriter, r *http.Request) error) error {
 	if len(middlewares) == 0 {
-		return finalHandler()
+		return finalHandler(w, r)
 	}
 	called := false
-	return middlewares[0](ctx, w, r, func() error {
+	return middlewares[0](ctx, w, r, func(w http.ResponseWriter, r *http.Request) error {
 		if called {
 			return ErrNextCalledMultipleTimes
 		}

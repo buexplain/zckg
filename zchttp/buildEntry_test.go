@@ -308,13 +308,13 @@ func TestBuildEntry_MiddlewareSnapshot(t *testing.T) {
 	}
 
 	mw1 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		return next()
+		return next(w, r)
 	}
 	mw2 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		return next()
+		return next(w, r)
 	}
 	mw3 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		return next()
+		return next(w, r)
 	}
 
 	global := []MiddlewareHandler{mw1, mw2}
@@ -350,7 +350,7 @@ func TestBuildEntry_MiddlewareSnapshot_IndependentCopy(t *testing.T) {
 	}
 
 	mw1 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		return next()
+		return next(w, r)
 	}
 
 	global := []MiddlewareHandler{mw1}

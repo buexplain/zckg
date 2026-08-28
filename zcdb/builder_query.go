@@ -247,13 +247,9 @@ func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColu
 //	// COUNT SQL: SELECT COUNT(*) FROM `users`
 //	// 数据 SQL:  SELECT * FROM `users` LIMIT 20
 func (b *Builder) Paginate(ctx context.Context, dest any) (totalCount int, err error) {
-	// 执行 COUNT 查询
-	c := b.Clone()
-	c.orders = nil
-	c.limit = 0
-	c.offset = 0
-	c.columns = nil
-	total, err := c.Count(ctx)
+	// ToCount 内部通过 saveTransientState 自动清除并恢复 limit/offset/orders/columns，
+	// 无需克隆，直接调用即可。
+	total, err := b.Count(ctx)
 	if err != nil {
 		return 0, err
 	}

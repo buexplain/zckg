@@ -322,11 +322,7 @@ type CreateUserReq struct {
 }
 ```
 
-## 五、已知边界
-
-- **中间件无法替换下游的 `http.ResponseWriter`**：`MiddlewareHandler` 的 `next` 无参且链上的 `w` 在请求开始时已固定，gzip 等需要包装下游 `ResponseWriter` 的中间件模式无法实现。这是中间件签名的架构决策；若需支持，需修改 `NextFunc` 签名（破坏性变更），当前版本不支持。详见 `middleware.md`。
-
-## 六、相关文档
+## 五、相关文档
 
 - 参数绑定来源、字段类型、`time.Time` 解析、`default` 机制、文件上传：`parameter-binding.md`
 - 校验规则（`nonzero` 递归校验、`Validate()` 自定义校验、错误处理）：`parameter-validate.md`

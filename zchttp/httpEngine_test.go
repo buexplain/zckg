@@ -59,7 +59,7 @@ func TestDefaultResponseSkipWhenWritten(t *testing.T) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("Content-Disposition", `attachment; filename="a.txt"`)
 		_, _ = w.Write([]byte("file-content"))
-		return next()
+		return next(w, r)
 	})
 	router.GET("/download", func(_ context.Context, req engineReq) (engineRes, error) {
 		return engineRes{Message: "should-be-ignored"}, nil
@@ -395,7 +395,7 @@ func TestDefaultValidationErrorHandler_SkipWhenWritten(t *testing.T) {
 	router.Use(func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("early"))
-		return next()
+		return next(w, r)
 	})
 	router.POST("/val", func(_ context.Context, _ valReq) (valRes, error) {
 		return valRes{OK: true}, nil

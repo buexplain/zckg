@@ -7,6 +7,7 @@ import (
 	"errors"
 	_ "modernc.org/sqlite"
 	"testing"
+	"time"
 )
 
 // TestSQLiteInteg_SelectWhereBasic 验证基础 WHERE 等值条件：WHERE age = 25 应精确匹配到对应行。
@@ -1021,6 +1022,19 @@ func TestSQLiteInteg_NewApi_WhereDate(t *testing.T) {
 	assertNoError(t, err)
 	if count != 2 {
 		t.Errorf("WhereDate: expected 2, got %d", count)
+	}
+}
+
+// TestSQLiteInteg_NewApi_WhereDate_Time 验证 WhereDate 传 time.Time 时仍能按日期匹配。
+func TestSQLiteInteg_NewApi_WhereDate_Time(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteEventsTable(t, db)
+
+	dt := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	count, err := db.Builder().Table("events").WhereDate("happened_at", dt).Count(context.Background())
+	assertNoError(t, err)
+	if count != 2 {
+		t.Errorf("WhereDate(time.Time): expected 2, got %d", count)
 	}
 }
 

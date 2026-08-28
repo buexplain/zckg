@@ -63,14 +63,14 @@ func TestOnionMiddlewareOrder(t *testing.T) {
 
 	mwA := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "A-before")
-		err := next()
+		err := next(w, r)
 		order = append(order, "A-after")
 		return err
 	}
 
 	mwB := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "B-before")
-		err := next()
+		err := next(w, r)
 		order = append(order, "B-after")
 		return err
 	}
@@ -121,7 +121,7 @@ func TestOnionMiddlewareShortCircuit(t *testing.T) {
 
 	mwB := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "B-before")
-		err := next()
+		err := next(w, r)
 		order = append(order, "B-after")
 		return err
 	}
@@ -160,7 +160,7 @@ func TestOnionMiddlewareErrorPropagation(t *testing.T) {
 	var capturedErr error
 
 	mwA := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		err := next()
+		err := next(w, r)
 		if err != nil {
 			capturedErr = err
 		}
@@ -295,14 +295,14 @@ func TestGroupMiddlewareWithGlobalMiddleware(t *testing.T) {
 
 	globalMW := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "global-before")
-		err := next()
+		err := next(w, r)
 		order = append(order, "global-after")
 		return err
 	}
 
 	groupMW := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "group-before")
-		err := next()
+		err := next(w, r)
 		order = append(order, "group-after")
 		return err
 	}
@@ -345,11 +345,11 @@ func TestNestedGroupMiddlewareInheritance(t *testing.T) {
 
 	parentMW := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "parent")
-		return next()
+		return next(w, r)
 	}
 	childMW := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "child")
-		return next()
+		return next(w, r)
 	}
 
 	router := NewRouter()
@@ -516,7 +516,7 @@ func TestInvalidHandlerPanic(t *testing.T) {
 // TestUseChainingRouter 验证 Router.Use 链式调用返回 *Router
 func TestUseChainingRouter(t *testing.T) {
 	mw := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		return next()
+		return next(w, r)
 	}
 
 	router := NewRouter()
@@ -529,7 +529,7 @@ func TestUseChainingRouter(t *testing.T) {
 // TestUseChainingGroup 验证 RouterGroup.Use 链式调用返回 *RouterGroup
 func TestUseChainingGroup(t *testing.T) {
 	mw := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		return next()
+		return next(w, r)
 	}
 
 	router := NewRouter()
@@ -546,7 +546,7 @@ func TestGroupUseOnlyAffectsSubsequentRoutes(t *testing.T) {
 
 	lateMW := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		order = append(order, "late")
-		return next()
+		return next(w, r)
 	}
 
 	router := NewRouter()
@@ -633,18 +633,18 @@ func TestRouterGroupAllHTTPMethods(t *testing.T) {
 	}
 }
 
-// TestMiddlewareNextCalledTwice 验证中间件重复调用 next() 时下游链与 handler 只执行一次：
+// TestMiddlewareNextCalledTwice 验证中间件重复调用 next(w, r) 时下游链与 handler 只执行一次：
 // 若无保护，handler 会被重复执行，写库等业务副作用重复触发且完全静默
 func TestMiddlewareNextCalledTwice(t *testing.T) {
 	var handlerCalls int
 	var secondErr error
 
 	mw := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-		if err := next(); err != nil {
+		if err := next(w, r); err != nil {
 			return err
 		}
-		// 模拟误写：重复调用 next()
-		secondErr = next()
+		// 模拟误写：重复调用 next(w, r)
+		secondErr = next(w, r)
 		return nil
 	}
 
@@ -663,10 +663,10 @@ func TestMiddlewareNextCalledTwice(t *testing.T) {
 	engine.ServeHTTP(rec, req)
 
 	if handlerCalls != 1 {
-		t.Fatalf("handler executed %d times, want 1 (duplicate next() re-runs downstream chain)", handlerCalls)
+		t.Fatalf("handler executed %d times, want 1 (duplicate next(w, r) re-runs downstream chain)", handlerCalls)
 	}
 	if secondErr == nil {
-		t.Fatal("second next() call should return error instead of silently re-running downstream")
+		t.Fatal("second next(w, r) call should return error instead of silently re-running downstream")
 	}
 }
 
