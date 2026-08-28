@@ -116,16 +116,16 @@ func TestTrieRequiredParamMatch(t *testing.T) {
 	router := NewRouter()
 	router.GET("/posts/{post_id}", paramEcho)
 
-	entry, values := router.matchParam("GET", "/posts/42")
+	entry, values := router.match("GET", "/posts/42")
 	if entry == nil {
 		t.Fatal("expected match, got nil")
 	}
 	if !reflect.DeepEqual(values, []string{"42"}) {
 		t.Fatalf("captured values = %v, want [42]", values)
 	}
-	if _, values := router.matchParam("GET", "/posts"); entry == nil || values != nil {
+	if entry, values := router.match("GET", "/posts"); entry == nil || values != nil {
 		// /posts 无终点 entry，应不命中
-		if e, _ := router.matchParam("GET", "/posts"); e != nil {
+		if e, _ := router.match("GET", "/posts"); e != nil {
 			t.Fatal("/posts should not match /posts/{post_id}")
 		}
 	}
@@ -136,17 +136,17 @@ func TestTrieOptionalParamMatch(t *testing.T) {
 	router.GET("/user/{name?}", hello)
 
 	// 提供参数时
-	entry, values := router.matchParam("GET", "/user/guest")
+	entry, values := router.match("GET", "/user/guest")
 	if entry == nil || !reflect.DeepEqual(values, []string{"guest"}) {
 		t.Fatalf("match /user/guest = %v, %v; want hit with [guest]", entry, values)
 	}
 	// 省略可选参数时
-	entry, values = router.matchParam("GET", "/user")
+	entry, values = router.match("GET", "/user")
 	if entry == nil || len(values) != 0 {
 		t.Fatalf("match /user = %v, %v; want omitted branch with empty values", entry, values)
 	}
 	// 多一段不命中
-	if e, _ := router.matchParam("GET", "/user/a/b"); e != nil {
+	if e, _ := router.match("GET", "/user/a/b"); e != nil {
 		t.Fatal("/user/a/b should not match /user/{name?}")
 	}
 }
@@ -155,15 +155,15 @@ func TestTrieMultiParamsTrailingOptional(t *testing.T) {
 	router := NewRouter()
 	router.GET("/posts/{post_id}/comments/{comment_id?}", paramEcho)
 
-	entry, values := router.matchParam("GET", "/posts/1/comments")
+	entry, values := router.match("GET", "/posts/1/comments")
 	if entry == nil || !reflect.DeepEqual(values, []string{"1"}) {
 		t.Fatalf("omitted trailing optional: entry=%v values=%v", entry, values)
 	}
-	entry, values = router.matchParam("GET", "/posts/1/comments/2")
+	entry, values = router.match("GET", "/posts/1/comments/2")
 	if entry == nil || !reflect.DeepEqual(values, []string{"1", "2"}) {
 		t.Fatalf("present trailing optional: entry=%v values=%v", entry, values)
 	}
-	if e, _ := router.matchParam("GET", "/posts/1"); e != nil {
+	if e, _ := router.match("GET", "/posts/1"); e != nil {
 		t.Fatal("/posts/1 should not match (no terminal entry)")
 	}
 }
@@ -173,16 +173,17 @@ func TestTrieStaticPreferredOverParam(t *testing.T) {
 	router.GET("/user/list", hello)
 	router.GET("/user/{name}", hello)
 
-	staticEntry := router.routes["GET"]["/user/list"]
-	entry, values := router.matchParam("GET", "/user/list")
-	// 基数树中静态分支优先，但 /user/list 在树上未注册终点，回退参数分支
-	if entry != nil && entry == staticEntry {
-		t.Fatal("static exact entry is not in trie, should not be returned by matchParam")
+	// 静态段优先于参数段：/user/list 命中静态路由，不捕获参数
+	entry, values := router.match("GET", "/user/list")
+	if entry == nil || values != nil {
+		t.Fatalf("match /user/list should hit static branch with no captured values, got %v, %v", entry, values)
 	}
-	if entry == nil || !reflect.DeepEqual(values, []string{"list"}) {
-		t.Fatalf("matchParam /user/list should fall back to param branch, got %v, %v", entry, values)
+	// /user/other 回退参数分支
+	entry, values = router.match("GET", "/user/other")
+	if entry == nil || !reflect.DeepEqual(values, []string{"other"}) {
+		t.Fatalf("match /user/other should fall back to param branch, got %v, %v", entry, values)
 	}
-	// 引擎层面：精确路由优先于参数路由
+	// 引擎层面：静态路由优先于参数路由
 	engine := NewEngine()
 	engine.Router = router
 	req := httptest.NewRequest(http.MethodGet, "/user/list?name=ignored", nil)
@@ -199,7 +200,7 @@ func TestTrieBacktrackToParamBranch(t *testing.T) {
 	router.GET("/a/static/c", hello)
 
 	// 静态分支 static->c 在请求 /a/static/b 下失败，应回溯参数分支命中 x=static
-	entry, values := router.matchParam("GET", "/a/static/b")
+	entry, values := router.match("GET", "/a/static/b")
 	if entry == nil || !reflect.DeepEqual(values, []string{"static"}) {
 		t.Fatalf("backtrack match failed: entry=%v values=%v", entry, values)
 	}
@@ -226,10 +227,10 @@ func TestTrieParamConflictPanics(t *testing.T) {
 	})
 }
 
-// TestMatchParamNilTree 覆盖基数树未初始化时 matchParam 的提前返回分支
+// TestMatchParamNilTree 覆盖基数树未初始化时 match 的提前返回分支
 func TestMatchParamNilTree(t *testing.T) {
 	r := &Router{}
-	entry, values := r.matchParam(http.MethodGet, "/x")
+	entry, values := r.match(http.MethodGet, "/x")
 	if entry != nil || values != nil {
 		t.Fatalf("expected nil entry and values, got %v / %v", entry, values)
 	}
@@ -242,7 +243,7 @@ func TestTrieSharedStaticPrefix(t *testing.T) {
 	router.GET("/api/shared/y/{id}", paramEcho)
 
 	for _, p := range []string{"/api/shared/x/1", "/api/shared/y/2"} {
-		entry, values := router.matchParam(http.MethodGet, p)
+		entry, values := router.match(http.MethodGet, p)
 		if entry == nil || len(values) != 1 {
 			t.Fatalf("route %s should match, got entry=%v values=%v", p, entry, values)
 		}

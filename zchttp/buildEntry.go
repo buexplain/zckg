@@ -42,7 +42,7 @@ type routeEntry struct {
 	needsRequestPhaseDefaults bool
 	// 请求阶段是否需要执行 validateNonzero（类型树任意深度存在 nonzero 字段，传递性标记）
 	needsNonzeroValidation bool
-	// 路由路径参数与 Req 字段的绑定关系，按注册顺序与捕获值对位；精确路由为 nil
+	// 路由路径参数与 Req 字段的绑定关系，按注册顺序与捕获值对位；静态路由为 nil
 	pathParams []pathParamBinding
 }
 

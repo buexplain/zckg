@@ -703,21 +703,34 @@ func TestParamRouteNoFieldPanic(t *testing.T) {
 	})
 }
 
-// TestMatchParam_UnknownMethod 覆盖 paramTrees 中无对应 method 时直接返回 nil 的分支
-func TestMatchParam_UnknownMethod(t *testing.T) {
+// TestMultiSlashRoutePanic 验证显式注册多斜杠路径时注册 panic：
+// 基数树按 "/" 逐段切分，空段无法表达（//a、/a//b 均含空段）。
+// 请求侧多斜杠（注册 /a/b、请求 /a//b）不受影响，仍 404。
+func TestMultiSlashRoutePanic(t *testing.T) {
+	cases := []string{"//a", "/a//b"}
+	for _, p := range cases {
+		expectPanicContains(t, []string{"invalid route path", "empty path segment"}, func() {
+			router := NewRouter()
+			router.GET(p, hello)
+		})
+	}
+}
+
+// TestMatch_UnknownMethod 覆盖 trees 中无对应 method 时直接返回 nil 的分支
+func TestMatch_UnknownMethod(t *testing.T) {
 	router := NewRouter()
-	entry, vals := router.matchParam("FOO", "/a/b")
+	entry, vals := router.match("FOO", "/a/b")
 	if entry != nil || vals != nil {
 		t.Fatalf("expected nil for unknown method, got %v %v", entry, vals)
 	}
-	// 未初始化 paramTrees 的 Router（root 为 nil）同样安全返回 nil
+	// 未初始化 trees 的 Router（root 为 nil）同样安全返回 nil
 	bare := &Router{}
-	entry, vals = bare.matchParam(http.MethodGet, "/a/b")
+	entry, vals = bare.match(http.MethodGet, "/a/b")
 	if entry != nil || vals != nil {
 		t.Fatalf("expected nil for bare router, got %v %v", entry, vals)
 	}
 	// 根路径 "/" 归一化为空串后无可选参数注册时应未命中
-	entry, vals = router.matchParam(http.MethodGet, "/")
+	entry, vals = router.match(http.MethodGet, "/")
 	if entry != nil || vals != nil {
 		t.Fatalf("expected nil for root path, got %v %v", entry, vals)
 	}

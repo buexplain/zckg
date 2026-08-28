@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// routeNode 是参数路由基数树的节点，按 path 段逐层下探：
+// routeNode 是基数树的节点，按 path 段逐层下探：
 //   - static 子节点对应静态字面量段，匹配时优先于参数段
 //   - param 子节点对应 {name}/{name?} 参数段，同一节点同一位置仅允许一个参数名
 //   - entries[0] 为按完整段数命中时的 entry；entries[1] 为尾部可选参数被省略时的 entry
@@ -14,15 +14,15 @@ type routeNode struct {
 	param     *routeNode
 	paramName string         // param 子节点的参数名（用于冲突检测）
 	optional  bool           // param 子节点是否为可选参数 {name?}
-	entries   [2]*routeEntry // [0]=参数命中, [1]=可选参数省略
+	entries   [2]*routeEntry // [0]=完整命中, [1]=可选参数省略
 	regEntry  *routeEntry    // 首个经过本节点的 entry，用于中间节点冲突时的位置提示
 }
 
-// insertParamRoute 将一条参数路由按段插入基数树。
+// insertRoute 将一条路由按段插入基数树（静态段与参数段同树）。
 // 遇可选参数段时，省略分支登记在 param 节点的 entries[1]，
 // 同时继续下探以便后续段命中 entries[0]。
 // 各类冲突（终点重复、参数名不一致、可选性不一致）立即 panic，消息包含冲突双方 handler 位置。
-func insertParamRoute(root *routeNode, segments []routeSegment, entry *routeEntry, method, path string) {
+func insertRoute(root *routeNode, segments []routeSegment, entry *routeEntry, method, path string) {
 	node := root
 	for _, seg := range segments {
 		if !seg.isParam {
@@ -63,7 +63,7 @@ func insertParamRoute(root *routeNode, segments []routeSegment, entry *routeEntr
 	}
 }
 
-// routeConflictPanic 以与精确路由冲突一致的格式 panic；
+// routeConflictPanic 以与静态路由冲突一致的格式 panic；
 // existing 可能为 nil（中间节点冲突且该节点尚无终点 entry），此时仅提示冲突原因与新路由位置
 func routeConflictPanic(method, path string, existing, incoming *routeEntry, reason string) {
 	if reason == "" {

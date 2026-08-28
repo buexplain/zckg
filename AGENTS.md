@@ -10,7 +10,7 @@
 |---|---|---|
 | `zcconfig` | 配置加载与读取：`.env` 文件（Env 通道）+ 业务配置树（Config 通道），泛型读取，另提供 `DBConfig` DSN 生成 | `config.go`、`cast.go`、`env.go`、`dbConfig.go` |
 | `zcdb` | 数据库访问：Builder 查询构造器（MySQL / PostgreSQL / SQLite 三方言）、主从连接池、读写分离、事务、Schema 元数据 | `builder_*.go`、`grammar.go`、`pool.go`、`db_dao.go` |
-| `zchttp` | HTTP 框架：路由（精确 + 基数树参数路由）、反射式参数绑定与校验、中间件、OpenAPI 生成 | `httpEngine.go`、`router.go`、`binding.go`、`openapi.go` |
+| `zchttp` | HTTP 框架：路由（基数树，静态段 + 参数段同树）、反射式参数绑定与校验、中间件、OpenAPI 生成 | `httpEngine.go`、`router.go`、`binding.go`、`openapi.go` |
 | `zcmodel` | 数据库模型代码生成：输入表结构，输出 Entity/DO 结构体与互转方法的 Go 源码，支持 AST 增量再生成 | `generate.go`、`build.go`、`columnTypeToGoType.go` |
 | `zcquit` | 优雅退出：全局可取消上下文 + 信号监听 + 分级清理 handler | `quit.go` |
 

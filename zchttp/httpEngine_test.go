@@ -579,24 +579,24 @@ func TestPathParamE2E_GroupPrefix(t *testing.T) {
 	}
 }
 
-// TestPathParamE2E_ExactRoutePreferred 验证精确路由优先于可选参数路由的省略分支
-func TestPathParamE2E_ExactRoutePreferred(t *testing.T) {
+// TestPathParamE2E_StaticRoutePreferred 验证静态路由优先于可选参数路由的省略分支
+func TestPathParamE2E_StaticRoutePreferred(t *testing.T) {
 	router := NewRouter()
 	router.GET("/user", func(_ context.Context, _ helloReq) (helloRes, error) {
-		return helloRes{Message: "exact"}, nil
+		return helloRes{Message: "static"}, nil
 	})
 	router.GET("/user/{name?}", hello)
 
 	engine := NewEngine()
 	engine.Router = router
 
-	// /user 命中精确路由
+	// /user 命中静态路由
 	rec := httptest.NewRecorder()
 	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/user", nil))
 	var res helloRes
 	decodeData(t, rec, &res)
-	if res.Message != "exact" {
-		t.Fatalf("message = %q, want 'exact' (exact route preferred)", res.Message)
+	if res.Message != "static" {
+		t.Fatalf("message = %q, want 'static' (static route preferred)", res.Message)
 	}
 
 	// /user/x 命中参数路由

@@ -60,36 +60,19 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 
 	paths := map[string]any{}
 	// 排序 method 与 path 保证输出确定性（不同包同名类型的 schema 序号稳定，快照/增量 diff 友好）
-	methods := make([]string, 0, len(r.routes))
-	for method := range r.routes {
-		methods = append(methods, method)
-	}
-	sort.Strings(methods)
-	for _, method := range methods {
-		routes := r.routes[method]
-		sortedPaths := make([]string, 0, len(routes))
-		for path := range routes {
-			sortedPaths = append(sortedPaths, path)
+	sortedRoutes := make([]routeRecord, len(r.routes))
+	copy(sortedRoutes, r.routes)
+	sort.Slice(sortedRoutes, func(i, j int) bool {
+		if sortedRoutes[i].method != sortedRoutes[j].method {
+			return sortedRoutes[i].method < sortedRoutes[j].method
 		}
-		sort.Strings(sortedPaths)
-		for _, path := range sortedPaths {
-			op := g.buildOperation(method, routes[path], nil, nil)
-			if op == nil {
-				continue
-			}
-			item, ok := paths[path].(map[string]any)
-			if !ok {
-				item = map[string]any{}
-				paths[path] = item
-			}
-			item[strings.ToLower(method)] = op
-		}
-	}
-	// 参数路由：从 paramRoutes 索引遍历（注册顺序），路径模板含 {name}/{name?} 参数段。
-	// 模板中的参数名声明为 path 参数（in: path）并从 query 参数中排除；
-	// OpenAPI 无 {name?} 语法，可选参数转换为 {name} 形式并以 required:false 声明
-	for _, pre := range r.paramRoutes {
-		segments, perr := parseRoutePath(pre.path)
+		return sortedRoutes[i].path < sortedRoutes[j].path
+	})
+	for _, rec := range sortedRoutes {
+		// 参数路由的 {name}/{name?} 段声明为 path 参数并从 query 排除；
+		// 静态路由无参数段，paramNames/optionalParams 为空集。
+		// OpenAPI 无 {name?} 语法，可选参数转换为 {name} 形式并以 required:false 声明
+		segments, perr := parseRoutePath(rec.path)
 		if perr != nil {
 			continue // 注册阶段已校验，防御性跳过
 		}
@@ -103,18 +86,18 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 				}
 			}
 		}
-		op := g.buildOperation(pre.method, pre.entry, paramNames, optionalParams)
+		op := g.buildOperation(rec.method, rec.entry, paramNames, optionalParams)
 		if op == nil {
 			continue
 		}
 		// 路径模板转换为 OpenAPI 规范形式：{name?} → {name}
-		openapiPath := strings.ReplaceAll(pre.path, "?}", "}")
+		openapiPath := strings.ReplaceAll(rec.path, "?}", "}")
 		item, ok := paths[openapiPath].(map[string]any)
 		if !ok {
 			item = map[string]any{}
 			paths[openapiPath] = item
 		}
-		item[strings.ToLower(pre.method)] = op
+		item[strings.ToLower(rec.method)] = op
 	}
 
 	infoMap := map[string]any{
@@ -152,14 +135,13 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 // 指针嵌套（*Struct）或切片/map 元素 → 注册阶段无法到达，仅请求阶段 fill 指针类型。
 // 此信息在 decorate 中判断值类型字段 default 是否应展示。
 func (g *openAPIGenerator) collectTypeUsages(r *Router) {
-	for _, routes := range r.routes {
-		for _, entry := range routes {
-			if entry.reqType != nil {
-				g.walkTypeUsage(derefType(entry.reqType), true, map[reflect.Type]bool{})
-			}
-			if entry.resType != nil {
-				g.walkTypeUsage(derefType(entry.resType), true, map[reflect.Type]bool{})
-			}
+	for _, rec := range r.routes {
+		entry := rec.entry
+		if entry.reqType != nil {
+			g.walkTypeUsage(derefType(entry.reqType), true, map[reflect.Type]bool{})
+		}
+		if entry.resType != nil {
+			g.walkTypeUsage(derefType(entry.resType), true, map[reflect.Type]bool{})
 		}
 	}
 }
@@ -236,14 +218,13 @@ func (g *openAPIGenerator) walkTypeUsage(t reflect.Type, viaValue bool, visiting
 //   - map 值类型为 Struct 或 *Struct：继承父级可达性
 //   - map 值类型为 Slice/Array：不可达（applyDefaults 无法穿透此类多层容器）
 func (g *openAPIGenerator) collectDefaultsReachability(r *Router) {
-	for _, routes := range r.routes {
-		for _, entry := range routes {
-			if entry.reqType != nil {
-				g.walkDefaultsReachability(derefType(entry.reqType), true, map[reflect.Type]bool{})
-			}
-			if entry.resType != nil {
-				g.walkDefaultsReachability(derefType(entry.resType), true, map[reflect.Type]bool{})
-			}
+	for _, rec := range r.routes {
+		entry := rec.entry
+		if entry.reqType != nil {
+			g.walkDefaultsReachability(derefType(entry.reqType), true, map[reflect.Type]bool{})
+		}
+		if entry.resType != nil {
+			g.walkDefaultsReachability(derefType(entry.resType), true, map[reflect.Type]bool{})
 		}
 	}
 }
@@ -308,7 +289,7 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 }
 
 // buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary）。
-// paramNames 为路径模板中的 {name}/{name?} 参数名集合（精确路由为 nil）：对应字段声明为
+// paramNames 为路径模板中的 {name}/{name?} 参数名集合（无参数段的路由为空集）：对应字段声明为
 // path 参数（in: path）且不再作为 query 参数展示；optionalParams 标记其中可选参数。
 func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, paramNames, optionalParams map[string]bool) map[string]any {
 	// 使用注册阶段预计算的类型信息，避免重复反射

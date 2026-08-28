@@ -72,8 +72,8 @@ func benchPathParamHandler(_ context.Context, req *benchPathParamReq) (benchPath
 
 // ---------- 基准用例 ----------
 
-// 精确路由 + GET query 绑定：最小热路径
-func BenchmarkServeHTTP_ExactRoute_GET(b *testing.B) {
+// 静态路由 + GET query 绑定：最小热路径
+func BenchmarkServeHTTP_StaticRoute_GET(b *testing.B) {
 	e := NewEngine()
 	e.Router.GET("/api/user", benchSimpleHandler)
 	req := httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil)
@@ -86,8 +86,8 @@ func BenchmarkServeHTTP_ExactRoute_GET(b *testing.B) {
 	}
 }
 
-// 精确路由 + POST JSON 绑定：典型业务路径
-func BenchmarkServeHTTP_ExactRoute_POST_JSON(b *testing.B) {
+// 静态路由 + POST JSON 绑定：典型业务路径
+func BenchmarkServeHTTP_StaticRoute_POST_JSON(b *testing.B) {
 	e := NewEngine()
 	e.Router.POST("/api/user", benchSimpleHandler)
 	body := `{"name":"alice","age":18}`
@@ -122,7 +122,7 @@ func BenchmarkServeHTTP_Nested_Nonzero(b *testing.B) {
 	}
 }
 
-// 参数路由基数树匹配路径：与 ExactRoute_GET 使用相同的 handler 形状（benchSimpleHandler，
+// 参数路由基数树匹配路径：与 StaticRoute_GET 使用相同的 handler 形状（benchSimpleHandler，
 // 仅路径注册方式不同），使基准真正隔离路由匹配开销（含路径参数绑定）
 func BenchmarkServeHTTP_ParamRoute(b *testing.B) {
 	e := NewEngine()

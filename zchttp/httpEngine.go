@@ -222,7 +222,7 @@ func DefaultNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 
 // ServeHTTP 实现 http.Handler，是请求处理的总入口：
 //  1. MaxBodyBytes > 0 时以 http.MaxBytesReader 包裹请求体（超限绑定失败映射为 400）；
-//  2. 路由查找：精确路由表优先，未命中回退参数路由基数树（末尾斜杠归一化）；
+//  2. 路由查找：基数树匹配，静态段优先、静态分支失败回溯参数段（末尾斜杠归一化）；
 //  3. 构造 Req 并绑定 query/body/路径参数与请求阶段默认值（绑定失败不提前返回，
 //     错误随中间件链穿透到 core 层）；
 //  4. 执行洋葱模型中间件链；*BindingError/*ValidationError 路由到 OnValidationError
@@ -251,17 +251,10 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 1. 查找路由：先按 method+path 精确匹配，未命中再回退到参数路由基数树匹配
-	//    （精确路由优先；末尾斜杠归一化，使 /hello 与 /hello/ 等价）
+	// 1. 查找路由：在基数树上匹配（静态段优先于参数段，静态分支失败回溯参数分支；
+	//    末尾斜杠归一化，使 /hello 与 /hello/ 等价）
 	normalizedPath := normalizePath(r.URL.Path)
-	var entry *routeEntry
-	var paramValues []string
-	if methodRoutes, ok := e.Router.routes[r.Method]; ok {
-		entry = methodRoutes[normalizedPath]
-	}
-	if entry == nil {
-		entry, paramValues = e.Router.matchParam(r.Method, normalizedPath)
-	}
+	entry, paramValues := e.Router.match(r.Method, normalizedPath)
 	if entry == nil {
 		e.OnNotFound(rw, r)
 		return
