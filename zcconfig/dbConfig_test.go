@@ -131,6 +131,72 @@ func TestDBConfig_GetMasterDSN(t *testing.T) {
 	}
 }
 
+// TestDBConfig_PostgresDSNEscape 锁死 postgres 键值对 DSN 中特殊字符的转义行为：
+// 值含空白/单引号/反斜杠时以单引号包裹并按 lib/pq 规则转义，简单值原样输出。
+func TestDBConfig_PostgresDSNEscape(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  DBConfig
+		want string
+	}{
+		{
+			name: "密码含空格",
+			cfg: DBConfig{
+				Driver:   "postgres",
+				Host:     "127.0.0.1",
+				Port:     5432,
+				Username: "postgres",
+				Password: "pa ss",
+				Database: "test_db",
+			},
+			want: "host=127.0.0.1 port=5432 user=postgres password='pa ss' dbname=test_db sslmode=disable",
+		},
+		{
+			name: "密码含单引号与反斜杠",
+			cfg: DBConfig{
+				Driver:   "postgres",
+				Host:     "127.0.0.1",
+				Port:     5432,
+				Username: "postgres",
+				Password: `p'a\ss`,
+				Database: "test_db",
+			},
+			want: `host=127.0.0.1 port=5432 user=postgres password='p\'a\\ss' dbname=test_db sslmode=disable`,
+		},
+		{
+			name: "用户名与库名含空格",
+			cfg: DBConfig{
+				Driver:   "postgres",
+				Host:     "127.0.0.1",
+				Port:     5432,
+				Username: "app user",
+				Password: "root",
+				Database: "my db",
+			},
+			want: "host=127.0.0.1 port=5432 user='app user' password=root dbname='my db' sslmode=disable",
+		},
+		{
+			name: "简单值不受影响（与既有输出一致）",
+			cfg: DBConfig{
+				Driver:   "postgres",
+				Host:     "127.0.0.1",
+				Port:     5432,
+				Username: "postgres",
+				Password: "root",
+				Database: "test_db",
+			},
+			want: "host=127.0.0.1 port=5432 user=postgres password=root dbname=test_db sslmode=disable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.GetMasterDSN(); got != tt.want {
+				t.Errorf("期望 %q，实际 %q", tt.want, got)
+			}
+		})
+	}
+}
+
 // TestDBConfig_GetSlaveDSN 验证从库 DSN 列表组装：复用主库的 Database / Charset / Loc，
 // 仅 Host / Port / Username / Password 取自各自的 DBSlaveConfig。
 func TestDBConfig_GetSlaveDSN(t *testing.T) {

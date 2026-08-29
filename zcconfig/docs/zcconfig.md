@@ -122,7 +122,7 @@ zcconfig/
 | 驱动 | 格式 | 说明 |
 |------|------|------|
 | `mysql` | `user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local` | `Charset` 为空默认 `utf8mb4`，`Loc` 为空默认 `Local`，`parseTime` 恒为 true（保证 `time.Time` 字段可直接扫描） |
-| `postgres` | `host=... port=... user=... password=... dbname=... sslmode=disable` | 键值对格式，密码无需转义；`password` / `dbname` 为空时省略对应键，`host` / `port` / `user` 恒输出（空 username 也输出 `user=`），`sslmode` 恒为 disable |
+| `postgres` | `host=... port=... user=... password=... dbname=... sslmode=disable` | 键值对格式；`password` / `user` / `host` / `dbname` 的值含空白、单引号或反斜杠时自动以单引号包裹并按 lib/pq 规则转义（`\` → `\\`、`'` → `\'`），简单值原样输出；`password` / `dbname` 为空时省略对应键，`host` / `port` / `user` 恒输出（空 username 也输出 `user=`），`sslmode` 恒为 disable |
 | `sqlite` | `Database` 原样返回 | 连接串即文件路径，如 `:memory:` 或 `file:/path/to.db` |
 
 除上表三种标准驱动名外，`buildDSN` 还接受别名：`sqlite3` 等同 `sqlite`，`postgresql` / `pgsql` 等同 `postgres`。未知驱动返回空字符串，由调用方（如 `zcdb.NewPool`）校验报错。从库复用主库的 `Database` / `Charset` / `Loc`，仅 `Host` / `Port` / `Username` / `Password` 取自各自的 `DBSlaveConfig`；`Slaves` 为空时 `GetSlaveDSN` 返回 nil。

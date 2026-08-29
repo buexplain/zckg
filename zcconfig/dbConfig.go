@@ -1,6 +1,10 @@
 package zcconfig
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
 
 // DBConfig 数据库连接配置结构体，用于承载数据库连接所需的各项参数。
 // 通常与 Register / Config 配合使用：通过 Register 注册配置数据后，
@@ -60,7 +64,8 @@ type DBConfig struct {
 //   - mysql：user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local
 //     （Charset 为空时默认 "utf8mb4"，Loc 为空时默认 "Local"，parseTime 恒为 true）
 //   - postgres：host=... port=... user=... password=... dbname=... sslmode=disable
-//     （键值对格式，密码无需转义；sslmode 恒为 disable）
+//     （键值对格式；含空白/单引号/反斜杠的值自动以单引号包裹并按 lib/pq 规则转义；
+//     sslmode 恒为 disable）
 //   - sqlite：Database 原样返回（":memory:" 或文件路径，如 "file:/path/to.db"）
 //
 // 未知驱动返回空字符串，由调用方（如 zcdb.NewPool）校验报错。
@@ -94,13 +99,14 @@ func (d DBConfig) buildDSN(host string, port int, username, password string) str
 		// sqlite 的连接串就是数据库文件路径（或 ":memory:"）
 		return d.Database
 	case "postgres", "postgresql", "pgsql":
-		// lib/pq 键值对格式：避免 URL 格式中密码特殊字符的转义问题
-		dsn := fmt.Sprintf("host=%s port=%d user=%s", host, port, username)
+		// lib/pq 键值对格式：值含空白/单引号/反斜杠时单引号包裹并转义，避免被误切分
+		dsn := fmt.Sprintf("host=%s port=%d user=%s",
+			escapePostgresValue(host), port, escapePostgresValue(username))
 		if password != "" {
-			dsn += " password=" + password
+			dsn += " password=" + escapePostgresValue(password)
 		}
 		if d.Database != "" {
-			dsn += " dbname=" + d.Database
+			dsn += " dbname=" + escapePostgresValue(d.Database)
 		}
 		return dsn + " sslmode=disable"
 	case "mysql":
@@ -117,6 +123,19 @@ func (d DBConfig) buildDSN(host string, port int, username, password string) str
 	default:
 		return ""
 	}
+}
+
+// escapePostgresValue 转义 lib/pq 键值对 DSN 中的单个值。
+// 值含空白、单引号或反斜杠时以单引号包裹并按 lib/pq 规则转义（\ → \\、' → \'），
+// 简单值原样返回，保持与既有输出一致。
+func escapePostgresValue(v string) string {
+	if !strings.ContainsAny(v, "'\\") && strings.IndexFunc(v, unicode.IsSpace) < 0 {
+		return v
+	}
+	// 顺序敏感：先转义反斜杠，再转义单引号，否则会把刚引入的反斜杠二次转义
+	escaped := strings.ReplaceAll(v, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `'`, `\'`)
+	return "'" + escaped + "'"
 }
 
 // DBSlaveConfig 从库配置结构体，用于承载从库连接所需的各项参数。
