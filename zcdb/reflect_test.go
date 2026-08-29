@@ -270,6 +270,77 @@ func TestParseStruct_EmbeddedShadowOuterWins(t *testing.T) {
 	}
 }
 
+// TestParseStruct_RecursiveEmbedSelf 锁死：自引用嵌入结构体（type E struct{ *E }）
+// 展开终止而非无限循环，且普通字段仍可映射。
+func TestParseStruct_RecursiveEmbedSelf(t *testing.T) {
+	// 类型名须大写（导出）：未导出的匿名嵌入字段会被 IsExported 直接跳过，
+	// 无法触发嵌入展开路径，也就无法锁死防环逻辑
+	type RecSelf struct {
+		*RecSelf
+		Name string `db:"name"`
+	}
+
+	info := parseStruct(reflect.TypeOf(RecSelf{}), "")
+	if info == nil {
+		t.Fatal("parseStruct returned nil")
+	}
+	if len(info.Fields) != 1 {
+		t.Fatalf("expected 1 field (recursive embed skipped, name kept), got %d: %+v", len(info.Fields), info.Fields)
+	}
+	if info.Fields[0].Column != "name" || !reflect.DeepEqual(info.Fields[0].Index, []int{1}) {
+		t.Errorf("expected name@[1], got %s@%v", info.Fields[0].Column, info.Fields[0].Index)
+	}
+}
+
+// 互引用嵌入对抗类型（须声明在包级：函数内局部类型不支持前向引用；
+// 类型名须大写导出，否则匿名嵌入字段被 IsExported 跳过、无法触发防环）
+type RecEmbedA struct{ *RecEmbedB }
+type RecEmbedB struct {
+	*RecEmbedA
+	X int `db:"x"`
+}
+
+// TestParseStruct_RecursiveEmbedMutual 锁死：互引用嵌入结构体（type A struct{ *B } /
+// type B struct{ *A }）展开终止，且非递归字段仍可映射。
+func TestParseStruct_RecursiveEmbedMutual(t *testing.T) {
+	info := parseStruct(reflect.TypeOf(RecEmbedA{}), "")
+	if info == nil {
+		t.Fatal("parseStruct returned nil")
+	}
+	if len(info.Fields) != 1 {
+		t.Fatalf("expected 1 field (recursive embed skipped, x kept), got %d: %+v", len(info.Fields), info.Fields)
+	}
+	if info.Fields[0].Column != "x" || !reflect.DeepEqual(info.Fields[0].Index, []int{0, 1}) {
+		t.Errorf("expected x@[0 1], got %s@%v", info.Fields[0].Column, info.Fields[0].Index)
+	}
+}
+
+// TestParseStruct_DiamondEmbed 锁死：菱形嵌入（同一类型经两个兄弟路径嵌入）不因
+// visited 去重而改变「外层优先」结果——最先（最浅）路径的字段仍生效。
+func TestParseStruct_DiamondEmbed(t *testing.T) {
+	// 类型名须大写导出：否则匿名嵌入字段被 IsExported 跳过、无法触发展开路径
+	type RecD struct {
+		Y int `db:"y"`
+	}
+	type RecB struct{ RecD }
+	type RecC struct{ RecD }
+	type RecA struct {
+		RecB
+		RecC
+	}
+
+	info := parseStruct(reflect.TypeOf(RecA{}), "")
+	if info == nil {
+		t.Fatal("parseStruct returned nil")
+	}
+	if len(info.Fields) != 1 {
+		t.Fatalf("expected 1 field (y deduped), got %d: %+v", len(info.Fields), info.Fields)
+	}
+	if !reflect.DeepEqual(info.Fields[0].Index, []int{0, 0, 0}) {
+		t.Errorf("expected y@[0 0 0] (via recB), got %v", info.Fields[0].Index)
+	}
+}
+
 // ==================== extractInsertData 测试 ====================
 
 // TestExtractInsertData_SingleStruct 验证单个结构体。

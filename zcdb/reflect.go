@@ -72,7 +72,13 @@ func collectStructFields(t reflect.Type, tagName string) []structField {
 
 	var fields []structField
 	seen := make(map[string]bool)
+	// visited 记录已展开（或已入队待展开）的嵌入结构体类型。自引用嵌入（type E struct{ *E }）
+	// 或互引用嵌入（type A struct{ *B } / type B struct{ *A }）会让 BFS 队列无限入队、
+	// 无界增长内存；同一类型只需展开一次——其列名由类型自身决定、与嵌入路径无关，
+	// 重复展开只会产生已被 seen 去重的同名列，跳过不改变「外层优先 + 遮蔽」语义。
+	visited := make(map[reflect.Type]bool)
 	queue := []pending{{typ: t}}
+	visited[t] = true
 
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -99,6 +105,10 @@ func collectStructFields(t reflect.Type, tagName string) []structField {
 					embeddedType = embeddedType.Elem()
 				}
 				if embeddedType.Kind() == reflect.Struct {
+					if visited[embeddedType] {
+						continue
+					}
+					visited[embeddedType] = true
 					queue = append(queue, pending{typ: embeddedType, index: index})
 					continue
 				}

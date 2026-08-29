@@ -255,6 +255,28 @@ func TestGetScanFieldInfo_EmbeddedShadowOuterWins(t *testing.T) {
 	}
 }
 
+// TestGetScanFieldInfo_RecursiveEmbedTerminates 锁死：自引用嵌入结构体经
+// getScanFieldInfo（扫描路径）展开终止而非无限循环，且普通字段仍可映射。
+func TestGetScanFieldInfo_RecursiveEmbedTerminates(t *testing.T) {
+	// 类型名须大写导出：否则匿名嵌入字段被 IsExported 跳过、无法触发展开路径
+	type RecSelf struct {
+		*RecSelf
+		Name string `db:"name"`
+	}
+
+	info := getScanFieldInfo(reflect.TypeOf(RecSelf{}), "")
+	if info == nil {
+		t.Fatal("getScanFieldInfo returned nil")
+	}
+	idx, ok := info.columnIndex["name"]
+	if !ok {
+		t.Fatalf("column 'name' not found in columnIndex: %+v", info.columnIndex)
+	}
+	if !reflect.DeepEqual(idx, []int{1}) {
+		t.Errorf("expected name@[1], got %v", idx)
+	}
+}
+
 // ==================== nullSafeField.Scan 测试 ====================
 
 // TestBug_ScanStringToMapJSON 复现审查候选 #7：[]byte→map 走 JSON 反序列化，
