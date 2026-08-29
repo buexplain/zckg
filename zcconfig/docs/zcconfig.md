@@ -121,7 +121,7 @@ zcconfig/
 
 | 驱动 | 格式 | 说明 |
 |------|------|------|
-| `mysql` | `user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local` | `Charset` 为空默认 `utf8mb4`，`Loc` 为空默认 `Local`，`parseTime` 恒为 true（保证 `time.Time` 字段可直接扫描） |
+| `mysql` | `user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local` | `Charset` 为空默认 `utf8mb4`，`Loc` 为空默认 `Local`，`parseTime` 恒为 true（保证 `time.Time` 字段可直接扫描）。凭据（用户名/密码）含 `@`/`:`/`/` 由 go-sql-driver 从后向前解析正确处理、无需转义；`Database`/`Charset`/`Loc` 不应包含 `?`/`&`/`=`/`/`（驱动对参数段无转义机制） |
 | `postgres` | `host=... port=... user=... password=... dbname=... sslmode=disable` | 键值对格式；`password` / `user` / `host` / `dbname` 的值含空白、单引号或反斜杠时自动以单引号包裹并按 lib/pq 规则转义（`\` → `\\`、`'` → `\'`），简单值原样输出；`password` / `dbname` 为空时省略对应键，`host` / `port` / `user` 恒输出（空 username 也输出 `user=`），`sslmode` 恒为 disable |
 | `sqlite` | `Database` 原样返回 | 连接串即文件路径，如 `:memory:` 或 `file:/path/to.db` |
 
@@ -370,6 +370,8 @@ pollInterval := zcconfig.Config("server.poll_interval", 1*time.Second) // 2 * ti
 ```
 
 支持的 Duration 格式遵循 Go `time.ParseDuration` 规范，如 `"10s"`、`"1h30m"`、`"500ms"`、`"100us"`、`"100ns"` 等。纯数字（如 `"10"`）缺少时间单位，解析失败返回默认值。
+
+> 注意：`time.ParseDuration` 仅对 **string 源值**生效。若存储值是数值类型（如 `.env` 中 `TIMEOUT=30` 被推断为 int），会走 reflect 兜底转换为 `time.Duration` 底层 int64——`30` 得到 `30ns` 而非 `30s`。需要秒级语义时请在 `.env` 中写成带单位的字符串（如 `30s`），或以带单位的 `time.Duration` 值作为默认值。
 
 ### 多次注册深度合并
 

@@ -31,6 +31,11 @@ func cast[T any](v any, def T) T {
 	// 通过 reflect 检查是否可转换，例如 int -> float64、int32 -> int 等
 	rv := reflect.ValueOf(v)
 	rt := reflect.TypeOf(def)
+	if rt == nil {
+		// def 为 nil 接口（如 Env[error]("KEY", nil)）：目标类型不可知，
+		// 直接返回 def，避免对 nil reflect.Type 调用 Kind() 触发空指针 panic
+		return def
+	}
 
 	// 针对 string 源值，尝试用 strconv 或 time.ParseDuration 解析到目标类型
 	if rv.Kind() == reflect.String {

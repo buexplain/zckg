@@ -595,3 +595,29 @@ func TestLoadEnv_Utf8Bom(t *testing.T) {
 		t.Errorf("期望 'v'，实际 %q", v)
 	}
 }
+
+// TestEnv_NilInterfaceDefKeyExists 验证键存在、目标为接口类型且默认值为 nil 时，
+// Env 返回 nil 而非 panic（cast 对 nil reflect.Type 的守卫，修复 P1）。
+func TestEnv_NilInterfaceDefKeyExists(t *testing.T) {
+	reset()
+	envMu.Lock()
+	envData["SOME_KEY"] = "some-value"
+	envMu.Unlock()
+
+	if v := Env[error]("SOME_KEY", nil); v != nil {
+		t.Errorf("Env[error] 期望 nil，实际 %v", v)
+	}
+}
+
+// TestConfig_NilInterfaceDefKeyExists 验证业务配置键存在、目标为接口类型且默认值为 nil 时，
+// Config 返回 nil 而非 panic。
+func TestConfig_NilInterfaceDefKeyExists(t *testing.T) {
+	reset()
+	Register("app", func() map[string]any {
+		return map[string]any{"value": "some-value"}
+	})
+
+	if v := Config[fmt.Stringer]("app.value", nil); v != nil {
+		t.Errorf("Config[fmt.Stringer] 期望 nil，实际 %v", v)
+	}
+}

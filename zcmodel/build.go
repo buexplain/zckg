@@ -106,7 +106,7 @@ func buildStruct(name string, columns []Column, useAny bool, comment string, col
 		// 构建字段 tag：顺序为 json、columnTagName、description；columnTagName 为空时跳过列名 tag
 		var tagParts []string
 		if col.StructFieldInfo.JsonTagValue != "" {
-			tagParts = append(tagParts, fmt.Sprintf("json:\"%s\"", col.StructFieldInfo.JsonTagValue))
+			tagParts = append(tagParts, fmt.Sprintf("json:\"%s\"", sanitizeTagValue(col.StructFieldInfo.JsonTagValue)))
 		}
 		if columnTagName != "" {
 			tagParts = append(tagParts, fmt.Sprintf("%s:\"%s\"", columnTagName, col.Name))

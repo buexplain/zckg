@@ -10,7 +10,7 @@ func formatStructFieldType(dialect Dialect, colType string) string {
 
 // makeColumnTypeToGoTypeMap 根据不同的数据库类型，生成该数据库类型支持的存储类型与 Go 类型的映射关系。
 // 返回的 map 键为不带长度/精度后缀的类型名（如 "varchar"、"decimal"），
-// 匹配带长度后缀的列类型（如 "varchar(255)"）时需先去除后缀，未匹配到的类型默认映射为 string。
+// 匹配带长度后缀的列类型（如 "varchar(255)"）时需先去除后缀，未匹配到的类型返回空串，由 Generate 兜底为 string。
 // 方言不支持或未知时返回 nil。
 func makeColumnTypeToGoTypeMap(dialect Dialect) map[string]string {
 	switch dialect {

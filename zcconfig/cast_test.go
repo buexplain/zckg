@@ -1,6 +1,7 @@
 package zcconfig
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -18,6 +19,17 @@ func TestCast_NilReturnsDefault(t *testing.T) {
 	}
 	if v := cast[float64](nil, 1.5); v != 1.5 {
 		t.Errorf("nil -> float64 期望 1.5，实际 %f", v)
+	}
+}
+
+// TestCast_NilInterfaceDefReturnsNil 验证目标为接口类型且 def 为 nil、断言失败时返回 nil 而非 panic。
+// 触发路径：reflect.TypeOf(nil 接口) 返回 nil，若未加守卫会对 nil reflect.Type 调用 Kind() 触发空指针 panic。
+func TestCast_NilInterfaceDefReturnsNil(t *testing.T) {
+	if v := cast[error]("not-an-error", nil); v != nil {
+		t.Errorf("nil 接口默认值 + 断言失败 期望 nil，实际 %v", v)
+	}
+	if v := cast[fmt.Stringer](42, nil); v != nil {
+		t.Errorf("nil 接口默认值 + 断言失败 期望 nil，实际 %v", v)
 	}
 }
 

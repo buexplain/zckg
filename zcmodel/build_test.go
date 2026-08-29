@@ -1,6 +1,7 @@
 package zcmodel
 
 import (
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
@@ -185,6 +186,104 @@ func TestBuildStruct_CommentWithSpecialChars(t *testing.T) {
 	}
 	if gotDesc := reflect.StructTag(`description:"` + m[1] + `"`).Get("description"); gotDesc != comment {
 		t.Errorf("reflect 还原失败\ngot:  %q\nwant: %q", gotDesc, comment)
+	}
+}
+
+// fieldTagOf 从解析后的文件中提取指定结构体字段的 tag 内容（去除外层反引号），找不到返回空串。
+func fieldTagOf(file *ast.File, fieldName string) string {
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok || st.Fields == nil {
+				continue
+			}
+			for _, f := range st.Fields.List {
+				for _, name := range f.Names {
+					if name.Name == fieldName && f.Tag != nil {
+						// f.Tag.Value 为含反引号的 raw string 字面量，reflect.StructTag 需要无引号的内容
+						return strings.Trim(f.Tag.Value, "`")
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// TestBuildStruct_JsonTagValueWithSpecialChars 验证含双引号/换行/反斜杠的 JsonTagValue
+// 生成的代码可解析且 reflect.StructTag 可完整还原（与 Comment 的净化行为对齐）。
+func TestBuildStruct_JsonTagValueWithSpecialChars(t *testing.T) {
+	jsonTag := "列表[\"a\"]\n第二行\\x"
+	cols := []Column{
+		{Name: "list_cover", StructFieldInfo: StructFieldInfo{Name: "ListCover", Type: "string", JsonTagValue: jsonTag}},
+	}
+	got := buildStruct("TEntity", cols, false, "", "db")
+	// 语法可解析（双引号/换行/反斜杠均被转义，反引号字符串不会被提前终止）
+	file, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("生成代码存在语法错误: %v\n%s", err, got)
+	}
+	tag := fieldTagOf(file, "ListCover")
+	if tag == "" {
+		t.Fatalf("未提取到字段 tag:\n%s", got)
+	}
+	if gotJSON := reflect.StructTag(tag).Get("json"); gotJSON != jsonTag {
+		t.Errorf("json tag 还原失败\ngot:  %q\nwant: %q", gotJSON, jsonTag)
+	}
+}
+
+// TestBuildStruct_JsonTagValueWithBacktick 验证含反引号的 JsonTagValue 被替换为单引号，代码可解析。
+func TestBuildStruct_JsonTagValueWithBacktick(t *testing.T) {
+	cols := []Column{
+		{Name: "list_cover", StructFieldInfo: StructFieldInfo{Name: "ListCover", Type: "string", JsonTagValue: "列表`封面`"}},
+	}
+	got := buildStruct("TEntity", cols, false, "", "db")
+	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
+		t.Fatalf("生成代码存在语法错误: %v\n%s", err, got)
+	}
+	if !strings.Contains(got, "json:\"列表'封面'\"") {
+		t.Errorf("反引号应替换为单引号:\n%s", got)
+	}
+}
+
+// TestGenerate_JsonTagValueWithSpecialChars 验证 formatJSONTag 入口（列名含双引号、显式指定合法字段名）
+// 产出的 json tag 经净化后生成文件可解析、反射可完整还原。
+func TestGenerate_JsonTagValueWithSpecialChars(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	input := Input{
+		OutputDir:        dir,
+		Dialect:          DialectMysql,
+		TableName:        "user_info",
+		JsonTagValueCase: NameCaseLowerCamel,
+		Columns: []*Column{
+			{Name: "na\"me", Type: "varchar(255)", StructFieldInfo: StructFieldInfo{Name: "Name"}},
+		},
+	}
+	if err := Generate(input); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "user_info.go", string(content), parser.AllErrors)
+	if err != nil {
+		t.Fatalf("生成文件存在语法错误: %v\n%s", err, content)
+	}
+	tag := fieldTagOf(file, "Name")
+	if tag == "" {
+		t.Fatalf("未提取到字段 tag:\n%s", content)
+	}
+	if gotJSON := reflect.StructTag(tag).Get("json"); gotJSON != "na\"me" {
+		t.Errorf("json tag 还原失败\ngot:  %q\nwant: %q", gotJSON, "na\"me")
 	}
 }
 

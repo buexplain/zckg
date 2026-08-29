@@ -213,16 +213,17 @@ func executeShutdown(sig os.Signal) {
 	}
 
 	// 步骤 3：通知 listen goroutine 退出，避免退出流程完成后其永久阻塞造成泄漏。
-	// 串行多次调用保护（防测试重复调用）：stopListenCh 由包初始化创建一次、不重建，
-	// 重复调用本函数时通道可能已被上一次关闭，此时跳过以避免 double close panic。
-	// 该保护仅覆盖串行重复调用，非并发安全——生产路径经 shutdownStarted CAS 保证本函数仅执行一次。
+	// stopListenCh 由包初始化创建一次、不重建，故用 select 守卫防止重复关闭导致 double close panic。
+	// 该守卫仅覆盖 stopListenCh 自身的重复关闭、非并发安全；本函数整体不支持重复调用（见步骤 4）。
 	select {
 	case <-stopListenCh:
 	default:
 		close(stopListenCh)
 	}
 
-	// 步骤 4：关闭 waitChan，解除 Listen 的阻塞
+	// 步骤 4：关闭 waitChan，解除 Listen 的阻塞。
+	// waitChan 无防二次关闭守卫：本函数不支持重复调用（重复调用会 double close panic）。
+	// 生产路径经 shutdownStarted CAS 保证本函数仅执行一次；测试路径由 resetState 重建 waitChan 规避。
 	close(waitChan)
 }
 
