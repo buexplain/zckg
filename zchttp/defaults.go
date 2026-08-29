@@ -39,7 +39,7 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if f.PkgPath != "" {
+		if f.PkgPath != "" && !isFlattenableEmbed(f) {
 			continue
 		}
 		if f.Anonymous && f.Type == metaType {
@@ -93,6 +93,14 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 		// - Map：viaValue=false，viaDefaults 仅当值类型为 Struct 或 *Struct 时不变，
 		//   若值类型为 Slice/Array 则 viaDefaults=false（applyDefaults 无法穿透）
 		ft := f.Type
+		// 匿名嵌入 struct/指针：buildStructMeta 会将其字段展开为顶层字段，
+		// 运行时 applyDefaults 经 fieldByIndex 恒能物化嵌入指针并填充默认值，
+		// 故 viaValue/viaDefaults 应按值嵌套（Struct 分支）传播，而非按普通指针置 viaValue=false
+		// （否则会对嵌入结构体的值类型 default 字段输出「never applied」误告警，与运行时行为矛盾）。
+		if f.Anonymous && isStructLike(ft) {
+			checkUnsupportedDefaults(derefType(ft), viaValue, viaDefaults, method, path, handlerName, handlerFile, handlerLine, visiting)
+			continue
+		}
 		switch ft.Kind() {
 		case reflect.Ptr:
 			checkUnsupportedDefaults(ft.Elem(), false, viaDefaults, method, path, handlerName, handlerFile, handlerLine, visiting)
@@ -455,7 +463,7 @@ func hasRequestPhaseDefaults(t reflect.Type, visiting map[reflect.Type]bool) boo
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if f.PkgPath != "" {
+		if f.PkgPath != "" && !isFlattenableEmbed(f) {
 			continue
 		}
 		if f.Anonymous && f.Type == metaType {

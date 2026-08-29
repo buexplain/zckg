@@ -31,7 +31,7 @@ GET /search?keyword=go&page=3
 | --- | --- |
 | `application/json` | `json.Decode` 解析请求体 |
 | `application/x-www-form-urlencoded` | `r.ParseForm()` 后绑定 `r.PostForm` |
-| `multipart/form-data` | `r.ParseMultipartForm(32MB)` 后绑定表单字段与上传文件 |
+| `multipart/form-data` | `r.ParseMultipartForm(MultipartFormMaxMemory)` 后绑定表单字段与上传文件 |
 | 其他（有请求体时） | 回退按 JSON 解析 |
 
 **body 覆盖 query 的粒度由解码器语义决定**（以 JSON 为例）：

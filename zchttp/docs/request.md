@@ -24,6 +24,28 @@ func CreateUser(ctx context.Context, req CreateUserReq) (CreateUserRes, error) {
 // 或指针形态：func CreateUser(ctx context.Context, req *CreateUserReq) (...)
 ```
 
+### 匿名嵌入结构体展开
+
+Go 的匿名嵌入（embedded struct）字段会被**展开（flatten）为顶层字段**，对齐 `encoding/json` 的扁平语义：`Base` 的导出字段等价于 `Req` 自身的顶层字段，query / form / JSON / 路径参数均可按字段绑定名直接绑定。
+
+```go
+type Base struct {
+    Name string `json:"name" nonzero:"true"`
+    Page int    `json:"page" default:"1"`
+}
+type Req struct {
+    *Base
+    Note string `json:"note"`
+}
+// name / page / note 均可直接按顶层字段绑定。
+```
+
+展开字段与顶层字段完全等价，关键语义：
+
+- **默认值填充**：嵌入指针在注册期模板中被 `fieldByIndex` 自动物化，其内部带 `default` 的字段与顶层字段一样在注册阶段填充。
+- **必填校验**：嵌入字段**没有**「父字段判零」环节——即使客户端完全不传嵌入对象，其内部 `nonzero:"true"` 字段仍会被强制校验（等价于顶层必填字段）。这与普通 `*Struct` 嵌套字段「父字段非零才递归校验」的规则不同（见 `parameter-validate.md`）。
+- **未导出指针嵌入不受支持**：`type Req struct { *base }`（类型名小写）注册时被跳过展开并输出 `slog.Warn` 引导改用导出类型名或值嵌入，其内部字段不进入可绑定集合（与 `encoding/json` 对「nil 未导出嵌入指针无法 unmarshal」的行为一致）。未导出**值**嵌入（`type Req struct { base }`）不受影响，内部导出字段仍可正常绑定、填充默认值与 nonzero 校验。
+
 ## 二、结构体标签总览
 
 | 标签 | 作用 | 说明 |

@@ -325,6 +325,80 @@ func TestIsStructLikeVariants(t *testing.T) {
 	}
 }
 
+// ========== 匿名嵌入 struct 展开（问题1 回归锁死） ==========
+
+// TestBuildStructMeta_UnexportedValueEmbedFlattened 未导出「值」嵌入仍应被展开：
+// 值字段已在内存中、fieldByIndex 不触发 Set，内部导出字段可正常绑定（防误伤）。
+func TestBuildStructMeta_UnexportedValueEmbedFlattened(t *testing.T) {
+	type unexportedBase struct {
+		Name string `json:"name"`
+	}
+	type req struct {
+		unexportedBase
+		Note string `json:"note"`
+	}
+
+	meta := buildStructMeta(reflect.TypeOf(req{}))
+
+	names := make(map[string]bool)
+	for _, fm := range meta.fields {
+		names[fm.name] = true
+	}
+	if !names["name"] {
+		t.Fatalf("unexported value embed should be flattened: inner field 'name' missing, fields=%+v", meta.fields)
+	}
+	if !names["note"] {
+		t.Fatalf("sibling field 'note' missing, fields=%+v", meta.fields)
+	}
+}
+
+// TestBuildStructMeta_UnexportedPtrEmbedSkipped 未导出「指针」嵌入应被跳过展开：
+// 注册不 panic、其内部字段不进入可绑定集合（问题1 修复）。
+func TestBuildStructMeta_UnexportedPtrEmbedSkipped(t *testing.T) {
+	type unexportedBase struct {
+		Name string `json:"name"`
+	}
+	type req struct {
+		*unexportedBase
+		Note string `json:"note"`
+	}
+
+	meta := buildStructMeta(reflect.TypeOf(req{}))
+
+	for _, fm := range meta.fields {
+		if fm.name == "name" {
+			t.Fatalf("unexported pointer embed must be skipped: 'name' should not be bindable, fields=%+v", meta.fields)
+		}
+	}
+	if len(meta.fields) != 1 || meta.fields[0].name != "note" {
+		t.Fatalf("expected only sibling field 'note', got fields=%+v", meta.fields)
+	}
+}
+
+// TestBuildStructMeta_ExportedPtrEmbedFlattened 导出「指针」嵌入仍应被展开（现状不回归）。
+func TestBuildStructMeta_ExportedPtrEmbedFlattened(t *testing.T) {
+	type ExportedBase struct {
+		Name string `json:"name"`
+	}
+	type req struct {
+		*ExportedBase
+		Note string `json:"note"`
+	}
+
+	meta := buildStructMeta(reflect.TypeOf(req{}))
+
+	names := make(map[string]bool)
+	for _, fm := range meta.fields {
+		names[fm.name] = true
+	}
+	if !names["name"] {
+		t.Fatalf("exported pointer embed should be flattened: 'name' missing, fields=%+v", meta.fields)
+	}
+	if !names["note"] {
+		t.Fatalf("sibling field 'note' missing, fields=%+v", meta.fields)
+	}
+}
+
 // ========== cachedStructMeta 测试（Nit-1: LoadOrStore） ==========
 
 // TestCachedStructMeta_ConcurrentConsistent 验证并发首次构建同一类型时，

@@ -124,9 +124,22 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		// 跳过未导出字段（但匿名嵌入的 struct 类型除外，因为 encoding/json 会展开其导出字段）
+		// 跳过未导出字段（但匿名嵌入的 struct 类型除外，因为 encoding/json 会展开其导出字段）。
+		// 例外中的例外：未导出 + 匿名 + 指向 struct 的指针（如 type Req struct{ *base }）——
+		// 展开后 fieldByIndex 对 nil 嵌入指针执行 v.Set(reflect.New(...)) 时，该字段由未导出字段
+		// 获得，reflect 拒绝写入（encoding/json 对 nil 未导出嵌入指针同样报错而非展开），会 panic。
+		// 故跳过展开并告警，其内部字段不进入可绑定集合。未导出「值」嵌入（type Req struct{ base }）
+		// 不受影响：值字段已在内存中、fieldByIndex 不触发 Set，内部导出字段可正常绑定/填默认值/校验。
 		if f.PkgPath != "" {
 			if !(f.Anonymous && isStructLike(f.Type)) {
+				continue
+			}
+			if f.Type.Kind() == reflect.Ptr {
+				slog.Warn("unexported embedded pointer struct is not supported for binding, its fields are skipped; use an exported type name or value embedding",
+					"struct", t.Name(),
+					"field", f.Name,
+					"embedded", f.Type.String(),
+				)
 				continue
 			}
 		}
@@ -245,4 +258,19 @@ func isStructPtr(t reflect.Type) bool {
 // 被编译器封死——嵌入 *T 要求 T 非指针，此处为预防性加固）。
 func isStructLike(t reflect.Type) bool {
 	return derefType(t).Kind() == reflect.Struct
+}
+
+// isFlattenableEmbed 判断匿名嵌入字段是否会被 buildStructMeta 展开为顶层字段：
+// 导出 struct / 指向 struct 的指针，或未导出的值 struct（未导出指针嵌入已被跳过展开）。
+// 供 hasNonzeroInTree / hasRequestPhaseDefaults / checkUnsupportedDefaults 三个
+// 原始类型树扫描器使用，使其穿透未导出嵌入字段的规则与 buildStructMeta 的展开逻辑保持一致。
+func isFlattenableEmbed(f reflect.StructField) bool {
+	if !f.Anonymous || !isStructLike(f.Type) {
+		return false
+	}
+	// 未导出指针嵌入（type Req struct{ *base }）已被 buildStructMeta 跳过展开
+	if f.PkgPath != "" && f.Type.Kind() == reflect.Ptr {
+		return false
+	}
+	return true
 }

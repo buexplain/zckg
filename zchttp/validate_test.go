@@ -1425,6 +1425,33 @@ func TestHasNonzeroInTree(t *testing.T) {
 	}
 }
 
+// TestHasNonzeroInTree_UnexportedValueEmbed 锁死：未导出「值」嵌入的内部 nonzero 字段
+// 必须被传递性扫描识别（与 buildStructMeta 的展开逻辑对齐），否则请求阶段整体跳过校验。
+func TestHasNonzeroInTree_UnexportedValueEmbed(t *testing.T) {
+	type unexportedBase struct {
+		Name string `json:"name" nonzero:"true"`
+	}
+	type reqWithNonzero struct {
+		unexportedBase
+		Note string `json:"note"`
+	}
+	if !hasNonzeroInTree(reflect.TypeOf(reqWithNonzero{}), nil) {
+		t.Fatal("hasNonzeroInTree should be true for nonzero inside unexported value embed")
+	}
+
+	// 对照组：未导出值嵌入内部无 nonzero → false
+	type plainBase struct {
+		Name string `json:"name"`
+	}
+	type reqPlain struct {
+		plainBase
+		Note string `json:"note"`
+	}
+	if hasNonzeroInTree(reflect.TypeOf(reqPlain{}), nil) {
+		t.Fatal("hasNonzeroInTree should be false when unexported value embed has no nonzero")
+	}
+}
+
 // TestValidateNonzeroNonStruct 覆盖目标非结构体时直接返回的分支
 func TestValidateNonzeroNonStruct(t *testing.T) {
 	v := reflect.New(reflect.TypeOf(0))

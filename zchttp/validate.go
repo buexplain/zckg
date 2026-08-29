@@ -107,7 +107,7 @@ func hasNonzeroInTree(t reflect.Type, visiting map[reflect.Type]bool) bool {
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if f.PkgPath != "" {
+		if f.PkgPath != "" && !isFlattenableEmbed(f) {
 			continue
 		}
 		if f.Anonymous && f.Type == metaType {

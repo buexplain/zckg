@@ -1817,6 +1817,202 @@ func TestBindAnonymousEmbeddedQuery(t *testing.T) {
 	}
 }
 
+// ========== 匿名嵌入 struct 展开（问题1 回归锁死） ==========
+
+// TestEmbed_UnexportedValueEmbedBindAndDefault 未导出「值」嵌入仍能绑定 + 填默认值（防误伤）：
+// 值字段已在内存中，内部导出字段的 json 绑定与注册期 default 填充均应生效。
+func TestEmbed_UnexportedValueEmbedBindAndDefault(t *testing.T) {
+	type unexportedBase struct {
+		Name string `json:"name" default:"default-name"`
+	}
+	type req struct {
+		unexportedBase
+		Note string `json:"note"`
+	}
+	type res struct {
+		Name string `json:"name"`
+		Note string `json:"note"`
+	}
+
+	router := NewRouter()
+	router.POST("/t", func(_ context.Context, r req) (res, error) {
+		return res{Name: r.Name, Note: r.Note}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	// name 未传 → 注册期 default 填充；note 传入 → JSON 覆盖
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(`{"note":"x"}`))
+	httpReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, httpReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data res `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if out.Data.Name != "default-name" {
+		t.Fatalf("name = %q, want default 'default-name'", out.Data.Name)
+	}
+	if out.Data.Note != "x" {
+		t.Fatalf("note = %q, want 'x'", out.Data.Note)
+	}
+}
+
+// TestEmbed_UnexportedPtrEmbedNoPanicAndNotBound 未导出「指针」嵌入：注册不 panic，
+// 且其内部字段不进入可绑定集合（query 绑定路径经 meta.fields，字段被跳过）。
+func TestEmbed_UnexportedPtrEmbedNoPanicAndNotBound(t *testing.T) {
+	type unexportedBase struct {
+		Name string `form:"name"`
+	}
+	type req struct {
+		*unexportedBase
+		Note string `form:"note"`
+	}
+	type res struct {
+		Name string `json:"name"`
+		Note string `json:"note"`
+	}
+
+	router := NewRouter()
+	// 修复前此注册即 panic（reflect: Set using value obtained using unexported field）
+	router.GET("/t", func(_ context.Context, r req) (res, error) {
+		// 嵌入指针被跳过展开后保持 nil；r.Name 会解引用 nil 指针，故先判空
+		name := ""
+		if r.unexportedBase != nil {
+			name = r.Name
+		}
+		return res{Name: name, Note: r.Note}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodGet, "/t?name=ignored&note=x", nil)
+	engine.ServeHTTP(rec, httpReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data res `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if out.Data.Name != "" {
+		t.Fatalf("unexported ptr embed fields must not be bound; name = %q, want empty", out.Data.Name)
+	}
+	if out.Data.Note != "x" {
+		t.Fatalf("note = %q, want 'x'", out.Data.Note)
+	}
+}
+
+// TestEmbed_ExportedPtrEmbedBindAndDefault 导出「指针」嵌入仍能绑定 + 填默认值（现状不回归）。
+func TestEmbed_ExportedPtrEmbedBindAndDefault(t *testing.T) {
+	type ExportedBase struct {
+		Page int `json:"page" default:"5"`
+	}
+	type req struct {
+		*ExportedBase
+		Note string `json:"note"`
+	}
+	type res struct {
+		Page int    `json:"page"`
+		Note string `json:"note"`
+	}
+
+	router := NewRouter()
+	router.POST("/t", func(_ context.Context, r req) (res, error) {
+		return res{Page: r.Page, Note: r.Note}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	// 空 body：Page 应被注册期 default 填充为 5（嵌入指针被 fieldByIndex 物化）
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(`{}`))
+	httpReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, httpReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data res `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if out.Data.Page != 5 {
+		t.Fatalf("page = %d, want default 5", out.Data.Page)
+	}
+}
+
+// TestEmbed_ExportedPtrEmbedNonzeroEnforced 锁死问题3：嵌入指针结构体的内部 nonzero 字段
+// 即使客户端完全不传嵌入对象，仍会强制校验（无「父字段判零」环节）。
+func TestEmbed_ExportedPtrEmbedNonzeroEnforced(t *testing.T) {
+	type ExportedBase struct {
+		Name string `json:"name" nonzero:"true"`
+	}
+	type req struct {
+		*ExportedBase
+		Note string `json:"note"`
+	}
+	type res struct {
+		Note string `json:"note"`
+	}
+
+	router := NewRouter()
+	router.POST("/t", func(_ context.Context, r req) (res, error) {
+		return res{Note: r.Note}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(`{}`))
+	httpReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, httpReq)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (embedded nonzero enforced), got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestEmbed_UnexportedValueEmbedNonzeroEnforced 锁死：未导出「值」嵌入的内部 nonzero 字段
+// 同样无条件校验（与 buildStructMeta 的展开逻辑对齐），客户端不传时返回 400。
+func TestEmbed_UnexportedValueEmbedNonzeroEnforced(t *testing.T) {
+	type unexportedBase struct {
+		Name string `json:"name" nonzero:"true"`
+	}
+	type req struct {
+		unexportedBase
+		Note string `json:"note"`
+	}
+	type res struct {
+		Note string `json:"note"`
+	}
+
+	router := NewRouter()
+	router.POST("/t", func(_ context.Context, r req) (res, error) {
+		return res{Note: r.Note}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(`{"note":"x"}`))
+	httpReq.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rec, httpReq)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (unexported value embed nonzero enforced), got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // --- BUG2: isAllDigits("-") 返回 true ---
 
 // TestIsAllDigits_SingleMinus 验证单个负号不应被认为是纯数字
