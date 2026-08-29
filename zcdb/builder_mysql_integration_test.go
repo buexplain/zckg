@@ -1263,3 +1263,183 @@ func setupMySQLNamesCsTable(t *testing.T, db *DBDao) {
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 	mustExec(t, db, `INSERT INTO names_cs (name) VALUES ('alice'), ('Alice'), ('BOB')`)
 }
+
+// —— 以下为审计修复回归用例（commit e13ffc6）：嵌入字段外层优先展开、
+//    WhereIn/Having 的 Expression 内联、Having nil 语义、ToExists 状态恢复 ——
+
+// TestMySQLInteg_EmbeddedShadowScanOuterWins 验证扫描列映射的「外层优先」：
+// 外层字段与嵌入字段同名列时，值写入外层字段，嵌入字段保持零值。
+func TestMySQLInteg_EmbeddedShadowScanOuterWins(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type base struct {
+		Name string `db:"name"`
+	}
+	// 外层字段声明在前
+	type outerFirst struct {
+		Name string `db:"name"`
+		base
+	}
+	// 嵌入字段声明在前
+	type embedFirst struct {
+		base
+		Name string `db:"name"`
+	}
+
+	var of outerFirst
+	if err := db.Builder().Table("users").Select("name").Where("id", "=", 1).
+		First(context.Background(), &of); err != nil {
+		t.Fatalf("outerFirst First error: %v", err)
+	}
+	if of.Name != "alice" {
+		t.Errorf("外层字段应收到值 alice，实际 %q", of.Name)
+	}
+	if of.base.Name != "" {
+		t.Errorf("嵌入字段不应收到值，实际 %q", of.base.Name)
+	}
+
+	var ef embedFirst
+	if err := db.Builder().Table("users").Select("name").Where("id", "=", 1).
+		First(context.Background(), &ef); err != nil {
+		t.Fatalf("embedFirst First error: %v", err)
+	}
+	if ef.Name != "alice" {
+		t.Errorf("外层字段应收到值 alice，实际 %q", ef.Name)
+	}
+	if ef.base.Name != "" {
+		t.Errorf("嵌入字段不应收到值，实际 %q", ef.base.Name)
+	}
+}
+
+// TestMySQLInteg_EmbeddedShadowInsertOuterWins 验证 Insert 字段提取的「外层优先」：
+// 同名列去重后仅保留外层字段，只写一列且值取自外层。
+func TestMySQLInteg_EmbeddedShadowInsertOuterWins(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type base struct {
+		Name string `db:"name"`
+	}
+	type outer struct {
+		Name string `db:"name"`
+		base
+	}
+
+	// 修复前：同名「name」列被追加两次，SQL 报「column specified twice」；
+	// 修复后：去重只保留外层字段，写入 outer_name。
+	if _, err := db.Builder().Table("users").
+		Insert(context.Background(), outer{Name: "outer_name", base: base{Name: "inner_name"}}); err != nil {
+		t.Fatalf("Insert error: %v", err)
+	}
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	var r row
+	if err := db.Builder().Table("users").Where("name", "=", "outer_name").
+		First(context.Background(), &r); err != nil {
+		t.Fatalf("回读 outer_name error: %v", err)
+	}
+	if r.Name != "outer_name" {
+		t.Errorf("期望写入 outer_name，实际 %q", r.Name)
+	}
+	exists, err := db.Builder().Table("users").Where("name", "=", "inner_name").Exists(context.Background())
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if exists {
+		t.Error("嵌入字段的值不应被写入")
+	}
+}
+
+// TestMySQLInteg_WhereInExpression 验证 WhereIn/WhereNotIn 的 Expression 元素直接内嵌、
+// 不占占位符，混合普通绑定值正确执行。
+func TestMySQLInteg_WhereInExpression(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	type row struct {
+		Name string `db:"name"`
+	}
+	// id IN (?, 2) → args [1]：命中的是 alice(id=1) 与 bob(id=2)
+	var rows []row
+	err := db.Builder().Table("users").Select("name").
+		WhereIn("id", []any{1, NewExpression("2")}).
+		OrderBy("id", "ASC").
+		Find(context.Background(), &rows)
+	assertNoError(t, err)
+	if len(rows) != 2 || rows[0].Name != "alice" || rows[1].Name != "bob" {
+		t.Errorf("WhereIn Expression 期望 [alice bob]，实际 %v", rows)
+	}
+
+	// NOT IN (parent_id, ?) → args [1]：排除 id 2 与 id 1 → charlie/diana/eve
+	rows = nil
+	err = db.Builder().Table("users").Select("name").
+		WhereNotIn("id", []any{NewExpression("2"), 1}).
+		OrderBy("id", "ASC").
+		Find(context.Background(), &rows)
+	assertNoError(t, err)
+	if len(rows) != 3 || rows[0].Name != "charlie" || rows[1].Name != "diana" || rows[2].Name != "eve" {
+		t.Errorf("WhereNotIn Expression 期望 [charlie diana eve]，实际 %v", rows)
+	}
+}
+
+// TestMySQLInteg_HavingNull 验证 Having 传 nil 的 IS NULL / IS NOT NULL 语义真实执行。
+func TestMySQLInteg_HavingNull(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	// HAVING age IS NULL：仅 eve 的 NULL 年龄组
+	type row struct {
+		Age *int `db:"age"`
+	}
+	var rows []row
+	err := db.Builder().Table("users").Select("age").
+		GroupBy("age").
+		Having("age", "=", nil).
+		Find(context.Background(), &rows)
+	assertNoError(t, err)
+	if len(rows) != 1 || rows[0].Age != nil {
+		t.Errorf("Having = nil 期望 1 个 NULL 组，实际 %v", rows)
+	}
+
+	// HAVING age IS NOT NULL：25/28/30/35 共 4 组
+	rows = nil
+	err = db.Builder().Table("users").Select("age").
+		GroupBy("age").
+		Having("age", "!=", nil).
+		Find(context.Background(), &rows)
+	assertNoError(t, err)
+	if len(rows) != 4 {
+		t.Errorf("Having != nil 期望 4 个非 NULL 组，实际 %d", len(rows))
+	}
+}
+
+// TestMySQLInteg_ExistsStateRestore 验证 Exists 编译期临时改动（列/分页/排序/锁）
+// 在返回后完整恢复：同一 Builder 复用仍按原 Select/Limit/OrderBy 查询。
+func TestMySQLInteg_ExistsStateRestore(t *testing.T) {
+	db := openMySQLTestDB(t)
+	setupMySQLUsersTable(t, db)
+
+	b := db.Builder().Table("users").Select("name").OrderBy("id", "ASC").Limit(2)
+	exists, err := b.Exists(context.Background())
+	if err != nil {
+		t.Fatalf("Exists error: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected exists=true")
+	}
+
+	// 复用同一 Builder：状态应已恢复，仍返回 name 列、按 id 升序、LIMIT 2
+	type row struct {
+		Name string `db:"name"`
+	}
+	var rows []row
+	if err := b.Find(context.Background(), &rows); err != nil {
+		t.Fatalf("Find after Exists error: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Name != "alice" || rows[1].Name != "bob" {
+		t.Errorf("状态未恢复：期望 [alice bob]，实际 %v", rows)
+	}
+}
