@@ -52,6 +52,10 @@ var (
 	// ErrInvalidSubQuery WhereExists 等方法的 sub 参数类型非法（仅支持 *Builder 或 func(*Builder)）
 	ErrInvalidSubQuery = errors.New("zcdb: sub must be a *Builder or func(*Builder)")
 
+	// ErrCyclicQuery 查询构造器的子查询图存在环（自引用/互引用，如 TableSub 或 Union 传入自身），
+	// 编译/克隆会无限递归直至栈溢出，故在编译前拒绝
+	ErrCyclicQuery = errors.New("zcdb: cyclic subquery graph detected")
+
 	// ErrInvalidWhereInValues JoinBuilder 的 WhereIn/WhereNotIn values 参数类型非法（仅支持 []any 或 *Builder）
 	ErrInvalidWhereInValues = errors.New("zcdb: WhereIn values must be []any or *Builder")
 

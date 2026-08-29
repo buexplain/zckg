@@ -125,12 +125,25 @@ func (b *Builder) Primary() *Builder {
 // WHERE（含 Values/Bindings 切片与嵌套子查询）、GROUP BY、HAVING、ORDER BY、
 // UNION、锁子句与强制主库标记；副本上继续链式修改不会影响原 Builder，反之亦然。
 // First/Value/Paginate/CursorBy 等终端方法内部即用 Clone 避免污染调用方的 Builder。
+// 若子查询图存在环（自引用/互引用，如 TableSub/Union 传入自身），深拷贝会无限递归，
+// 此时返回携带 ErrCyclicQuery 的副本（经后续编译方法报错）而非递归崩溃。
 //
 //	base := db.Builder().Table("users").Where("status", "active")
 //	admins := base.Clone().Where("role", "admin")
 //	// base 编译:  SELECT * FROM `users` WHERE `status` = ?            args: [active]
 //	// admins 编译: SELECT * FROM `users` WHERE `status` = ? AND `role` = ?  args: [active admin]
 func (b *Builder) Clone() *Builder {
+	if err := b.validateAcyclic(); err != nil {
+		// 环引用无法深拷贝（会无限递归），返回携带错误的浅副本，
+		// 后续 ToXxx 编译方法经 b.err 前置检查返回 ErrCyclicQuery。
+		return &Builder{grammar: b.grammar, dao: b.dao, err: err}
+	}
+	return b.cloneInternal()
+}
+
+// cloneInternal 深拷贝实现：调用方已通过 validateAcyclic 确认无环，
+// 子构建器递归走 cloneInternal 而非 Clone，避免每个子树重复做环检测。
+func (b *Builder) cloneInternal() *Builder {
 	clone := &Builder{
 		grammar:    b.grammar,
 		dao:        b.dao,
@@ -146,7 +159,7 @@ func (b *Builder) Clone() *Builder {
 	}
 	// FROM 子查询深拷贝
 	if b.tableSub != nil {
-		clone.tableSub = b.tableSub.Clone()
+		clone.tableSub = b.tableSub.cloneInternal()
 	}
 	if b.columns != nil {
 		clone.columns = make([]SelectColumn, len(b.columns))
@@ -157,7 +170,7 @@ func (b *Builder) Clone() *Builder {
 		copy(clone.selectSubs, b.selectSubs)
 		for i := range clone.selectSubs {
 			if clone.selectSubs[i].Query != nil {
-				clone.selectSubs[i].Query = clone.selectSubs[i].Query.Clone()
+				clone.selectSubs[i].Query = clone.selectSubs[i].Query.cloneInternal()
 			}
 		}
 	}
@@ -179,10 +192,10 @@ func (b *Builder) Clone() *Builder {
 				clone.wheres[i].Bindings = cp
 			}
 			if clone.wheres[i].Nested != nil {
-				clone.wheres[i].Nested = clone.wheres[i].Nested.Clone()
+				clone.wheres[i].Nested = clone.wheres[i].Nested.cloneInternal()
 			}
 			if clone.wheres[i].Sub != nil {
-				clone.wheres[i].Sub = clone.wheres[i].Sub.Clone()
+				clone.wheres[i].Sub = clone.wheres[i].Sub.cloneInternal()
 			}
 		}
 	}
@@ -207,7 +220,7 @@ func (b *Builder) Clone() *Builder {
 				clone.havings[i].Bindings = cp
 			}
 			if clone.havings[i].Nested != nil {
-				clone.havings[i].Nested = clone.havings[i].Nested.Clone()
+				clone.havings[i].Nested = clone.havings[i].Nested.cloneInternal()
 			}
 		}
 	}
@@ -220,7 +233,7 @@ func (b *Builder) Clone() *Builder {
 		copy(clone.unions, b.unions)
 		for i := range clone.unions {
 			if clone.unions[i].Query != nil {
-				clone.unions[i].Query = clone.unions[i].Query.Clone()
+				clone.unions[i].Query = clone.unions[i].Query.cloneInternal()
 			}
 		}
 	}
@@ -237,7 +250,7 @@ func cloneJoinClauses(joins []JoinClause) []JoinClause {
 	for i := range cloned {
 		// 派生表子查询深拷贝
 		if cloned[i].Sub != nil {
-			cloned[i].Sub = cloned[i].Sub.Clone()
+			cloned[i].Sub = cloned[i].Sub.cloneInternal()
 		}
 		cloned[i].Conditions = cloneJoinConditions(cloned[i].Conditions)
 		// 嵌套 join 组递归深拷贝
@@ -266,7 +279,7 @@ func cloneJoinConditions(conditions []JoinCondition) []JoinCondition {
 			conds[j].Values = cp
 		}
 		if conds[j].Sub != nil {
-			conds[j].Sub = conds[j].Sub.Clone()
+			conds[j].Sub = conds[j].Sub.cloneInternal()
 		}
 		if conds[j].Nested != nil {
 			inner := &JoinBuilder{
@@ -279,4 +292,100 @@ func cloneJoinConditions(conditions []JoinCondition) []JoinCondition {
 		}
 	}
 	return conds
+}
+
+// ==================== 子查询图环检测 ====================
+
+// validateAcyclic 检测 Builder 子查询图是否存在环（自引用或互引用）。
+// 自引用（如 b.TableSub(b, ...) / b.Union(b)）或经多个子查询位互引用会令
+// Clone 深拷贝、Grammar 编译与绑定参数收集无限递归直至栈溢出，故编译/克隆前必须拒绝。
+func (b *Builder) validateAcyclic() error {
+	return checkBuilderAcyclic(b, make(map[*Builder]bool), make(map[*Builder]bool))
+}
+
+// checkBuilderAcyclic 深度优先遍历 Builder 子查询图检测环。
+// visiting 记录当前 DFS 路径上的节点，命中即环；done 记录已确认无环的子树，
+// 避免共享子查询（菱形引用，非环）被重复遍历。
+func checkBuilderAcyclic(b *Builder, visiting, done map[*Builder]bool) error {
+	if b == nil || done[b] {
+		return nil
+	}
+	if visiting[b] {
+		return ErrCyclicQuery
+	}
+	visiting[b] = true
+	defer delete(visiting, b)
+
+	if err := checkBuilderAcyclic(b.tableSub, visiting, done); err != nil {
+		return err
+	}
+	for i := range b.selectSubs {
+		if err := checkBuilderAcyclic(b.selectSubs[i].Query, visiting, done); err != nil {
+			return err
+		}
+	}
+	for i := range b.joins {
+		if err := checkJoinClauseAcyclic(&b.joins[i], visiting, done); err != nil {
+			return err
+		}
+	}
+	for i := range b.wheres {
+		if err := checkBuilderAcyclic(b.wheres[i].Nested, visiting, done); err != nil {
+			return err
+		}
+		if err := checkBuilderAcyclic(b.wheres[i].Sub, visiting, done); err != nil {
+			return err
+		}
+	}
+	for i := range b.havings {
+		if err := checkBuilderAcyclic(b.havings[i].Nested, visiting, done); err != nil {
+			return err
+		}
+	}
+	for i := range b.unions {
+		if err := checkBuilderAcyclic(b.unions[i].Query, visiting, done); err != nil {
+			return err
+		}
+	}
+
+	done[b] = true
+	return nil
+}
+
+// checkJoinClauseAcyclic 遍历单个 JOIN 子句（派生表 Sub、ON 条件、嵌套 join 组）中的子查询图。
+func checkJoinClauseAcyclic(j *JoinClause, visiting, done map[*Builder]bool) error {
+	if err := checkBuilderAcyclic(j.Sub, visiting, done); err != nil {
+		return err
+	}
+	for i := range j.Conditions {
+		if err := checkJoinConditionAcyclic(&j.Conditions[i], visiting, done); err != nil {
+			return err
+		}
+	}
+	for i := range j.Joins {
+		if err := checkJoinClauseAcyclic(&j.Joins[i], visiting, done); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkJoinConditionAcyclic 遍历单个 ON 条件（Sub 子查询、Nested 嵌套条件组及其内部 join 组）中的子查询图。
+func checkJoinConditionAcyclic(c *JoinCondition, visiting, done map[*Builder]bool) error {
+	if err := checkBuilderAcyclic(c.Sub, visiting, done); err != nil {
+		return err
+	}
+	if c.Nested != nil {
+		for i := range c.Nested.Conditions {
+			if err := checkJoinConditionAcyclic(&c.Nested.Conditions[i], visiting, done); err != nil {
+				return err
+			}
+		}
+		for i := range c.Nested.Joins {
+			if err := checkJoinClauseAcyclic(&c.Nested.Joins[i], visiting, done); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

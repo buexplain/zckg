@@ -149,6 +149,7 @@ func main() {
 | `ErrEmptyData` | 插入数据为空 |
 | `ErrInvalidOperator` | 运算符不在白名单内 |
 | `ErrInvalidSubQuery` | WhereExists 等方法的子查询参数类型非法 |
+| `ErrCyclicQuery` | 查询构造器的子查询图存在环（自引用/互引用，如 TableSub/Union 传入自身） |
 | `ErrInvalidWhereInValues` | JoinBuilder 的 WhereIn/WhereNotIn values 参数类型非法（仅支持 `[]any` 或 `*Builder`） |
 | `ErrInvalidAggregate` | 聚合函数不是 MAX/MIN/SUM/AVG |
 | `ErrPluckDest` / `ErrPluckColumns` | Pluck 目标类型或列数不匹配 |

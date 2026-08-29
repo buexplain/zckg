@@ -29,6 +29,11 @@ func (b *Builder) ToSelect() (string, []any, error) {
 		return "", nil, ErrEmptyTable
 	}
 
+	// 子查询图环检测：自引用/互引用会让编译与绑定收集无限递归，必须先拒绝
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
+	}
+
 	// 检查不支持的锁子句场景
 	if b.lockClause != "" {
 		switch b.grammar.(type) {
@@ -281,6 +286,9 @@ func (b *Builder) ToInsertUsing(columns []string, callback func(*Builder)) (stri
 	if sub.table == "" && sub.tableSub == nil {
 		return "", nil, ErrEmptyTable
 	}
+	if err := sub.validateAcyclic(); err != nil {
+		return "", nil, err
+	}
 
 	// 列数校验：子查询显式 Select/AddSelect 指定列且不含通配符时，
 	// 编译期校验目标列数与子查询列数一致，不一致直接报错（早于数据库执行期发现）；
@@ -331,6 +339,9 @@ func (b *Builder) ToInsertOrIgnoreUsing(columns []string, callback func(*Builder
 	}
 	if sub.table == "" && sub.tableSub == nil {
 		return "", nil, ErrEmptyTable
+	}
+	if err := sub.validateAcyclic(); err != nil {
+		return "", nil, err
 	}
 
 	// 列数校验：同 ToInsertUsing，子查询列数可静态判定且与目标列数不一致时直接报错
@@ -405,6 +416,9 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
+	}
 
 	columns, values, err := extractUpdateData(data, b.tagName())
 	if err != nil {
@@ -460,6 +474,9 @@ func (b *Builder) ToDelete() (string, []any, error) {
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
 	}
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
+	}
 
 	sql := b.grammar.CompileDelete(b)
 	args := b.collectWhereBindings()
@@ -493,6 +510,9 @@ func (b *Builder) ToDeleteJoin() (string, []any, error) {
 	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
+	}
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
 	}
 	if len(b.joins) == 0 {
 		return "", nil, ErrDeleteJoinNoJoin
@@ -574,6 +594,9 @@ func (b *Builder) ToCount() (string, []any, error) {
 	}
 	if b.table == "" && b.tableSub == nil && len(b.unions) == 0 {
 		return "", nil, ErrEmptyTable
+	}
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
 	}
 
 	// UNION 查询：将整个 UNION 作为子查询包裹后计数
@@ -664,6 +687,9 @@ func (b *Builder) ToExists() (string, []any, error) {
 	if b.table == "" && b.tableSub == nil && len(b.unions) == 0 {
 		return "", nil, ErrEmptyTable
 	}
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
+	}
 
 	// 保存并清除分页/排序/锁/列：存在性检查只关心是否有匹配行；
 	// defer 恢复确保 panic 时状态也能完整还原（与 ToCount/ToAggregate 共用 saveTransientState）
@@ -698,6 +724,9 @@ func (b *Builder) ToAggregate(aggregate string, column string) (string, []any, e
 	}
 	if b.table == "" && b.tableSub == nil && len(b.unions) == 0 {
 		return "", nil, ErrEmptyTable
+	}
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
 	}
 	switch aggregate {
 	case "MAX", "MIN", "SUM", "AVG":
@@ -770,6 +799,9 @@ func (b *Builder) toIncDec(columns []string, amounts []any, op string) (string, 
 	}
 	if b.table == "" {
 		return "", nil, ErrEmptyTable
+	}
+	if err := b.validateAcyclic(); err != nil {
+		return "", nil, err
 	}
 	if len(columns) == 0 || len(columns) != len(amounts) {
 		return "", nil, ErrIncrementColumns

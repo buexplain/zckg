@@ -2320,3 +2320,74 @@ func TestNewApi_SelectSubCompile(t *testing.T) {
 		assertArgs(t, []any{100}, args)
 	})
 }
+
+// ==================== 子查询图环检测（防栈溢出）回归测试 ====================
+
+// TestBuilder_CyclicTableSub 自引用 FROM 子查询（TableSub 传入自身）应在编译前返回
+// ErrCyclicQuery，而非陷入无限递归导致栈溢出。
+func TestBuilder_CyclicTableSub(t *testing.T) {
+	b := NewBuilder(&MySQLGrammar{}, nil)
+	b.TableSub(b, "x")
+	if _, _, err := b.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
+		t.Fatalf("expected ErrCyclicQuery for self-referential TableSub, got %v", err)
+	}
+}
+
+// TestBuilder_CyclicUnion 自引用 UNION（Union 传入自身）应返回 ErrCyclicQuery。
+func TestBuilder_CyclicUnion(t *testing.T) {
+	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b.Union(b)
+	if _, _, err := b.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
+		t.Fatalf("expected ErrCyclicQuery for self-referential Union, got %v", err)
+	}
+}
+
+// TestBuilder_CyclicClone Clone 遇环引用时不应递归崩溃，而应返回携带错误的副本，
+// 使后续编译方法经 b.err 前置检查返回 ErrCyclicQuery。
+func TestBuilder_CyclicClone(t *testing.T) {
+	b := NewBuilder(&MySQLGrammar{}, nil)
+	b.TableSub(b, "x")
+	clone := b.Clone()
+	if _, _, err := clone.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
+		t.Fatalf("expected ErrCyclicQuery from cloned cyclic builder, got %v", err)
+	}
+}
+
+// TestBuilder_CyclicMutual 互引用（a.TableSub(b) 且 b.Union(a)）应返回 ErrCyclicQuery。
+func TestBuilder_CyclicMutual(t *testing.T) {
+	a := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := NewBuilder(&MySQLGrammar{}, nil).Table("orders")
+	a.TableSub(b, "o")
+	b.Union(a)
+	if _, _, err := a.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
+		t.Fatalf("expected ErrCyclicQuery for mutual cycle, got %v", err)
+	}
+}
+
+// TestBuilder_CyclicJoinSubUpdate 写路径（UPDATE）经 JoinSub 自引用也应返回 ErrCyclicQuery，
+// 覆盖非 SELECT 编译入口的环检测。
+func TestBuilder_CyclicJoinSubUpdate(t *testing.T) {
+	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b.JoinSub(b, "x", nil)
+	if _, _, err := b.ToUpdate(userInsert{Name: "alice"}); !errors.Is(err, ErrCyclicQuery) {
+		t.Fatalf("expected ErrCyclicQuery for cyclic join sub in UPDATE, got %v", err)
+	}
+}
+
+// TestBuilder_AcyclicSharedSubquery 同一子查询被多次引用（菱形引用，非环）不应误报，应正常编译。
+func TestBuilder_AcyclicSharedSubquery(t *testing.T) {
+	g := NewMySQLGrammar()
+	shared := NewBuilder(g, nil).Table("orders").Where("status", "=", "paid")
+	b := NewBuilder(g, nil).Table("users").
+		SelectSub(shared, "cnt_a").
+		SelectSub(shared, "cnt_b")
+	sql, args, err := b.ToSelect()
+	if err != nil {
+		t.Fatalf("expected no error for shared (diamond) subquery, got %v", err)
+	}
+	if !strings.Contains(sql, "AS `cnt_a`") || !strings.Contains(sql, "AS `cnt_b`") {
+		t.Errorf("expected both subquery aliases in SQL, got %q", sql)
+	}
+	// 两个子查询各绑定一次 "paid"
+	assertArgs(t, []any{"paid", "paid"}, args)
+}
