@@ -54,7 +54,7 @@ func GetCtx() context.Context {
 }
 
 // cancel 是 ctx 的取消函数，与 context.WithCancel 配对。
-// 仅在包内使用：listen 中信号到达时调用，以及 [Shutdown] 中主动触发退出时调用。
+// 在 [executeShutdown] 中调用；[listen] 收到信号或 [Shutdown] 主动触发时，经由 [doShutdown] 间接触发。
 var cancel context.CancelFunc
 
 // listenOnce 确保信号监听 goroutine 只启动一次，由 [doListen] 函数内部使用。
@@ -213,8 +213,9 @@ func executeShutdown(sig os.Signal) {
 	}
 
 	// 步骤 3：通知 listen goroutine 退出，避免退出流程完成后其永久阻塞造成泄漏。
-	// 幂等关闭：stopListenCh 由包初始化创建一次、不重建，测试直接多次调用本函数时
-	// 通道可能已被上一次调用关闭，此时跳过以避免 double close panic。
+	// 串行多次调用保护（防测试重复调用）：stopListenCh 由包初始化创建一次、不重建，
+	// 重复调用本函数时通道可能已被上一次关闭，此时跳过以避免 double close panic。
+	// 该保护仅覆盖串行重复调用，非并发安全——生产路径经 shutdownStarted CAS 保证本函数仅执行一次。
 	select {
 	case <-stopListenCh:
 	default:

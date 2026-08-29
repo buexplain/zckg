@@ -499,3 +499,24 @@ func TestShutdown_FullFlow(t *testing.T) {
 		t.Fatal("完整退出流程后上下文应已被取消")
 	}
 }
+
+// TestListen_AfterShutdownReturnsImmediately 锁死「Shutdown 先于 Listen 调用时，Listen 立即返回」不变量：
+// 先同步完成整个退出流程，再调用 Listen，应因 waitChan 已关闭而立即返回（不阻塞等待信号）。
+// 依赖 listenOnce 全局仅启动一次，声明在 TestShutdown_FullFlow 之后（与现有布局约定一致）。
+func TestListen_AfterShutdownReturnsImmediately(t *testing.T) {
+	resetState()
+
+	Shutdown() // 先同步完成整个退出流程
+
+	done := make(chan struct{})
+	go func() {
+		Listen()
+		close(done)
+	}()
+
+	select {
+	case <-done: // 期望：立即返回
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown 完成后 Listen 应立即返回")
+	}
+}
