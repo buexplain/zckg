@@ -162,8 +162,15 @@ func (p *Pool) AddSlave(dsn string) error {
 		return fmt.Errorf("ping slave db: %w", err)
 	}
 
-	// 验证成功后短暂持写锁追加
+	// 验证成功后短暂持写锁追加。锁内复检 closed：Ping 网络往返期间 Close 可能已完成
+	// （置 closed=true、清空 slaves），若不复检会把一个活从库追加进已关闭的池，
+	// 该从库此后永远不会被任何 Close 关闭（Close 幂等已返回）。复检命中则关闭新从库并返回错误。
 	p.mu.Lock()
+	if p.closed.Load() {
+		p.mu.Unlock()
+		_ = db.Close()
+		return errPoolClosed
+	}
 	p.slaves = append(p.slaves, db)
 	p.mu.Unlock()
 	return nil

@@ -4,6 +4,7 @@ package zcdb
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
@@ -12,13 +13,32 @@ import (
 	"time"
 )
 
+// mysqlTestMasterDSN 集成测试共用的主库 DSN。
+const mysqlTestMasterDSN = "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local"
+
+// requireMySQLAvailable 探测 MySQL 主库是否可达：不可达时跳过测试（门控），
+// 保证无数据库环境下 go test ./... 不误报。
+func requireMySQLAvailable(t *testing.T) {
+	t.Helper()
+	db, err := sql.Open("mysql", mysqlTestMasterDSN)
+	if err != nil {
+		t.Skipf("mysql unavailable, skipping integration test: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Skipf("mysql unavailable, skipping integration test: %v", err)
+	}
+}
+
 // openMySQLTestDB 打开 MySQL 连接，自动创建测试数据库（若不存在），然后清理并重建 users/orders 相关表，保证测试隔离。
 // docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
 func openMySQLTestDB(t *testing.T) *DBDao {
 	t.Helper()
 	pool, err := NewPool(PoolConfig{
 		DriverName: "mysql",
-		DSN:        "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local",
+		DSN:        mysqlTestMasterDSN,
 	})
 	if err != nil {
 		// 门控：MySQL 不可达时跳过而非失败，保证无数据库环境下 go test 不误报
@@ -493,9 +513,10 @@ func TestMySQLInteg_ScanAllRowsNonStruct(t *testing.T) {
 
 // TestMySQLInteg_PoolCloseAndPing 验证 Pool 创建后 Close 再 Ping 返回错误。
 func TestMySQLInteg_PoolCloseAndPing(t *testing.T) {
+	requireMySQLAvailable(t)
 	pool, err := NewPool(PoolConfig{
 		DriverName: "mysql",
-		DSN:        "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local",
+		DSN:        mysqlTestMasterDSN,
 	})
 	if err != nil {
 		t.Fatalf("NewPool error: %v", err)
@@ -513,10 +534,13 @@ func TestMySQLInteg_PoolCloseAndPing(t *testing.T) {
 }
 
 // TestMySQLInteg_NewPoolWithSlaveFail 验证 NewPool 从库连接失败时整体返回错误。
+// 需先探测主库可达：若主库不可达则跳过（避免因主库失败而静默通过），
+// 主库可达、从库不可达时才断言 NewPool 返回错误。
 func TestMySQLInteg_NewPoolWithSlaveFail(t *testing.T) {
+	requireMySQLAvailable(t)
 	_, err := NewPool(PoolConfig{
 		DriverName: "mysql",
-		DSN:        "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local",
+		DSN:        mysqlTestMasterDSN,
 		SlaveDSNs:  []string{"root:wrong_password@tcp(127.0.0.1:33306)/?charset=utf8mb4"},
 	})
 	if err == nil {

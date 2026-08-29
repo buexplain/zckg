@@ -527,7 +527,7 @@ var order Order
 err := db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &order)
 ```
 
-与 `LockForUpdate`/`SharedLock` 相同，`Primary()` 标记经 Clone 保留，First/Value/Paginate 等内部克隆的终端方法同样生效。
+与 `LockForUpdate`/`SharedLock` 相同，`Primary()` 标记经 Clone 保留，First/Value 等内部克隆的终端方法同样生效。
 
 ## Clone（查询复用）
 
@@ -544,4 +544,4 @@ sqlAdmins, _, _ := admins.ToSelect()
 // SQL: SELECT * FROM `users` WHERE `status` = ? AND `role` = ?
 ```
 
-First/Value/Paginate/CursorBy 等终端方法内部也用 Clone 避免污染调用方的 Builder。
+First/Value/CursorBy 等终端方法内部用 Clone 避免污染调用方的 Builder；Paginate 不克隆，直接复用原 Builder（由 `ToCount` 内部临时清除并 `defer` 恢复分页/排序/列，效果等价）。

@@ -54,58 +54,80 @@ func parseStruct(t reflect.Type, tagName string) *structInfo {
 		return cached.(*structInfo)
 	}
 
-	info := &structInfo{}
-	parseStructFields(t, info, nil, tagName)
+	info := &structInfo{Fields: collectStructFields(t, tagName)}
 
 	structCache.Store(key, info)
 	return info
 }
 
-// parseStructFields 递归解析结构体字段，支持嵌入结构体。
-// indexPrefix 是当前嵌入路径的前缀，tagName 为列映射标签名。
-func parseStructFields(t reflect.Type, info *structInfo, indexPrefix []int, tagName string) {
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
+// collectStructFields 按「外层优先」顺序展开结构体字段（含匿名嵌入结构体）。
+// 采用广度优先遍历：浅层字段先于深层（嵌入）字段处理，同层内按声明顺序；
+// 遇到已出现的列名直接跳过（浅层遮蔽深层，对齐 encoding/json 语义）。
+// 返回去重后的字段序列，供扫描映射与 Insert/Update 数据提取共用。
+func collectStructFields(t reflect.Type, tagName string) []structField {
+	type pending struct {
+		typ   reflect.Type
+		index []int
+	}
 
-		// 跳过未导出字段
-		if !field.IsExported() {
-			continue
-		}
+	var fields []structField
+	seen := make(map[string]bool)
+	queue := []pending{{typ: t}}
 
-		// 构建当前字段的完整索引路径
-		index := make([]int, len(indexPrefix)+1)
-		copy(index, indexPrefix)
-		index[len(indexPrefix)] = i
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
 
-		// 处理嵌入结构体（匿名字段，支持值类型与指针类型）
-		if field.Anonymous {
-			embeddedType := field.Type
-			if embeddedType.Kind() == reflect.Ptr {
-				embeddedType = embeddedType.Elem()
-			}
-			if embeddedType.Kind() == reflect.Struct {
-				parseStructFields(embeddedType, info, index, tagName)
+		for i := 0; i < cur.typ.NumField(); i++ {
+			field := cur.typ.Field(i)
+
+			// 跳过未导出字段
+			if !field.IsExported() {
 				continue
 			}
-		}
 
-		// 解析列映射标签
-		tag := field.Tag.Get(tagName)
-		if tag == "-" {
-			continue
-		}
+			// 构建当前字段的完整索引路径
+			index := make([]int, len(cur.index)+1)
+			copy(index, cur.index)
+			index[len(cur.index)] = i
 
-		column := tag
-		if column == "" {
-			// 无标签时将 GoFieldName 转为 snake_case
-			column = toSnakeCase(field.Name)
-		}
+			// 处理嵌入结构体（匿名字段，支持值类型与指针类型）：
+			// 不立即递归，而是入队待下一层处理，保证外层字段优先
+			if field.Anonymous {
+				embeddedType := field.Type
+				if embeddedType.Kind() == reflect.Ptr {
+					embeddedType = embeddedType.Elem()
+				}
+				if embeddedType.Kind() == reflect.Struct {
+					queue = append(queue, pending{typ: embeddedType, index: index})
+					continue
+				}
+			}
 
-		info.Fields = append(info.Fields, structField{
-			Column: column,
-			Index:  index,
-		})
+			// 解析列映射标签
+			tag := field.Tag.Get(tagName)
+			if tag == "-" {
+				continue
+			}
+
+			column := tag
+			if column == "" {
+				// 无标签时将 GoFieldName 转为 snake_case
+				column = toSnakeCase(field.Name)
+			}
+
+			// 浅层遮蔽深层：同名列仅保留最先（最浅）出现者
+			if seen[column] {
+				continue
+			}
+			seen[column] = true
+			fields = append(fields, structField{
+				Column: column,
+				Index:  index,
+			})
+		}
 	}
+	return fields
 }
 
 // extractInsertData 从 INSERT 数据中提取列名和值。

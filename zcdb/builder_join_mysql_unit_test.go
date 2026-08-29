@@ -153,6 +153,31 @@ func TestMySQLGrammar_JoinBuilderWhereExists(t *testing.T) {
 	})
 }
 
+// TestMySQLGrammar_JoinBuilderWhereInInvalid 验证 JoinBuilder.WhereIn/WhereNotIn 非法 values 类型
+// 返回专属错误 ErrInvalidWhereInValues（而非误导性的 ErrInvalidSubQuery）。
+func TestMySQLGrammar_JoinBuilderWhereInInvalid(t *testing.T) {
+	g := NewMySQLGrammar()
+	for _, not := range []bool{false, true} {
+		name := "WhereIn"
+		if not {
+			name = "WhereNotIn"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, _, err := NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+				j.On("profiles.user_id", "=", "users.id")
+				if not {
+					j.WhereNotIn("profiles.status", 123)
+				} else {
+					j.WhereIn("profiles.status", 123)
+				}
+			}).ToSelect()
+			if !errors.Is(err, ErrInvalidWhereInValues) {
+				t.Errorf("非法 values 类型期望 ErrInvalidWhereInValues，得到: %v", err)
+			}
+		})
+	}
+}
+
 // TestMySQLGrammar_JoinBuilderNested 验证 OnNested/OrWhereNested 嵌套条件组的括号编译形态。
 func TestMySQLGrammar_JoinBuilderNested(t *testing.T) {
 	g := NewMySQLGrammar()

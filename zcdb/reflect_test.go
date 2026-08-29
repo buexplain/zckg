@@ -227,6 +227,49 @@ func TestParseStruct_EmbeddedPtrStruct(t *testing.T) {
 	}
 }
 
+// TestParseStruct_EmbeddedShadowOuterWins 验证同名列的嵌入展开为「外层优先」：
+// 外层字段遮蔽嵌入层同名字段，与声明顺序无关（对齐 encoding/json 语义）。
+func TestParseStruct_EmbeddedShadowOuterWins(t *testing.T) {
+	type Base struct {
+		Name string `db:"name"`
+	}
+	// 外层字段声明在前
+	type OuterFirst struct {
+		Name string `db:"name"`
+		Base
+	}
+	// 嵌入字段声明在前
+	type EmbedFirst struct {
+		Base
+		Name string `db:"name"`
+	}
+
+	for _, tc := range []struct {
+		name string
+		typ  reflect.Type
+		want []int
+	}{
+		{"外层在前", reflect.TypeOf(OuterFirst{}), []int{0}},
+		{"嵌入在前", reflect.TypeOf(EmbedFirst{}), []int{1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := parseStruct(tc.typ, "")
+			if info == nil {
+				t.Fatal("parseStruct returned nil")
+			}
+			if len(info.Fields) != 1 {
+				t.Fatalf("expected 1 field (deduped), got %d: %+v", len(info.Fields), info.Fields)
+			}
+			if info.Fields[0].Column != "name" {
+				t.Errorf("expected column name, got %q", info.Fields[0].Column)
+			}
+			if !reflect.DeepEqual(info.Fields[0].Index, tc.want) {
+				t.Errorf("expected index %v, got %v", tc.want, info.Fields[0].Index)
+			}
+		})
+	}
+}
+
 // ==================== extractInsertData 测试 ====================
 
 // TestExtractInsertData_SingleStruct 验证单个结构体。

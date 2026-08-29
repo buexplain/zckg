@@ -132,7 +132,7 @@ total, err := db.Builder().Table("users").
 
 内部行为：
 
-- 先**克隆** Builder 并清除 orders/limit/offset/columns 后执行 COUNT（原 Builder 不受影响）；
+- 复用 `Count`（内部走 `ToCount`）统计总数：`ToCount` 临时清除 limit/offset/orders/columns 并 `defer` 恢复，`Paginate` 直接复用原 Builder，原 Builder 状态不受影响；
 - `totalCount == 0` 时不再执行数据查询，直接返回；
 - 分页范围需预先通过 `ForPage` 或 `Limit+Offset` 设置。
 
@@ -189,6 +189,8 @@ for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id", tru
 ## ScanStruct / ScanStructClose
 
 配合 [dao.Query 原始 SQL](connection.md#原始-sql) 使用的行扫描工具，按 db 标签（或 snake_case 字段名）将 `*sql.Rows` 扫描到结构体，支持嵌入结构体字段展开：
+
+> 嵌入结构体字段展开为「外层优先」：匿名嵌入结构体的字段被提升到外层，若外层与嵌入层存在同名列，**外层字段遮蔽嵌入层字段**（浅层优先，与 encoding/json 语义一致），与字段声明顺序无关。
 
 ```go
 rows, err := db.Query(ctx, "SELECT id, name, age FROM users WHERE age > ?", 18)

@@ -45,46 +45,16 @@ func getScanFieldInfo(t reflect.Type, tagName string) *scanFieldInfo {
 	info := &scanFieldInfo{
 		columnIndex: make(map[string][]int),
 	}
-	buildScanFields(t, info, nil, tagName)
+	buildScanFields(t, info, tagName)
 
 	scanCache.Store(key, info)
 	return info
 }
 
-// buildScanFields 递归构建扫描字段映射，支持嵌入结构体，tagName 为列映射标签名。
-func buildScanFields(t reflect.Type, info *scanFieldInfo, indexPrefix []int, tagName string) {
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if !field.IsExported() {
-			continue
-		}
-
-		// 构建当前字段的完整索引路径
-		index := make([]int, len(indexPrefix)+1)
-		copy(index, indexPrefix)
-		index[len(indexPrefix)] = i
-
-		// 处理嵌入结构体（匿名字段，支持值类型与指针类型）
-		if field.Anonymous {
-			embeddedType := field.Type
-			if embeddedType.Kind() == reflect.Ptr {
-				embeddedType = embeddedType.Elem()
-			}
-			if embeddedType.Kind() == reflect.Struct {
-				buildScanFields(embeddedType, info, index, tagName)
-				continue
-			}
-		}
-
-		tag := field.Tag.Get(tagName)
-		if tag == "-" {
-			continue
-		}
-		column := tag
-		if column == "" {
-			column = toSnakeCase(field.Name)
-		}
-		info.columnIndex[column] = index
+// buildScanFields 构建扫描字段映射，复用 collectStructFields 的外层优先展开结果。
+func buildScanFields(t reflect.Type, info *scanFieldInfo, tagName string) {
+	for _, f := range collectStructFields(t, tagName) {
+		info.columnIndex[f.Column] = f.Index
 	}
 }
 

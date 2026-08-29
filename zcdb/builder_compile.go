@@ -665,26 +665,14 @@ func (b *Builder) ToExists() (string, []any, error) {
 		return "", nil, ErrEmptyTable
 	}
 
-	// 保存并清除分页/排序/锁/列：存在性检查只关心是否有匹配行
-	origLimit, origOffset := b.limit, b.offset
-	origOrders := b.orders
-	origLock := b.lockClause
-	origColumns := b.columns
-	origSelectSubs := b.selectSubs
+	// 保存并清除分页/排序/锁/列：存在性检查只关心是否有匹配行；
+	// defer 恢复确保 panic 时状态也能完整还原（与 ToCount/ToAggregate 共用 saveTransientState）
+	defer b.saveTransientState()()
 	b.limit, b.offset = 0, 0
 	b.orders = nil
 	b.lockClause = ""
 	b.columns = []SelectColumn{{Value: "1", Raw: true}}
 	b.selectSubs = nil
-
-	// 使用 defer 确保 panic 时也能恢复状态
-	defer func() {
-		b.limit, b.offset = origLimit, origOffset
-		b.orders = origOrders
-		b.lockClause = origLock
-		b.columns = origColumns
-		b.selectSubs = origSelectSubs
-	}()
 
 	subSQL := b.grammar.CompileSelect(b, b.columns)
 	args := b.collectSelectBindings()
@@ -855,6 +843,10 @@ func collectHavingBindings(havings []HavingClause) []any {
 	for _, h := range havings {
 		switch h.Type {
 		case "basic":
+			// nil 特判：= / != / <> 遇 nil 编译为 IS [NOT] NULL，无绑定参数（与 compileHavings 对称）
+			if h.Value == nil && (h.Operator == "=" || h.Operator == "!=" || h.Operator == "<>") {
+				continue
+			}
 			// Expression 已直接内嵌到 SQL，不作为绑定参数
 			if _, ok := h.Value.(Expression); !ok {
 				args = append(args, h.Value)
@@ -978,9 +970,18 @@ func (b *Builder) collectWhereBindings() []any {
 				args = append(args, w.Value)
 			}
 		case WhereTypeIn:
-			args = append(args, w.Values...)
+			for _, v := range w.Values {
+				// Expression 已直接内嵌 SQL，不作为绑定参数（与 compileWhereIn 对称）
+				if _, ok := v.(Expression); !ok {
+					args = append(args, v)
+				}
+			}
 		case WhereTypeNotIn:
-			args = append(args, w.Values...)
+			for _, v := range w.Values {
+				if _, ok := v.(Expression); !ok {
+					args = append(args, v)
+				}
+			}
 		case WhereTypeBetween, WhereTypeNotBetween:
 			args = append(args, w.Min, w.Max)
 		case WhereTypeRaw:

@@ -240,3 +240,61 @@ func TestPool_CloseIdempotentAndAddSlaveAfterClose(t *testing.T) {
 		t.Errorf("Close 后 AddSlave 应返回 errPoolClosed，实际: %v", err)
 	}
 }
+
+// TestPool_AddSlaveCloseRace 验证 AddSlave 的 Ping 网络往返期间 Close 完成时，
+// AddSlave 在锁内复检 closed 并关闭新从库、返回 errPoolClosed（修复前：新从库被
+// 追加进已关闭的池，此后永不被 Close，造成连接泄漏）。
+func TestPool_AddSlaveCloseRace(t *testing.T) {
+	registerBlockingPingDriver()
+	release := make(chan struct{})
+	pingStarted := make(chan struct{})
+	testBlockingPingDriver.reset(release, pingStarted)
+
+	master, err := sql.Open("zcdb_test_blocking_ping_driver", "master")
+	if err != nil {
+		t.Fatalf("open master failed: %v", err)
+	}
+	t.Cleanup(func() { _ = master.Close() })
+	pool := &Pool{
+		master:                master,
+		driverName:            "zcdb_test_blocking_ping_driver",
+		slaveStrategy:         &RandomStrategy{},
+		maxOpenConns:          50,
+		maxIdleConns:          50,
+		connMaxLifetimeSecond: 600,
+		connectTimeout:        time.Second,
+	}
+
+	// AddSlave 阻塞在 Ping（模拟慢网络，已通过入口处的 closed 快速检查）
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- pool.AddSlave("slave1")
+	}()
+
+	select {
+	case <-pingStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("AddSlave did not reach Ping in time")
+	}
+
+	// Ping 阻塞期间 Close 完成（置 closed、清空 slaves）
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	// 释放 Ping：AddSlave 锁内复检 closed，应关闭新从库并返回 errPoolClosed
+	close(release)
+	select {
+	case err := <-addDone:
+		if !errors.Is(err, errPoolClosed) {
+			t.Fatalf("AddSlave 在 Ping 期间遭遇 Close 应返回 errPoolClosed，实际: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AddSlave did not complete after release")
+	}
+
+	// 已关闭的池不应持有任何从库
+	if got := pool.PickReadDB(); got != pool.master {
+		t.Errorf("关闭后 PickReadDB 应回退主库，实际返回从库")
+	}
+}

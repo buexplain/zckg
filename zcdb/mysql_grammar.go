@@ -652,27 +652,37 @@ func (g *MySQLGrammar) compileWhereBasic(w WhereClause) string {
 }
 
 // compileWhereIn 编译 IN 条件；空值列表编译为 0 = 1（恒假）。
+// Expression 元素直接内嵌原始 SQL（不占占位符），其余元素各占一个 ?。
 func (g *MySQLGrammar) compileWhereIn(w WhereClause) string {
 	if len(w.Values) == 0 {
 		return "0 = 1" // 空 IN 等价于 false
 	}
-	placeholders := make([]string, len(w.Values))
-	for i := range w.Values {
-		placeholders[i] = "?"
+	parts := make([]string, len(w.Values))
+	for i, v := range w.Values {
+		if expr, ok := v.(Expression); ok {
+			parts[i] = expr.Value()
+		} else {
+			parts[i] = "?"
+		}
 	}
-	return g.WrapColumn(w.Column) + " IN (" + strings.Join(placeholders, ", ") + ")"
+	return g.WrapColumn(w.Column) + " IN (" + strings.Join(parts, ", ") + ")"
 }
 
 // compileWhereNotIn 编译 NOT IN 条件；空值列表编译为 1 = 1（恒真）。
+// Expression 元素直接内嵌原始 SQL（不占占位符），其余元素各占一个 ?。
 func (g *MySQLGrammar) compileWhereNotIn(w WhereClause) string {
 	if len(w.Values) == 0 {
 		return "1 = 1" // 空 NOT IN 等价于 true
 	}
-	placeholders := make([]string, len(w.Values))
-	for i := range w.Values {
-		placeholders[i] = "?"
+	parts := make([]string, len(w.Values))
+	for i, v := range w.Values {
+		if expr, ok := v.(Expression); ok {
+			parts[i] = expr.Value()
+		} else {
+			parts[i] = "?"
+		}
 	}
-	return g.WrapColumn(w.Column) + " NOT IN (" + strings.Join(placeholders, ", ") + ")"
+	return g.WrapColumn(w.Column) + " NOT IN (" + strings.Join(parts, ", ") + ")"
 }
 
 // compileJoin 编译 JOIN 子句。
@@ -814,7 +824,15 @@ func (g *MySQLGrammar) compileHavings(b *Builder) string {
 		var clause string
 		switch h.Type {
 		case "basic":
-			if expr, ok := h.Value.(Expression); ok {
+			// nil 特判：= nil / != nil / <> nil 编译为 IS NULL / IS NOT NULL，
+			// 与 Where 的 nil 语义对齐（防止永假的 HAVING = NULL）
+			if h.Value == nil && (h.Operator == "=" || h.Operator == "!=" || h.Operator == "<>") {
+				if h.Operator == "=" {
+					clause = g.WrapColumn(h.Column) + " IS NULL"
+				} else {
+					clause = g.WrapColumn(h.Column) + " IS NOT NULL"
+				}
+			} else if expr, ok := h.Value.(Expression); ok {
 				clause = g.WrapColumn(h.Column) + " " + h.Operator + " " + expr.Value()
 			} else {
 				clause = g.WrapColumn(h.Column) + " " + h.Operator + " ?"

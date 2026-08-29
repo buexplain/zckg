@@ -52,6 +52,9 @@ var (
 	// ErrInvalidSubQuery WhereExists 等方法的 sub 参数类型非法（仅支持 *Builder 或 func(*Builder)）
 	ErrInvalidSubQuery = errors.New("zcdb: sub must be a *Builder or func(*Builder)")
 
+	// ErrInvalidWhereInValues JoinBuilder 的 WhereIn/WhereNotIn values 参数类型非法（仅支持 []any 或 *Builder）
+	ErrInvalidWhereInValues = errors.New("zcdb: WhereIn values must be []any or *Builder")
+
 	// ErrInvalidAggregate ToAggregate 的聚合函数非法（仅支持 MAX/MIN/SUM/AVG）
 	ErrInvalidAggregate = errors.New("zcdb: aggregate must be one of MAX, MIN, SUM, AVG")
 

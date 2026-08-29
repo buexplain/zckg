@@ -219,6 +219,42 @@ func TestMakeScanValues_EmbeddedStruct(t *testing.T) {
 	}
 }
 
+// TestGetScanFieldInfo_EmbeddedShadowOuterWins 验证扫描列映射的「外层优先」遮蔽：
+// 同名列应映射到外层字段而非嵌入层字段，与声明顺序无关。
+func TestGetScanFieldInfo_EmbeddedShadowOuterWins(t *testing.T) {
+	type Base struct {
+		Name string `db:"name"`
+	}
+	type OuterFirst struct {
+		Name string `db:"name"`
+		Base
+	}
+	type EmbedFirst struct {
+		Base
+		Name string `db:"name"`
+	}
+
+	for _, tc := range []struct {
+		name string
+		typ  reflect.Type
+		want []int
+	}{
+		{"外层在前", reflect.TypeOf(OuterFirst{}), []int{0}},
+		{"嵌入在前", reflect.TypeOf(EmbedFirst{}), []int{1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := getScanFieldInfo(tc.typ, "")
+			got, ok := info.columnIndex["name"]
+			if !ok {
+				t.Fatal("column name not found")
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("expected index %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
 // ==================== nullSafeField.Scan 测试 ====================
 
 // TestBug_ScanStringToMapJSON 复现审查候选 #7：[]byte→map 走 JSON 反序列化，

@@ -405,7 +405,7 @@ func (j *JoinBuilder) addWhereIn(column string, values any, not bool) *JoinBuild
 			Boolean: "AND",
 		})
 	default:
-		j.err = ErrInvalidSubQuery
+		j.err = ErrInvalidWhereInValues
 	}
 	return j
 }

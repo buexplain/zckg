@@ -6,7 +6,7 @@ zcdb 是一个基于 `database/sql` 的数据库访问模块，核心是 **Build
 
 - **Builder 累积查询状态，Grammar 编译为 SQL**——同一套链式 API 生成 MySQL / PostgreSQL / SQLite 三种方言的 SQL；
 - **主从连接池**：读操作按策略路由到从库，写操作与事务固定走主库，带锁查询与 `Primary()` 标记的查询强制走主库（后者用于写后读场景，不加锁）；
-- **结构体自动映射**：按 `db` 标签（或 snake_case 字段名）在 SQL 列与结构体字段之间双向映射，标签名可在创建 DAO 时自定义；
+- **结构体自动映射**：按 `db` 标签（或 snake_case 字段名）在 SQL 列与结构体字段之间双向映射，标签名可在创建 DAO 时自定义；匿名嵌入结构体字段展开为「外层优先」（同名列浅层遮蔽深层，对齐 encoding/json 语义）；
 - **破坏性操作保护**：无 WHERE 条件的 Update/Delete 默认拒绝执行，需显式 `Force()`。
 
 zcdb 本身不依赖具体数据库驱动，需由使用方引入 `database/sql` 驱动并传入驱动名。
@@ -149,6 +149,7 @@ func main() {
 | `ErrEmptyData` | 插入数据为空 |
 | `ErrInvalidOperator` | 运算符不在白名单内 |
 | `ErrInvalidSubQuery` | WhereExists 等方法的子查询参数类型非法 |
+| `ErrInvalidWhereInValues` | JoinBuilder 的 WhereIn/WhereNotIn values 参数类型非法（仅支持 `[]any` 或 `*Builder`） |
 | `ErrInvalidAggregate` | 聚合函数不是 MAX/MIN/SUM/AVG |
 | `ErrPluckDest` / `ErrPluckColumns` | Pluck 目标类型或列数不匹配 |
 | `ErrDeleteWithoutWhere` / `ErrUpdateWithoutWhere` | 无 WHERE 的 Delete/Update 被保护机制拒绝 |

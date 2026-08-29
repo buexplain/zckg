@@ -1112,6 +1112,40 @@ func TestBuilder_WhereNotInEmpty(t *testing.T) {
 	assertArgs(t, []any{}, args)
 }
 
+// TestBuilder_WhereInExpression 验证 WhereIn/WhereNotIn 的 Expression 元素直接内嵌 SQL、
+// 不占占位符，其余元素照常绑定（三方言对称）。
+func TestBuilder_WhereInExpression(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "SELECT * FROM `users` WHERE `id` IN (?, parent_id)"},
+		{"postgres", NewPostgresGrammar(), `SELECT * FROM "users" WHERE "id" IN ($1, parent_id)`},
+		{"sqlite", NewSQLiteGrammar(), `SELECT * FROM "users" WHERE "id" IN (?, parent_id)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args, err := NewBuilder(tt.grammar, nil).
+				Table("users").
+				WhereIn("id", []any{1, NewExpression("parent_id")}).
+				ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+			assertArgs(t, []any{1}, args)
+		})
+	}
+
+	// NOT IN 同构（MySQL 形态）
+	sql, args, err := NewBuilder(NewMySQLGrammar(), nil).
+		Table("users").
+		WhereNotIn("id", []any{NewExpression("parent_id"), 2}).
+		ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, "SELECT * FROM `users` WHERE `id` NOT IN (parent_id, ?)", sql)
+	assertArgs(t, []any{2}, args)
+}
+
 // TestBug_HavingWithExpression 验证 Having/OrHaving 传入 Expression 时直接内嵌 SQL。
 // 当前行为（BUG）：compileHavings 的 basic 分支固定生成占位符，
 // Expression 被当作绑定参数传入驱动导致执行失败。
@@ -2048,6 +2082,53 @@ func TestNewApi_HavingCompile(t *testing.T) {
 			assertNoError(t, err)
 			assertSQL(t, tt.sql, sql)
 			assertArgs(t, tt.args, args)
+		})
+	}
+}
+
+// TestNewApi_HavingNil 验证 Having 传 nil 时按运算符编译：= nil → IS NULL、
+// != / <> nil → IS NOT NULL（与 Where 对齐，避免永假的 HAVING = NULL）；
+// 其它运算符仍生成占位符并绑定 nil。
+func TestNewApi_HavingNil(t *testing.T) {
+	tests := []struct {
+		name    string
+		grammar Grammar
+		eqSQL   string
+		neSQL   string
+		gtSQL   string
+	}{
+		{"mysql", NewMySQLGrammar(),
+			"SELECT * FROM `users` GROUP BY `dept_id` HAVING `email` IS NULL",
+			"SELECT * FROM `users` GROUP BY `dept_id` HAVING `email` IS NOT NULL",
+			"SELECT * FROM `users` GROUP BY `dept_id` HAVING `email` > ?"},
+		{"postgres", NewPostgresGrammar(),
+			`SELECT * FROM "users" GROUP BY "dept_id" HAVING "email" IS NULL`,
+			`SELECT * FROM "users" GROUP BY "dept_id" HAVING "email" IS NOT NULL`,
+			`SELECT * FROM "users" GROUP BY "dept_id" HAVING "email" > $1`},
+		{"sqlite", NewSQLiteGrammar(),
+			`SELECT * FROM "users" GROUP BY "dept_id" HAVING "email" IS NULL`,
+			`SELECT * FROM "users" GROUP BY "dept_id" HAVING "email" IS NOT NULL`,
+			`SELECT * FROM "users" GROUP BY "dept_id" HAVING "email" > ?`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := NewBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", "=", nil)
+			sql, args, err := b.ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.eqSQL, sql)
+			assertArgs(t, nil, args)
+
+			b = NewBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", "!=", nil)
+			sql, args, err = b.ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.neSQL, sql)
+			assertArgs(t, nil, args)
+
+			b = NewBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", ">", nil)
+			sql, args, err = b.ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.gtSQL, sql)
+			assertArgs(t, []any{nil}, args)
 		})
 	}
 }
