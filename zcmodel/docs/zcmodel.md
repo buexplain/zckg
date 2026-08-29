@@ -88,7 +88,7 @@ func Generate(input Input) error
 | `表名非法: xxx` | `TableName` 为 `.` 或 `..` |
 | `表名包含非法字符: xxx` | `TableName` 含路径分隔符（`/`、`\`）或 Windows 非法文件名字符（`< > : " | ? *`） |
 | `表名首字符必须为 ASCII 字母或下划线: xxx` | `TableName` 首字符为数字或非 ASCII 字符（如中文表名），会推导出无法编译的结构体名 |
-| `invalid json tag value case` | `JsonTagValueCase` 非空但不是合法的 `NameCase` 枚举值 |
+| `不支持的 json tag 命名风格: xxx` | `JsonTagValueCase` 非空但不是合法的 `NameCase` 枚举值 |
 | `列 xxx 转换后的字段名为空` | 列名经 `toPascalCase` 转换后为空（如纯分隔符列名） |
 | `列 xxx 转换后的字段名 xxx 不是合法的 Go 标识符` | 转换后字段名数字开头等（如列名 `2fa_code`）；请在 `StructFieldInfo.Name` 显式指定合法名称 |
 | `列 xxx 与 xxx 转换后的字段名重复: xxx` | 不同列转换后字段名相同（如 `user_id` 与 `userId`） |
@@ -297,13 +297,13 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 
 1. **AST 解析**整个现有文件（`parser.ParseComments`），解析失败则报错返回，绝不覆盖；
 2. **识别并移除旧的生成代码**（内部由 `isGeneratedTypeSpec` / `isGeneratedMethod` 判定）：
-   - 名为 `{EntityName}` / `{DOName}` 的 type 声明（混合 type 声明块按 Spec 粒度过滤：仅剔除生成的类型，同块中的用户类型保留）；
+   - 名为 `{EntityName}` / `{DOName}` 的 type 声明（混合 type 声明块按 Spec 粒度过滤：按源码偏移剔除生成的类型，同块中的用户类型及其注释、块内游离注释均原样保留）；
    - Entity 上的 `ToDO` 方法、DO 上的 `ToEntity` 方法（含值接收者版本，避免同名方法共存导致编译失败）；
 3. **分类保留用户代码**：
-   - Entity 上的自定义方法 → 紧随 Entity 生成代码之后；
-   - DO 上的自定义方法 → 紧随 DO 生成代码之后；
+   - Entity 上的自定义方法（指针/值接收者均识别）→ 紧随 Entity 生成代码之后；
+   - DO 上的自定义方法（指针/值接收者均识别）→ 紧随 DO 生成代码之后；
    - 其他声明（import 单独收集）→ 放在文件末尾；
-4. **补齐 import**：生成代码所需的包（如 `time`）若文件中缺失，自动补充到 import 区；存量文件以**别名导入**（含 `_`、`.` 导入）所需包时不视为已存在，仍会补充默认导入（生成代码引用默认包名，两种导入可合法共存）；
+4. **补齐 import**：生成代码所需的包（如 `time`）若文件中缺失，自动补充并合并进原第一个 import 块（避免形成两个 import 块）；存量文件以**别名导入**（含 `_`、`.` 导入）所需包时不视为已存在，仍会补充默认导入（生成代码引用默认包名，两种导入可合法共存）；
 5. 按固定布局重写整个文件；
 6. **落盘保障**：全部处理成功后，对完整内容执行 `go/format.Source` 语法自校验，再经同目录临时文件 + rename 原子替换目标文件（见下方“落盘安全三重防线”）。
 
@@ -433,7 +433,7 @@ columns := []*zcmodel.Column{
 用户可以在生成文件中自由添加自定义方法，表结构变化后再次调用 `Generate`：
 
 - Entity/DO 结构体与 ToDO/ToEntity 被**替换**为最新版本；
-- 自定义方法（如 `func (e *UserOrderEntity) Validate() error`）**原样保留**，且自动归位到对应结构体的生成代码之后；
+- 自定义方法（如 `func (e *UserOrderEntity) Validate() error`，指针与值接收者均支持）**原样保留**，且自动归位到对应结构体的生成代码之后；
 - 若新表结构引入了新的依赖包（如新增 datetime 列），`time` import 会被自动补上。
 
 ## 注意事项

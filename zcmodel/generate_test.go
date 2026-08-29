@@ -80,8 +80,12 @@ func TestGenerate_InvalidJsonTagValueCase(t *testing.T) {
 		TableName:        "user_info",
 		JsonTagValueCase: NameCase("invalidCase"),
 	}
-	if err := Generate(input); err == nil {
-		t.Errorf("Generate() 期望返回错误，实际为 nil")
+	err := Generate(input)
+	if err == nil {
+		t.Fatalf("Generate() 期望返回错误，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "不支持的 json tag 命名风格") {
+		t.Errorf("错误信息应说明 json tag 命名风格不合法，实际: %v", err)
 	}
 }
 
@@ -736,8 +740,11 @@ func (e *UserInfoEntity) Now() mytime.Time {
 	if !strings.Contains(got, "mytime \"time\"") {
 		t.Errorf("用户别名导入应保留:\n%s", got)
 	}
-	if !strings.Contains(got, "import \"time\"") {
-		t.Errorf("别名导入不满足生成代码需要，应补充标准导入 import \"time\":\n%s", got)
+	if !strings.Contains(got, "\t\"time\"\n") {
+		t.Errorf("别名导入不满足生成代码需要，应补充标准导入 \"time\":\n%s", got)
+	}
+	if strings.Count(got, "import (") != 1 {
+		t.Errorf("缺失导入应合并进原 import 块（不形成两个 import 块）:\n%s", got)
 	}
 	if !strings.Contains(got, "func (e *UserInfoEntity) Now() mytime.Time {") {
 		t.Errorf("用户自定义方法应保留:\n%s", got)

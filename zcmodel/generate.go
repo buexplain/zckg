@@ -41,7 +41,7 @@ func Generate(input Input) error {
 	// 处理json tag的值
 	if input.JsonTagValueCase != "" {
 		if input.JsonTagValueCase.IsValid() == false {
-			return errors.New("invalid json tag value case")
+			return fmt.Errorf("不支持的 json tag 命名风格: %s", input.JsonTagValueCase)
 		}
 		for i := range columns {
 			if columns[i].StructFieldInfo.JsonTagValue == "" {

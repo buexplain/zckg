@@ -6,7 +6,6 @@ import (
 	"go/ast"
 	"go/format"
 	"go/parser"
-	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -212,12 +211,14 @@ func writeGeneratedFile(filePath string, content []byte) error {
 // 文件最终布局为：原文件头（build tags、文件级注释、原 package 行）+ imports + Entity 生成代码 +
 // Entity 自定义方法 + DO 生成代码 + DO 自定义方法 + 其他用户代码。
 // 若文件已存在，通过 AST 解析识别并移除旧的生成代码（Entity/DO 结构体、ToDO/ToEntity 方法，
-// 含值接收者版本），保留用户自定义代码（含 Entity/DO 上的自定义方法）并按上述布局重新组织；
+// 含值接收者版本），保留用户自定义代码（含 Entity/DO 上的自定义方法，指针/值接收者均识别）并按上述布局重新组织；
 // go/parser 不会把 package 声明之前的 build tags/文件级注释放进 file.Decls，重建时按源码偏移
 // 显式前置保留，已有文件的包名尊重原文件，仅新建文件使用目录推导包名。
-// type 声明块按 Spec 粒度过滤：块中混有用户类型时仅剔除生成的类型，用户类型（含注释）保留。
+// type 声明块按 Spec 粒度过滤：块中混有用户类型时按源码偏移剔除生成的类型，用户类型（含各自注释）
+// 与块内不附着于任何 Spec 的游离注释均原样保留。
 // 最终产物统一经 go/format 格式化并原子写入，保留原文件权限位。
-// neededImports 为生成代码引用的包（如 time.Time 需要 time），写入时若文件缺少对应 import 会自动补上；
+// neededImports 为生成代码引用的包（如 time.Time 需要 time），写入时若文件缺少对应 import 会自动补上
+// （合并进原第一个 import 块，避免形成两个 import 块）；
 // 存量文件以别名（含 _、. 导入）引入所需包时不视为已存在，仍会补充默认导入，保证生成代码可编译。
 // filePath: 输出文件路径
 // entityName: Entity 结构体名
@@ -285,22 +286,82 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		return ok && (typeSpec.Name.Name == entityName || typeSpec.Name.Name == doName)
 	}
 
+	// specSpan 返回单个 Spec 的源码区间 [from, to)，包含其前置 Doc 注释与尾注释；
+	// 无注释时退化为 Spec 自身的源码区间。
+	specSpan := func(spec ast.Spec) (from, to int) {
+		from = tf.Offset(spec.Pos())
+		to = tf.Offset(spec.End())
+		switch s := spec.(type) {
+		case *ast.ImportSpec:
+			if s.Doc != nil {
+				from = tf.Offset(s.Doc.Pos())
+			}
+			if s.Comment != nil {
+				to = tf.Offset(s.Comment.End())
+			}
+		case *ast.TypeSpec:
+			if s.Doc != nil {
+				from = tf.Offset(s.Doc.Pos())
+			}
+			if s.Comment != nil {
+				to = tf.Offset(s.Comment.End())
+			}
+		}
+		return from, to
+	}
+
+	// getSpecSource 从原始文件内容中截取单个 Spec 的源码文本（含 Doc 与尾注释）
+	getSpecSource := func(spec ast.Spec) string {
+		from, to := specSpan(spec)
+		return string(origContent[from:to])
+	}
+
+	// removeGeneratedSpecs 在混合 type 声明块中按源码偏移剔除生成的类型 Spec（含其 Doc 注释与尾注释），
+	// 其余内容（保留的用户类型 Spec、块内游离注释、原格式）原样保留。
+	// 相比用 go/printer 重写过滤后的 AST，此法不重建声明节点，
+	// 块内不附着于任何 Spec 的游离注释不会被丢弃。
+	removeGeneratedSpecs := func(d *ast.GenDecl) string {
+		start := tf.Offset(d.Pos())
+		end := tf.Offset(d.End())
+		if d.Doc != nil {
+			start = tf.Offset(d.Doc.Pos())
+		}
+		var sb strings.Builder
+		last := start
+		for _, spec := range d.Specs {
+			if !isGeneratedTypeSpec(spec) {
+				continue
+			}
+			from, to := specSpan(spec)
+			sb.WriteString(string(origContent[last:from]))
+			last = to
+		}
+		sb.WriteString(string(origContent[last:end]))
+		return sb.String()
+	}
+
+	// receiverTypeName 返回方法接收者的类型名：指针接收者 (*Name) 与值接收者 (Name) 均返回 Name，
+	// 无接收者或接收者为其他类型（如泛型、选择器表达式）时返回空串。
+	receiverTypeName := func(decl *ast.FuncDecl) string {
+		if decl.Recv == nil || len(decl.Recv.List) == 0 {
+			return ""
+		}
+		switch t := decl.Recv.List[0].Type.(type) {
+		case *ast.StarExpr:
+			if ident, ok := t.X.(*ast.Ident); ok {
+				return ident.Name
+			}
+		case *ast.Ident:
+			return t.Name
+		}
+		return ""
+	}
+
 	// isGeneratedMethod 判断方法是否为生成代码（需被移除并重新生成）。
 	// 同时识别指针接收者 (*EntityName) 与值接收者 (EntityName)：用户手写的值接收者
 	// ToDO/ToEntity 视为对生成方法的覆盖，一并移除，避免同名方法共存导致编译失败。
 	isGeneratedMethod := func(decl *ast.FuncDecl) bool {
-		if decl.Recv == nil || len(decl.Recv.List) == 0 {
-			return false
-		}
-		var recvName string
-		switch t := decl.Recv.List[0].Type.(type) {
-		case *ast.StarExpr:
-			if ident, ok := t.X.(*ast.Ident); ok {
-				recvName = ident.Name
-			}
-		case *ast.Ident:
-			recvName = t.Name
-		}
+		recvName := receiverTypeName(decl)
 		// 仅 ToDO（Entity 上）和 ToEntity（DO 上）为生成方法
 		if recvName == entityName && decl.Name.Name == "ToDO" {
 			return true
@@ -313,10 +374,11 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 
 	// 分类收集用户代码和 import 声明
 	// 用户代码分为三类：
-	//   1. Entity 上的自定义方法（放在 Entity 生成代码后面）
-	//   2. DO 上的自定义方法（放在 DO 生成代码后面）
+	//   1. Entity 上的自定义方法（指针/值接收者均识别，放在 Entity 生成代码后面）
+	//   2. DO 上的自定义方法（指针/值接收者均识别，放在 DO 生成代码后面）
 	//   3. 其他用户代码（放在最后）
 	var importDecls []string
+	var firstImportDecl *ast.GenDecl
 	var entityMethodDecls []string
 	var doMethodDecls []string
 	var userDecls []string
@@ -326,6 +388,9 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		switch d := decl.(type) {
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
+				if firstImportDecl == nil {
+					firstImportDecl = d
+				}
 				importDecls = append(importDecls, getDeclSource(decl))
 				// 记录现有文件已导入的包路径，供 neededImports 校验缺失时补充。
 				// 仅统计无别名的导入：别名导入（含 _ 与 . 导入）绑定的是非默认包名，
@@ -364,19 +429,8 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 					// 全部为生成类型，整体移除
 					continue
 				}
-				// 混合 type 块：剔除生成类型，其余 Spec（含各自注释）用 go/printer 重写保留
-				filtered := *d
-				filtered.Specs = make([]ast.Spec, 0, kept)
-				for _, spec := range d.Specs {
-					if !isGeneratedTypeSpec(spec) {
-						filtered.Specs = append(filtered.Specs, spec)
-					}
-				}
-				var sb bytes.Buffer
-				if err := printer.Fprint(&sb, fset, &filtered); err != nil {
-					return fmt.Errorf("保留用户类型声明失败: %v", err)
-				}
-				userDecls = append(userDecls, sb.String())
+				// 混合 type 块：按源码偏移剔除生成的类型 Spec，用户类型与块内游离注释原样保留
+				userDecls = append(userDecls, removeGeneratedSpecs(d))
 				continue
 			}
 			// 其他 GenDecl（var/const）：整体保留
@@ -385,18 +439,14 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 			if isGeneratedMethod(d) {
 				continue
 			}
-			// 判断是否为 Entity 或 DO 上的自定义方法（接收者为 *EntityName 或 *DOName）
-			if d.Recv != nil && len(d.Recv.List) > 0 {
-				if starExpr, ok := d.Recv.List[0].Type.(*ast.StarExpr); ok {
-					if ident, ok := starExpr.X.(*ast.Ident); ok && ident.Name == entityName {
-						entityMethodDecls = append(entityMethodDecls, getDeclSource(decl))
-						continue
-					}
-					if ident, ok := starExpr.X.(*ast.Ident); ok && ident.Name == doName {
-						doMethodDecls = append(doMethodDecls, getDeclSource(decl))
-						continue
-					}
-				}
+			// 判断是否为 Entity 或 DO 上的自定义方法（指针/值接收者均识别并归位）
+			switch receiverTypeName(d) {
+			case entityName:
+				entityMethodDecls = append(entityMethodDecls, getDeclSource(decl))
+				continue
+			case doName:
+				doMethodDecls = append(doMethodDecls, getDeclSource(decl))
+				continue
 			}
 			userDecls = append(userDecls, getDeclSource(decl))
 		default:
@@ -406,15 +456,48 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 	}
 
 	// 重建文件：文件头 + 原 package 行 + imports + Entity生成代码 + Entity自定义方法 + DO生成代码 + DO自定义方法 + 其他用户代码
-	// 生成代码需要的 import 缺失时自动补充（放在原有 import 之前，保持同一位置）
+	// 生成代码需要的 import 缺失时自动补充：若文件已有 import 声明则合并进原第一个 import 块
+	// （避免形成两个 import 块），否则新建一个 import 声明。
 	var missingImports []string
 	for _, p := range neededImports {
 		if !existingImports[p] {
 			missingImports = append(missingImports, p)
 		}
 	}
+	// mergeMissingImports 将缺失的 import 路径合并进原第一个 import 声明块：
+	// 已为 import (…) 块时按源码偏移在右括号前插入新 spec，其余原文（含注释）不变；
+	// 单个 import "x" 时展开为 import (…) 块，保留原块 Doc 注释与各 spec 原文（含尾注释）。
+	mergeMissingImports := func(first *ast.GenDecl, missing []string) string {
+		declStart := tf.Offset(first.Pos())
+		declEnd := tf.Offset(first.End())
+		if first.Doc != nil {
+			declStart = tf.Offset(first.Doc.Pos())
+		}
+		var newLines strings.Builder
+		for _, p := range missing {
+			newLines.WriteString("\t")
+			newLines.WriteString(strconv.Quote(p))
+			newLines.WriteString("\n")
+		}
+		if first.Lparen.IsValid() {
+			rparen := tf.Offset(first.Rparen)
+			return string(origContent[declStart:rparen]) + newLines.String() + string(origContent[rparen:declEnd])
+		}
+		var sb strings.Builder
+		for _, spec := range first.Specs {
+			sb.WriteString("\t")
+			sb.WriteString(getSpecSource(spec))
+			sb.WriteString("\n")
+		}
+		sb.WriteString(newLines.String())
+		return string(origContent[declStart:tf.Offset(first.Pos())]) + "import (\n" + sb.String() + ")"
+	}
 	if len(missingImports) > 0 {
-		importDecls = append([]string{buildImportDecl(missingImports)}, importDecls...)
+		if firstImportDecl != nil {
+			importDecls[0] = mergeMissingImports(firstImportDecl, missingImports)
+		} else {
+			importDecls = append([]string{buildImportDecl(missingImports)}, importDecls...)
+		}
 	}
 
 	var buf bytes.Buffer

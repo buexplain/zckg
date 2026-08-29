@@ -459,11 +459,9 @@ func (e *UserEntity) Hello() string {
 		t.Fatalf("读取文件失败: %v", err)
 	}
 	got := string(content)
-	if !strings.Contains(got, "import \"time\"") {
-		t.Errorf("已存在文件缺少 time import 时应自动补上:\n%s", got)
-	}
-	if !strings.Contains(got, "import \"fmt\"") {
-		t.Errorf("用户原有 import 应保留:\n%s", got)
+	// 缺失的 time 合并进原 import 块（单一 import 块，避免形成两个 import 块）
+	if !strings.Contains(got, "import (\n\t\"fmt\"\n\t\"time\"\n)") {
+		t.Errorf("缺失的 time import 应合并进原 import 块:\n%s", got)
 	}
 	if !strings.Contains(got, "func (e *UserEntity) Hello() string {") {
 		t.Errorf("用户自定义方法应保留:\n%s", got)
@@ -560,13 +558,17 @@ type UserEntity struct {
 				t.Fatalf("读取文件失败: %v", err)
 			}
 			got := string(content)
-			// 别名/空白导入不满足生成代码对默认包名的引用，必须补充标准导入
-			if !strings.Contains(got, "import \"time\"") {
-				t.Errorf("存量文件为%s时不应视为已导入，应补充标准导入 import \"time\":\n%s", tt.name, got)
+			// 别名/空白导入不满足生成代码对默认包名的引用，必须补充标准导入（合并进同一 import 块）
+			if !strings.Contains(got, "\t\"time\"\n") {
+				t.Errorf("存量文件为%s时不应视为已导入，应补充标准导入 \"time\":\n%s", tt.name, got)
 			}
-			// 用户原有的别名/空白导入完整保留（与标准导入合法共存）
+			// 用户原有的别名/空白导入完整保留（与标准导入合法共存于同一 import 块）
 			if !strings.Contains(got, tt.keepImport) {
 				t.Errorf("用户原有导入 %s 应保留:\n%s", tt.keepImport, got)
+			}
+			// 缺失导入合并进原 import 块，不形成两个 import 块
+			if strings.Count(got, "import (") != 1 {
+				t.Errorf("应只有一个 import 块:\n%s", got)
 			}
 			if !strings.Contains(got, "type UserEntity struct {") {
 				t.Errorf("生成代码缺失:\n%s", got)
@@ -620,13 +622,12 @@ type UserEntity struct {
 		t.Fatalf("读取文件失败: %v", err)
 	}
 	got = string(content)
-	if !strings.Contains(got, `import "time"`) {
-		t.Errorf("已有的 import 应保留:\n%s", got)
+	// 缺失的包合并进原 import 块（"time" 已存在不重复，仅补 "github.com/foo/bar"；
+	// 最终经 gofmt 排序，"github.com/foo/bar" 排在前）
+	if !strings.Contains(got, "import (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)") {
+		t.Errorf("缺失的 import 应合并进原 import 块:\n%s", got)
 	}
-	if !strings.Contains(got, `import "github.com/foo/bar"`) {
-		t.Errorf("缺失的 import 应补充:\n%s", got)
-	}
-	if strings.Count(got, `import "time"`) != 1 {
+	if strings.Count(got, `"time"`) != 1 {
 		t.Errorf("已存在的 import 不应重复添加:\n%s", got)
 	}
 }
@@ -920,5 +921,155 @@ func TestWriteOrReplaceStruct_ReadOnlyDir(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Errorf("失败后应无临时文件残留，目录内容: %v", entries)
+	}
+}
+
+// TestWriteOrReplaceStruct_ValueReceiverCustomMethod 验证值接收者自定义方法
+// （如 func (e UserEntity) Validate() error）与指针接收者同样归位到对应结构体生成代码之后，
+// 而非落入文件末尾的"其他用户代码"。
+func TestWriteOrReplaceStruct_ValueReceiverCustomMethod(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	filePath := filepath.Join(dir, "user.go")
+
+	orig := `package model
+
+type UserEntity struct {
+	ID int
+}
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+
+// Validate 值接收者自定义方法
+func (e UserEntity) Validate() error {
+	return nil
+}
+
+// Tag 值接收者自定义方法
+func (d UserDO) Tag() string {
+	return "do"
+}
+
+// FreeFunc 无接收者函数
+func FreeFunc() {}
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	got := string(content)
+
+	// 值接收者自定义方法与无接收者函数均保留
+	for _, s := range []string{
+		"func (e UserEntity) Validate() error {",
+		"func (d UserDO) Tag() string {",
+		"func FreeFunc() {",
+	} {
+		if !strings.Contains(got, s) {
+			t.Errorf("值接收者自定义方法应保留，缺少: %s\n输出:\n%s", s, got)
+		}
+	}
+	// 布局顺序：Entity 生成代码 < Entity 值接收者方法 < DO 生成代码 < DO 值接收者方法 < 其他函数
+	order := []string{
+		"type UserEntity struct {",
+		"func (e UserEntity) Validate() error {",
+		"type UserDO struct {",
+		"func (d UserDO) Tag() string {",
+		"func FreeFunc() {",
+	}
+	last := -1
+	for _, s := range order {
+		idx := strings.Index(got, s)
+		if idx < 0 {
+			t.Errorf("输出缺少: %s", s)
+			continue
+		}
+		if idx < last {
+			t.Errorf("布局顺序错误: %s 位置不正确\n输出:\n%s", s, got)
+		}
+		last = idx
+	}
+}
+
+// TestWriteOrReplaceStruct_KeepFreeFloatingCommentInMixedBlock 验证混合 type 块中
+// 不附着于任何 Spec 的游离注释（前后均有空行）在再生成时原样保留：
+// 按源码偏移重建而非经 go/printer 重印，游离注释不会丢失。
+func TestWriteOrReplaceStruct_KeepFreeFloatingCommentInMixedBlock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	filePath := filepath.Join(dir, "user.go")
+
+	orig := `package model
+
+type (
+	UserEntity struct {
+		ID int
+	}
+
+	// 游离注释：不与任何类型绑定
+
+	MyHelper struct {
+		X int
+	}
+)
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	got := string(content)
+
+	// 游离注释与用户类型均保留
+	if !strings.Contains(got, "// 游离注释：不与任何类型绑定") {
+		t.Errorf("混合 type 块中的游离注释应保留:\n%s", got)
+	}
+	if !strings.Contains(got, "MyHelper struct {") {
+		t.Errorf("混合 type 块中的用户类型应保留:\n%s", got)
+	}
+	if strings.Count(got, "type UserEntity struct {") != 1 {
+		t.Errorf("生成类型应只保留一份:\n%s", got)
+	}
+	// 生成文件必须可解析
+	fset := token.NewFileSet()
+	if _, err := parser.ParseFile(fset, "", got, parser.AllErrors); err != nil {
+		t.Fatalf("生成文件解析失败: %v\n%s", err, got)
 	}
 }
