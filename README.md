@@ -164,6 +164,18 @@ go test ./...
 - `*_unit_test.go`：纯单元测试，无外部依赖。
 - `*_integration_test.go`：集成测试，连接 `127.0.0.1` 上的 MySQL（3306）/ PostgreSQL（5432）/ SQLite（纯 Go 驱动，无需环境）；数据库不可达时自动 `t.Skip`。
 
+### 测试覆盖率
+
+| 模块 | 覆盖率 |
+|---|---|
+| zcconfig | 99.4% |
+| zcdb | 98.8% |
+| zchttp | 99.8% |
+| zcmodel | 98.4% |
+| zcquit | 98.3% |
+
+> 语句覆盖率，运行 `go test ./... -cover` 复现（zcdb 集成测试在数据库可达时计入）。
+
 本地准备 MySQL / PostgreSQL 测试环境：
 
 ```bash
