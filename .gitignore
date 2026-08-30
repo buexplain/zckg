@@ -1,2 +1,6 @@
 .idea
 .qoder
+
+# Go 覆盖率产物
+coverage.out
+cov.out
