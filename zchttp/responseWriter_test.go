@@ -303,3 +303,106 @@ func TestResponseWriter_ReadFromFallback(t *testing.T) {
 		t.Fatal("ReadFrom fallback should mark responseWriter as written")
 	}
 }
+
+// ========== 不含 Flusher 的能力组合变体（H / P / HP）测试 ==========
+// 现有用例的底层 fake writer 均嵌入 httptest.ResponseRecorder（总实现 Flusher），
+// 只能命中含 Flusher 的组合；此处用仅实现 Hijacker / Pusher 的底层 writer 覆盖
+// H、P、HP 三种不含 Flusher 的包装变体及其 baseResponseWriter/Hijack/Push 透传。
+
+// hijackOnlyWriter 仅实现 http.ResponseWriter 与 http.Hijacker（不含 Flusher/Pusher）
+type hijackOnlyWriter struct {
+	plainWriter
+	hijacked bool
+}
+
+func (h *hijackOnlyWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	return nil, nil, nil
+}
+
+// pushOnlyWriter 仅实现 http.ResponseWriter 与 http.Pusher（不含 Flusher/Hijacker）
+type pushOnlyWriter struct {
+	plainWriter
+	pushed string
+}
+
+func (p *pushOnlyWriter) Push(target string, _ *http.PushOptions) error {
+	p.pushed = target
+	return nil
+}
+
+// hijackPushWriter 实现 http.ResponseWriter + Hijacker + Pusher（不含 Flusher）
+type hijackPushWriter struct {
+	hijackOnlyWriter
+	pushed string
+}
+
+func (h *hijackPushWriter) Push(target string, _ *http.PushOptions) error {
+	h.pushed = target
+	return nil
+}
+
+// TestResponseWriter_HijackOnlyCombo 验证底层仅支持 Hijacker 时返回 H 变体并透传 Hijack。
+func TestResponseWriter_HijackOnlyCombo(t *testing.T) {
+	hw := &hijackOnlyWriter{}
+	rw := acquireResponseWriter(hw)
+	defer releaseResponseWriter(rw)
+
+	if _, ok := rw.(http.Flusher); ok {
+		t.Fatal("H-only wrapper must not implement Flusher")
+	}
+	h, ok := rw.(http.Hijacker)
+	if !ok {
+		t.Fatal("wrapper must expose Hijacker")
+	}
+	if _, _, err := h.Hijack(); err != nil || !hw.hijacked {
+		t.Fatal("Hijack not delegated to underlying writer")
+	}
+}
+
+// TestResponseWriter_PushOnlyCombo 验证底层仅支持 Pusher 时返回 P 变体并透传 Push。
+func TestResponseWriter_PushOnlyCombo(t *testing.T) {
+	pw := &pushOnlyWriter{}
+	rw := acquireResponseWriter(pw)
+	defer releaseResponseWriter(rw)
+
+	if _, ok := rw.(http.Flusher); ok {
+		t.Fatal("P-only wrapper must not implement Flusher")
+	}
+	p, ok := rw.(http.Pusher)
+	if !ok {
+		t.Fatal("wrapper must expose Pusher")
+	}
+	if err := p.Push("/x.js", nil); err != nil || pw.pushed != "/x.js" {
+		t.Fatalf("Push not delegated: err=%v target=%q", err, pw.pushed)
+	}
+}
+
+// TestResponseWriter_HijackPushCombo 验证底层支持 Hijacker+Pusher（不含 Flusher）时返回 HP 变体。
+func TestResponseWriter_HijackPushCombo(t *testing.T) {
+	hp := &hijackPushWriter{}
+	rw := acquireResponseWriter(hp)
+	defer releaseResponseWriter(rw)
+
+	if _, ok := rw.(http.Flusher); ok {
+		t.Fatal("HP wrapper must not implement Flusher")
+	}
+	if _, ok := rw.(http.Hijacker); !ok {
+		t.Fatal("HP wrapper must expose Hijacker")
+	}
+	if _, ok := rw.(http.Pusher); !ok {
+		t.Fatal("HP wrapper must expose Pusher")
+	}
+	if _, _, err := rw.(http.Hijacker).Hijack(); err != nil || !hp.hijacked {
+		t.Fatal("HP Hijack not delegated")
+	}
+	if err := rw.(http.Pusher).Push("/y.js", nil); err != nil || hp.pushed != "/y.js" {
+		t.Fatalf("HP Push not delegated: err=%v target=%q", err, hp.pushed)
+	}
+}
+
+// TestResponseWriter_ReleaseNonWrapperNoop 验证 releaseResponseWriter 对非包装类型为 no-op（防御分支）。
+func TestResponseWriter_ReleaseNonWrapperNoop(t *testing.T) {
+	rec := httptest.NewRecorder()
+	releaseResponseWriter(rec) // 不应 panic
+}
