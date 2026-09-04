@@ -120,6 +120,22 @@ func TestDefaultErrorHandler(t *testing.T) {
 	}
 }
 
+// TestHandlerErrorReturns500 验证 handler 返回普通 error → OnError（500）
+func TestHandlerErrorReturns500(t *testing.T) {
+	router := NewRouter()
+	router.GET("/fail", plainErrRouteHandler)
+	engine := NewEngine()
+	engine.Router = router
+
+	req := httptest.NewRequest(http.MethodGet, "/fail", nil)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for handler error, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestDefaultErrorHandlerHtml 验证 Accept 包含 text/html 时错误回调返回 HTML；
 // m4：HTML 分支同样脱敏，不包含内部错误详情
 func TestDefaultErrorHandlerHtml(t *testing.T) {

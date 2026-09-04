@@ -339,6 +339,22 @@ func TestCast_IntToBool(t *testing.T) {
 	}
 }
 
+func TestCast_UintToBool(t *testing.T) {
+	// uint 系列 -> bool 走同一 C 惯例分支（cast.go 的 uint 分支）。
+	if v := cast(uint(1), false); v != true {
+		t.Errorf("uint(1) -> bool 期望 true，实际 %v", v)
+	}
+	if v := cast(uint(0), true); v != false {
+		t.Errorf("uint(0) -> bool 期望 false，实际 %v", v)
+	}
+	if v := cast(uint64(42), false); v != true {
+		t.Errorf("uint64(42) -> bool 期望 true，实际 %v", v)
+	}
+	if v := cast(uint32(0), true); v != false {
+		t.Errorf("uint32(0) -> bool 期望 false，实际 %v", v)
+	}
+}
+
 func TestCast_IntToStringReturnsDefault(t *testing.T) {
 	// 数值类型 -> string 是 Unicode 码点语义（65 -> "A"），不是数字转字符串，应返回 def
 	if v := cast(65, "fallback"); v != "fallback" {

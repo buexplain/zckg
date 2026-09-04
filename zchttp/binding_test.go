@@ -2436,3 +2436,71 @@ func TestBindMultipartMaxMemoryTempFile(t *testing.T) {
 		t.Fatalf("file size = %d, want %d (content must survive temp file spill)", res.Size, len(payload))
 	}
 }
+
+// emptyTimeReq 用于覆盖 setTime 的空值短路分支。
+type emptyTimeReq struct {
+	T time.Time `form:"t" time_format:"2006-01-02"`
+}
+
+// TestBindValues_EmptyTimeValue 覆盖 setTime 对空字符串直接返回的分支：
+// query 参数存在但值为空时不解析、字段保持零值。
+func TestBindValues_EmptyTimeValue(t *testing.T) {
+	router := NewRouter()
+	router.GET("/t", func(_ context.Context, req emptyTimeReq) (emptyTimeReq, error) { return req, nil })
+
+	rec := serveRequest(t, router, http.MethodGet, "/t?t=", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	var got emptyTimeReq
+	decodeData(t, rec, &got)
+	if !got.T.IsZero() {
+		t.Fatalf("空 query 值不应解析出时间，实际: %v", got.T)
+	}
+}
+
+// hiddenFieldReq 含一个未导出字段（仅用于包内直调构造病态 meta）。
+type hiddenFieldReq struct {
+	Public  string
+	private string //nolint:structcheck // 仅用于构造不可设置字段
+}
+
+// TestBindValues_UnsettableFieldSkipped 覆盖 bindValues 中字段不可设置（CanSet=false）
+// 时跳过的防御分支：正常注册路径无法构造出该状态，包内直调以病态 meta 触发。
+func TestBindValues_UnsettableFieldSkipped(t *testing.T) {
+	meta := structMeta{fields: []fieldMeta{
+		{name: "public", indices: []int{0}},
+		{name: "private", indices: []int{1}},
+	}}
+	reqPtr := reflect.New(reflect.TypeOf(hiddenFieldReq{}))
+	if err := bindValues(reqPtr, map[string][]string{
+		"public":  {"ok"},
+		"private": {"x"},
+	}, nil, meta); err != nil {
+		t.Fatalf("bindValues 尽力绑定应恒返回 nil: %v", err)
+	}
+	got := reqPtr.Interface().(*hiddenFieldReq)
+	if got.Public != "ok" {
+		t.Fatalf("可设置字段应正常绑定，实际: %q", got.Public)
+	}
+	if got.private != "" {
+		t.Fatal("不可设置字段不应被绑定")
+	}
+}
+
+// TestBindPathParams_UnsettableFieldSkipped 覆盖 bindPathParams 中
+// 字段不可设置时跳过的防御分支（病态 meta 直调触发）。
+func TestBindPathParams_UnsettableFieldSkipped(t *testing.T) {
+	params := []pathParamBinding{
+		{indices: []int{0}},
+		{indices: []int{1}},
+	}
+	reqPtr := reflect.New(reflect.TypeOf(hiddenFieldReq{}))
+	if err := bindPathParams(reqPtr, params, []string{"v0", "v1"}); err != nil {
+		t.Fatalf("不可设置字段应被跳过而非报错: %v", err)
+	}
+	got := reqPtr.Interface().(*hiddenFieldReq)
+	if got.Public != "v0" {
+		t.Fatalf("可设置路径参数应正常绑定，实际: %q", got.Public)
+	}
+}

@@ -1,10 +1,13 @@
-// 本文件为 Builder 编译/构造方法的错误前置分支补充单元测试。
-// 覆盖各 To* 方法的 b.err != nil 短路、空表名 ErrEmptyTable，
+// 本文件为 Builder 编译/构造/终端方法的错误前置分支补充单元测试。
+// 覆盖各 To* 方法的 b.err != nil 短路、空表名 ErrEmptyTable、
+// 终端方法（First/Pluck/Count/Exists/Max/Value/Cursor/CursorBy）与便捷写方法
+// （InsertUsing/Increment/Decrement/DeleteJoin）的编译错误传播，
 // 以及 JoinBuilder/addJoinOn/addJoinSub/addNested/WhereExists/addHavingBasic 的 error 累积分支。
 // 仅验证错误分支，不依赖数据库连接。
 package zcdb
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -358,4 +361,230 @@ func TestBuilder_JoinSubInvalidOp(t *testing.T) {
 	if _, _, err := b.ToSelect(); !errors.Is(err, ErrInvalidOperator) {
 		t.Fatalf("expected ErrInvalidOperator, got %v", err)
 	}
+}
+
+// TestBuilder_TerminalMethodsPropagateCompileError 验证各终端方法在
+// Builder 未设置表名时把 ErrEmptyTable 传播给调用方（编译期错误分支）。
+func TestBuilder_TerminalMethodsPropagateCompileError(t *testing.T) {
+	ctx := context.Background()
+	g := NewMySQLGrammar()
+	type row struct {
+		ID int64 `db:"id"`
+	}
+
+	t.Run("First", func(t *testing.T) {
+		var r row
+		if err := NewBuilder(g, nil).First(ctx, &r); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("PluckSlice", func(t *testing.T) {
+		var ids []int64
+		if err := NewBuilder(g, nil).Pluck(ctx, &ids, "id"); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("PluckKeyBy", func(t *testing.T) {
+		m := map[int64]row{}
+		if err := NewBuilder(g, nil).Pluck(ctx, &m, "id"); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("Count", func(t *testing.T) {
+		if _, err := NewBuilder(g, nil).Count(ctx); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("Exists", func(t *testing.T) {
+		if _, err := NewBuilder(g, nil).Exists(ctx); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("Max", func(t *testing.T) {
+		if _, err := NewBuilder(g, nil).Max(ctx, "age"); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("Value", func(t *testing.T) {
+		var v int64
+		if err := NewBuilder(g, nil).Select("id").Value(ctx, &v); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("Cursor", func(t *testing.T) {
+		var r row
+		var got error
+		for err := range NewBuilder(g, nil).Cursor(ctx, &r) {
+			got = err
+		}
+		if !errors.Is(got, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", got)
+		}
+	})
+	t.Run("CursorBy", func(t *testing.T) {
+		var r row
+		var got error
+		for err := range NewBuilder(g, nil).CursorBy(ctx, &r, 10, "id") {
+			got = err
+		}
+		if !errors.Is(got, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", got)
+		}
+	})
+}
+
+// TestBuilder_ExecMethodCompileErrors 覆盖便捷写方法（非 To* 层）的编译期错误分支：
+// 与 To* 层共用同一错误码，此处锁定经便捷方法入口的传播路径。
+func TestBuilder_ExecMethodCompileErrors(t *testing.T) {
+	ctx := context.Background()
+	g := NewMySQLGrammar()
+
+	t.Run("InsertUsing", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Table("dst").InsertUsing(ctx, []string{"name"}, func(sub *Builder) {})
+		if !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("InsertUsing 子查询缺表应报 ErrEmptyTable，实际 %v", err)
+		}
+	})
+	t.Run("InsertOrIgnoreUsing", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Table("dst").InsertOrIgnoreUsing(ctx, []string{"name"}, func(sub *Builder) {})
+		if !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("InsertOrIgnoreUsing 子查询缺表应报 ErrEmptyTable，实际 %v", err)
+		}
+	})
+	t.Run("IncrementEmptyTable", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Force().Increment(ctx, "wallet", 1)
+		if !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("Increment 缺表应报 ErrEmptyTable，实际 %v", err)
+		}
+	})
+	t.Run("DecrementOddExtra", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Decrement(ctx, "wallet", 1, "extra")
+		if !errors.Is(err, ErrIncrementColumns) {
+			t.Fatalf("Decrement 奇数 extra 应报 ErrIncrementColumns，实际 %v", err)
+		}
+	})
+	t.Run("DecrementEmptyTable", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Force().Decrement(ctx, "wallet", 1)
+		if !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("Decrement 缺表应报 ErrEmptyTable，实际 %v", err)
+		}
+	})
+	t.Run("DeleteJoinNoJoin", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Force().Table("t").DeleteJoin(ctx)
+		if !errors.Is(err, ErrDeleteJoinNoJoin) {
+			t.Fatalf("DeleteJoin 无 join 应报 ErrDeleteJoinNoJoin，实际 %v", err)
+		}
+	})
+}
+
+// TestJoinBuilder_ZeroValueWhereExists 覆盖零值 JoinBuilder（无 grammar）
+// 调用 WhereExists 时累积 ErrInvalidSubQuery 的防御分支。
+func TestJoinBuilder_ZeroValueWhereExists(t *testing.T) {
+	var j JoinBuilder
+	j.WhereExists(func(q *Builder) {})
+	if !errors.Is(j.err, ErrInvalidSubQuery) {
+		t.Fatalf("expected ErrInvalidSubQuery, got %v", j.err)
+	}
+}
+
+// TestBuilder_ExtractErrorPropagation 覆盖 Insert/Update 终端方法对
+// extractInsertData / extractUpdateData 非法入参错误的传播分支：
+// nil、含 nil 指针元素的切片、无字段结构体。
+func TestBuilder_ExtractErrorPropagation(t *testing.T) {
+	ctx := context.Background()
+	g := NewMySQLGrammar()
+
+	t.Run("InsertNil", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Table("users").Insert(ctx, nil)
+		if !errors.Is(err, ErrInvalidStruct) {
+			t.Fatalf("expected ErrInvalidStruct, got %v", err)
+		}
+	})
+	t.Run("InsertSliceFirstNilPtr", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Table("users").Insert(ctx, []*userInsert{nil})
+		if !errors.Is(err, ErrInvalidStruct) {
+			t.Fatalf("expected ErrInvalidStruct, got %v", err)
+		}
+	})
+	t.Run("InsertSliceMiddleNilPtr", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Table("users").Insert(ctx, []*userInsert{{Name: "a"}, nil})
+		if !errors.Is(err, ErrInvalidStruct) {
+			t.Fatalf("expected ErrInvalidStruct, got %v", err)
+		}
+	})
+	t.Run("UpdateNil", func(t *testing.T) {
+		_, err := NewBuilder(g, nil).Table("users").Force().Update(ctx, nil)
+		if !errors.Is(err, ErrInvalidStruct) {
+			t.Fatalf("expected ErrInvalidStruct, got %v", err)
+		}
+	})
+	t.Run("UpdateNoFields", func(t *testing.T) {
+		type noFields struct{ hidden string } //nolint:unused // 无导出字段即无映射列
+		_, err := NewBuilder(g, nil).Table("users").Force().Update(ctx, noFields{hidden: "x"})
+		if !errors.Is(err, ErrNoFields) {
+			t.Fatalf("expected ErrNoFields, got %v", err)
+		}
+	})
+}
+
+// EmbBase / EmbRow 为导出嵌入类型：嵌入指针为 nil 时才会进入
+// fieldByIndexSafe 的「嵌入字段不可用」分支（非导出嵌入指针在 parse 阶段即被跳过）。
+type EmbBase struct {
+	Extra string `db:"extra"`
+}
+
+type EmbRow struct {
+	*EmbBase
+	Name string `db:"name"`
+}
+
+// TestBuilder_NilEmbeddedPointerSkips 覆盖 ToInsert/ToUpdate 编译路径中
+// extract 遇到 nil 嵌入指针（或 nil 指针字段）时跳过列/按 NULL 处理的分支。
+func TestBuilder_NilEmbeddedPointerSkips(t *testing.T) {
+	g := NewMySQLGrammar()
+	strPtr := func(s string) *string { return &s }
+
+	t.Run("InsertSingleRowNilEmbed", func(t *testing.T) {
+		// 首（唯一）行嵌入指针为 nil：收集列时跳过嵌入字段
+		_, _, err := NewBuilder(g, nil).Table("t").ToInsert([]EmbRow{{Name: "x"}})
+		if err != nil {
+			t.Fatalf("nil 嵌入指针首行应跳过嵌入列而非报错: %v", err)
+		}
+	})
+	t.Run("InsertLaterRowNilEmbed", func(t *testing.T) {
+		// 首行嵌入指针非 nil（确定列），后行为 nil（该列按 NULL）
+		_, _, err := NewBuilder(g, nil).Table("t").ToInsert([]EmbRow{
+			{EmbBase: &EmbBase{Extra: "e"}, Name: "a"},
+			{Name: "b"},
+		})
+		if err != nil {
+			t.Fatalf("后行 nil 嵌入指针应按 NULL 处理: %v", err)
+		}
+	})
+	t.Run("UpdateNilEmbed", func(t *testing.T) {
+		_, _, err := NewBuilder(g, nil).Table("t").ToUpdate(EmbRow{Name: "x"})
+		if err != nil {
+			t.Fatalf("更新时 nil 嵌入指针应跳过嵌入列: %v", err)
+		}
+	})
+
+	type nilPtrRow struct {
+		P    *string `db:"p"`
+		Name string  `db:"name"`
+	}
+	t.Run("InsertNilPtrFieldFirstRow", func(t *testing.T) {
+		_, _, err := NewBuilder(g, nil).Table("t").ToInsert([]nilPtrRow{{Name: "x"}})
+		if err != nil {
+			t.Fatalf("首行 nil 指针字段应跳过列: %v", err)
+		}
+	})
+	t.Run("InsertNilPtrFieldLaterRow", func(t *testing.T) {
+		_, _, err := NewBuilder(g, nil).Table("t").ToInsert([]nilPtrRow{
+			{P: strPtr("a"), Name: "x"},
+			{Name: "y"},
+		})
+		if err != nil {
+			t.Fatalf("后行 nil 指针字段应按 NULL 处理: %v", err)
+		}
+	})
 }

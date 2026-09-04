@@ -217,3 +217,38 @@ func TestGrammar_JoinConditionsColumnAndRaw(t *testing.T) {
 		})
 	}
 }
+
+// TestGrammar_JoinConditionNotInVariants 覆盖 compileJoinConditions 的
+// IN 空列表（0=1）、NOT IN 列表、NOT IN 子查询分支（三方言一致）。
+func TestGrammar_JoinConditionNotInVariants(t *testing.T) {
+	grammars := map[string]Grammar{
+		"mysql":    NewMySQLGrammar(),
+		"postgres": NewPostgresGrammar(),
+		"sqlite":   NewSQLiteGrammar(),
+	}
+	for name, g := range grammars {
+		t.Run(name, func(t *testing.T) {
+			sub := NewBuilder(g, nil).Table("t").Select("id")
+			cond := func(jc []JoinCondition) string {
+				switch gg := g.(type) {
+				case *MySQLGrammar:
+					return gg.compileJoinConditions(jc)
+				case *PostgresGrammar:
+					return gg.compileJoinConditions(jc)
+				case *SQLiteGrammar:
+					return gg.compileJoinConditions(jc)
+				}
+				return ""
+			}
+			if s := cond([]JoinCondition{{Type: "in", First: "a", Values: []any{}}}); s != "0 = 1" {
+				t.Fatalf("IN 空列表应编译为 0 = 1，实际 %q", s)
+			}
+			if s := cond([]JoinCondition{{Type: "in", First: "a", Values: []any{1, 2}, Not: true}}); s == "" {
+				t.Fatal("NOT IN 列表应编译出 SQL")
+			}
+			if s := cond([]JoinCondition{{Type: "inSub", First: "a", Sub: sub, Not: true}}); s == "" {
+				t.Fatal("NOT IN 子查询应编译出 SQL")
+			}
+		})
+	}
+}

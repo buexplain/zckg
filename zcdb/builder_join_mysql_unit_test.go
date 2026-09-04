@@ -254,3 +254,24 @@ func TestMySQLGrammar_JoinBuilderNestedJoin(t *testing.T) {
 	assertNoError(t, err2)
 	assertSQL(t, "SELECT * FROM `users` INNER JOIN (`orders` CROSS JOIN `items` ON `items`.`order_id` = `orders`.`id`) ON `orders`.`user_id` = `users`.`id`", sql2)
 }
+
+// TestMySQLGrammar_JoinConditionAcyclicNested 覆盖 checkJoinConditionAcyclic
+// 递归进入 Nested 条件组（含子条件与子 join）的分支：
+// 无环结构应正常编译（有环检测用例见 builder_acyclic_clone_unit_test.go）。
+func TestMySQLGrammar_JoinConditionAcyclicNested(t *testing.T) {
+	g := NewMySQLGrammar()
+
+	b := NewBuilder(g, nil).Table("users")
+	b.JoinOn("orders", func(j *JoinBuilder) {
+		j.On("orders.user_id", "=", "users.id").
+			WhereNested(func(n *JoinBuilder) {
+				n.On("orders.status", "=", "paid").
+					JoinOn("payments", func(p *JoinBuilder) {
+						p.On("payments.order_id", "=", "orders.id")
+					})
+			})
+	})
+	if _, _, err := b.ToSelect(); err != nil {
+		t.Fatalf("嵌套 join 条件无环时应正常编译: %v", err)
+	}
+}

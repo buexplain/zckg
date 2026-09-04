@@ -529,3 +529,27 @@ func TestSQLiteInteg_CursorBy_ExactPageBoundary(t *testing.T) {
 		t.Errorf("expected 2 queries for exact page boundary, got %d", got)
 	}
 }
+
+// TestSQLiteInteg_CursorByNullAnyField 覆盖 CursorBy 游标列值为 NULL 时
+// 经 isNilValue(nil) 判定并返回 ErrCursorColumnNull 的分支：
+// dest 游标字段为 any 类型，NULL 扫描后保持 nil，Interface() 得到未类型化 nil。
+// （原 crossDialect 方言特有用例归位。）
+func TestSQLiteInteg_CursorByNullAnyField(t *testing.T) {
+	dao := openSQLiteTestDB(t)
+	ctx := context.Background()
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_nullcur (id INTEGER, name TEXT)`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_nullcur (id, name) VALUES (NULL, 'x')`)
+
+	type anyRow struct {
+		ID   any    `db:"id"`
+		Name string `db:"name"`
+	}
+	var r anyRow
+	var got error
+	for err := range dao.Builder().Table("cross_dialect_nullcur").CursorBy(ctx, &r, 10, "id") {
+		got = err
+	}
+	if !errors.Is(got, ErrCursorColumnNull) {
+		t.Fatalf("游标列 NULL 应报 ErrCursorColumnNull，实际 %v", got)
+	}
+}

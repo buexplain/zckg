@@ -1065,22 +1065,6 @@ func TestValidatePtrMapValueChildMissing(t *testing.T) {
 
 // ========== P0/P1 校验相关测试 ==========
 
-// TestHandlerErrorReturns500 验证 handler 返回普通 error → OnError（500）
-func TestHandlerErrorReturns500(t *testing.T) {
-	router := NewRouter()
-	router.GET("/fail", plainErrRouteHandler)
-	engine := NewEngine()
-	engine.Router = router
-
-	req := httptest.NewRequest(http.MethodGet, "/fail", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 for handler error, got %d, body: %s", rec.Code, rec.Body.String())
-	}
-}
-
 // TestSelfRefStructNoStackOverflow 验证自引用结构体不会因循环递归导致栈溢出
 func TestSelfRefStructNoStackOverflow(t *testing.T) {
 	router := NewRouter()
@@ -1476,4 +1460,34 @@ func TestReleaseVisitMap_Oversized(t *testing.T) {
 		t.Fatalf("acquired visit map should be empty, len=%d", len(m))
 	}
 	releaseVisitMap(m)
+}
+
+type ptrValidator struct{}
+
+func (c *ptrValidator) Validate() error { return errors.New("boom") }
+
+// TestValidateCustom_AssertionFails 覆盖 implementsValidator 为 true 但
+// 值类型接口断言失败的防御分支（方法定义在指针接收者上，传入的却是值）。
+func TestValidateCustom_AssertionFails(t *testing.T) {
+	typ := reflect.TypeOf(ptrValidator{})
+	meta := cachedStructMeta(typ)
+	if !meta.implementsValidator {
+		t.Fatal("*ptrValidator 应被判定为实现 Validator")
+	}
+	if err := validateCustom(reflect.ValueOf(ptrValidator{}), meta); err != nil {
+		t.Fatalf("断言失败应返回 nil（防御分支），实际: %v", err)
+	}
+}
+
+// TestValidateNonzeroWalk_NonStructAndNilVisited 覆盖入口值非结构体直接返回、
+// 以及 visited 为 nil 时惰性创建的分支（包内直调）。
+func TestValidateNonzeroWalk_NonStructAndNilVisited(t *testing.T) {
+	if err := validateNonzeroWalk(reflect.ValueOf(42), structMeta{}, nil, "", false); err != nil {
+		t.Fatalf("非结构体应直接返回 nil: %v", err)
+	}
+	type noNonzero struct{ A string }
+	x := noNonzero{}
+	if err := validateNonzeroWalk(reflect.ValueOf(&x).Elem(), cachedStructMeta(reflect.TypeOf(x)), nil, "", false); err != nil {
+		t.Fatalf("无 nonzero 字段应返回 nil: %v", err)
+	}
 }

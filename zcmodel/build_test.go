@@ -254,39 +254,6 @@ func TestBuildStruct_JsonTagValueWithBacktick(t *testing.T) {
 	}
 }
 
-// TestGenerate_JsonTagValueWithSpecialChars 验证 formatJSONTag 入口（列名含双引号、显式指定合法字段名）
-// 产出的 json tag 经净化后生成文件可解析、反射可完整还原。
-func TestGenerate_JsonTagValueWithSpecialChars(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	input := Input{
-		OutputDir:        dir,
-		Dialect:          DialectMysql,
-		TableName:        "user_info",
-		JsonTagValueCase: NameCaseLowerCamel,
-		Columns: []*Column{
-			{Name: "na\"me", Type: "varchar(255)", StructFieldInfo: StructFieldInfo{Name: "Name"}},
-		},
-	}
-	if err := Generate(input); err != nil {
-		t.Fatalf("Generate() error = %v", err)
-	}
-	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
-	if err != nil {
-		t.Fatalf("读取生成文件失败: %v", err)
-	}
-	file, err := parser.ParseFile(token.NewFileSet(), "user_info.go", string(content), parser.AllErrors)
-	if err != nil {
-		t.Fatalf("生成文件存在语法错误: %v\n%s", err, content)
-	}
-	tag := fieldTagOf(file, "Name")
-	if tag == "" {
-		t.Fatalf("未提取到字段 tag:\n%s", content)
-	}
-	if gotJSON := reflect.StructTag(tag).Get("json"); gotJSON != "na\"me" {
-		t.Errorf("json tag 还原失败\ngot:  %q\nwant: %q", gotJSON, "na\"me")
-	}
-}
-
 // TestWriteOrReplaceStruct_NewFile 验证文件不存在时创建新文件
 func TestWriteOrReplaceStruct_NewFile(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "model")
@@ -1170,5 +1137,215 @@ func (d *UserDO) ToEntity() {}
 	fset := token.NewFileSet()
 	if _, err := parser.ParseFile(fset, "", got, parser.AllErrors); err != nil {
 		t.Fatalf("生成文件解析失败: %v\n%s", err, got)
+	}
+}
+
+// TestWriteOrReplaceStruct_PkgNameFallback 覆盖包名推导回退分支：
+// 相对路径（无目录部分）的 Dir 为 "."，包名回退为 "main"。
+func TestWriteOrReplaceStruct_PkgNameFallback(t *testing.T) {
+	const filePath = "zcmodel_fallback_probe_output.go"
+	t.Cleanup(func() { _ = os.Remove(filePath) })
+
+	entityCode := "type FallBackEntity struct {\n\tID int\n}"
+	doCode := "type FallBackDO struct {\n\tID any\n}"
+	if err := writeOrReplaceStruct(filePath, "FallBackEntity", entityCode, "FallBackDO", doCode, nil); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	if !strings.HasPrefix(string(content), "package main\n") {
+		t.Fatalf("无目录部分的相对路径应回退为 package main，实际:\n%s", content)
+	}
+}
+
+// TestWriteOrReplaceStruct_ReadFileFails 覆盖现有文件读取失败的分支：
+// 目标路径已存在但为目录时，os.Stat 成功而 ReadFile 失败。
+func TestWriteOrReplaceStruct_ReadFileFails(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "adir.go")
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	err := writeOrReplaceStruct(target, "E", "type E struct{}", "D", "type D struct{}", nil)
+	if err == nil {
+		t.Fatal("目标路径为目录时 ReadFile 应失败")
+	}
+}
+
+// TestWriteOrReplaceStruct_SingleImportDocAndComment 覆盖单行 import 声明
+// （无括号）合并缺失 import 的路径：ImportSpec 的 Doc/尾注释经 specSpan 保留，
+// import 声明自身的 Doc 经 mergeMissingImports 的 first.Doc 分支保留，并展开为块形式。
+func TestWriteOrReplaceStruct_SingleImportDocAndComment(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "user.go")
+	orig := `package model
+
+// import block doc
+import "fmt" // trailing comment
+
+var _ = fmt.Sprintf
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+
+	entityCode := "type UserEntity struct {\n\tID int\n}"
+	doCode := "type UserDO struct {\n\tID any\n}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	s := string(content)
+	for _, want := range []string{"// import block doc", "import (", `"fmt" // trailing comment`, `"time"`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("结果缺少 %q:\n%s", want, s)
+		}
+	}
+}
+
+// TestWriteOrReplaceStruct_MixedBlockDocAndTrailing 覆盖混合 type 块剔除生成类型时
+// GenDecl 自身 Doc 注释保留（removeGeneratedSpecs 的 d.Doc 分支），
+// 以及生成类型 Spec 带尾注释时的区间剔除（specSpan 的 TypeSpec.Comment 分支）。
+func TestWriteOrReplaceStruct_MixedBlockDocAndTrailing(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "user.go")
+	orig := `package model
+
+// block doc
+type (
+	// user type doc
+	UserType struct {
+		Name string
+	}
+	UserEntity struct {
+		ID int
+	} // generated trailing
+)
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+
+	entityCode := "type UserEntity struct {\n\tID int64\n}"
+	doCode := "type UserDO struct {\n\tID any\n}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	s := string(content)
+	if !strings.Contains(s, "// block doc") {
+		t.Fatalf("混合 type 块的块级 Doc 注释应保留:\n%s", s)
+	}
+	if !strings.Contains(s, "UserType") || !strings.Contains(s, "// user type doc") {
+		t.Fatalf("用户类型及其注释应保留:\n%s", s)
+	}
+	if strings.Contains(s, "generated trailing") {
+		t.Fatalf("旧生成类型的尾注释应随 Spec 一并剔除:\n%s", s)
+	}
+	if !strings.Contains(s, "int64") {
+		t.Fatalf("新生成的 Entity 代码应写入:\n%s", s)
+	}
+}
+
+// TestWriteOrReplaceStruct_NonIdentReceiverKept 覆盖 receiverTypeName 对
+// 非 Ident/指针接收者（如泛型实例化 Box[int]）返回空串的分支：
+// 此类方法既非生成方法也不归属 Entity/DO，原样保留为其他用户代码。
+func TestWriteOrReplaceStruct_NonIdentReceiverKept(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "user.go")
+	orig := `package model
+
+type Box[T any] struct{ V T }
+
+func (b Box[int]) Marker() int { return 0 }
+
+type UserEntity struct {
+	ID int
+}
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+
+	entityCode := "type UserEntity struct {\n\tID int64\n}"
+	doCode := "type UserDO struct {\n\tID any\n}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	if !strings.Contains(string(content), "func (b Box[int]) Marker()") {
+		t.Fatalf("泛型实例化接收者的用户方法应保留:\n%s", content)
+	}
+}
+
+// TestWriteOrReplaceStruct_NoImportDeclAddMissing 覆盖文件完全没有 import 声明、
+// 但 neededImports 非空时新建 import 声明前置的分支。
+func TestWriteOrReplaceStruct_NoImportDeclAddMissing(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "user.go")
+	orig := `package model
+
+type UserEntity struct {
+	ID int
+}
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+
+	entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}"
+	doCode := "type UserDO struct {\n\tCreatedAt any\n}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	if !strings.Contains(string(content), `import "time"`) {
+		t.Fatalf("无 import 声明时应新建 import 声明:\n%s", content)
+	}
+}
+
+// TestWriteOrReplaceStruct_NamedImportWithDoc 覆盖 specSpan 的 ImportSpec.Doc 分支
+// 与 mergeMissingImports 的命名导入（Name 非空）分支：块内带文档注释的别名导入
+// 应完整保留，缺失的标准导入仍可追加。
+func TestWriteOrReplaceStruct_NamedImportWithDoc(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "user.go")
+	orig := `package model
+
+import (
+	// fmt alias doc
+	f "fmt"
+)
+
+type UserEntity struct {
+	ID int
+}
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+
+	entityCode := "type UserEntity struct {\n\tID int64\n}"
+	doCode := "type UserDO struct {\n\tID any\n}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
+		t.Fatalf("writeOrReplaceStruct() error = %v", err)
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	s := string(content)
+	for _, want := range []string{"// fmt alias doc", `f "fmt"`, `"time"`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("结果缺少 %q:\n%s", want, s)
+		}
 	}
 }

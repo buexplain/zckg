@@ -1576,3 +1576,39 @@ func TestSQLiteInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 		t.Errorf("query after panicked callback: expected cnt=6, got %+v", dest)
 	}
 }
+
+// TestSQLiteInteg_TruncateSequenceStates 覆盖 SQLite Truncate 的两种序列状态：
+// 先清无 AUTOINCREMENT 的表（sqlite_sequence 不存在 → 跳过清理），
+// 再清有 AUTOINCREMENT 的表（存在 → 删除序列记录，自增从头开始）。
+// 顺序不可颠倒：首个用例依赖库内尚未出现 sqlite_sequence。
+// （原 crossDialect 方言特有用例归位。）
+func TestSQLiteInteg_TruncateSequenceStates(t *testing.T) {
+	dao := openSQLiteTestDB(t)
+	ctx := context.Background()
+
+	// 状态一：库内尚无 sqlite_sequence（未使用过 AUTOINCREMENT）
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_plain (id INTEGER PRIMARY KEY, name TEXT)`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_plain (id, name) VALUES (1, 'a')`)
+	if err := dao.Builder().Table("cross_dialect_plain").Truncate(ctx); err != nil {
+		t.Fatalf("Truncate 无 AUTOINCREMENT 表不应报错: %v", err)
+	}
+	n, err := dao.Builder().Table("cross_dialect_plain").Count(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("Truncate 后应为空表，实际 %d, err=%v", n, err)
+	}
+
+	// 状态二：AUTOINCREMENT 表 → sqlite_sequence 存在，清理后自增重置
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_auto (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_auto (name) VALUES ('a'), ('b')`)
+	if err := dao.Builder().Table("cross_dialect_auto").Truncate(ctx); err != nil {
+		t.Fatalf("Truncate AUTOINCREMENT 表不应报错: %v", err)
+	}
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_auto (name) VALUES ('c')`)
+	var id int64
+	if err := dao.Builder().Table("cross_dialect_auto").Select("id").Value(ctx, &id); err != nil {
+		t.Fatalf("查询 Truncate 后自增值失败: %v", err)
+	}
+	if id != 1 {
+		t.Fatalf("Truncate 后自增应重置为 1，实际 %d", id)
+	}
+}

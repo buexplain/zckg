@@ -2136,3 +2136,87 @@ func TestDeepCopyDefaults_NilInterface(t *testing.T) {
 		t.Fatal("nil any field should remain nil after deepCopyDefaults")
 	}
 }
+
+// defaultSub 带指针默认值字段，用于运行时嵌套容器默认值填充。
+type defaultSub struct {
+	Tag *string `json:"tag" default:"filled"`
+}
+
+type sliceNilReq struct {
+	Items []*defaultSub `json:"items"`
+}
+
+// TestApplyDefaults_SliceNilElem 覆盖运行时 applyDefaults 遍历结构体指针切片时
+// 跳过 nil 元素的分支：null 元素跳过，非空元素的指针默认值正常填充。
+func TestApplyDefaults_SliceNilElem(t *testing.T) {
+	router := NewRouter()
+	router.POST("/s", func(_ context.Context, req sliceNilReq) (sliceNilReq, error) { return req, nil })
+
+	rec := serveRequest(t, router, http.MethodPost, "/s", `{"items":[null,{"tag":null}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	var got sliceNilReq
+	decodeData(t, rec, &got)
+	if len(got.Items) != 2 || got.Items[0] != nil {
+		t.Fatalf("第一个元素应保持 nil，实际: %+v", got.Items)
+	}
+	if got.Items[1].Tag == nil || *got.Items[1].Tag != "filled" {
+		t.Fatalf("第二个元素的指针默认值应被填充，实际: %+v", got.Items[1])
+	}
+}
+
+type mapNilReq struct {
+	M map[string]*defaultSub `json:"m"`
+}
+
+// TestApplyDefaults_MapNilValue 覆盖运行时 applyDefaults 遍历指针值 map 时
+// 跳过 nil 值的分支。
+func TestApplyDefaults_MapNilValue(t *testing.T) {
+	router := NewRouter()
+	router.POST("/m", func(_ context.Context, req mapNilReq) (mapNilReq, error) { return req, nil })
+
+	rec := serveRequest(t, router, http.MethodPost, "/m", `{"m":{"a":null,"b":{"tag":null}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	var got mapNilReq
+	decodeData(t, rec, &got)
+	if got.M["a"] != nil {
+		t.Fatalf("nil 值应保持 nil，实际: %+v", got.M["a"])
+	}
+	if got.M["b"].Tag == nil || *got.M["b"].Tag != "filled" {
+		t.Fatalf("非 nil 值的指针默认值应被填充，实际: %+v", got.M["b"])
+	}
+}
+
+// deepContainerReq 覆盖注册期容器展开循环中的指针中间层分支。
+type deepContainerReq struct {
+	A [][]*defaultSub          `json:"a"`
+	B map[string][]*defaultSub `json:"b"`
+}
+
+// TestCheckUnsupportedDefaults_NestedContainerPtrLayers 覆盖 checkUnsupportedDefaults
+// 展开多层容器时的指针中间层分支（切片元素仍为指针）与
+// map 值类型为指针元素切片的分支：注册不应 panic。
+func TestCheckUnsupportedDefaults_NestedContainerPtrLayers(t *testing.T) {
+	router := NewRouter()
+	router.POST("/deep", func(_ context.Context, req deepContainerReq) (deepContainerReq, error) { return req, nil })
+
+	// 注册成功即通过：类型树扫描完整走完（分支覆盖由覆盖率报告验证）
+	rec := serveRequest(t, router, http.MethodPost, "/deep", `{"a":[[{"tag":"x"}]],"b":{"k":[{"tag":"y"}]}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestApplyDefaultsWithVisiting_NonStructAndNilVisiting 覆盖
+// reqPtr 指向非结构体时直接返回、以及 visiting 为 nil 时惰性创建的分支（包内直调）。
+func TestApplyDefaultsWithVisiting_NonStructAndNilVisiting(t *testing.T) {
+	n := 42
+	applyDefaultsWithVisiting(reflect.ValueOf(&n), structMeta{}, false, nil) // 非 struct 直接返回
+
+	type plain struct{ A string }
+	applyDefaultsWithVisiting(reflect.ValueOf(&plain{}), cachedStructMeta(reflect.TypeOf(plain{})), false, nil)
+	// 不 panic 即通过：visiting 惰性创建后正常遍历
+}

@@ -1343,3 +1343,21 @@ func TestSQLiteInteg_NewApi_WhereExistsBuilder(t *testing.T) {
 		t.Errorf("expected ErrInvalidSubQuery, got %v", err)
 	}
 }
+
+// TestSQLiteInteg_LikeCaseSensitiveExpression 覆盖 SQLite 大小写敏感 Like
+// 退化为 GLOB 且值为 Expression 的内联分支。
+// （原 crossDialect 方言特有用例归位。）
+func TestSQLiteInteg_LikeCaseSensitiveExpression(t *testing.T) {
+	dao := openSQLiteTestDB(t)
+	crossDialectSetupScanTable(t, dao)
+	ctx := context.Background()
+
+	count, err := dao.Builder().Table("cross_dialect_scan").
+		WhereLike("name", NewExpression("'abc'"), true).Count(ctx)
+	if err != nil {
+		t.Fatalf("GLOB Expression 查询不应报错: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("GLOB 'abc' 应命中 1 行，实际 %d", count)
+	}
+}

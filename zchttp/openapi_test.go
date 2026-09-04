@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -2542,5 +2544,191 @@ func TestCoerceExampleArray(t *testing.T) {
 				t.Fatalf("coerceExample(%v, %q) = %#v (%T), want %#v (%T)", c.schema, c.raw, got, got, c.want, c.want)
 			}
 		})
+	}
+}
+
+// TestGenerateOpenAPI_NilReqResEntry 覆盖 buildOperation 对 reqType/resType
+// 为 nil 的 entry 返回空并被跳过的防御分支（注册路径不可达，直接构造路由记录）。
+func TestGenerateOpenAPI_NilReqResEntry(t *testing.T) {
+	r := NewRouter()
+	r.routes = append(r.routes, routeRecord{
+		method: http.MethodGet,
+		path:   "/ghost",
+		entry:  &routeEntry{handlerName: "ghost"},
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	paths, _ := doc["paths"].(map[string]any)
+	if _, ok := paths["/ghost"]; ok {
+		t.Fatalf("reqType/resType 为 nil 的路由不应出现在文档中: %v", paths)
+	}
+}
+
+type walkSub struct {
+	Name string `json:"name" default:"n"`
+}
+
+type mapWalkReq struct {
+	A map[string][]*walkSub `json:"a"`
+	B map[string][]walkSub  `json:"b"`
+	C map[string]*walkSub   `json:"c"`
+}
+
+type mapWalkRes struct{ Ok bool }
+
+// TestGenerateOpenAPI_MapContainerWalks 覆盖 walkTypeUsage / walkDefaultsReachability
+// 对 map 值类型为切片（指针/值元素）与指针的穿透分支。
+func TestGenerateOpenAPI_MapContainerWalks(t *testing.T) {
+	r := NewRouter()
+	r.POST("/walk", func(_ context.Context, req mapWalkReq) (mapWalkRes, error) {
+		return mapWalkRes{Ok: true}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	if doc["paths"] == nil {
+		t.Fatal("文档应包含 paths")
+	}
+	if _, ok := doc["components"].(map[string]any)["schemas"].(map[string]any)["walkSub"]; !ok {
+		t.Fatalf("map 容器穿透后应注册元素结构体 schema: %v", doc["components"])
+	}
+}
+
+type querySkipReq struct {
+	Hidden string                `json:"hidden" ignore:"true"`
+	File   *multipart.FileHeader `json:"file"`
+	Plain  string                `json:"plain"`
+	M      map[string]string     `json:"m"`
+	Nested walkSub               `json:"nested"`
+}
+
+// TestGenerateOpenAPI_QueryParamSkips 覆盖 buildQueryParams 跳过
+// ignore 字段与文件字段的分支。
+func TestGenerateOpenAPI_QueryParamSkips(t *testing.T) {
+	r := NewRouter()
+	r.GET("/skip", func(_ context.Context, req querySkipReq) (querySkipReq, error) { return req, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	paths := doc["paths"].(map[string]any)
+	op := paths["/skip"].(map[string]any)["get"].(map[string]any)
+	params, _ := op["parameters"].([]any)
+	names := map[string]bool{}
+	for _, p := range params {
+		pm := p.(map[string]any)
+		if pm["in"] == "query" {
+			names[pm["name"].(string)] = true
+		}
+	}
+	if names["hidden"] || names["file"] || names["m"] || names["nested"] {
+		t.Fatalf("ignore/文件/map/结构体字段不应作为 query 参数: %v", names)
+	}
+	if !names["plain"] {
+		t.Fatalf("普通字段应作为 query 参数: %v", names)
+	}
+}
+
+// TestBuildPathParams_NonStruct 覆盖 reqType 非结构体时返回 nil 的防御分支（包内直调）。
+func TestBuildPathParams_NonStruct(t *testing.T) {
+	g := &openAPIGenerator{
+		schemas:           map[string]any{},
+		typeNames:         map[reflect.Type]string{},
+		nameToType:        map[string]reflect.Type{},
+		reachedViaValue:   map[reflect.Type]bool{},
+		reachedByDefaults: map[reflect.Type]bool{},
+	}
+	if got := g.buildPathParams(reflect.TypeOf(42), structMeta{}, map[string]bool{"a": true}, nil); got != nil {
+		t.Fatalf("非结构体应返回 nil，实际: %v", got)
+	}
+}
+
+type pathExtraReq struct {
+	ID    int    `json:"id"`
+	Extra string `json:"extra"`
+}
+
+// TestGenerateOpenAPI_PathParamExtraFields 覆盖 buildPathParams 遍历字段时
+// 跳过非路径参数字段的分支。
+func TestGenerateOpenAPI_PathParamExtraFields(t *testing.T) {
+	r := NewRouter()
+	r.GET("/u/{id}", func(_ context.Context, req pathExtraReq) (pathExtraReq, error) { return req, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	paths := doc["paths"].(map[string]any)
+	op := paths["/u/{id}"].(map[string]any)["get"].(map[string]any)
+	params, _ := op["parameters"].([]any)
+	pathParams := map[string]bool{}
+	for _, p := range params {
+		pm := p.(map[string]any)
+		if pm["in"] == "path" {
+			pathParams[pm["name"].(string)] = true
+		}
+	}
+	if !pathParams["id"] || pathParams["extra"] {
+		t.Fatalf("path 参数应仅含 id: %v", pathParams)
+	}
+}
+
+type schemaSkipReq struct {
+	Secret string `json:"-"`
+	Ign    string `json:"ign" ignore:"true"`
+	Kept   string `json:"kept"`
+}
+
+// TestGenerateOpenAPI_SchemaFieldSkips 覆盖 registerStructSchema 跳过
+// name 为 "-" 与 ignore 字段的分支。
+func TestGenerateOpenAPI_SchemaFieldSkips(t *testing.T) {
+	r := NewRouter()
+	r.POST("/schema", func(_ context.Context, req schemaSkipReq) (schemaSkipReq, error) { return req, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	schema := schemas["schemaSkipReq"].(map[string]any)
+	props := schema["properties"].(map[string]any)
+	if _, ok := props["Secret"]; ok {
+		t.Fatal("json:\"-\" 字段不应出现在 schema")
+	}
+	if _, ok := props["ign"]; ok {
+		t.Fatal("ignore 字段不应出现在 schema")
+	}
+	if _, ok := props["kept"]; !ok {
+		t.Fatal("正常字段应出现在 schema")
+	}
+}
+
+type mapKeyReq struct {
+	M1 map[int]string `json:"m1" description:"int-keyed map"`
+	M2 map[int]string `json:"m2"`
+}
+
+// TestGenerateOpenAPI_MapNonStringKey 覆盖 typeToSchema 对非 string key map
+// 追加 key type 说明的两个分支（已有 description 追加 / 无 description 新建）。
+func TestGenerateOpenAPI_MapNonStringKey(t *testing.T) {
+	r := NewRouter()
+	r.POST("/mapkey", func(_ context.Context, req mapKeyReq) (mapKeyReq, error) { return req, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	props := schemas["mapKeyReq"].(map[string]any)["properties"].(map[string]any)
+
+	m1 := props["m1"].(map[string]any)
+	d1, _ := m1["description"].(string)
+	if !strings.Contains(d1, "int-keyed map") || !strings.Contains(d1, "key type: int") {
+		t.Fatalf("已有 description 应追加 key type 说明: %q", d1)
+	}
+	m2 := props["m2"].(map[string]any)
+	d2, _ := m2["description"].(string)
+	if d2 != "key type: int" {
+		t.Fatalf("无 description 应新建 key type 说明: %q", d2)
+	}
+}
+
+type chanFieldReq struct {
+	Ch chan int `json:"ch"`
+}
+
+// TestGenerateOpenAPI_UnmappableKindEmptySchema 覆盖 typeToSchema 对
+// 无法映射的 Kind（chan）退化为空 schema 的 default 分支。
+func TestGenerateOpenAPI_UnmappableKindEmptySchema(t *testing.T) {
+	r := NewRouter()
+	r.POST("/chan", func(_ context.Context, req chanFieldReq) (chanFieldReq, error) { return req, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	props := schemas["chanFieldReq"].(map[string]any)["properties"].(map[string]any)
+	ch, ok := props["ch"].(map[string]any)
+	if !ok || len(ch) != 0 {
+		t.Fatalf("chan 字段应退化为空 schema，实际: %v", props["ch"])
 	}
 }

@@ -38,3 +38,29 @@ func TestBug_ToUpdateWithJoin_MySQL(t *testing.T) {
 func TestMySQLCompile_InsertUsingColumnMismatch(t *testing.T) {
 	assertInsertUsingColumnMismatch(t, NewMySQLGrammar())
 }
+
+// TestMySQLCompile_UpsertEmptyUpdateColumnsElse 覆盖 MySQL CompileUpsert 在
+// updateColumns 为空且 uniqueBy 为空时退化为 columns[:1] 的 else 分支。
+// 该分支经公共 ToUpsert 不可达（空 updateColumns 会被展开为全部非 uniqueBy 列），
+// 故以 grammar 直调方式锁死。
+func TestMySQLCompile_UpsertEmptyUpdateColumnsElse(t *testing.T) {
+	g := NewMySQLGrammar()
+	b := NewBuilder(g, nil).Table("t")
+	sql := g.CompileUpsert(b, []string{"id"}, [][]any{{int64(1)}}, nil, nil, nil)
+	if sql == "" || sql != "INSERT INTO `t` (`id`) VALUES (?) ON DUPLICATE KEY UPDATE `id` = VALUES(`id`)" {
+		t.Fatalf("空 updateColumns + 空 uniqueBy 应退化为首列自赋值，实际: %s", sql)
+	}
+}
+
+// TestMySQLCompile_InsertOrIgnoreMultiRowAndExpression 覆盖 MySQL 方言
+// CompileInsertOrIgnore 的多行分隔符与 Expression 内联分支。
+func TestMySQLCompile_InsertOrIgnoreMultiRowAndExpression(t *testing.T) {
+	rows := [][]any{
+		{int64(1), NewExpression("UPPER('a')")},
+		{int64(2), "b"},
+	}
+	my := NewMySQLGrammar()
+	if sql := my.CompileInsertOrIgnore(NewBuilder(my, nil).Table("t"), []string{"id", "name"}, rows); sql == "" {
+		t.Fatal("MySQL CompileInsertOrIgnore 应产出 SQL")
+	}
+}

@@ -249,3 +249,19 @@ func TestTrieSharedStaticPrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestRouteConflictPanic_NilExisting 覆盖 existing 为 nil 时的冲突提示格式
+// （中间节点冲突且该节点尚无终点 entry 的防御分支，正常注册路径不可达）。
+func TestRouteConflictPanic_NilExisting(t *testing.T) {
+	incoming := &routeEntry{handlerName: "pkg.H", handlerFile: "h.go", handlerLine: 9}
+	defer func() {
+		msg, ok := recover().(string)
+		if !ok {
+			t.Fatal("应 panic")
+		}
+		if !strings.Contains(msg, "route conflict") || !strings.Contains(msg, "pkg.H") || strings.Contains(msg, "already registered") {
+			t.Fatalf("existing=nil 的冲突消息格式不符: %s", msg)
+		}
+	}()
+	routeConflictPanic("GET", "/x", nil, incoming, "")
+}

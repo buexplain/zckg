@@ -2,22 +2,6 @@ package zcconfig
 
 import "testing"
 
-// TestCast_UintToBool 验证 uint 系列数值 -> bool 的 C 惯例分支（cast.go 的 uint 分支）。
-func TestCast_UintToBool(t *testing.T) {
-	if v := cast(uint(1), false); v != true {
-		t.Errorf("uint(1) -> bool 期望 true，实际 %v", v)
-	}
-	if v := cast(uint(0), true); v != false {
-		t.Errorf("uint(0) -> bool 期望 false，实际 %v", v)
-	}
-	if v := cast(uint64(42), false); v != true {
-		t.Errorf("uint64(42) -> bool 期望 true，实际 %v", v)
-	}
-	if v := cast(uint32(0), true); v != false {
-		t.Errorf("uint32(0) -> bool 期望 false，实际 %v", v)
-	}
-}
-
 // TestRegister_NilDataNoop 验证 Register 的 fn 返回 nil 时不做任何合并。
 func TestRegister_NilDataNoop(t *testing.T) {
 	reset()

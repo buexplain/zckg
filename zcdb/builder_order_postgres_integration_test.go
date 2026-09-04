@@ -615,3 +615,29 @@ func TestPgInteg_NewApi_LockSelect(t *testing.T) {
 	})
 	assertNoError(t, err)
 }
+
+// TestPgInteg_SelectRowLock 覆盖 PostgreSQL SELECT 行锁（FOR UPDATE / FOR SHARE）
+// 编译分支：带锁查询可正常执行并返回结果。
+// （原 crossDialect 方言特有用例归位。）
+func TestPgInteg_SelectRowLock(t *testing.T) {
+	dao := openPgTestDB(t)
+	crossDialectSetupScanTable(t, dao)
+
+	var rows []crossDialectRow
+	if err := dao.Builder().Table("cross_dialect_scan").OrderBy("id", "ASC").
+		LockForUpdate().Find(t.Context(), &rows); err != nil {
+		t.Fatalf("FOR UPDATE 查询不应报错: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("FOR UPDATE 应返回 2 行，实际 %d", len(rows))
+	}
+
+	rows = nil
+	if err := dao.Builder().Table("cross_dialect_scan").OrderBy("id", "ASC").
+		SharedLock().Find(t.Context(), &rows); err != nil {
+		t.Fatalf("FOR SHARE 查询不应报错: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("FOR SHARE 应返回 2 行，实际 %d", len(rows))
+	}
+}

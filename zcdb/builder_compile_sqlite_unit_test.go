@@ -97,3 +97,16 @@ func TestNewApi_SQLiteCompileForms(t *testing.T) {
 func TestSQLiteCompile_InsertUsingColumnMismatch(t *testing.T) {
 	assertInsertUsingColumnMismatch(t, NewSQLiteGrammar())
 }
+
+// TestSQLiteCompile_InsertOrIgnoreMultiRowAndExpression 覆盖 SQLite 方言
+// CompileInsertOrIgnore 的多行分隔符与 Expression 内联分支。
+func TestSQLiteCompile_InsertOrIgnoreMultiRowAndExpression(t *testing.T) {
+	rows := [][]any{
+		{int64(1), NewExpression("UPPER('a')")},
+		{int64(2), "b"},
+	}
+	li := NewSQLiteGrammar()
+	if sql := li.CompileInsertOrIgnore(NewBuilder(li, nil).Table("t"), []string{"id", "name"}, rows); sql == "" {
+		t.Fatal("SQLite CompileInsertOrIgnore 应产出 SQL")
+	}
+}

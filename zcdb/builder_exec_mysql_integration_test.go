@@ -1543,3 +1543,57 @@ func TestMySQLInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 		t.Errorf("query after panicked callback: expected cnt=6, got %+v", dest)
 	}
 }
+
+// TestMySQLInteg_OrderByRawInUpdateDelete 覆盖 MySQL 方言 UPDATE/DELETE
+// 编译中 ORDER BY 原始片段的分支（MySQL 支持 UPDATE/DELETE 带 ORDER BY + LIMIT）。
+// （原 crossDialect 方言特有用例归位。）
+func TestMySQLInteg_OrderByRawInUpdateDelete(t *testing.T) {
+	type obUpdRow struct {
+		Name string `db:"name"`
+	}
+	dao := openMySQLTestDB(t)
+	ctx := context.Background()
+	crossDialectDrop(t, dao, "cross_dialect_ob")
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_ob (id INTEGER PRIMARY KEY, name TEXT)`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_ob (id, name) VALUES (1, 'a'), (2, 'b')`)
+
+	affected, err := dao.Builder().Table("cross_dialect_ob").Where("id", ">", 0).
+		OrderByRaw("id DESC").OrderByRaw("name ASC").Limit(1).
+		Update(ctx, &obUpdRow{Name: "x"})
+	if err != nil || affected != 1 {
+		t.Fatalf("UPDATE 携带 ORDER BY raw 失败: affected=%d err=%v", affected, err)
+	}
+
+	affected, err = dao.Builder().Table("cross_dialect_ob").Where("id", ">", 0).
+		OrderByRaw("id DESC").OrderByRaw("name ASC").Limit(1).
+		Delete(ctx)
+	if err != nil || affected != 1 {
+		t.Fatalf("DELETE 携带 ORDER BY raw 失败: affected=%d err=%v", affected, err)
+	}
+}
+
+// TestMySQLInteg_UpsertEmptyUpdateColumnsNoop 覆盖 MySQL ON DUPLICATE KEY UPDATE
+// 在 updateColumns 为空且插入列全部为 uniqueBy 时的 no-op 自赋值退化分支：
+// 冲突时不更新任何列。
+// （原 crossDialect 方言特有用例归位。）
+func TestMySQLInteg_UpsertEmptyUpdateColumnsNoop(t *testing.T) {
+	type upNoopRow struct {
+		A int64 `db:"a"`
+		B int64 `db:"b"`
+	}
+	dao := openMySQLTestDB(t)
+	ctx := context.Background()
+	crossDialectDrop(t, dao, "cross_dialect_upnoop")
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_upnoop (a INTEGER, b INTEGER, UNIQUE KEY uniq_ab (a, b))`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_upnoop (a, b) VALUES (1, 2)`)
+
+	// 插入列全部为 uniqueBy：updateColumns 解析为空 → 退化自赋值，冲突不更新
+	if _, err := dao.Builder().Table("cross_dialect_upnoop").Upsert(ctx,
+		upNoopRow{A: 1, B: 2}, []string{"a", "b"}, nil); err != nil {
+		t.Fatalf("空 updateColumns no-op Upsert 不应报错: %v", err)
+	}
+	n, err := dao.Builder().Table("cross_dialect_upnoop").Count(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("no-op Upsert 后应仍为 1 行，实际 %d, err=%v", n, err)
+	}
+}

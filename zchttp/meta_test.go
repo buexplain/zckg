@@ -1,8 +1,11 @@
 package zchttp
 
 import (
+	"context"
 	"mime/multipart"
+	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -431,5 +434,101 @@ func TestCachedStructMeta_ConcurrentConsistent(t *testing.T) {
 	}
 	if again := cachedStructMeta(tp); !reflect.DeepEqual(again, metas[0]) {
 		t.Fatal("cache hit returned inconsistent structMeta")
+	}
+}
+
+type raceMeta struct{ A string }
+
+// TestCachedStructMeta_ConcurrentLoadOrStore 以并发竞争覆盖
+// LoadOrStore 发现其他协程已抢先写入的分支（尽力触发：多轮并发重建）。
+func TestCachedStructMeta_ConcurrentLoadOrStore(t *testing.T) {
+	typ := reflect.TypeOf(raceMeta{})
+	for round := 0; round < 30; round++ {
+		structMetaCache.Delete(typ)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 64; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				cachedStructMeta(typ)
+			}()
+		}
+		close(start)
+		wg.Wait()
+	}
+	if _, ok := structMetaCache.Load(typ); !ok {
+		t.Fatal("并发构建后缓存应存在")
+	}
+}
+
+// TestBuildStructMetaWithVisiting_AlreadyVisiting 覆盖入口类型已在
+// visiting 集合中时返回空 meta 断开环的分支（包内直调）。
+func TestBuildStructMetaWithVisiting_AlreadyVisiting(t *testing.T) {
+	typ := reflect.TypeOf(raceMeta{})
+	m := buildStructMetaWithVisiting(typ, map[reflect.Type]bool{typ: true})
+	if len(m.fields) != 0 {
+		t.Fatalf("已在访问路径上的类型应返回空 meta，实际: %+v", m)
+	}
+}
+
+// SelfEmbedReq 自引用嵌入类型：注册期嵌入展开必须断开环并告警，不得栈溢出。
+// 类型名必须导出，否则会先被“未导出嵌入指针”分支拦截，触达不到递归环检测。
+type SelfEmbedReq struct {
+	*SelfEmbedReq
+	Name string `json:"name"`
+}
+
+type selfEmbedRes struct {
+	Name string `json:"name"`
+}
+
+// TestRegister_SelfRecursiveEmbedding 覆盖嵌入展开检测到自引用环时
+// 跳过嵌入并告警的分支：注册与请求均应正常完成。
+func TestRegister_SelfRecursiveEmbedding(t *testing.T) {
+	router := NewRouter()
+	router.POST("/self", func(_ context.Context, req SelfEmbedReq) (selfEmbedRes, error) {
+		return selfEmbedRes{Name: req.Name}, nil
+	})
+	rec := serveRequest(t, router, http.MethodPost, "/self", `{"name":"n1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "n1") {
+		t.Fatalf("自引用嵌入类型应正常绑定，实际: %s", rec.Body.String())
+	}
+}
+
+// embedIgnored 嵌入结构体含 json:"-" 字段，展开时应被跳过。
+type embedIgnored struct {
+	Secret string `json:"-"`
+	Shown  string `json:"shown"`
+}
+
+type embedIgnoredReq struct {
+	embedIgnored
+}
+
+// TestBuildStructMeta_EmbeddedFieldSkipped 覆盖嵌入展开循环中
+// name 为空或 "-" 的子字段被跳过的分支。
+func TestBuildStructMeta_EmbeddedFieldSkipped(t *testing.T) {
+	m := buildStructMeta(reflect.TypeOf(embedIgnoredReq{}))
+	for _, fm := range m.fields {
+		if fm.name == "-" || fm.name == "" {
+			t.Fatalf("meta 不应包含需跳过的字段: %+v", fm)
+		}
+		if fm.name == "Secret" {
+			t.Fatal("json:\"-\" 的嵌入字段不应进入可绑定集合")
+		}
+	}
+	found := false
+	for _, fm := range m.fields {
+		if fm.name == "shown" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("正常嵌入字段 shown 应进入可绑定集合")
 	}
 }

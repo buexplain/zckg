@@ -2,6 +2,8 @@ package zcmodel
 
 import (
 	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -70,6 +72,39 @@ func TestGenerate(t *testing.T) {
 		if !re.MatchString(got) {
 			t.Errorf("生成内容未匹配: %v", re)
 		}
+	}
+}
+
+// TestGenerate_JsonTagValueWithSpecialChars 验证 formatJSONTag 入口（列名含双引号、显式指定合法字段名）
+// 产出的 json tag 经净化后生成文件可解析、反射可完整还原。
+func TestGenerate_JsonTagValueWithSpecialChars(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	input := Input{
+		OutputDir:        dir,
+		Dialect:          DialectMysql,
+		TableName:        "user_info",
+		JsonTagValueCase: NameCaseLowerCamel,
+		Columns: []*Column{
+			{Name: "na\"me", Type: "varchar(255)", StructFieldInfo: StructFieldInfo{Name: "Name"}},
+		},
+	}
+	if err := Generate(input); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "user_info.go", string(content), parser.AllErrors)
+	if err != nil {
+		t.Fatalf("生成文件存在语法错误: %v\n%s", err, content)
+	}
+	tag := fieldTagOf(file, "Name")
+	if tag == "" {
+		t.Fatalf("未提取到字段 tag:\n%s", content)
+	}
+	if gotJSON := reflect.StructTag(tag).Get("json"); gotJSON != "na\"me" {
+		t.Errorf("json tag 还原失败\ngot:  %q\nwant: %q", gotJSON, "na\"me")
 	}
 }
 
