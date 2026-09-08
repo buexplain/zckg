@@ -2,6 +2,10 @@ package zcmodel
 
 import "testing"
 
+// TestNormalizeColumnType 验证列类型归一化的三方言代表规则：
+// 去除长度/精度与枚举值列表、MySQL 的 unsigned/zerofill 修饰、
+// PostgreSQL 的时区后缀规范化、SQLite 的引号剥离，
+// 以及空字符串与未知方言（走通用处理）两个边界。
 func TestNormalizeColumnType(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -94,8 +98,9 @@ func TestNormalizeColumnTypeMatchesMap(t *testing.T) {
 	}
 }
 
-// TestFormatStructFieldType 验证列类型映射入口：已知类型命中映射表，
-// 未知方言返回空串（由 Generate 兜底为 string）。
+// TestFormatStructFieldType 验证列类型映射入口：三方言分别覆盖全部 Go 目标类型类别
+// （int / int64 / float64 / bool / string / time.Time / []byte），
+// 未知方言无映射表返回空串（由 Generate 兜底为 string）。
 func TestFormatStructFieldType(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -103,9 +108,33 @@ func TestFormatStructFieldType(t *testing.T) {
 		colType string
 		want    string
 	}{
-		{"MySQL bigint", DialectMysql, "bigint(20)", "int64"},
-		{"Postgres timestamptz", DialectPostgres, "timestamp with time zone", "time.Time"},
-		{"SQLite blob", DialectSqlite, "blob", "[]byte"},
+		// MySQL：覆盖全部 Go 目标类型
+		{"MySQL int", DialectMysql, "int(11)", "int"},
+		{"MySQL int64", DialectMysql, "bigint(20)", "int64"},
+		{"MySQL float64", DialectMysql, "decimal(10,2)", "float64"},
+		{"MySQL bool", DialectMysql, "boolean", "bool"},
+		{"MySQL string", DialectMysql, "varchar(255)", "string"},
+		{"MySQL time.Time", DialectMysql, "datetime", "time.Time"},
+		{"MySQL []byte", DialectMysql, "blob", "[]byte"},
+
+		// PostgreSQL：覆盖全部 Go 目标类型
+		{"Postgres int", DialectPostgres, "integer", "int"},
+		{"Postgres int64", DialectPostgres, "bigint", "int64"},
+		{"Postgres float64", DialectPostgres, "double precision", "float64"},
+		{"Postgres bool", DialectPostgres, "boolean", "bool"},
+		{"Postgres string", DialectPostgres, "character varying(255)", "string"},
+		{"Postgres time.Time", DialectPostgres, "timestamp with time zone", "time.Time"},
+		{"Postgres []byte", DialectPostgres, "bytea", "[]byte"},
+
+		// SQLite：覆盖全部 Go 目标类型
+		{"SQLite int", DialectSqlite, "INTEGER", "int"},
+		{"SQLite int64", DialectSqlite, "UNSIGNED BIG INT", "int64"},
+		{"SQLite float64", DialectSqlite, "DOUBLE PRECISION", "float64"},
+		{"SQLite bool", DialectSqlite, "boolean", "bool"},
+		{"SQLite string", DialectSqlite, "VARYING CHARACTER(10)", "string"},
+		{"SQLite time.Time", DialectSqlite, "datetime", "time.Time"},
+		{"SQLite []byte", DialectSqlite, "blob", "[]byte"},
+
 		{"未知方言无映射表", Dialect("oracle"), "bigint", ""},
 	}
 	for _, tt := range tests {

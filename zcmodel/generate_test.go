@@ -12,6 +12,9 @@ import (
 	"testing"
 )
 
+// TestGenerate 验证 Generate 主流程产物：包名、自动补全的 time import、
+// Entity/DO 结构体注释与声明、字段行（字段名 + 类型 + 完整 tag）、
+// 以及 ToDO/ToEntity 方法签名与其中的字段赋值/类型断言语句。
 func TestGenerate(t *testing.T) {
 	// 输出目录名需为合法 Go 包名（writeOrReplaceStruct 以目录名推导包名）
 	dir := filepath.Join(t.TempDir(), "model")
@@ -55,11 +58,7 @@ func TestGenerate(t *testing.T) {
 		"if v, ok := d.ID.(int64); ok {",
 		"if v, ok := d.UserName.(string); ok {",
 	}
-	for _, s := range want {
-		if !strings.Contains(got, s) {
-			t.Errorf("生成内容缺少: %s", s)
-		}
-	}
+	assertContainsAll(t, got, want, "Generate 产物")
 	// 字段行按 gofmt 风格对齐，用正则匹配字段名、类型、tag 的组合
 	wantRegex := []*regexp.Regexp{
 		regexp.MustCompile(`ID\s+int64\s+` + "`json:\"id\" db:\"id\" description:\"主键\"`"),
@@ -108,6 +107,8 @@ func TestGenerate_JsonTagValueWithSpecialChars(t *testing.T) {
 	}
 }
 
+// TestGenerate_InvalidJsonTagValueCase 验证 JsonTagValueCase 不在六种支持风格之内时的错误路径：
+// Generate 必须返回错误，且错误消息说明命名风格不受支持。
 func TestGenerate_InvalidJsonTagValueCase(t *testing.T) {
 	input := Input{
 		OutputDir:        t.TempDir(),
@@ -124,18 +125,29 @@ func TestGenerate_InvalidJsonTagValueCase(t *testing.T) {
 	}
 }
 
+// TestGenerate_UnknownDialect 验证方言不在 mysql/postgres/sqlite 之内时的错误路径：
+// Generate 必须返回错误，且错误消息指明原因与传入的非法方言值。
 func TestGenerate_UnknownDialect(t *testing.T) {
 	input := Input{
 		OutputDir: t.TempDir(),
 		Dialect:   Dialect("oracle"),
 		TableName: "user_info",
 	}
-	if err := Generate(input); err == nil {
-		t.Errorf("Generate() 期望返回错误，实际为 nil")
+	err := Generate(input)
+	if err == nil {
+		t.Fatalf("Generate() 期望返回错误，实际为 nil")
+	}
+	// 断言具体错误原因：避免因其他前置校验报错而假通过
+	if !strings.Contains(err.Error(), "不支持的数据库方言") {
+		t.Errorf("错误信息应说明方言不受支持，实际: %v", err)
+	}
+	if !strings.Contains(err.Error(), "oracle") {
+		t.Errorf("错误信息应包含传入的方言值 oracle，实际: %v", err)
 	}
 }
 
-// TestGenerate_KeepUserCode 验证文件已存在时重新生成会保留用户自定义代码
+// TestGenerate_KeepUserCode 验证文件已存在时重新生成会保留用户自定义代码（含方法体），
+// 且生成部分被正确更新：新增列同时进入 Entity 与 DO，各生成声明只保留一份。
 func TestGenerate_KeepUserCode(t *testing.T) {
 	// 输出目录名需为合法 Go 包名（writeOrReplaceStruct 以目录名推导包名）
 	dir := filepath.Join(t.TempDir(), "model")
@@ -154,16 +166,24 @@ func TestGenerate_KeepUserCode(t *testing.T) {
 		t.Fatalf("第一次 Generate() error = %v", err)
 	}
 
-	// 在生成的文件中追加用户自定义代码
+	// 在生成的文件中追加用户自定义代码。
+	// 用闭包收敛句柄生命周期：defer 保证 WriteString 失败时句柄也被释放，
+	// 且第二次 Generate 之前文件已关闭（Windows 上 rename 无法覆盖存在打开句柄的文件）。
 	filePath := filepath.Join(dir, "user_info.go")
-	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		t.Fatalf("打开文件失败: %v", err)
-	}
-	if _, err := f.WriteString("\n// 用户自定义方法\nfunc (e *UserInfoEntity) CustomMethod() string {\n\treturn \"custom\"\n}\n"); err != nil {
-		t.Fatalf("追加用户代码失败: %v", err)
-	}
-	_ = f.Close()
+	func() {
+		f, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			t.Fatalf("打开文件失败: %v", err)
+		}
+		defer func() {
+			if cerr := f.Close(); cerr != nil {
+				t.Errorf("关闭文件失败: %v", cerr)
+			}
+		}()
+		if _, err := f.WriteString("\n// 用户自定义方法\nfunc (e *UserInfoEntity) CustomMethod() string {\n\treturn \"custom\"\n}\n"); err != nil {
+			t.Fatalf("追加用户代码失败: %v", err)
+		}
+	}()
 
 	// 再次生成（新增一个字段）
 	input.Columns = append(input.Columns, &Column{Name: "extra", Type: "text"})
@@ -176,11 +196,28 @@ func TestGenerate_KeepUserCode(t *testing.T) {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
 	got := string(content)
-	if !strings.Contains(got, "func (e *UserInfoEntity) CustomMethod() string {") {
-		t.Errorf("重新生成后用户自定义代码未被保留")
-	}
+	// 方法体也必须完整保留：验证 AST 偏移截取不会截断函数体
+	assertContainsAll(t, got, []string{
+		"func (e *UserInfoEntity) CustomMethod() string {",
+		"return \"custom\"",
+	}, "重新生成后用户自定义代码应完整保留")
+	// 新增列应同时进入 Entity（具体类型）与 DO（any）
 	if !regexp.MustCompile(`Extra\s+string\s+` + "`json:\"extra\" db:\"extra\"`").MatchString(got) {
-		t.Errorf("重新生成后缺少新增字段 Extra")
+		t.Errorf("重新生成后 Entity 缺少新增字段 Extra")
+	}
+	if !regexp.MustCompile(`Extra\s+any\s+` + "`json:\"extra\" db:\"extra\"`").MatchString(got) {
+		t.Errorf("重新生成后 DO 缺少新增字段 Extra")
+	}
+	// 生成声明各只保留一份：重新生成为替换而非追加
+	for _, decl := range []string{
+		"type UserInfoEntity struct {",
+		"type UserInfoDO struct {",
+		"func (e *UserInfoEntity) ToDO(",
+		"func (d *UserInfoDO) ToEntity(",
+	} {
+		if n := strings.Count(got, decl); n != 1 {
+			t.Errorf("生成声明 %q 应只出现一次，实际 %d 次:\n%s", decl, n, got)
+		}
 	}
 }
 
@@ -267,9 +304,7 @@ func TestGenerate_AutoFillTimeImport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
-	if !strings.Contains(string(content), `import "time"`) {
-		t.Errorf("生成文件缺少 import \"time\":\n%s", content)
-	}
+	assertContains(t, string(content), `import "time"`, "自动补全 time import")
 }
 
 // TestGenerate_CustomTypeImport 验证调用者自定义字段类型并指定 Import 时，生成代码完整引入对应包
@@ -302,12 +337,10 @@ func TestGenerate_CustomTypeImport(t *testing.T) {
 	}
 	got := string(content)
 	// 自定义 Import 与自动填充的 time 组成 import 块（多包时不是单行 import "time"）
-	if !strings.Contains(got, `"github.com/shopspring/decimal"`) {
-		t.Errorf("生成文件缺少自定义 import github.com/shopspring/decimal:\n%s", got)
-	}
-	if !strings.Contains(got, "\t\"time\"\n") {
-		t.Errorf("生成文件缺少 import \"time\":\n%s", got)
-	}
+	assertContainsAll(t, got, []string{
+		`"github.com/shopspring/decimal"`,
+		"\t\"time\"\n",
+	}, "自定义 import 与自动补全的 time 应同时出现")
 	if !regexp.MustCompile(`Amount\s+decimal\.Decimal\s+` + "`json:\"amount\" db:\"amount\"`").MatchString(got) {
 		t.Errorf("自定义类型字段生成错误:\n%s", got)
 	}
@@ -466,16 +499,12 @@ func TestGenerate_EmptyColumns(t *testing.T) {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
 	got := string(content)
-	for _, s := range []string{
+	assertContainsAll(t, got, []string{
 		"type UserInfoEntity struct {",
 		"type UserInfoDO struct {",
 		"func (e *UserInfoEntity) ToDO(userInfoDO ...*UserInfoDO) *UserInfoDO {",
 		"func (d *UserInfoDO) ToEntity(userInfoEntity ...*UserInfoEntity) *UserInfoEntity {",
-	} {
-		if !strings.Contains(got, s) {
-			t.Errorf("空 Columns 生成内容缺少: %s\n%s", s, got)
-		}
-	}
+	}, "空 Columns 应生成空结构体与互转方法")
 	// 产物必须是可解析的合法 Go 代码
 	if _, err := format.Source(content); err != nil {
 		t.Errorf("空 Columns 生成产物无法通过 gofmt: %v", err)
@@ -682,11 +711,8 @@ func TestGenerate_NoInputSideEffect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
-	for _, s := range []string{"ID", "CreatedAt", "time.Time", `import "time"`} {
-		if !strings.Contains(string(content), s) {
-			t.Errorf("生成文件缺少补全后的内容 %q:\n%s", s, content)
-		}
-	}
+	assertContainsAll(t, string(content), []string{"ID", "CreatedAt", "time.Time", `import "time"`},
+		"补全结果应体现在生成文件中")
 }
 
 // TestGenerate_KeepBuildTags 验证对含 build tags 的已有文件再生成时，文件头指令与 package 注释完整保留。
@@ -720,12 +746,10 @@ func TestGenerate_KeepBuildTags(t *testing.T) {
 	if !strings.HasPrefix(got, wantHeader) {
 		t.Errorf("文件头 build tags/package 注释未保留\nwant prefix:\n%s\ngot:\n%s", wantHeader, got)
 	}
-	if !strings.Contains(got, "var Extra = 1") {
-		t.Errorf("用户代码丢失:\n%s", got)
-	}
-	if !strings.Contains(got, "type UserInfoEntity struct {") {
-		t.Errorf("生成代码缺失:\n%s", got)
-	}
+	assertContainsAll(t, got, []string{
+		"var Extra = 1",
+		"type UserInfoEntity struct {",
+	}, "含 build tags 的文件再生成后用户代码与生成代码应共存")
 }
 
 // TestGenerate_RegenerateWithAliasImport 验证存量文件以别名导入生成代码所需包（如 import mytime "time"）时，
@@ -772,17 +796,14 @@ func (e *UserInfoEntity) Now() mytime.Time {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
 	got := string(content)
-	if !strings.Contains(got, "mytime \"time\"") {
-		t.Errorf("用户别名导入应保留:\n%s", got)
-	}
-	if !strings.Contains(got, "\t\"time\"\n") {
-		t.Errorf("别名导入不满足生成代码需要，应补充标准导入 \"time\":\n%s", got)
-	}
+	// 别名导入不满足生成代码需要，须补充标准导入 "time"，同时保留用户别名导入与自定义方法
+	assertContainsAll(t, got, []string{
+		"mytime \"time\"",
+		"\t\"time\"\n",
+		"func (e *UserInfoEntity) Now() mytime.Time {",
+	}, "别名导入存量文件再生成")
 	if strings.Count(got, "import (") != 1 {
 		t.Errorf("缺失导入应合并进原 import 块（不形成两个 import 块）:\n%s", got)
-	}
-	if !strings.Contains(got, "func (e *UserInfoEntity) Now() mytime.Time {") {
-		t.Errorf("用户自定义方法应保留:\n%s", got)
 	}
 	if !regexp.MustCompile(`CreatedAt\s+time\.Time`).MatchString(got) {
 		t.Errorf("新增列 CreatedAt 生成错误:\n%s", got)

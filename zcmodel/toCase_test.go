@@ -34,26 +34,29 @@ func TestFormatJSONTag(t *testing.T) {
 // TestToPascalCase 验证 toPascalCase 对多种输入风格转换为 PascalCase，单词 id 统一转为 ID
 func TestToPascalCase(t *testing.T) {
 	tests := []struct {
+		name string
 		in   string
 		want string
 	}{
-		{"user_info", "UserInfo"},
-		{"user_info_id", "UserInfoID"},
-		{"userId", "UserID"},
-		{"UserID", "UserID"},
-		{"USER_ID", "UserID"},
-		{"user-info", "UserInfo"},
-		{"user id", "UserID"},
-		{"HTTPServer", "HttpServer"},
-		{"user2_name", "User2Name"},
-		{"id", "ID"},
-		{"a", "A"},
-		{"", ""},
+		{"下划线", "user_info", "UserInfo"},
+		{"下划线含id结尾", "user_info_id", "UserInfoID"},
+		{"lowerCamel输入", "userId", "UserID"},
+		{"PascalCase输入", "UserID", "UserID"},
+		{"UPPER_SNAKE输入", "USER_ID", "UserID"},
+		{"连字符", "user-info", "UserInfo"},
+		{"空格分隔", "user id", "UserID"},
+		{"连续大写缩写", "HTTPServer", "HttpServer"},
+		{"含数字", "user2_name", "User2Name"},
+		{"单词id", "id", "ID"},
+		{"单字符", "a", "A"},
+		{"空串", "", ""},
 	}
 	for _, tt := range tests {
-		if got := toPascalCase(tt.in); got != tt.want {
-			t.Errorf("toPascalCase(%q) = %q, want %q", tt.in, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := toPascalCase(tt.in); got != tt.want {
+				t.Errorf("toPascalCase(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -61,47 +64,53 @@ func TestToPascalCase(t *testing.T) {
 // ASCII 首字符正常小写；多字节字符（如中文）首字符完整保留，不被按字节截断产生残缺字节。
 func TestLowerFirst(t *testing.T) {
 	tests := []struct {
+		name string
 		in   string
 		want string
 	}{
-		{"UserInfoDO", "userInfoDO"},
-		{"UserInfoEntity", "userInfoEntity"},
-		{"ID", "iD"},
-		{"A", "a"},
-		{"", ""},
+		{"DO后缀", "UserInfoDO", "userInfoDO"},
+		{"Entity后缀", "UserInfoEntity", "userInfoEntity"},
+		{"全大写缩写", "ID", "iD"},
+		{"单字符", "A", "a"},
+		{"空串", "", ""},
 		// 中文首字符按 rune 完整保留，不产生残缺字节导致非法标识符
-		{"订单DO", "订单DO"},
-		{"订单Entity", "订单Entity"},
+		{"中文前缀DO", "订单DO", "订单DO"},
+		{"中文前缀Entity", "订单Entity", "订单Entity"},
 	}
 	for _, tt := range tests {
-		if got := lowerFirst(tt.in); got != tt.want {
-			t.Errorf("lowerFirst(%q) = %q, want %q", tt.in, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := lowerFirst(tt.in); got != tt.want {
+				t.Errorf("lowerFirst(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
 // TestSplitWords 验证 splitWords 的拆分规则：分隔符、小写到大写边界、连续大写后接小写边界
 func TestSplitWords(t *testing.T) {
 	tests := []struct {
+		name string
 		in   string
 		want []string
 	}{
-		{"", nil},
-		{"user_id", []string{"user", "id"}},
-		{"userId", []string{"user", "Id"}},
-		{"UserID", []string{"User", "ID"}},
-		{"USER_ID", []string{"USER", "ID"}},
-		{"HTTPServer", []string{"HTTP", "Server"}},
-		{"user-info", []string{"user", "info"}},
-		{"user id", []string{"user", "id"}},
-		{"a_b_c", []string{"a", "b", "c"}},
-		{"user2_name", []string{"user2", "name"}},
-		{"single", []string{"single"}},
+		{"空串", "", nil},
+		{"下划线", "user_id", []string{"user", "id"}},
+		{"lowerCamel", "userId", []string{"user", "Id"}},
+		{"PascalCase含缩写", "UserID", []string{"User", "ID"}},
+		{"UPPER_SNAKE", "USER_ID", []string{"USER", "ID"}},
+		{"连续大写后接小写", "HTTPServer", []string{"HTTP", "Server"}},
+		{"连字符", "user-info", []string{"user", "info"}},
+		{"空格分隔", "user id", []string{"user", "id"}},
+		{"多段下划线", "a_b_c", []string{"a", "b", "c"}},
+		{"含数字", "user2_name", []string{"user2", "name"}},
+		{"单个单词", "single", []string{"single"}},
 	}
 	for _, tt := range tests {
-		if got := splitWords(tt.in); !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("splitWords(%q) = %v, want %v", tt.in, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := splitWords(tt.in); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("splitWords(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -109,28 +118,30 @@ func TestSplitWords(t *testing.T) {
 func TestToCase_各命名风格(t *testing.T) {
 	tests := []struct {
 		name string
-		got  string
+		fn   func() string
 		want string
 	}{
-		{"toLowerCamel", toLowerCamel([]string{"user", "id"}), "userId"},
-		{"toLowerCamel_首单词全小写", toLowerCamel([]string{"User", "ID"}), "userId"},
-		{"toLowerCamel_单单词", toLowerCamel([]string{"ID"}), "id"},
-		{"toLowerCamel_空列表", toLowerCamel(nil), ""},
-		{"toUpperCamel", toUpperCamel([]string{"user", "id"}), "UserId"},
-		{"toUpperCamel_空列表", toUpperCamel(nil), ""},
-		{"toLowerSnake", toLowerSnake([]string{"user", "ID"}), "user_id"},
-		{"toLowerSnake_空列表", toLowerSnake(nil), ""},
-		{"toUpperSnake", toUpperSnake([]string{"user", "id"}), "USER_ID"},
-		{"toUpperSnake_空列表", toUpperSnake(nil), ""},
-		{"toLowerKebab", toLowerKebab([]string{"user", "id"}), "user-id"},
-		{"toLowerKebab_空列表", toLowerKebab(nil), ""},
-		{"toUpperKebab", toUpperKebab([]string{"user", "id"}), "USER-ID"},
-		{"toUpperKebab_空列表", toUpperKebab(nil), ""},
+		{"toLowerCamel", func() string { return toLowerCamel([]string{"user", "id"}) }, "userId"},
+		{"toLowerCamel_首单词全小写", func() string { return toLowerCamel([]string{"User", "ID"}) }, "userId"},
+		{"toLowerCamel_单单词", func() string { return toLowerCamel([]string{"ID"}) }, "id"},
+		{"toLowerCamel_空列表", func() string { return toLowerCamel(nil) }, ""},
+		{"toUpperCamel", func() string { return toUpperCamel([]string{"user", "id"}) }, "UserId"},
+		{"toUpperCamel_空列表", func() string { return toUpperCamel(nil) }, ""},
+		{"toLowerSnake", func() string { return toLowerSnake([]string{"user", "ID"}) }, "user_id"},
+		{"toLowerSnake_空列表", func() string { return toLowerSnake(nil) }, ""},
+		{"toUpperSnake", func() string { return toUpperSnake([]string{"user", "id"}) }, "USER_ID"},
+		{"toUpperSnake_空列表", func() string { return toUpperSnake(nil) }, ""},
+		{"toLowerKebab", func() string { return toLowerKebab([]string{"user", "id"}) }, "user-id"},
+		{"toLowerKebab_空列表", func() string { return toLowerKebab(nil) }, ""},
+		{"toUpperKebab", func() string { return toUpperKebab([]string{"user", "id"}) }, "USER-ID"},
+		{"toUpperKebab_空列表", func() string { return toUpperKebab(nil) }, ""},
 	}
 	for _, tt := range tests {
-		if tt.got != tt.want {
-			t.Errorf("%s = %q, want %q", tt.name, tt.got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fn(); got != tt.want {
+				t.Errorf("%s = %q, want %q", tt.name, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -143,22 +154,24 @@ func TestToCase_EmptyWordSkipped(t *testing.T) {
 
 	tests := []struct {
 		name string
-		got  string
+		fn   func() string
 		want string
 	}{
-		{"toPascalCase_空单词", toPascalCase("user__id"), "UserID"},
-		{"toLowerCamel_空单词", toLowerCamel(emptyWord), "userId"},
-		{"toLowerCamel_前导空", toLowerCamel(leadingEmpty), "User"},
-		{"toUpperCamel_空单词", toUpperCamel(emptyWord), "UserId"},
-		{"toUpperCamel_前导空", toUpperCamel(leadingEmpty), "User"},
-		{"toLowerSnake_空单词", toLowerSnake(emptyWord), "user_id"},
-		{"toUpperSnake_空单词", toUpperSnake(emptyWord), "USER_ID"},
-		{"toLowerKebab_空单词", toLowerKebab(emptyWord), "user-id"},
-		{"toUpperKebab_空单词", toUpperKebab(emptyWord), "USER-ID"},
+		{"toPascalCase_空单词", func() string { return toPascalCase("user__id") }, "UserID"},
+		{"toLowerCamel_空单词", func() string { return toLowerCamel(emptyWord) }, "userId"},
+		{"toLowerCamel_前导空", func() string { return toLowerCamel(leadingEmpty) }, "User"},
+		{"toUpperCamel_空单词", func() string { return toUpperCamel(emptyWord) }, "UserId"},
+		{"toUpperCamel_前导空", func() string { return toUpperCamel(leadingEmpty) }, "User"},
+		{"toLowerSnake_空单词", func() string { return toLowerSnake(emptyWord) }, "user_id"},
+		{"toUpperSnake_空单词", func() string { return toUpperSnake(emptyWord) }, "USER_ID"},
+		{"toLowerKebab_空单词", func() string { return toLowerKebab(emptyWord) }, "user-id"},
+		{"toUpperKebab_空单词", func() string { return toUpperKebab(emptyWord) }, "USER-ID"},
 	}
 	for _, tt := range tests {
-		if tt.got != tt.want {
-			t.Errorf("%s = %q, want %q", tt.name, tt.got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fn(); got != tt.want {
+				t.Errorf("%s = %q, want %q", tt.name, got, tt.want)
+			}
+		})
 	}
 }

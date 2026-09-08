@@ -256,59 +256,28 @@ func TestBuildStruct_JsonTagValueWithBacktick(t *testing.T) {
 
 // TestWriteOrReplaceStruct_NewFile 验证文件不存在时创建新文件
 func TestWriteOrReplaceStruct_NewFile(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
 	entityCode := "type UserEntity struct {\n\tID int\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
+	got := writeAndVerify(t, "", entityCode, doCode, nil)
 	want := "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
-	if string(content) != want {
-		t.Errorf("新建文件内容错误\nwant:\n%s\ngot:\n%s", want, content)
+	if got != want {
+		t.Errorf("新建文件内容错误\nwant:\n%s\ngot:\n%s", want, got)
 	}
 }
 
 // TestWriteOrReplaceStruct_EmptyFile 验证空文件按新建处理
 func TestWriteOrReplaceStruct_EmptyFile(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-	if err := os.WriteFile(filePath, []byte("  \n"), 0644); err != nil {
-		t.Fatalf("创建空文件失败: %v", err)
-	}
 	entityCode := "type UserEntity struct {\n\tID int\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
+	got := writeAndVerify(t, "  \n", entityCode, doCode, nil)
 	want := "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
-	if string(content) != want {
-		t.Errorf("空文件重建内容错误\nwant:\n%s\ngot:\n%s", want, content)
+	if got != want {
+		t.Errorf("空文件重建内容错误\nwant:\n%s\ngot:\n%s", want, got)
 	}
 }
 
-// TestWriteOrReplaceStruct_KeepUserCode 验证重新生成时移除旧生成代码、保留用户代码与 import
+// TestWriteOrReplaceStruct_KeepUserCode 验证重新生成时移除旧生成代码、保留用户代码（含方法体）与 import
 func TestWriteOrReplaceStruct_KeepUserCode(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-
 	// 模拟第一次生成后的文件：生成代码 + import + 用户自定义代码
 	orig := `package model
 
@@ -340,41 +309,29 @@ func (d *UserDO) World() string {
 
 var Extra = 1
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	// 第二次生成：结构体字段变化（移除 Name，新增 Age）
 	entityCode := "type UserEntity struct {\n\tID   int64\n\tAge  int\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
 	doCode := "type UserDO struct {\n\tID   any\n\tAge  any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
 	// 用户代码与 import 保留
-	for _, s := range []string{
+	assertContainsAll(t, got, []string{
 		"import \"fmt\"",
 		"func (e *UserEntity) Hello() string {",
 		"func (d *UserDO) World() string {",
 		"var Extra = 1",
-	} {
-		if !strings.Contains(got, s) {
-			t.Errorf("重新生成后缺少: %s\n输出:\n%s", s, got)
-		}
-	}
+	}, "重新生成后用户代码与 import 应保留")
+	// 方法体也必须完整保留：验证按 AST 偏移截取用户代码时不会截断函数体
+	assertContainsAll(t, got, []string{
+		"return fmt.Sprintf(\"hi %d\", e.ID)",
+		"return \"world\"",
+	}, "重新生成后用户方法体应完整保留")
 	// 新生成代码生效、旧字段被移除（产物经 gofmt 格式化，字段对齐按 gofmt 标准）
 	if !regexp.MustCompile(`Age\s+int\b`).MatchString(got) {
 		t.Errorf("重新生成后缺少新字段 Age:\n%s", got)
 	}
-	if strings.Contains(got, "Name string") || strings.Contains(got, "Name any") {
-		t.Errorf("重新生成后旧字段 Name 未被移除:\n%s", got)
-	}
+	assertNotContains(t, got, "Name string", "重新生成后旧字段 Name 应被移除")
+	assertNotContains(t, got, "Name any", "重新生成后旧字段 Name 应被移除")
 	// 生成代码各只保留一份
 	if strings.Count(got, "type UserEntity struct {") != 1 || strings.Count(got, "type UserDO struct {") != 1 {
 		t.Errorf("重新生成后生成代码出现多次:\n%s", got)
@@ -404,11 +361,6 @@ var Extra = 1
 // TestWriteOrReplaceStruct_ExistingFile_UserTypeBlock 验证存量文件中仅含用户类型的 type 声明块
 // （不含任何生成类型）再生成时整体原样保留。
 func TestWriteOrReplaceStruct_ExistingFile_UserTypeBlock(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
 	orig := `package model
 
 type UserEntity struct {
@@ -421,24 +373,10 @@ type (
 	Level  int
 )
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
 	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
 	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
-	for _, s := range []string{"type (", "Status int", "Level  int", "// 用户自定义类型块"} {
-		if !strings.Contains(got, s) {
-			t.Errorf("用户类型块应完整保留，缺少: %s\n输出:\n%s", s, got)
-		}
-	}
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContainsAll(t, got, []string{"type (", "Status int", "Level  int", "// 用户自定义类型块"}, "用户类型块应完整保留")
 	if !regexp.MustCompile(`ID\s+int64`).MatchString(got) {
 		t.Errorf("新生成代码未生效:\n%s", got)
 	}
@@ -466,25 +404,11 @@ func TestWriteGeneratedFile_SyntaxError(t *testing.T) {
 
 // TestWriteOrReplaceStruct_NewFile_NeededImports 验证生成代码需要 import 时，新建文件自动引入 import "time"
 func TestWriteOrReplaceStruct_NewFile_NeededImports(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
 	entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}"
 	doCode := "type UserDO struct {\n\tCreatedAt any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, "", entityCode, doCode, []string{"time"})
 	// import "time" 自动引入，且位于 package 与生成代码之间
-	if !strings.Contains(got, "import \"time\"") {
-		t.Errorf("需要 time 包时新建文件应自动引入 import \"time\":\n%s", got)
-	}
+	assertContains(t, got, "import \"time\"", "需要 time 包时新建文件应自动引入 import")
 	if !strings.HasPrefix(got, "package model\n\nimport \"time\"\n\ntype UserEntity struct {") {
 		t.Errorf("import 位置错误:\n%s", got)
 	}
@@ -492,11 +416,6 @@ func TestWriteOrReplaceStruct_NewFile_NeededImports(t *testing.T) {
 
 // TestWriteOrReplaceStruct_ExistingFile_AutoAddTimeImport 验证已存在文件缺少 time import 时自动补上，且保留用户 import
 func TestWriteOrReplaceStruct_ExistingFile_AutoAddTimeImport(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
 	// 模拟用户已有文件：无 time import，含用户自定义方法与用户 import
 	orig := `package model
 
@@ -510,37 +429,16 @@ func (e *UserEntity) Hello() string {
 	return fmt.Sprint(e.ID)
 }
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
 	doCode := "type UserDO struct {\n\tCreatedAt any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
 	// 缺失的 time 合并进原 import 块（单一 import 块，避免形成两个 import 块）
-	if !strings.Contains(got, "import (\n\t\"fmt\"\n\t\"time\"\n)") {
-		t.Errorf("缺失的 time import 应合并进原 import 块:\n%s", got)
-	}
-	if !strings.Contains(got, "func (e *UserEntity) Hello() string {") {
-		t.Errorf("用户自定义方法应保留:\n%s", got)
-	}
+	assertContains(t, got, "import (\n\t\"fmt\"\n\t\"time\"\n)", "缺失的 time import 应合并进原 import 块")
+	assertContains(t, got, "func (e *UserEntity) Hello() string {", "用户自定义方法应保留")
 }
 
 // TestWriteOrReplaceStruct_ExistingFile_TimeImportExists 验证文件已导入 time 时不重复添加
 func TestWriteOrReplaceStruct_ExistingFile_TimeImportExists(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
 	orig := `package model
 
 import "time"
@@ -549,19 +447,9 @@ type UserEntity struct {
 	ID int
 }
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
 	entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
 	doCode := "type UserDO struct {\n\tCreatedAt any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
 	if strings.Count(got, `import "time"`) != 1 {
 		t.Errorf("已导入 time 时不应重复添加:\n%s", got)
 	}
@@ -606,63 +494,30 @@ type UserEntity struct {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := filepath.Join(t.TempDir(), "model")
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				t.Fatalf("创建目录失败: %v", err)
-			}
-			filePath := filepath.Join(dir, "user.go")
-			if err := os.WriteFile(filePath, []byte(tt.orig), 0644); err != nil {
-				t.Fatalf("写入初始文件失败: %v", err)
-			}
 			entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
 			doCode := "type UserDO struct {\n\tCreatedAt any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
-			if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
-				t.Fatalf("writeOrReplaceStruct() error = %v", err)
-			}
-			content, err := os.ReadFile(filePath)
-			if err != nil {
-				t.Fatalf("读取文件失败: %v", err)
-			}
-			got := string(content)
+			got := writeAndVerify(t, tt.orig, entityCode, doCode, []string{"time"})
 			// 别名/空白导入不满足生成代码对默认包名的引用，必须补充标准导入（合并进同一 import 块）
-			if !strings.Contains(got, "\t\"time\"\n") {
-				t.Errorf("存量文件为%s时不应视为已导入，应补充标准导入 \"time\":\n%s", tt.name, got)
-			}
+			assertContains(t, got, "\t\"time\"\n", "存量文件为"+tt.name+"时不应视为已导入，应补充标准导入 \"time\"")
 			// 用户原有的别名/空白导入完整保留（与标准导入合法共存于同一 import 块）
-			if !strings.Contains(got, tt.keepImport) {
-				t.Errorf("用户原有导入 %s 应保留:\n%s", tt.keepImport, got)
-			}
+			assertContains(t, got, tt.keepImport, "用户原有导入应保留")
 			// 缺失导入合并进原 import 块，不形成两个 import 块
 			if strings.Count(got, "import (") != 1 {
 				t.Errorf("应只有一个 import 块:\n%s", got)
 			}
-			if !strings.Contains(got, "type UserEntity struct {") {
-				t.Errorf("生成代码缺失:\n%s", got)
-			}
+			assertContains(t, got, "type UserEntity struct {", "生成代码应写入")
 		})
 	}
 }
 
 // TestWriteOrReplaceStruct_MultipleNeededImports 验证需要多个包时生成 import (…) 块，且缺失的包逐个补齐
 func TestWriteOrReplaceStruct_MultipleNeededImports(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
 	entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}"
 	doCode := "type UserDO struct {\n\tCreatedAt any\n}"
 	needed := []string{"time", "github.com/foo/bar"}
 
 	// 新建文件：多个 import 组装为排序后的 import (…) 块
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, needed); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, "", entityCode, doCode, needed)
 	want := "package model\n\nimport (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)\n\n"
 	if !strings.HasPrefix(got, want) {
 		t.Errorf("多 import 块格式错误\nwant prefix:\n%s\ngot:\n%s", want, got)
@@ -677,22 +532,10 @@ type UserEntity struct {
 	ID int
 }
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, needed); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err = os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got = string(content)
+	got = writeAndVerify(t, orig, entityCode, doCode, needed)
 	// 缺失的包合并进原 import 块（"time" 已存在不重复，仅补 "github.com/foo/bar"；
 	// 最终经 gofmt 排序，"github.com/foo/bar" 排在前）
-	if !strings.Contains(got, "import (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)") {
-		t.Errorf("缺失的 import 应合并进原 import 块:\n%s", got)
-	}
+	assertContains(t, got, "import (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)", "缺失的 import 应合并进原 import 块")
 	if strings.Count(got, `"time"`) != 1 {
 		t.Errorf("已存在的 import 不应重复添加:\n%s", got)
 	}
@@ -701,12 +544,6 @@ type UserEntity struct {
 // TestWriteOrReplaceStruct_KeepBuildTagsAndPackageComment 验证再生成保留文件头 build tags、
 // package 文档注释与原 package 行（逐字节），且已有文件尊重原包名而非输出目录推导名。
 func TestWriteOrReplaceStruct_KeepBuildTagsAndPackageComment(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-
 	// 原文件包名与输出目录推导名不一致（custompkg != model），应保留原包名
 	orig := `//go:build ignore
 // +build ignore
@@ -730,21 +567,9 @@ func (d *UserDO) ToEntity() {}
 
 var Extra = 1
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID   int64\n\tAge  int\n}\n\nfunc (e *UserEntity) ToDO() {}"
 	doCode := "type UserDO struct {\n\tID  any\n\tAge any\n}\n\nfunc (d *UserDO) ToEntity() {}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
 	// 文件头（build tags + package 注释 + 原 package 行）逐字节保留
 	wantHeader := "//go:build ignore\n// +build ignore\n\n// Package custompkg 包文档注释。\npackage custompkg\n"
@@ -752,13 +577,9 @@ var Extra = 1
 		t.Errorf("文件头 build tags/package 注释未逐字节保留\nwant prefix:\n%s\ngot:\n%s", wantHeader, got)
 	}
 	// 包名尊重原文件，不被输出目录推导名 model 覆盖
-	if strings.Contains(got, "\npackage model\n") {
-		t.Errorf("已有文件的包名不应被改为输出目录推导名:\n%s", got)
-	}
+	assertNotContains(t, got, "\npackage model\n", "已有文件的包名不应被改为输出目录推导名")
 	// 用户代码保留
-	if !strings.Contains(got, "var Extra = 1") {
-		t.Errorf("用户代码丢失:\n%s", got)
-	}
+	assertContains(t, got, "var Extra = 1", "用户代码应保留")
 	// 生成代码各只保留一份
 	if strings.Count(got, "type UserEntity struct {") != 1 || strings.Count(got, "type UserDO struct {") != 1 {
 		t.Errorf("重新生成后生成代码出现多次:\n%s", got)
@@ -768,12 +589,6 @@ var Extra = 1
 // TestWriteOrReplaceStruct_KeepUserTypeInMixedBlock 验证 type 块中混有用户类型时，
 // 再生成仅剔除生成的类型（按 Spec 粒度），用户类型及其注释完整保留。
 func TestWriteOrReplaceStruct_KeepUserTypeInMixedBlock(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-
 	orig := `package model
 
 type (
@@ -799,32 +614,16 @@ func (d *UserDO) ToEntity() {}
 // MyFunc 用户函数
 func MyFunc() {}
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
 	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
 	// 混合 type 块中的用户类型（含注释）与用户函数保留
-	for _, s := range []string{
+	assertContainsAll(t, got, []string{
 		"// MyHelper 用户手写类型",
 		"MyHelper struct {",
 		"func MyFunc() {",
-	} {
-		if !strings.Contains(got, s) {
-			t.Errorf("混合 type 块中的用户代码丢失: %s\n输出:\n%s", s, got)
-		}
-	}
+	}, "混合 type 块中的用户代码应保留")
 	// 生成类型各只一份（块内的旧声明被剔除）
 	if strings.Count(got, "type UserEntity struct {") != 1 || strings.Count(got, "type UserDO struct {") != 1 {
 		t.Errorf("生成类型应各只保留一份:\n%s", got)
@@ -839,12 +638,6 @@ func MyFunc() {}
 // TestWriteOrReplaceStruct_RemoveValueReceiverToDO 验证用户手写的值接收者 ToDO 与生成的
 // 指针接收者 ToDO 同名共存时，再生成移除值接收者版本，避免方法集冲突导致编译失败。
 func TestWriteOrReplaceStruct_RemoveValueReceiverToDO(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-
 	orig := `package model
 
 type UserEntity struct {
@@ -864,32 +657,16 @@ type UserDO struct {
 
 func (d *UserDO) ToEntity() {}
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
 	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
 	// 值接收者 ToDO 被移除，仅保留生成的指针接收者版本
-	if strings.Contains(got, "func (e UserEntity) ToDO()") {
-		t.Errorf("值接收者 ToDO 未被移除:\n%s", got)
-	}
+	assertNotContains(t, got, "func (e UserEntity) ToDO()", "值接收者 ToDO 应被移除")
 	if strings.Count(got, "ToDO()") != 1 {
 		t.Errorf("ToDO 方法应只保留一份:\n%s", got)
 	}
-	if !strings.Contains(got, "func (e *UserEntity) ToDO()") {
-		t.Errorf("生成的指针接收者 ToDO 丢失:\n%s", got)
-	}
+	assertContains(t, got, "func (e *UserEntity) ToDO()", "生成的指针接收者 ToDO 应保留")
 	// 生成文件必须可解析
 	fset := token.NewFileSet()
 	if _, err := parser.ParseFile(fset, "", got, parser.AllErrors); err != nil {
@@ -994,12 +771,6 @@ func TestWriteOrReplaceStruct_ReadOnlyDir(t *testing.T) {
 // （如 func (e UserEntity) Validate() error）与指针接收者同样归位到对应结构体生成代码之后，
 // 而非落入文件末尾的"其他用户代码"。
 func TestWriteOrReplaceStruct_ValueReceiverCustomMethod(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-
 	orig := `package model
 
 type UserEntity struct {
@@ -1027,32 +798,16 @@ func (d UserDO) Tag() string {
 // FreeFunc 无接收者函数
 func FreeFunc() {}
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
 	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
 	// 值接收者自定义方法与无接收者函数均保留
-	for _, s := range []string{
+	assertContainsAll(t, got, []string{
 		"func (e UserEntity) Validate() error {",
 		"func (d UserDO) Tag() string {",
 		"func FreeFunc() {",
-	} {
-		if !strings.Contains(got, s) {
-			t.Errorf("值接收者自定义方法应保留，缺少: %s\n输出:\n%s", s, got)
-		}
-	}
+	}, "值接收者自定义方法与无接收者函数应保留")
 	// 布局顺序：Entity 生成代码 < Entity 值接收者方法 < DO 生成代码 < DO 值接收者方法 < 其他函数
 	order := []string{
 		"type UserEntity struct {",
@@ -1079,12 +834,6 @@ func FreeFunc() {}
 // 不附着于任何 Spec 的游离注释（前后均有空行）在再生成时原样保留：
 // 按源码偏移重建而非经 go/printer 重印，游离注释不会丢失。
 func TestWriteOrReplaceStruct_KeepFreeFloatingCommentInMixedBlock(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-
 	orig := `package model
 
 type (
@@ -1107,29 +856,13 @@ type UserDO struct {
 
 func (d *UserDO) ToEntity() {}
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
 	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	got := string(content)
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
 	// 游离注释与用户类型均保留
-	if !strings.Contains(got, "// 游离注释：不与任何类型绑定") {
-		t.Errorf("混合 type 块中的游离注释应保留:\n%s", got)
-	}
-	if !strings.Contains(got, "MyHelper struct {") {
-		t.Errorf("混合 type 块中的用户类型应保留:\n%s", got)
-	}
+	assertContains(t, got, "// 游离注释：不与任何类型绑定", "混合 type 块中的游离注释应保留")
+	assertContains(t, got, "MyHelper struct {", "混合 type 块中的用户类型应保留")
 	if strings.Count(got, "type UserEntity struct {") != 1 {
 		t.Errorf("生成类型应只保留一份:\n%s", got)
 	}
@@ -1142,9 +875,11 @@ func (d *UserDO) ToEntity() {}
 
 // TestWriteOrReplaceStruct_PkgNameFallback 覆盖包名推导回退分支：
 // 相对路径（无目录部分）的 Dir 为 "."，包名回退为 "main"。
+// 用 t.Chdir 把工作目录切到临时目录，既保持"无目录部分"的相对路径语义，
+// 又避免在仓库目录下生成文件（残留与并行 go test 竞争）。
 func TestWriteOrReplaceStruct_PkgNameFallback(t *testing.T) {
+	t.Chdir(t.TempDir())
 	const filePath = "zcmodel_fallback_probe_output.go"
-	t.Cleanup(func() { _ = os.Remove(filePath) })
 
 	entityCode := "type FallBackEntity struct {\n\tID int\n}"
 	doCode := "type FallBackDO struct {\n\tID any\n}"
@@ -1177,7 +912,6 @@ func TestWriteOrReplaceStruct_ReadFileFails(t *testing.T) {
 // （无括号）合并缺失 import 的路径：ImportSpec 的 Doc/尾注释经 specSpan 保留，
 // import 声明自身的 Doc 经 mergeMissingImports 的 first.Doc 分支保留，并展开为块形式。
 func TestWriteOrReplaceStruct_SingleImportDocAndComment(t *testing.T) {
-	filePath := filepath.Join(t.TempDir(), "user.go")
 	orig := `package model
 
 // import block doc
@@ -1185,32 +919,17 @@ import "fmt" // trailing comment
 
 var _ = fmt.Sprintf
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	s := string(content)
-	for _, want := range []string{"// import block doc", "import (", `"fmt" // trailing comment`, `"time"`} {
-		if !strings.Contains(s, want) {
-			t.Fatalf("结果缺少 %q:\n%s", want, s)
-		}
-	}
+	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
+	assertContainsAll(t, got, []string{"// import block doc", "import (", `"fmt" // trailing comment`, `"time"`},
+		"单行 import 声明的 Doc/尾注释应保留并展开为块形式")
 }
 
 // TestWriteOrReplaceStruct_MixedBlockDocAndTrailing 覆盖混合 type 块剔除生成类型时
 // GenDecl 自身 Doc 注释保留（removeGeneratedSpecs 的 d.Doc 分支），
 // 以及生成类型 Spec 带尾注释时的区间剔除（specSpan 的 TypeSpec.Comment 分支）。
 func TestWriteOrReplaceStruct_MixedBlockDocAndTrailing(t *testing.T) {
-	filePath := filepath.Join(t.TempDir(), "user.go")
 	orig := `package model
 
 // block doc
@@ -1224,39 +943,19 @@ type (
 	} // generated trailing
 )
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int64\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	s := string(content)
-	if !strings.Contains(s, "// block doc") {
-		t.Fatalf("混合 type 块的块级 Doc 注释应保留:\n%s", s)
-	}
-	if !strings.Contains(s, "UserType") || !strings.Contains(s, "// user type doc") {
-		t.Fatalf("用户类型及其注释应保留:\n%s", s)
-	}
-	if strings.Contains(s, "generated trailing") {
-		t.Fatalf("旧生成类型的尾注释应随 Spec 一并剔除:\n%s", s)
-	}
-	if !strings.Contains(s, "int64") {
-		t.Fatalf("新生成的 Entity 代码应写入:\n%s", s)
-	}
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContains(t, got, "// block doc", "混合 type 块的块级 Doc 注释应保留")
+	assertContainsAll(t, got, []string{"UserType", "// user type doc"}, "用户类型及其注释应保留")
+	assertNotContains(t, got, "generated trailing", "旧生成类型的尾注释应随 Spec 一并剔除")
+	assertContains(t, got, "int64", "新生成的 Entity 代码应写入")
 }
 
 // TestWriteOrReplaceStruct_NonIdentReceiverKept 覆盖 receiverTypeName 对
 // 非 Ident/指针接收者（如泛型实例化 Box[int]）返回空串的分支：
 // 此类方法既非生成方法也不归属 Entity/DO，原样保留为其他用户代码。
 func TestWriteOrReplaceStruct_NonIdentReceiverKept(t *testing.T) {
-	filePath := filepath.Join(t.TempDir(), "user.go")
 	orig := `package model
 
 type Box[T any] struct{ V T }
@@ -1267,57 +966,31 @@ type UserEntity struct {
 	ID int
 }
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int64\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	if !strings.Contains(string(content), "func (b Box[int]) Marker()") {
-		t.Fatalf("泛型实例化接收者的用户方法应保留:\n%s", content)
-	}
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContains(t, got, "func (b Box[int]) Marker()", "泛型实例化接收者的用户方法应保留")
 }
 
 // TestWriteOrReplaceStruct_NoImportDeclAddMissing 覆盖文件完全没有 import 声明、
 // 但 neededImports 非空时新建 import 声明前置的分支。
 func TestWriteOrReplaceStruct_NoImportDeclAddMissing(t *testing.T) {
-	filePath := filepath.Join(t.TempDir(), "user.go")
 	orig := `package model
 
 type UserEntity struct {
 	ID int
 }
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}"
 	doCode := "type UserDO struct {\n\tCreatedAt any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	if !strings.Contains(string(content), `import "time"`) {
-		t.Fatalf("无 import 声明时应新建 import 声明:\n%s", content)
-	}
+	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
+	assertContains(t, got, `import "time"`, "无 import 声明时应新建 import 声明")
 }
 
 // TestWriteOrReplaceStruct_NamedImportWithDoc 覆盖 specSpan 的 ImportSpec.Doc 分支
 // 与 mergeMissingImports 的命名导入（Name 非空）分支：块内带文档注释的别名导入
 // 应完整保留，缺失的标准导入仍可追加。
 func TestWriteOrReplaceStruct_NamedImportWithDoc(t *testing.T) {
-	filePath := filepath.Join(t.TempDir(), "user.go")
 	orig := `package model
 
 import (
@@ -1329,23 +1002,9 @@ type UserEntity struct {
 	ID int
 }
 `
-	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
-		t.Fatalf("写入初始文件失败: %v", err)
-	}
-
 	entityCode := "type UserEntity struct {\n\tID int64\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, []string{"time"}); err != nil {
-		t.Fatalf("writeOrReplaceStruct() error = %v", err)
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	s := string(content)
-	for _, want := range []string{"// fmt alias doc", `f "fmt"`, `"time"`} {
-		if !strings.Contains(s, want) {
-			t.Fatalf("结果缺少 %q:\n%s", want, s)
-		}
-	}
+	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
+	assertContainsAll(t, got, []string{"// fmt alias doc", `f "fmt"`, `"time"`},
+		"带文档注释的别名导入应保留且缺失的标准导入应追加")
 }

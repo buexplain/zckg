@@ -42,9 +42,11 @@ func TestNameCase_Constants(t *testing.T) {
 		{NameCaseUpperKebab, "upperKebab"},
 	}
 	for _, tt := range tests {
-		if string(tt.c) != tt.want {
-			t.Errorf("NameCase 常量值 = %q, want %q", tt.c, tt.want)
-		}
+		t.Run(tt.want, func(t *testing.T) {
+			if string(tt.c) != tt.want {
+				t.Errorf("NameCase 常量值 = %q, want %q", tt.c, tt.want)
+			}
+		})
 	}
 }
 
@@ -59,8 +61,10 @@ func TestDialect_Constants(t *testing.T) {
 		{DialectSqlite, "sqlite"},
 	}
 	for _, tt := range tests {
-		if string(tt.dialect) != tt.want {
-			t.Errorf("Dialect 常量值 = %q, want %q", tt.dialect, tt.want)
-		}
+		t.Run(tt.want, func(t *testing.T) {
+			if string(tt.dialect) != tt.want {
+				t.Errorf("Dialect 常量值 = %q, want %q", tt.dialect, tt.want)
+			}
+		})
 	}
 }

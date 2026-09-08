@@ -30,6 +30,8 @@ func openSQLiteDAO(t *testing.T) *zcdb.DBDao {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
+	// 连接池创建成功即注册清理，避免后续 NewDBDao 失败时泄漏；Pool.Close 幂等，可与 dao.Close 共存
+	t.Cleanup(func() { _ = pool.Close() })
 	dao, err := zcdb.NewDBDao(pool, "sqlite", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
@@ -49,6 +51,8 @@ func openMySQLDAO(t *testing.T) *zcdb.DBDao {
 	if err != nil {
 		t.Skipf("mysql 不可用，跳过集成测试: %v", err)
 	}
+	// 连接池创建成功即注册清理，避免后续 NewDBDao 失败时泄漏；Pool.Close 幂等，可与 dao.Close 共存
+	t.Cleanup(func() { _ = pool.Close() })
 	dao, err := zcdb.NewDBDao(pool, "mysql", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create mysql dao: %v", err)
@@ -68,14 +72,16 @@ func openMySQLDAO(t *testing.T) *zcdb.DBDao {
 // docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
 func openPgDAO(t *testing.T) *zcdb.DBDao {
 	t.Helper()
-	pool, err := zcdb.NewPool(zcdb.PoolConfig{
+	adminPool, err := zcdb.NewPool(zcdb.PoolConfig{
 		DriverName: "postgres",
 		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable",
 	})
 	if err != nil {
 		t.Skipf("postgres 不可用，跳过集成测试: %v", err)
 	}
-	dao, err := zcdb.NewDBDao(pool, "postgres", nil, "")
+	// 连接池创建成功即注册清理，避免后续 NewDBDao 失败时泄漏；Pool.Close 幂等，可与 dao.Close 共存
+	t.Cleanup(func() { _ = adminPool.Close() })
+	dao, err := zcdb.NewDBDao(adminPool, "postgres", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}
@@ -94,14 +100,15 @@ func openPgDAO(t *testing.T) *zcdb.DBDao {
 	_ = dao.Close()
 
 	// 重新连接到测试数据库
-	pool, err = zcdb.NewPool(zcdb.PoolConfig{
+	testPool, err := zcdb.NewPool(zcdb.PoolConfig{
 		DriverName: "postgres",
 		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=zckg_test_integ",
 	})
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
-	dao, err = zcdb.NewDBDao(pool, "postgres", nil, "")
+	t.Cleanup(func() { _ = testPool.Close() })
+	dao, err = zcdb.NewDBDao(testPool, "postgres", nil, "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}
@@ -528,7 +535,7 @@ func generateAndVerify(t *testing.T, dao *zcdb.DBDao, dialect Dialect, database 
 		if !strings.Contains(got, `db:"`+colName+`"`) {
 			t.Errorf("列 %s 缺少 db tag", colName)
 		}
-		jsonVal := strings.ToLower(fname[:1]) + fname[1:]
+		jsonVal := formatJSONTag(colName, NameCaseLowerCamel)
 		if !strings.Contains(got, `json:"`+jsonVal+`"`) {
 			t.Errorf("列 %s 缺少 json tag %s", colName, jsonVal)
 		}
@@ -542,16 +549,9 @@ func generateAndVerify(t *testing.T, dao *zcdb.DBDao, dialect Dialect, database 
 	}
 }
 
-// fieldNameOf 将列名 c_tinyint 转换为生成的字段名 CTinyint（与 toPascalCase 输出一致）。
+// fieldNameOf 将列名 c_tinyint 转换为生成的字段名 CTinyint。
+// 直接委托被测的 toPascalCase，避免 helper 自行实现一套命名规则后与实现分叉
+// （如 id → ID 的特例、连字符/驼峰混合输入）。
 func fieldNameOf(colName string) string {
-	parts := strings.Split(colName, "_")
-	var b strings.Builder
-	for _, p := range parts {
-		if p == "" {
-			continue
-		}
-		b.WriteString(strings.ToUpper(p[:1]))
-		b.WriteString(p[1:])
-	}
-	return b.String()
+	return toPascalCase(colName)
 }
