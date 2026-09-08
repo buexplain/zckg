@@ -4,7 +4,7 @@ import "testing"
 
 // TestRegister_NilDataNoop 验证 Register 的 fn 返回 nil 时不做任何合并。
 func TestRegister_NilDataNoop(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any { return nil })
 	if v := Config("app.name", "fallback"); v != "fallback" {
 		t.Errorf("nil 数据注册后 Config 应返回默认值，实际 %q", v)
@@ -14,7 +14,7 @@ func TestRegister_NilDataNoop(t *testing.T) {
 // TestRegister_NestedMapRecursiveMerge 验证 mergeMap 的递归合并分支：
 // 两次 Register 到同一 key，且值均含同名 map 子节点时，深层 map 递归合并而非整块覆盖。
 func TestRegister_NestedMapRecursiveMerge(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{"db": map[string]any{"host": "localhost", "port": 3306}}
 	})
@@ -35,7 +35,7 @@ func TestRegister_NestedMapRecursiveMerge(t *testing.T) {
 // TestRegister_ScalarThenSubtreeOverwrite 验证 mergeMap 的覆盖分支：
 // 先注册标量值，再在同一路径下注册子 map，标量应被覆盖为 map（文档约定的行为）。
 func TestRegister_ScalarThenSubtreeOverwrite(t *testing.T) {
-	reset()
+	resetForTest(t)
 	// 先注册 "app.name" 为标量
 	Register("app", func() map[string]any {
 		return map[string]any{"name": "myapp"}

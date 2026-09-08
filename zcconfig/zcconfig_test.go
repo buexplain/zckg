@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -20,8 +21,27 @@ func writeTestFile(t *testing.T, content string) string {
 	return path
 }
 
-func TestLoadEnv_BasicTypes(t *testing.T) {
+// resetForTest 前置清空 env 与业务配置存储，并注册 t.Cleanup 在测试结束后再次清空，
+// 保证单个测试的注册数据不泄漏到包内后续测试。
+func resetForTest(t *testing.T) {
+	t.Helper()
 	reset()
+	t.Cleanup(reset)
+}
+
+// loadTestEnv 将 content 写入临时 .env 文件并加载，失败时 t.Fatalf 终止用例。
+// 仅用于成功加载路径；需要断言 LoadEnv 错误的用例请直接使用 writeTestFile。
+func loadTestEnv(t *testing.T, content string) string {
+	t.Helper()
+	path := writeTestFile(t, content)
+	if err := LoadEnv(path); err != nil {
+		t.Fatalf("LoadEnv 失败: %v", err)
+	}
+	return path
+}
+
+func TestLoadEnv_BasicTypes(t *testing.T) {
+	resetForTest(t)
 	content := `
 # 注释行
 APP_NAME="my app"
@@ -32,10 +52,7 @@ export EXPORTED_KEY=exported_value
 EMPTY_KEY=
 NO_QUOTE=hello world
 `
-	path := writeTestFile(t, content)
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, content)
 
 	// 字符串（双引号去除）
 	if v := Env("APP_NAME", "default"); v != "my app" {
@@ -81,12 +98,9 @@ NO_QUOTE=hello world
 // 超长单行（70KB，超过 bufio.Scanner 默认 64KB 上限）应能正常加载，
 // 调大后的缓冲区（上限 1MB）避免 bufio.ErrTooLong 导致整体加载失败。
 func TestLoadEnv_LongLine(t *testing.T) {
-	reset()
+	resetForTest(t)
 	longVal := strings.Repeat("a", 70*1024)
-	path := writeTestFile(t, "LONG_KEY="+longVal+"\n")
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("70KB 单行 LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, "LONG_KEY="+longVal+"\n")
 
 	if v := Env("LONG_KEY", "fallback"); v != longVal {
 		t.Errorf("期望长值完整读回（长度 %d），实际长度 %d", len(longVal), len(v))
@@ -95,12 +109,9 @@ func TestLoadEnv_LongLine(t *testing.T) {
 
 // export 前缀识别：大小写不敏感，兼容多个空格/Tab；无空白分隔的 "exportKEY=v" 不受影响。
 func TestLoadEnv_ExportPrefixVariants(t *testing.T) {
-	reset()
+	resetForTest(t)
 	content := "EXPORT KEY=v1\nexport  KEY2=v2\nexport\tKEY3=v3\nExPoRt   KEY4=v4\nexportKEY=v5\n"
-	path := writeTestFile(t, content)
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, content)
 
 	// 大小写不敏感
 	if v := Env("KEY", "fallback"); v != "v1" {
@@ -125,17 +136,10 @@ func TestLoadEnv_ExportPrefixVariants(t *testing.T) {
 }
 
 func TestLoadEnv_MergeMultipleFiles(t *testing.T) {
-	reset()
+	resetForTest(t)
 
-	path1 := writeTestFile(t, "KEY1=value1\nSHARED=from_file1")
-	path2 := writeTestFile(t, "KEY2=value2\nSHARED=from_file2")
-
-	if err := LoadEnv(path1); err != nil {
-		t.Fatalf("LoadEnv path1 失败: %v", err)
-	}
-	if err := LoadEnv(path2); err != nil {
-		t.Fatalf("LoadEnv path2 失败: %v", err)
-	}
+	loadTestEnv(t, "KEY1=value1\nSHARED=from_file1")
+	loadTestEnv(t, "KEY2=value2\nSHARED=from_file2")
 
 	if v := Env("KEY1", ""); v != "value1" {
 		t.Errorf("期望 'value1'，实际 %s", v)
@@ -150,17 +154,14 @@ func TestLoadEnv_MergeMultipleFiles(t *testing.T) {
 }
 
 func TestEnv_TypeConversion(t *testing.T) {
-	reset()
+	resetForTest(t)
 	content := `
 INT_VAL=42
 FLOAT_VAL=3.14
 BOOL_VAL=true
 STR_VAL=hello
 `
-	path := writeTestFile(t, content)
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, content)
 
 	// string -> int
 	if v := Env("INT_VAL", 0); v != 42 {
@@ -189,20 +190,27 @@ STR_VAL=hello
 }
 
 func TestEnv_OsEnvFallback(t *testing.T) {
-	reset()
-	_ = os.Setenv("MY_TEST_OS_ENV", "os_value")
+	resetForTest(t)
+	const key = "MY_TEST_OS_ENV"
+	// 设置前保存原值，结束后恢复而非直接删除，避免污染开发机同名环境变量
+	orig, had := os.LookupEnv(key)
+	_ = os.Setenv(key, "os_value")
 	defer func() {
-		_ = os.Unsetenv("MY_TEST_OS_ENV")
+		if had {
+			_ = os.Setenv(key, orig)
+		} else {
+			_ = os.Unsetenv(key)
+		}
 	}()
 
 	// .env 中没有此 key，回退到 OS 环境变量
-	if v := Env("MY_TEST_OS_ENV", "default"); v != "os_value" {
+	if v := Env(key, "default"); v != "os_value" {
 		t.Errorf("期望 'os_value'，实际 %s", v)
 	}
 }
 
 func TestConfig_BasicLookup(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "myapp",
@@ -241,7 +249,7 @@ func TestConfig_BasicLookup(t *testing.T) {
 }
 
 func TestConfig_DefaultValues(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "myapp",
@@ -265,7 +273,7 @@ func TestConfig_DefaultValues(t *testing.T) {
 }
 
 func TestConfig_NestedRegistration(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "myapp",
@@ -297,7 +305,7 @@ func TestConfig_NestedRegistration(t *testing.T) {
 }
 
 func TestConfig_ImmediateExecution(t *testing.T) {
-	reset()
+	resetForTest(t)
 	callCount := 0
 	Register("app", func() map[string]any {
 		callCount++
@@ -319,7 +327,7 @@ func TestConfig_ImmediateExecution(t *testing.T) {
 }
 
 func TestConfig_MergeRegistration(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "first",
@@ -350,7 +358,7 @@ func TestConfig_MergeRegistration(t *testing.T) {
 }
 
 func TestConfig_TypeConversion(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("db", func() map[string]any {
 		return map[string]any{
 			"port":  "3306",
@@ -370,12 +378,9 @@ func TestConfig_TypeConversion(t *testing.T) {
 }
 
 func TestEnvAll(t *testing.T) {
-	reset()
+	resetForTest(t)
 	content := "A=1\nB=hello\n"
-	path := writeTestFile(t, content)
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, content)
 
 	all := EnvAll()
 	if len(all) != 2 {
@@ -384,32 +389,53 @@ func TestEnvAll(t *testing.T) {
 	if v, ok := all["A"]; !ok || v != 1 {
 		t.Errorf("期望 A=1，实际 %v", v)
 	}
+	if v, ok := all["B"]; !ok || v != "hello" {
+		t.Errorf("期望 B=hello，实际 %v", v)
+	}
 }
 
 func TestConfigAll(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{
 			"name": "test",
+			"database": map[string]any{
+				"host": "localhost",
+				"port": 5432,
+			},
+			"cache": map[string]any{
+				"driver": "memory",
+			},
 		}
 	})
+	Register("", func() map[string]any {
+		return map[string]any{"debug": true}
+	})
 
+	want := map[string]any{
+		"app": map[string]any{
+			"name": "test",
+			"database": map[string]any{
+				"host": "localhost",
+				"port": 5432,
+			},
+			"cache": map[string]any{
+				"driver": "memory",
+			},
+		},
+		"debug": true,
+	}
 	all := ConfigAll()
-	if v, ok := all["app"].(map[string]any); !ok {
-		t.Errorf("期望 app 为 map[string]any")
-	} else if v["name"] != "test" {
-		t.Errorf("期望 name=test，实际 %v", v["name"])
+	if !reflect.DeepEqual(all, want) {
+		t.Errorf("ConfigAll 与期望的完整树不一致:\n期望: %v\n实际: %v", want, all)
 	}
 }
 
 // .env 中 "1"/"0" 被 parseValue 推断为 int，经 cast 数值→bool 特判转为 bool
 func TestEnv_BoolFromIntString(t *testing.T) {
-	reset()
+	resetForTest(t)
 	content := "BOOL_ONE=1\nBOOL_ZERO=0\n"
-	path := writeTestFile(t, content)
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, content)
 
 	if v := Env("BOOL_ONE", false); v != true {
 		t.Errorf(".env 中 BOOL_ONE=1 期望 true，实际 %v", v)
@@ -419,9 +445,9 @@ func TestEnv_BoolFromIntString(t *testing.T) {
 	}
 }
 
-// 并发读写压力测试：并发 Register + Config 不应产生数据竞争
+// 并发读写压力测试：并发 Register + Config 不应产生数据竞争（需以 `go test -race` 运行验证）
 func TestConcurrent_RegisterAndConfig(t *testing.T) {
-	reset()
+	resetForTest(t)
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
@@ -437,30 +463,53 @@ func TestConcurrent_RegisterAndConfig(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	// 全部 goroutine 结束后验证 100 个注册结果均存在且值正确，
+	// 排除"单次读成功但并发合并丢数据"的场景
+	all := ConfigAll()
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key_%d", i)
+		node, ok := all[key].(map[string]any)
+		if !ok {
+			t.Fatalf("ConfigAll 缺少 key %q，实际 %v", key, all)
+		}
+		if v, ok := node["value"]; !ok || v != i {
+			t.Errorf("key_%d.value 期望 %d，实际 %v", i, i, v)
+		}
+	}
 }
 
-// 并发读写压力测试：并发 LoadEnv + Env + EnvAll 不应产生数据竞争
+// 并发读写压力测试：并发 LoadEnv + Env + EnvAll 不应产生数据竞争（需以 `go test -race` 运行验证）
 func TestConcurrent_LoadEnvAndEnv(t *testing.T) {
-	reset()
+	resetForTest(t)
 	path := writeTestFile(t, "KEY=value\n")
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = LoadEnv(path)
-			_ = Env("KEY", "")
+			if err := LoadEnv(path); err != nil {
+				t.Errorf("LoadEnv 失败: %v", err)
+			}
+			if v := Env("KEY", ""); v != "value" {
+				t.Errorf("Env(KEY) 期望 'value'，实际 %q", v)
+			}
 			_ = EnvAll()
 		}()
 	}
 	wg.Wait()
+	// EnvAll 返回内部零拷贝引用，在 goroutine 内遍历其内容会与 LoadEnv 的写入
+	// 构成数据竞争，因此内容断言统一放在 wg.Wait() 之后
+	all := EnvAll()
+	if v, ok := all["KEY"]; !ok || v != "value" {
+		t.Errorf("EnvAll 期望 KEY=value，实际 %v（全部内容 %v）", v, all)
+	}
 }
 
 // ConfigAll 返回内部存储的直接引用（零拷贝）：写入返回值会穿透到内部
 // 注意：此写操作仅在测试单 goroutine 下安全；生产代码中写返回值会产生
 // 数据竞争，文档已警示仅限只读场景。
 func TestConfigAll_ZeroCopy(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{"name": "test"}
 	})
@@ -475,15 +524,13 @@ func TestConfigAll_ZeroCopy(t *testing.T) {
 
 // reset 后再读取：两条通道均应清空，仅剩 OS 环境变量回退
 func TestReset_ThenRead(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{"name": "test"}
 	})
-	path := writeTestFile(t, "RESET_ENV_KEY=reset_val\n")
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, "RESET_ENV_KEY=reset_val\n")
 
+	// 测试中途显式 reset：本用例专门验证 reset 的清空语义
 	reset()
 
 	if v := Config("app.name", "fallback"); v != "fallback" {
@@ -502,7 +549,7 @@ func TestReset_ThenRead(t *testing.T) {
 
 // ZCC-03/04：加载不存在的文件应返回错误，且错误信息包含文件路径
 func TestLoadEnv_FileNotFound(t *testing.T) {
-	reset()
+	resetForTest(t)
 	path := filepath.Join(t.TempDir(), "not_exist.env")
 	err := LoadEnv(path)
 	if err == nil {
@@ -515,7 +562,7 @@ func TestLoadEnv_FileNotFound(t *testing.T) {
 
 // ZCC-03/04：单行超过 1MB 上限应返回 bufio.ErrTooLong，且错误信息包含文件路径
 func TestLoadEnv_LineTooLong(t *testing.T) {
-	reset()
+	resetForTest(t)
 	longVal := strings.Repeat("a", 1024*1024+1)
 	path := writeTestFile(t, "LONG_KEY="+longVal+"\n")
 	err := LoadEnv(path)
@@ -533,7 +580,7 @@ func TestLoadEnv_LineTooLong(t *testing.T) {
 // ZCC-04：加载失败不污染已有数据：先加载合法文件，再加载超限行文件失败后，
 // 先前 key 仍可读，失败文件的局部解析结果不得泄漏
 func TestLoadEnv_FailureDoesNotPollute(t *testing.T) {
-	reset()
+	resetForTest(t)
 	goodPath := writeTestFile(t, "GOOD_KEY=good_value\n")
 	if err := LoadEnv(goodPath); err != nil {
 		t.Fatalf("LoadEnv 合法文件失败: %v", err)
@@ -557,17 +604,14 @@ func TestLoadEnv_FailureDoesNotPollute(t *testing.T) {
 
 // ZCC-06：无 "=" 的行与空 key 行被静默跳过，且不影响其他行解析
 func TestLoadEnv_SkipsInvalidLines(t *testing.T) {
-	reset()
+	resetForTest(t)
 	content := `
 PORT 8080
 =value_without_key
    =also_skipped
 VALID_KEY=value
 `
-	path := writeTestFile(t, content)
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	loadTestEnv(t, content)
 
 	if v := Env("VALID_KEY", "fallback"); v != "value" {
 		t.Errorf("期望 'value'，实际 %q", v)
@@ -580,11 +624,8 @@ VALID_KEY=value
 
 // ZCC-07：首行 UTF-8 BOM 被剥离，首行 key 可正常读取
 func TestLoadEnv_Utf8Bom(t *testing.T) {
-	reset()
-	path := writeTestFile(t, "\ufeffAPP_NAME=bom_app\nOTHER_KEY=v\n")
-	if err := LoadEnv(path); err != nil {
-		t.Fatalf("LoadEnv 失败: %v", err)
-	}
+	resetForTest(t)
+	loadTestEnv(t, "\ufeffAPP_NAME=bom_app\nOTHER_KEY=v\n")
 
 	// BOM 剥离后首行 key 不带 \ufeff 前缀
 	if v := Env("APP_NAME", "default"); v != "bom_app" {
@@ -598,8 +639,10 @@ func TestLoadEnv_Utf8Bom(t *testing.T) {
 
 // TestEnv_NilInterfaceDefKeyExists 验证键存在、目标为接口类型且默认值为 nil 时，
 // Env 返回 nil 而非 panic（cast 对 nil reflect.Type 的守卫，修复 P1）。
+// 绕过 LoadEnv 直接写 envData 是因为需要构造 LoadEnv 无法产生的 any 类型值
+// （string 类型值存入 envData 后以 error 接口读取），以验证 cast 对 nil reflect.Type 的守卫。
 func TestEnv_NilInterfaceDefKeyExists(t *testing.T) {
-	reset()
+	resetForTest(t)
 	envMu.Lock()
 	envData["SOME_KEY"] = "some-value"
 	envMu.Unlock()
@@ -612,7 +655,7 @@ func TestEnv_NilInterfaceDefKeyExists(t *testing.T) {
 // TestConfig_NilInterfaceDefKeyExists 验证业务配置键存在、目标为接口类型且默认值为 nil 时，
 // Config 返回 nil 而非 panic。
 func TestConfig_NilInterfaceDefKeyExists(t *testing.T) {
-	reset()
+	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{"value": "some-value"}
 	})

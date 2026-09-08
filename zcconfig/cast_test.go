@@ -33,6 +33,16 @@ func TestCast_NilInterfaceDefReturnsNil(t *testing.T) {
 	}
 }
 
+// castCase 构造单条 cast 断言子测试，供 table-driven 测试按行复用，
+// 目标类型由 def/want 的类型推断。
+func castCase[T comparable](input any, def, want T) func(t *testing.T) {
+	return func(t *testing.T) {
+		if got := cast(input, def); got != want {
+			t.Errorf("cast(%v, def=%v) 期望 %v，实际 %v", input, def, want, got)
+		}
+	}
+}
+
 // --- string -> string ---
 
 func TestCast_StringToString(t *testing.T) {
@@ -50,92 +60,67 @@ func TestCast_StringToString(t *testing.T) {
 	}
 }
 
-// --- string -> int 系列 ---
+// --- string -> int 系列（table-driven，合并原 ToInt/ToInt64/ToInt32/ToInt16/ToInt8 正常路径） ---
 
-func TestCast_StringToInt(t *testing.T) {
-	if v := cast("42", 0); v != 42 {
-		t.Errorf("期望 42，实际 %d", v)
+func TestCast_StringToIntSeries(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"int 正数", castCase("42", 0, 42)},
+		{"int 负数", castCase("-42", 0, -42)},
+		{"int 零", castCase("0", 0, 0)},
+		{"int64 最大值", castCase("9223372036854775807", int64(0), int64(9223372036854775807))},
+		{"int64 最小值", castCase("-9223372036854775808", int64(0), int64(-9223372036854775808))},
+		{"int32 最大值", castCase("2147483647", int32(0), int32(2147483647))},
+		{"int16 最大值", castCase("32767", int16(0), int16(32767))},
+		{"int8 最大值", castCase("127", int8(0), int8(127))},
 	}
-	if v := cast("-42", 0); v != -42 {
-		t.Errorf("期望 -42，实际 %d", v)
-	}
-	if v := cast("0", 0); v != 0 {
-		t.Errorf("期望 0，实际 %d", v)
-	}
-}
-
-func TestCast_StringToInt64(t *testing.T) {
-	if v := cast("9223372036854775807", int64(0)); v != int64(9223372036854775807) {
-		t.Errorf("期望 max int64，实际 %d", v)
-	}
-	if v := cast("-9223372036854775808", int64(0)); v != int64(-9223372036854775808) {
-		t.Errorf("期望 min int64，实际 %d", v)
-	}
-}
-
-func TestCast_StringToInt32(t *testing.T) {
-	if v := cast("2147483647", int32(0)); v != int32(2147483647) {
-		t.Errorf("期望 max int32，实际 %d", v)
-	}
-}
-
-func TestCast_StringToInt16(t *testing.T) {
-	if v := cast("32767", int16(0)); v != int16(32767) {
-		t.Errorf("期望 max int16，实际 %d", v)
-	}
-}
-
-func TestCast_StringToInt8(t *testing.T) {
-	if v := cast("127", int8(0)); v != int8(127) {
-		t.Errorf("期望 max int8，实际 %d", v)
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
 func TestCast_StringToIntOverflow(t *testing.T) {
-	// 超出 int8 范围，应返回默认值
-	if v := cast("200", int8(0)); v != int8(0) {
-		t.Errorf("超出 int8 范围期望默认值 0，实际 %d", v)
+	// 超出目标范围应返回 def；def 取非零值，避免与"错误返回类型零值"混淆
+	if v := cast("200", int8(77)); v != int8(77) {
+		t.Errorf("超出 int8 范围期望默认值 77，实际 %d", v)
 	}
-	if v := cast("99999999999", int32(0)); v != int32(0) {
-		t.Errorf("超出 int32 范围期望默认值 0，实际 %d", v)
+	if v := cast("99999999999", int32(42)); v != int32(42) {
+		t.Errorf("超出 int32 范围期望默认值 42，实际 %d", v)
 	}
 }
 
 func TestCast_StringToIntInvalid(t *testing.T) {
-	if v := cast("abc", 0); v != 0 {
-		t.Errorf("非数字字符串期望默认值 0，实际 %d", v)
+	// 各用例 def 取互不相同的非零值，避免与"错误返回类型零值"混淆
+	if v := cast("abc", 99); v != 99 {
+		t.Errorf("非数字字符串期望默认值 99，实际 %d", v)
 	}
-	if v := cast("12.5", 0); v != 0 {
-		t.Errorf("浮点字符串转 int 期望默认值 0，实际 %d", v)
+	if v := cast("12.5", 88); v != 88 {
+		t.Errorf("浮点字符串转 int 期望默认值 88，实际 %d", v)
 	}
-	if v := cast("", 0); v != 0 {
-		t.Errorf("空字符串转 int 期望默认值 0，实际 %d", v)
+	if v := cast("", 77); v != 77 {
+		t.Errorf("空字符串转 int 期望默认值 77，实际 %d", v)
 	}
-	if v := cast("  42", 0); v != 0 {
-		t.Errorf("带空格字符串期望默认值 0，实际 %d", v)
-	}
-}
-
-// --- string -> uint 系列 ---
-
-func TestCast_StringToUint(t *testing.T) {
-	if v := cast("42", uint(0)); v != uint(42) {
-		t.Errorf("期望 42，实际 %d", v)
-	}
-	if v := cast("0", uint(0)); v != uint(0) {
-		t.Errorf("期望 0，实际 %d", v)
+	if v := cast("  42", 66); v != 66 {
+		t.Errorf("带空格字符串期望默认值 66，实际 %d", v)
 	}
 }
 
-func TestCast_StringToUint64(t *testing.T) {
-	if v := cast("18446744073709551615", uint64(0)); v != uint64(18446744073709551615) {
-		t.Errorf("期望 max uint64，实际 %d", v)
-	}
-}
+// --- string -> uint 系列（table-driven，合并原 ToUint/ToUint64/ToUint32 正常路径） ---
 
-func TestCast_StringToUint32(t *testing.T) {
-	if v := cast("4294967295", uint32(0)); v != uint32(4294967295) {
-		t.Errorf("期望 max uint32，实际 %d", v)
+func TestCast_StringToUintSeries(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"uint 正数", castCase("42", uint(0), uint(42))},
+		{"uint 零", castCase("0", uint(0), uint(0))},
+		{"uint64 最大值", castCase("18446744073709551615", uint64(0), uint64(18446744073709551615))},
+		{"uint32 最大值", castCase("4294967295", uint32(0), uint32(4294967295))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
@@ -147,40 +132,38 @@ func TestCast_StringToUintNegative(t *testing.T) {
 }
 
 func TestCast_StringToUintOverflow(t *testing.T) {
-	if v := cast("300", uint8(0)); v != uint8(0) {
-		t.Errorf("超出 uint8 范围期望默认值 0，实际 %d", v)
+	// def 取非零值，避免与"错误返回类型零值"混淆
+	if v := cast("300", uint8(77)); v != uint8(77) {
+		t.Errorf("超出 uint8 范围期望默认值 77，实际 %d", v)
 	}
 }
 
 // --- string -> float 系列 ---
 
-func TestCast_StringToFloat64(t *testing.T) {
-	if v := cast("3.14", 0.0); v != 3.14 {
-		t.Errorf("期望 3.14，实际 %f", v)
+// table-driven，合并原 ToFloat64/ToFloat32 正常路径
+func TestCast_StringToFloatSeries(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"float64 小数", castCase("3.14", 0.0, 3.14)},
+		{"float64 负小数", castCase("-0.5", 0.0, -0.5)},
+		{"float64 零", castCase("0", 0.0, 0.0)},
+		{"float64 整数字符串", castCase("100", 0.0, 100.0)},
+		{"float32 小数", castCase("1.5", float32(0), float32(1.5))},
 	}
-	if v := cast("-0.5", 0.0); v != -0.5 {
-		t.Errorf("期望 -0.5，实际 %f", v)
-	}
-	if v := cast("0", 0.0); v != 0.0 {
-		t.Errorf("期望 0.0，实际 %f", v)
-	}
-	if v := cast("100", 0.0); v != 100.0 {
-		t.Errorf("整数字符串转 float64 期望 100.0，实际 %f", v)
-	}
-}
-
-func TestCast_StringToFloat32(t *testing.T) {
-	if v := cast("1.5", float32(0)); v != float32(1.5) {
-		t.Errorf("期望 1.5，实际 %f", v)
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
 func TestCast_StringToFloatInvalid(t *testing.T) {
-	if v := cast("abc", 0.0); v != 0.0 {
-		t.Errorf("非数字字符串转 float64 期望默认值 0.0，实际 %f", v)
+	// def 取非零值，避免与"错误返回类型零值"混淆
+	if v := cast("abc", 1.23); v != 1.23 {
+		t.Errorf("非数字字符串转 float64 期望默认值 1.23，实际 %f", v)
 	}
-	if v := cast("", 0.0); v != 0.0 {
-		t.Errorf("空字符串转 float64 期望默认值 0.0，实际 %f", v)
+	if v := cast("", 4.56); v != 4.56 {
+		t.Errorf("空字符串转 float64 期望默认值 4.56，实际 %f", v)
 	}
 }
 
@@ -316,6 +299,8 @@ func TestCast_Float64ToIntTruncation(t *testing.T) {
 	}
 }
 
+// --- 数值类型 → bool 特判（C 惯例：零值为 false） ---
+
 func TestCast_IntToBool(t *testing.T) {
 	// 数值类型 -> bool 特判：C 语言惯例，零值为 false，非零为 true。
 	// 此特判解决 .env 中 "1"/"0" 被 parseValue 推断为 int 后无法转 bool 的问题。
@@ -354,6 +339,8 @@ func TestCast_UintToBool(t *testing.T) {
 		t.Errorf("uint32(0) -> bool 期望 false，实际 %v", v)
 	}
 }
+
+// --- 数值类型 → string 防护（拒绝 Unicode 码点语义） ---
 
 func TestCast_IntToStringReturnsDefault(t *testing.T) {
 	// 数值类型 -> string 是 Unicode 码点语义（65 -> "A"），不是数字转字符串，应返回 def

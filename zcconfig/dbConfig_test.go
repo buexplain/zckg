@@ -111,6 +111,25 @@ func TestDBConfig_GetMasterDSN(t *testing.T) {
 			want: "host=127.0.0.1 port=5432 user=postgres dbname=test_db sslmode=disable",
 		},
 		{
+			name: "pgsql 别名按 postgres 组装",
+			cfg: DBConfig{
+				Driver:   "pgsql",
+				Host:     "127.0.0.1",
+				Port:     5432,
+				Username: "postgres",
+				Database: "test_db",
+			},
+			want: "host=127.0.0.1 port=5432 user=postgres dbname=test_db sslmode=disable",
+		},
+		{
+			name: "sqlite3 别名按 sqlite 组装",
+			cfg: DBConfig{
+				Driver:   "sqlite3",
+				Database: ":memory:",
+			},
+			want: ":memory:",
+		},
+		{
 			name: "未知驱动返回空字符串",
 			cfg: DBConfig{
 				Driver:   "oracle",
@@ -198,35 +217,77 @@ func TestDBConfig_PostgresDSNEscape(t *testing.T) {
 }
 
 // TestDBConfig_GetSlaveDSN 验证从库 DSN 列表组装：复用主库的 Database / Charset / Loc，
-// 仅 Host / Port / Username / Password 取自各自的 DBSlaveConfig。
+// 仅 Host / Port / Username / Password 取自各自的 DBSlaveConfig，并覆盖三种驱动的从库场景。
 func TestDBConfig_GetSlaveDSN(t *testing.T) {
-	cfg := DBConfig{
-		Driver:   "mysql",
-		Host:     "127.0.0.1",
-		Port:     3306,
-		Username: "root",
-		Password: "root",
-		Database: "test_db",
-		Charset:  "utf8mb4",
-		Loc:      "Local",
-		Slaves: []DBSlaveConfig{
-			{Host: "127.0.0.1", Port: 3307, Username: "root", Password: "root"},
-			{Host: "10.0.0.2", Port: 3306, Username: "reader", Password: "rpass"},
+	tests := []struct {
+		name string
+		cfg  DBConfig
+		want []string
+	}{
+		{
+			name: "mysql 多从库复用主库 Database/Charset/Loc",
+			cfg: DBConfig{
+				Driver:   "mysql",
+				Host:     "127.0.0.1",
+				Port:     3306,
+				Username: "root",
+				Password: "root",
+				Database: "test_db",
+				Charset:  "utf8mb4",
+				Loc:      "Local",
+				Slaves: []DBSlaveConfig{
+					{Host: "127.0.0.1", Port: 3307, Username: "root", Password: "root"},
+					{Host: "10.0.0.2", Port: 3306, Username: "reader", Password: "rpass"},
+				},
+			},
+			want: []string{
+				"root:root@tcp(127.0.0.1:3307)/test_db?charset=utf8mb4&parseTime=true&loc=Local",
+				"reader:rpass@tcp(10.0.0.2:3306)/test_db?charset=utf8mb4&parseTime=true&loc=Local",
+			},
+		},
+		{
+			name: "postgres 从库键值对格式与特殊字符转义",
+			cfg: DBConfig{
+				Driver:   "postgres",
+				Host:     "127.0.0.1",
+				Port:     5432,
+				Username: "postgres",
+				Password: "root",
+				Database: "test_db",
+				Slaves: []DBSlaveConfig{
+					{Host: "127.0.0.1", Port: 5433, Username: "rep user", Password: "p ass"},
+				},
+			},
+			want: []string{
+				"host=127.0.0.1 port=5433 user='rep user' password='p ass' dbname=test_db sslmode=disable",
+			},
+		},
+		{
+			name: "sqlite 从库复用主库 Database",
+			cfg: DBConfig{
+				Driver:   "sqlite",
+				Database: "file:/tmp/app.db",
+				Slaves: []DBSlaveConfig{
+					{Host: "127.0.0.1", Port: 3306, Username: "root", Password: "root"},
+				},
+			},
+			want: []string{
+				"file:/tmp/app.db",
+			},
 		},
 	}
-
-	want := []string{
-		"root:root@tcp(127.0.0.1:3307)/test_db?charset=utf8mb4&parseTime=true&loc=Local",
-		"reader:rpass@tcp(10.0.0.2:3306)/test_db?charset=utf8mb4&parseTime=true&loc=Local",
-	}
-	got := cfg.GetSlaveDSN()
-	if len(got) != len(want) {
-		t.Fatalf("期望 %d 个从库 DSN，实际 %d：%v", len(want), len(got), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("第 %d 个从库 DSN 期望 %q，实际 %q", i, want[i], got[i])
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetSlaveDSN()
+			if len(got) != len(tt.want) {
+				t.Fatalf("期望 %d 个从库 DSN，实际 %d：%v", len(tt.want), len(got), got)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("第 %d 个从库 DSN 期望 %q，实际 %q", i, tt.want[i], got[i])
+				}
+			}
+		})
 	}
 }
 
