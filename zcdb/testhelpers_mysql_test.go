@@ -68,12 +68,19 @@ func openMySQLTestDB(t *testing.T) *DBDao {
 	return dao
 }
 
-// dropMySQLTables 清除所有测试用表
+// dropMySQLTables 清除所有测试用表。
+// 表名清单必须覆盖所有集成测试建过的表（含 setupMySQLNewApiTables 的
+// events/wallets/archive/colors/names_cs）：新 API 测试虽在自身开头清理，
+// 但用例中途崩溃时清理不会执行，只有这里的开场清理能消除残留表。
+// DROP 错误刻意忽略：DROP TABLE IF EXISTS 在表不存在时不报错，其余异常
+// （连接断开、权限不足）会在紧随其后的建表或查询处以更明确的错误暴露，
+// 在此 Fatal 只会掩盖真实失败点。
 func dropMySQLTables(t *testing.T, db *DBDao) {
 	t.Helper()
 	tables := []string{"users_archive", "profiles", "orders", "users",
 		"numeric_test", "datetime_test", "string_test", "binary_test", "bool_test",
-		"json_conv_test", "articles", "bit_test"}
+		"json_conv_test", "articles", "bit_test",
+		"events", "wallets", "archive", "colors", "names_cs", "empty_t"}
 	for _, table := range tables {
 		_, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS `"+table+"`")
 	}

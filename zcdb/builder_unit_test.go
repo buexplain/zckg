@@ -1702,6 +1702,7 @@ func assertSQL(t *testing.T, expected, actual string) {
 	}
 }
 
+// assertArgs 类型敏感地断言参数列表：长度与每个位置的值、动态类型都必须一致。
 func assertArgs(t *testing.T, expected []any, actual []any) {
 	t.Helper()
 	if len(expected) == 0 && len(actual) == 0 {
@@ -1712,9 +1713,88 @@ func assertArgs(t *testing.T, expected []any, actual []any) {
 		return
 	}
 	for i := range expected {
-		if expected[i] != actual[i] {
+		if !argsEqual(expected[i], actual[i]) {
 			t.Errorf("args[%d] mismatch: expected %v (%T), got %v (%T)", i, expected[i], expected[i], actual[i], actual[i])
 		}
+	}
+}
+
+// argsEqual 比较单个参数：类型敏感（int(1) 与 int64(1) 判为不等），
+// 且对 []byte、切片、map 等不可用 == 比较的动态类型也安全——直接用 != 比较接口值
+// 在这些类型上会 panic，故统一走 reflect.DeepEqual（它同样要求动态类型一致）。
+// nil 单独处理：reflect.DeepEqual(nil, nil) 返回 false，且无类型 nil 与
+// 有类型 nil 指针应判为不等。
+func argsEqual(expected, actual any) bool {
+	if expected == nil || actual == nil {
+		return expected == nil && actual == nil
+	}
+	return reflect.DeepEqual(expected, actual)
+}
+
+// assertPgPlaceholderSequence 验证 PG 方言 SQL 中的 $N 占位符与 args 索引一一对应：
+// 按出现顺序的编号必须是 1、2、…、argCount，即无跳号、无重复、无越界。
+func assertPgPlaceholderSequence(t *testing.T, sql string, argCount int) {
+	t.Helper()
+	var nums []int
+	for i := 0; i < len(sql); i++ {
+		if sql[i] != '$' {
+			continue
+		}
+		j := i + 1
+		for j < len(sql) && sql[j] >= '0' && sql[j] <= '9' {
+			j++
+		}
+		if j == i+1 {
+			continue
+		}
+		n, err := strconv.Atoi(sql[i+1 : j])
+		if err != nil {
+			t.Fatalf("解析占位符编号失败 %q: %v", sql[i:j], err)
+		}
+		nums = append(nums, n)
+		i = j - 1
+	}
+	if len(nums) != argCount {
+		t.Errorf("占位符数量与 args 长度不符: 占位符 %v, args 长度 %d\n  SQL: %s", nums, argCount, sql)
+		return
+	}
+	for idx, n := range nums {
+		if n != idx+1 {
+			t.Errorf("占位符编号应从 $1 起连续递增: 第 %d 个为 $%d\n  SQL: %s", idx+1, n, sql)
+			return
+		}
+	}
+}
+
+// TestArgsEqual_TypeSensitiveAndPanicSafe 锁死 argsEqual 的比较语义：
+// 类型敏感（int vs int64、无类型 nil vs 有类型 nil 指针均判为不等），
+// 且对 []byte / map 等不可用 == 比较的动态类型不会 panic。
+func TestArgsEqual_TypeSensitiveAndPanicSafe(t *testing.T) {
+	var nilPtr *int
+	tests := []struct {
+		name           string
+		expected       any
+		actual         any
+		wantEqualValue bool
+	}{
+		{"both_untyped_nil", nil, nil, true},
+		{"untyped_nil_vs_typed_nil_ptr", nil, nilPtr, false},
+		{"typed_nil_ptr_vs_typed_nil_ptr", nilPtr, (*int)(nil), true},
+		{"untyped_nil_vs_value", nil, 1, false},
+		{"int_vs_int64", 1, int64(1), false},
+		{"int_vs_int", 1, 1, true},
+		{"bytes_equal", []byte("abc"), []byte("abc"), true},
+		{"bytes_differ", []byte("abc"), []byte("abd"), false},
+		{"bytes_vs_string", []byte("abc"), "abc", false},
+		{"map_equal", map[string]int{"a": 1}, map[string]int{"a": 1}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 旧实现对 []byte / map 用 != 比较接口值会 panic，此处必须正常返回结果
+			if got := argsEqual(tt.expected, tt.actual); got != tt.wantEqualValue {
+				t.Errorf("argsEqual(%#v, %#v) = %v, want %v", tt.expected, tt.actual, got, tt.wantEqualValue)
+			}
+		})
 	}
 }
 

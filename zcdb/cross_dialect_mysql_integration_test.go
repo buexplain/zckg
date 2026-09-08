@@ -21,10 +21,12 @@ func TestCrossDialect_MySQL_Integration(t *testing.T) {
 		{"IncrementDecrement", crossDialectTestIncrementDecrement},
 		{"InsertUsing", crossDialectTestInsertUsing},
 		{"BatchInsertAndExpressionValue", crossDialectTestBatchInsertAndExpressionValue},
+		{"UpsertMultiUniqueBy", crossDialectTestUpsertMultiUniqueBy},
 		{"WhereNotInVariants", crossDialectTestWhereNotInVariants},
 		{"NullSafeExpression", crossDialectTestNullSafeExpression},
 		{"DeleteJoinNested", crossDialectTestDeleteJoinNested},
 		{"DeleteJoinExecError", crossDialectTestDeleteJoinExecError},
+		{"UpdateJoinNested", crossDialectTestUpdateJoinNested},
 		{"TransactionBeginError", crossDialectTestTransactionBeginError},
 	}
 	for _, st := range subtests {

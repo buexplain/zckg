@@ -24,6 +24,11 @@ var (
 // docBuilder 创建无 DAO 的纯编译用 Builder。
 func docBuilder(g Grammar) *Builder { return NewBuilder(g, nil) }
 
+// docAssertSQL 断言编译出的 SQL 与 args 是否与文档示例一致。
+// 参数比较刻意使用 fmt.Sprint 的字符串形式而非类型敏感比较：本文件的定位是
+// 文档-代码一致性回归锁死，文档示例只书写字面量（如 18），无法表达 Go 侧的具体
+// 数值类型，因此 int(1) 与 int64(1) 在此视为相等。
+// 需要校验参数 Go 类型精度时应改用 builder_unit_test.go 的 assertArgs（类型敏感）。
 func docAssertSQL(t *testing.T, label string, gotSQL string, gotArgs []any, wantSQL string, wantArgs []any) {
 	t.Helper()
 	if gotSQL != wantSQL {

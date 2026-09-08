@@ -70,7 +70,13 @@ func openPgTestDB(t *testing.T) *DBDao {
 	return dao
 }
 
-// dropPgTables 清除所有测试用表
+// dropPgTables 清除所有测试用表。
+// 表名清单必须覆盖所有集成测试建过的表（含 setupPgNewApiTables 的
+// events/wallets/archive/colors/names_cs/empty_t）：新 API 测试虽在自身开头清理，
+// 但用例中途崩溃时清理不会执行，只有这里的开场清理能消除残留表。
+// DROP 错误刻意忽略：DROP TABLE IF EXISTS 在表不存在时不报错，其余异常
+// （连接断开、权限不足）会在紧随其后的建表或查询处以更明确的错误暴露，
+// 在此 Fatal 只会掩盖真实失败点。
 func dropPgTables(t *testing.T, db *DBDao) {
 	t.Helper()
 	tables := []string{"users_archive", "orders", "profiles", "users",
@@ -78,7 +84,8 @@ func dropPgTables(t *testing.T, db *DBDao) {
 		"binary_test", "json_test", "uuid_test", "network_test",
 		"array_test", "money_test", "json_conv_test",
 		"byte_num_test", "byte_bool_test", "ptr_test", "json_err_test",
-		"articles", "bit_test", "json_date_test"}
+		"articles", "bit_test", "json_date_test",
+		"events", "wallets", "archive", "colors", "names_cs", "empty_t"}
 	for _, table := range tables {
 		_, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS "+table+" CASCADE")
 	}

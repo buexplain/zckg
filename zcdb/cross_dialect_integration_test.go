@@ -206,6 +206,14 @@ func crossDialectTestIncrementDecrement(t *testing.T, dao *DBDao) {
 	if wallet != 150 {
 		t.Fatalf("wallet 应为 150，实际 %d", wallet)
 	}
+	// 多列自增的第二列必须一并验证，否则只自增首列的缺陷不会被发现。
+	var level int64
+	if err := dao.Builder().Table("cross_dialect_counter").Select("level").Where("id", "=", 1).Value(ctx, &level); err != nil {
+		t.Fatalf("查询多列自增的 level 失败: %v", err)
+	}
+	if level != 3 {
+		t.Fatalf("level 应为 3（1+2），实际 %d", level)
+	}
 
 	affected, err = dao.Builder().Table("cross_dialect_counter").Where("id", "=", 1).Decrement(ctx, "wallet", 30)
 	if err != nil || affected != 1 {
@@ -243,6 +251,14 @@ func crossDialectTestInsertUsing(t *testing.T, dao *DBDao) {
 	n, err := dao.Builder().Table("cross_dialect_dst").Count(ctx)
 	if err != nil || n != 2 {
 		t.Fatalf("InsertUsing 后行数应为 2，实际 %d, err=%v", n, err)
+	}
+	// 仅比对行数无法发现列映射错误或写入空值，需回查具体值。
+	var names []string
+	if err := dao.Builder().Table("cross_dialect_dst").OrderBy("name").Pluck(ctx, &names, "name"); err != nil {
+		t.Fatalf("回查 InsertUsing 写入值失败: %v", err)
+	}
+	if len(names) != 2 || names[0] != "a" || names[1] != "b" {
+		t.Fatalf("InsertUsing 写入值应为 [a b]，实际 %v", names)
 	}
 
 	affected, err = dao.Builder().Table("cross_dialect_dst").InsertOrIgnoreUsing(ctx, []string{"name"}, func(sub *Builder) {
@@ -471,6 +487,8 @@ type crossDialectUUpd struct {
 
 // crossDialectTestUpdateJoinNested 覆盖 PG/SQLite 方言 Update 的 FROM 展平递归分支：
 // 更新带嵌套 join（join 内再 join）时，FROM 子句需递归展平嵌套 join 组。
+// MySQL 不走 FROM 展平（编译为 UPDATE ... JOIN ... SET），本用例同时锁死三方言
+// 在该场景下的行为等价性。
 func crossDialectTestUpdateJoinNested(t *testing.T, dao *DBDao) {
 	ctx := context.Background()
 	crossDialectDrop(t, dao, "cross_dialect_x", "cross_dialect_o", "cross_dialect_u")
