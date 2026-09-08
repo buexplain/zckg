@@ -164,8 +164,14 @@ func TestListen_SignalTriggersShutdown(t *testing.T) {
 	}
 
 	out := buf.String()
-	if !strings.Contains(out, "SIG=") || strings.Contains(out, "SIG=<nil>") {
-		t.Fatalf("handler 应收到非 nil 的真实信号，输出: %s", out)
+	// 按平台断言收到的信号名称：Windows 为 interrupt（控制事件映射为 SIGINT），Unix 为 terminated（SIGTERM）。
+	// 仅断言非 nil 无法排除收到其他意外信号的情况。
+	if !strings.Contains(out, "SIG="+helperTermSignal.String()) {
+		t.Fatalf("handler 应收到平台投递的终止类信号 %s，输出: %s", helperTermSignal.String(), out)
+	}
+	// 负向断言：子进程不应因等待信号或 Listen 返回而超时失败
+	if strings.Contains(out, "TIMEOUT") {
+		t.Fatalf("子进程不应出现超时失败标记，输出: %s", out)
 	}
 	if !strings.Contains(out, "LISTEN_RETURNED") {
 		t.Fatalf("收到信号后 Listen 应解除阻塞返回，输出: %s", out)

@@ -3,6 +3,7 @@ package zcquit
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -12,9 +13,12 @@ import (
 
 // resetState 在每个测试前重置包级可变状态，使测试可重复执行。
 // 测试直接调用 executeShutdown（不依赖幂等标记）以绕过全局状态；shutdownStarted 同步重置。
-// stopListenCh 不重建：通道由包初始化创建一次、此后只读，executeShutdown 以幂等方式关闭。
-// listenOnce 不重置：listen goroutine 全局仅启动一次，依赖完整退出路径（Shutdown/Listen）的
-// 用例统一放在文件末尾的 TestShutdown_FullFlow 中。
+// stopListenCh 不重建：变量不重新赋值（包初始化创建一次），通道可被 executeShutdown 关闭和接收
+// （close 属写操作语义，executeShutdown 以幂等守卫关闭）。
+// listenOnce 不重置：listen goroutine 全局仅启动一次，依赖完整退出路径（Shutdown/Listen）的用例
+// 统一放在文件末尾的 TestShutdown_FullFlow 和 TestListen_AfterShutdownReturnsImmediately 中
+// （后者必须位于前者之后，依赖 go test 按声明顺序执行同文件测试的当前实现）。
+// 警告：本函数并非完整重置（listenOnce、stopListenCh 不可重建），不得在白盒测试中使用 t.Parallel()。
 func resetState() {
 	ctx, cancel = context.WithCancel(context.Background())
 	signalHandlerMap = map[int][]SigHandler{}
@@ -119,9 +123,11 @@ func TestExecuteShutdown_ConcurrentWithinLevel(t *testing.T) {
 
 	var running atomic.Int32
 	var maxConcurrent atomic.Int32
+	var executed atomic.Int32
 
 	for i := 0; i < 5; i++ {
 		AddSigHandler(0, func(sig os.Signal) {
+			executed.Add(1)
 			cur := running.Add(1)
 			// 更新最大并发数
 			for {
@@ -137,6 +143,10 @@ func TestExecuteShutdown_ConcurrentWithinLevel(t *testing.T) {
 
 	executeShutdown(nil)
 
+	// 全部 handler 必须执行完毕：WaitGroup 提前完成等遗漏执行的 bug 应在此暴露
+	if executed.Load() != 5 {
+		t.Fatalf("期望 5 个 handler 全部执行，实际执行 %d 个", executed.Load())
+	}
 	if maxConcurrent.Load() < 2 {
 		t.Fatalf("期望同级别 handler 存在并发执行（最大并发 >= 2），实际最大并发: %d", maxConcurrent.Load())
 	}
@@ -171,25 +181,30 @@ func TestExecuteShutdown_LevelSequential(t *testing.T) {
 func TestExecuteShutdown_PanicRecovery(t *testing.T) {
 	resetState()
 
-	var normalCalled bool
+	// 同级与高级 handler 分别用独立标记：共享布尔无法区分两者是否分别执行
+	var level0NormalCalled bool
+	var level1Called bool
 
 	AddSigHandler(0,
 		func(sig os.Signal) {
 			panic("模拟 panic")
 		},
 		func(sig os.Signal) {
-			normalCalled = true
+			level0NormalCalled = true
 		},
 	)
 	// 高级别的 handler 也应正常执行
 	AddSigHandler(1, func(sig os.Signal) {
-		normalCalled = true
+		level1Called = true
 	})
 
 	executeShutdown(nil)
 
-	if !normalCalled {
-		t.Fatal("某个 handler panic 后，其他 handler 未被执行")
+	if !level0NormalCalled {
+		t.Fatal("level 0 的 panic handler 不应影响同级别正常 handler 的执行")
+	}
+	if !level1Called {
+		t.Fatal("某个 handler panic 后，高级别 handler 未被执行")
 	}
 }
 
@@ -233,7 +248,8 @@ func TestExecuteShutdown_WaitChanClosed(t *testing.T) {
 	}
 }
 
-// TestExecuteShutdown_SignalPassedToHandler 测试信号值正确传递给 handler
+// TestExecuteShutdown_SignalPassedToHandler 测试信号值正确传递给 handler：
+// 覆盖 nil（Shutdown 主动触发）与具体信号值（OS 信号触发）两条路径。
 func TestExecuteShutdown_SignalPassedToHandler(t *testing.T) {
 	resetState()
 
@@ -248,6 +264,21 @@ func TestExecuteShutdown_SignalPassedToHandler(t *testing.T) {
 
 	if receivedSig != nil {
 		t.Fatalf("Shutdown 触发时 handler 应收到 nil 信号，实际收到 %v", receivedSig)
+	}
+
+	// 第二阶段：resetState 后验证具体信号值经退出流程原样传递给 handler
+	resetState()
+	receivedSig = nil
+
+	AddSigHandler(0, func(sig os.Signal) {
+		receivedSig = sig
+	})
+
+	// executeShutdown(syscall.SIGTERM) 模拟 OS 信号触发，handler 收到该信号值
+	executeShutdown(syscall.SIGTERM)
+
+	if receivedSig != syscall.SIGTERM {
+		t.Fatalf("OS 信号触发时 handler 应收到 %v，实际收到 %v", syscall.SIGTERM, receivedSig)
 	}
 }
 
@@ -277,6 +308,10 @@ func TestExecuteShutdown_NegativeLevel(t *testing.T) {
 	executeShutdown(nil)
 
 	expected := []int{-1, 0, 1}
+	// 先校验长度：handler 遗漏时给出清晰的失败消息，而非索引越界 panic（与 LevelOrder 一致）
+	if len(order) != 3 {
+		t.Fatalf("期望 3 个 handler 被执行，实际 %d", len(order))
+	}
 	for i, v := range expected {
 		if order[i] != v {
 			t.Fatalf("期望执行顺序 %v，实际 %v", expected, order)
@@ -345,8 +380,21 @@ func TestAddSigHandler_NilHandlerPanics(t *testing.T) {
 	resetState()
 
 	defer func() {
-		if recover() == nil {
+		r := recover()
+		if r == nil {
 			t.Fatal("注册 nil handler 应触发 panic")
+		}
+		// 断言 panic 值为预期的注册期防御消息，避免其他意外 panic 被误判为通过
+		if msg, ok := r.(string); !ok || !strings.Contains(msg, "zcquit: 不允许注册 nil 的 SigHandler") {
+			t.Fatalf("panic 值应为 nil handler 注册防御消息，实际: %v", r)
+		}
+		// AddSigHandler 先校验全部参数再加锁写入，panic 发生于任何写入之前，
+		// 混合传入中的非 nil handler 不应残留（注册原子性的防御性断言）
+		signalHandlerMux.RLock()
+		n := len(signalHandlerMap[0])
+		signalHandlerMux.RUnlock()
+		if n != 0 {
+			t.Fatalf("panic 前不应有 handler 写入，level 0 实际已有 %d 个", n)
 		}
 	}()
 
@@ -394,13 +442,19 @@ func TestExecuteShutdown_AllHandlersPanic(t *testing.T) {
 	default:
 		t.Fatal("全部 handler panic 后 waitChan 仍应被关闭")
 	}
+
+	select {
+	case <-GetCtx().Done():
+		// 期望：handler 全部 panic 不影响上下文取消（退出流程步骤 1 照常完成）
+	default:
+		t.Fatal("全部 handler panic 后上下文仍应被取消")
+	}
 }
 
 // TestConcurrent_AddSigHandlerAndShutdown 压力测试：并发注册 handler 与退出流程并发进行，验证无竞争无死锁
 func TestConcurrent_AddSigHandlerAndShutdown(t *testing.T) {
 	resetState()
 
-	var executed atomic.Int32
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 
@@ -410,9 +464,7 @@ func TestConcurrent_AddSigHandlerAndShutdown(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			AddSigHandler(0, func(sig os.Signal) {
-				executed.Add(1)
-			})
+			AddSigHandler(0, func(sig os.Signal) {})
 		}()
 	}
 
@@ -484,6 +536,14 @@ func TestShutdown_FullFlow(t *testing.T) {
 	case <-waitListenDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Shutdown 后并发 Listen 未在超时内返回")
+	}
+
+	// 显式断言 waitChan 已关闭：Listen 返回仅是间接证据，此处直接验证退出流程收尾步骤
+	select {
+	case <-waitChan:
+		// 期望：完整退出流程后 waitChan 已被关闭
+	default:
+		t.Fatal("完整退出流程后 waitChan 应已被关闭")
 	}
 
 	if execCount.Load() != 1 {

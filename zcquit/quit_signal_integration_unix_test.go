@@ -52,8 +52,9 @@ func TestListen_SIGHUPIgnored(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil && !strings.Contains(buf.String(), "LISTEN_RETURNED") {
-			t.Fatalf("SIGTERM 应触发正常退出流程: %v，输出: %s", err, buf.String())
+		// 正常退出流程要求退出码为 0：非零退出码（如 panic/异常终止）不应因输出含标记而被放过
+		if err != nil {
+			t.Fatalf("SIGTERM 应触发正常退出流程（退出码 0），实际: %v，输出: %s", err, buf.String())
 		}
 	case <-time.After(30 * time.Second):
 		_ = cmd.Process.Kill()
