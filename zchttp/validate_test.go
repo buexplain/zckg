@@ -165,6 +165,40 @@ func orderArrayHandler(_ context.Context, req orderArrayReq) (orderArrayRes, err
 	return orderArrayRes{OrderNo: req.OrderNo, Count: len(req.Items) + count}, nil
 }
 
+// ---- 指针包裹容器（*[]Struct / *map[K]Struct） ----
+
+// ptrContainerValidateReq 包含 *[]Struct 和 *map[K]Struct 字段，用于验证指针不阻断 nonzero 校验
+type ptrContainerValidateReq struct {
+	OrderNo string                 `json:"orderNo" nonzero:"true"`
+	Items   *[]orderItem           `json:"items" nonzero:"true"`
+	Extras  *map[string]*orderItem `json:"extras"`
+}
+
+type ptrContainerValidateRes struct {
+	OrderNo string `json:"orderNo"`
+	Count   int    `json:"count"`
+}
+
+func ptrContainerValidateHandler(_ context.Context, req ptrContainerValidateReq) (ptrContainerValidateRes, error) {
+	res := ptrContainerValidateRes{OrderNo: req.OrderNo}
+	if req.Items != nil {
+		res.Count += len(*req.Items)
+	}
+	if req.Extras != nil {
+		res.Count += len(*req.Extras)
+	}
+	return res, nil
+}
+
+// ---- 非指针值类型自引用（map 值为 struct 值） ----
+
+// cyclicValNode 非指针值类型的自引用结构体：map 值为 struct 值，
+// 但 struct 内部的 map 字段是引用类型，复制后仍指向同一底层桶，可形成环
+type cyclicValNode struct {
+	Name     string                   `json:"name" nonzero:"true"`
+	Children map[string]cyclicValNode `json:"children"`
+}
+
 // ---- 自引用结构体 ----
 type treeNode struct {
 	Name   string    `json:"name" nonzero:"true"`
@@ -962,29 +996,6 @@ func TestValidateRequiredArrayPtrNilElement(t *testing.T) {
 
 // ========== 指针包裹容器 nonzero 递归校验 ==========
 
-// ptrContainerValidateReq 包含 *[]Struct 和 *map[K]Struct 字段，用于验证指针不阻断 nonzero 校验
-type ptrContainerValidateReq struct {
-	OrderNo string                 `json:"orderNo" nonzero:"true"`
-	Items   *[]orderItem           `json:"items" nonzero:"true"`
-	Extras  *map[string]*orderItem `json:"extras"`
-}
-
-type ptrContainerValidateRes struct {
-	OrderNo string `json:"orderNo"`
-	Count   int    `json:"count"`
-}
-
-func ptrContainerValidateHandler(_ context.Context, req ptrContainerValidateReq) (ptrContainerValidateRes, error) {
-	res := ptrContainerValidateRes{OrderNo: req.OrderNo}
-	if req.Items != nil {
-		res.Count += len(*req.Items)
-	}
-	if req.Extras != nil {
-		res.Count += len(*req.Extras)
-	}
-	return res, nil
-}
-
 // TestValidatePtrSliceElemAllPass *[]Struct 每个元素 nonzero 字段均满足，校验通过
 func TestValidatePtrSliceElemAllPass(t *testing.T) {
 	router := NewRouter()
@@ -1228,13 +1239,6 @@ func TestValidateNonzeroWalk_MapCycle(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("BUG1 confirmed: validateNonzeroWalk infinite recursion on map cycle (timed out)")
 	}
-}
-
-// cyclicValNode 非指针值类型的自引用结构体：map 值为 struct 值，
-// 但 struct 内部的 map 字段是引用类型，复制后仍指向同一底层桶，可形成环
-type cyclicValNode struct {
-	Name     string                   `json:"name" nonzero:"true"`
-	Children map[string]cyclicValNode `json:"children"`
 }
 
 // TestValidateNonzeroWalk_MapValueCycle 验证非指针值类型的 map 循环引用不会无限递归

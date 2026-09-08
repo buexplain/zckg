@@ -77,10 +77,11 @@ func BenchmarkServeHTTP_StaticRoute_GET(b *testing.B) {
 	e := NewEngine()
 	e.Router.GET("/api/user", benchSimpleHandler)
 	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil))
-	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// 每迭代新建 Recorder：复用会让响应体与 header 在迭代间累积，污染 allocs 度量
+		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil)
 		e.ServeHTTP(w, req)
 	}
@@ -94,10 +95,11 @@ func BenchmarkServeHTTP_StaticRoute_POST_JSON(b *testing.B) {
 	check := httptest.NewRequest(http.MethodPost, "/api/user", strings.NewReader(body))
 	check.Header.Set("Content-Type", "application/json")
 	benchExpectOK(b, e, check)
-	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// 每迭代新建 Recorder：复用会让响应体与 header 在迭代间累积，污染 allocs 度量
+		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/api/user", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		e.ServeHTTP(w, req)
@@ -112,10 +114,11 @@ func BenchmarkServeHTTP_Nested_Nonzero(b *testing.B) {
 	check := httptest.NewRequest(http.MethodPost, "/api/nested", strings.NewReader(body))
 	check.Header.Set("Content-Type", "application/json")
 	benchExpectOK(b, e, check)
-	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// 每迭代新建 Recorder：复用会让响应体与 header 在迭代间累积，污染 allocs 度量
+		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/api/nested", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		e.ServeHTTP(w, req)
@@ -128,10 +131,11 @@ func BenchmarkServeHTTP_ParamRoute(b *testing.B) {
 	e := NewEngine()
 	e.Router.GET("/api/{name}", benchSimpleHandler)
 	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/api/alice?age=18", nil))
-	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// 每迭代新建 Recorder：复用会让响应体与 header 在迭代间累积，污染 allocs 度量
+		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/api/alice?age=18", nil)
 		e.ServeHTTP(w, req)
 	}
@@ -146,10 +150,11 @@ func BenchmarkServeHTTP_WithMiddlewares(b *testing.B) {
 	e.Router.Use(noop, noop, noop)
 	e.Router.GET("/api/user", benchSimpleHandler)
 	benchExpectOK(b, e, httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil))
-	w := httptest.NewRecorder()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// 每迭代新建 Recorder：复用会让响应体与 header 在迭代间累积，污染 allocs 度量
+		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/api/user?name=alice&age=18", nil)
 		e.ServeHTTP(w, req)
 	}

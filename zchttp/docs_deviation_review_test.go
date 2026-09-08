@@ -16,14 +16,11 @@ import (
 	"testing"
 )
 
+// docReviewDoJSON 在 serveJSONOn 之上追加响应解码：200 时把响应体解析为 map 供断言使用，
+// 非 200 时只返回 recorder（错误响应结构由调用方自行判定）。
 func docReviewDoJSON(t *testing.T, h http.Handler, method, target, body string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
-	req := httptest.NewRequest(method, target, strings.NewReader(body))
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	rec := serveJSONOn(t, h, method, target, body)
 	var m map[string]any
 	if rec.Code == 200 {
 		if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {

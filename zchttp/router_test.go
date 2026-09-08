@@ -21,10 +21,21 @@ func hello(_ context.Context, req helloReq) (helloRes, error) {
 	return helloRes{Message: "Hello, " + req.Name}, nil
 }
 
+// TestBasic 验证根路径 "/" 静态路由的最小可用链路：GET / 命中 hello handler，
+// 返回 HTTP 200，且 Name 未传时 Res 为 Message="Hello, "（确认空 Req 也走完整绑定与响应流程）。
 func TestBasic(t *testing.T) {
 	router := NewRouter()
 	router.GET("/", hello)
-	t.Log("BasicTest")
+
+	rec := serveRequest(t, router, http.MethodGet, "/", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var res helloRes
+	decodeData(t, rec, &res)
+	if res.Message != "Hello, " {
+		t.Fatalf("unexpected response message: %q, want %q", res.Message, "Hello, ")
+	}
 }
 
 // helloPtr 使用结构体指针作为参数与返回值，验证指针类型支持

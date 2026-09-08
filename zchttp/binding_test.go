@@ -59,15 +59,11 @@ func TestBindQueryGet(t *testing.T) {
 	router := NewRouter()
 	router.GET("/search", searchHandler)
 
-	engine := NewEngine()
-	engine.Router = router
-
-	req := httptest.NewRequest(http.MethodGet, "/search?keyword=go&page=3&active=true&tags=a&tags=b", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	target := "/search?keyword=go&page=3&active=true&tags=a&tags=b"
+	rec := serveRequest(t, router, http.MethodGet, target, "")
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+		t.Fatalf("GET %s: expected 200, got %d, body: %s", target, rec.Code, rec.Body.String())
 	}
 	var res searchRes
 	decodeData(t, rec, &res)
@@ -111,17 +107,11 @@ func TestBindJSONPost(t *testing.T) {
 	router := NewRouter()
 	router.POST("/search", searchHandler)
 
-	engine := NewEngine()
-	engine.Router = router
-
 	body := `{"keyword":"json","page":9,"active":true,"tags":["m","n"]}`
-	req := httptest.NewRequest(http.MethodPost, "/search", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	rec := serveRequest(t, router, http.MethodPost, "/search", body)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+		t.Fatalf("POST /search: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
 	}
 	var res searchRes
 	decodeData(t, rec, &res)
@@ -231,9 +221,6 @@ func TestBindTime(t *testing.T) {
 	router := NewRouter()
 	router.GET("/event", eventHandler)
 
-	engine := NewEngine()
-	engine.Router = router
-
 	// start_time: unix 秒；date: yyyy-MM-dd；slash_date: dd/MM/yyyy；
 	// auto: RFC3339 自动探测；auto_milli: 13 位毫秒时间戳自动探测
 	query := "start_time=1700000000" +
@@ -241,12 +228,10 @@ func TestBindTime(t *testing.T) {
 		"&slash_date=15/06/2023" +
 		"&auto=2023-06-15T10:00:00Z" +
 		"&auto_milli=1700000000123"
-	req := httptest.NewRequest(http.MethodGet, "/event?"+query, nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	rec := serveRequest(t, router, http.MethodGet, "/event?"+query, "")
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+		t.Fatalf("GET /event: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
 	}
 	var res eventRes
 	decodeData(t, rec, &res)
@@ -365,14 +350,8 @@ func TestBindJSONErrorReturns400(t *testing.T) {
 			OK bool `json:"ok"`
 		}{OK: true}, nil
 	})
-	engine := NewEngine()
-	engine.Router = router
-
 	// 非法 JSON
-	req := httptest.NewRequest(http.MethodPost, "/item", strings.NewReader(`{"name":}`))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	rec := serveRequest(t, router, http.MethodPost, "/item", `{"name":}`)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for JSON parse error, got %d, body: %s", rec.Code, rec.Body.String())
@@ -383,16 +362,11 @@ func TestBindJSONErrorReturns400(t *testing.T) {
 func TestFormTagPriorityOverJSON(t *testing.T) {
 	router := NewRouter()
 	router.GET("/search", formPriorityHandler)
-	engine := NewEngine()
-	engine.Router = router
-
 	// q 命中 form 标签，page 命中 json 标签
-	req := httptest.NewRequest(http.MethodGet, "/search?q=go&page=3", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	rec := serveRequest(t, router, http.MethodGet, "/search?q=go&page=3", "")
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+		t.Fatalf("GET /search: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
 	}
 	var res formPriorityRes
 	decodeData(t, rec, &res)
@@ -409,17 +383,13 @@ func TestDeleteHeadBindQuery(t *testing.T) {
 	router := NewRouter()
 	router.DELETE("/item", formPriorityHandler)
 	router.HEAD("/item", formPriorityHandler)
-	engine := NewEngine()
-	engine.Router = router
 
 	for _, method := range []string{http.MethodDelete, http.MethodHead} {
 		t.Run(method, func(t *testing.T) {
-			req := httptest.NewRequest(method, "/item?q=test&page=7", nil)
-			rec := httptest.NewRecorder()
-			engine.ServeHTTP(rec, req)
+			rec := serveRequest(t, router, method, "/item?q=test&page=7", "")
 			// HEAD 请求不返回 body，仅检查状态码
 			if rec.Code != http.StatusOK {
-				t.Fatalf("%s: expected 200, got %d", method, rec.Code)
+				t.Fatalf("%s /item: expected 200, got %d, body: %s", method, rec.Code, rec.Body.String())
 			}
 			if method == http.MethodDelete {
 				var res formPriorityRes
@@ -540,12 +510,9 @@ func TestMergedBinding_JSONNullAndZero(t *testing.T) {
 
 	do := func(t *testing.T, target, body string) mergeBindRes {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		engine.ServeHTTP(rec, req)
+		rec := serveJSONOn(t, engine, http.MethodPost, target, body)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+			t.Fatalf("POST %s: expected 200, got %d, body: %s", target, rec.Code, rec.Body.String())
 		}
 		var res mergeBindRes
 		decodeData(t, rec, &res)
@@ -586,13 +553,10 @@ func TestMergedBinding_PathParamPriority(t *testing.T) {
 	engine.Router = router
 
 	// 三者同名全传：path 最终胜出
-	req := httptest.NewRequest(http.MethodPost, "/merge/from-path?source=from-query",
-		strings.NewReader(`{"source":"from-body","name":"alice"}`))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	target := "/merge/from-path?source=from-query"
+	rec := serveJSONOn(t, engine, http.MethodPost, target, `{"source":"from-body","name":"alice"}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+		t.Fatalf("POST %s: expected 200, got %d, body: %s", target, rec.Code, rec.Body.String())
 	}
 	var res mergeBindRes
 	decodeData(t, rec, &res)
@@ -604,11 +568,10 @@ func TestMergedBinding_PathParamPriority(t *testing.T) {
 	}
 
 	// body 未传同名字段时：path 仍覆盖 query
-	req = httptest.NewRequest(http.MethodPost, "/merge/from-path?source=from-query",
-		strings.NewReader(`{"name":"bob"}`))
-	req.Header.Set("Content-Type", "application/json")
-	rec = httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	rec = serveJSONOn(t, engine, http.MethodPost, target, `{"name":"bob"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST %s: expected 200, got %d, body: %s", target, rec.Code, rec.Body.String())
+	}
 	var res2 mergeBindRes
 	decodeData(t, rec, &res2)
 	if res2.Source != "from-path" {
@@ -622,16 +585,12 @@ func TestMergedBinding_PathParamPriority(t *testing.T) {
 func TestTimeLocationTag(t *testing.T) {
 	router := NewRouter()
 	router.GET("/meeting", timeTzHandler)
-	engine := NewEngine()
-	engine.Router = router
 
 	// 2023-06-15 14:30 在 Asia/Shanghai 时区
-	req := httptest.NewRequest(http.MethodGet, "/meeting?meeting=2023-06-15+14:30", nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	rec := serveRequest(t, router, http.MethodGet, "/meeting?meeting=2023-06-15+14:30", "")
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+		t.Fatalf("GET /meeting: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
 	}
 	var res timeTzRes
 	decodeData(t, rec, &res)
@@ -647,17 +606,13 @@ func TestTimeLocationTag(t *testing.T) {
 func TestTimePrecisionFormats(t *testing.T) {
 	router := NewRouter()
 	router.GET("/ts", timePrecisionHandler)
-	engine := NewEngine()
-	engine.Router = router
 
 	// milli=1700000000123 (13位), micro=1700000000123456 (16位), nano=1700000000123456789 (19位)
 	query := "milli=1700000000123&micro=1700000000123456&nano=1700000000123456789"
-	req := httptest.NewRequest(http.MethodGet, "/ts?"+query, nil)
-	rec := httptest.NewRecorder()
-	engine.ServeHTTP(rec, req)
+	rec := serveRequest(t, router, http.MethodGet, "/ts?"+query, "")
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+		t.Fatalf("GET /ts: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
 	}
 	var res timePrecisionRes
 	decodeData(t, rec, &res)
@@ -848,15 +803,16 @@ func TestBindJSONNestedStruct(t *testing.T) {
 	if res.Street != "Chang'an Ave" {
 		t.Errorf("street = %q, want Chang'an Ave", res.Street)
 	}
-	// zip 未传但 struct 有 default:"000000"，但由于嵌套 struct 字段不被 buildStructMeta 展开，
-	// 默认值无法应用到嵌套字段；json 反序列化后 Zip 仍为空字符串（符合预期行为）
-	if res.Zip != "" {
-		t.Logf("zip = %q (nested default not applied, expected empty for JSON binding)", res.Zip)
+	// default 在注册阶段预填进 Req 模板，请求阶段先拷贝模板再做 JSON 绑定；
+	// JSON 解码按 key 驱动，body 中未出现的 key 不覆盖模板值。
+	// 因此 addr.zip 保留 nestedAddress 的 default:"000000"
+	// （applyDefaults 会递归进入值类型嵌套 struct，见 parameter-binding.md 注册阶段说明）。
+	if res.Zip != "000000" {
+		t.Errorf("zip = %q, want %q（body 未出现 addr.zip，应保留注册阶段预填的 default）", res.Zip, "000000")
 	}
-	// tags 有顶层 default:"a,b"，但 JSON body 中没有传 tags，
-	// JSON 反序列化优先，切片被设为 nil（JSON null），不会触发 default 填充
-	if len(res.Tags) != 0 {
-		t.Logf("tags = %v (JSON body takes precedence, default not merged)", res.Tags)
+	// tags 未出现在 body 中，同样保留顶层 default:"a,b" 预填结果
+	if len(res.Tags) != 2 || res.Tags[0] != "a" || res.Tags[1] != "b" {
+		t.Errorf("tags = %v, want [a b]（body 未出现 tags，应保留注册阶段预填的 default）", res.Tags)
 	}
 }
 

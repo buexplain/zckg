@@ -44,6 +44,70 @@ func TestIsResponseWritten(t *testing.T) {
 	releaseResponseWriter(rw3)
 }
 
+// statusRecordingWriter 记录底层实际收到的 WriteHeader 状态码序列，
+// 用于断言包装层是否真的把重复调用挡在了底层之外（而非仅看最终状态码）。
+type statusRecordingWriter struct {
+	header http.Header
+	codes  []int
+	body   []byte
+}
+
+func (s *statusRecordingWriter) Header() http.Header {
+	if s.header == nil {
+		s.header = http.Header{}
+	}
+	return s.header
+}
+
+func (s *statusRecordingWriter) Write(b []byte) (int, error) {
+	s.body = append(s.body, b...)
+	return len(b), nil
+}
+
+func (s *statusRecordingWriter) WriteHeader(code int) {
+	s.codes = append(s.codes, code)
+}
+
+// TestResponseWriter_WriteHeaderIdempotent 锁死 WriteHeader 的幂等语义：
+// 按 net/http 规定多次调用仅首次生效，包装层须把重复调用挡在底层之外
+// （否则 httptest.ResponseRecorder / net/http 会打印 superfluous WriteHeader 警告）。
+func TestResponseWriter_WriteHeaderIdempotent(t *testing.T) {
+	sw := &statusRecordingWriter{}
+	rw := acquireResponseWriter(sw)
+	defer releaseResponseWriter(rw)
+
+	rw.WriteHeader(http.StatusCreated)
+	rw.WriteHeader(http.StatusInternalServerError)
+
+	if len(sw.codes) != 1 || sw.codes[0] != http.StatusCreated {
+		t.Fatalf("重复 WriteHeader 只应透传首次调用，底层收到: %v", sw.codes)
+	}
+	if !IsResponseWritten(rw) {
+		t.Fatal("WriteHeader 后 written 应为 true")
+	}
+}
+
+// TestResponseWriter_WriteHeaderInformationalNotFinal 验证 1xx 信息性响应
+// （如 103 Early Hints）不代表最终响应已写出：不标记 written，且不阻断随后的最终状态码，
+// 保持 net/http 允许的「1xx 之后再写最终状态码」语义。
+func TestResponseWriter_WriteHeaderInformationalNotFinal(t *testing.T) {
+	sw := &statusRecordingWriter{}
+	rw := acquireResponseWriter(sw)
+	defer releaseResponseWriter(rw)
+
+	rw.WriteHeader(http.StatusEarlyHints)
+	if IsResponseWritten(rw) {
+		t.Fatal("1xx 信息性响应不应标记 written")
+	}
+	rw.WriteHeader(http.StatusOK)
+	if !IsResponseWritten(rw) {
+		t.Fatal("最终状态码写出后 written 应为 true")
+	}
+	if len(sw.codes) != 2 || sw.codes[0] != http.StatusEarlyHints || sw.codes[1] != http.StatusOK {
+		t.Fatalf("1xx 与最终状态码都应透传底层，底层收到: %v", sw.codes)
+	}
+}
+
 // ========== 能力组合包装（m2）测试 ==========
 
 // plainWriter 仅实现 http.ResponseWriter，不提供 Flusher/Hijacker/Pusher/ReaderFrom，

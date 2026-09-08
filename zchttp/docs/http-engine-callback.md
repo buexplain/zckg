@@ -117,6 +117,8 @@ func IsResponseWritten(w http.ResponseWriter) bool {
 
 - 判定依据是是否真正写入过响应体或状态码，而非仅仅设置了 Header。
 - 这样，仅设置 Header 的中间件（如 CORS）不会导致 JSON 响应被误跳过；只有真正写了响应（如文件流）才跳过。
+- `WriteHeader` 是幂等的：按 `net/http` 语义仅首次调用生效，重复调用被包装层挡下（不再透传底层），避免出现 `superfluous response.WriteHeader call` 警告。
+- 1xx 信息性响应（如 `103 Early Hints`）是例外：它不代表最终响应已写出，因此**不标记 written**，也不参与上述幂等判定——`WriteHeader(103)` 之后仍可正常写出最终状态码与响应体。
 
 ## 六、自定义响应示例
 

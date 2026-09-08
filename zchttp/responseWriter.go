@@ -117,8 +117,19 @@ func releaseResponseWriter(rw http.ResponseWriter) {
 	responseWriterPool.Put(base)
 }
 
-// WriteHeader 实现 http.ResponseWriter：标记响应已写入，再透传底层 WriteHeader。
+// WriteHeader 实现 http.ResponseWriter：首次调用标记响应已写入并透传底层 WriteHeader；
+// 重复调用按 net/http 语义为无效操作（直接返回，不再透传），避免底层
+// ResponseWriter 打印 "superfluous response.WriteHeader call"。
+// 1xx 是信息性响应（如 103 Early Hints），不代表最终响应已写出：既不标记 written
+// 也不参与幂等判定，使 net/http 允许的「1xx 之后再写最终状态码」仍然生效。
 func (w *responseWriter) WriteHeader(statusCode int) {
+	if statusCode >= 100 && statusCode < 200 {
+		w.ResponseWriter.WriteHeader(statusCode)
+		return
+	}
+	if w.written {
+		return
+	}
 	w.written = true
 	w.ResponseWriter.WriteHeader(statusCode)
 }
