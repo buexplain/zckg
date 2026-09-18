@@ -214,6 +214,7 @@ func (g *openAPIGenerator) walkTypeUsage(t reflect.Type, viaValue bool, visiting
 //   - 顶层 Req/Res：可达
 //   - 值类型 struct 字段：继承父级可达性
 //   - 指针字段（*Struct）：继承父级可达性（applyDefaults 可跟随非 nil 指针）
+//   - 指针包裹容器（*[]Struct / *[N]Struct / *map[K]Struct）：按解包后的容器处理
 //   - 切片/数组元素：继承父级可达性（applyDefaults 可遍历切片元素）
 //   - map 值类型为 Struct 或 *Struct：继承父级可达性
 //   - map 值类型为 Slice/Array：不可达（applyDefaults 无法穿透此类多层容器）
@@ -251,6 +252,13 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 	for _, fm := range meta.fields {
 		f := fm.field
 		ft := f.Type
+		// 指针包裹容器需先解包，否则只接受 struct 的递归入口会漏掉容器元素。
+		if ft.Kind() == reflect.Ptr {
+			switch ft.Elem().Kind() {
+			case reflect.Slice, reflect.Array, reflect.Map:
+				ft = ft.Elem()
+			}
+		}
 		switch ft.Kind() {
 		case reflect.Ptr:
 			// *Struct：applyDefaults 可跟随非 nil 指针，viaDefaults 不变
@@ -288,9 +296,9 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 	}
 }
 
-// buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary）。
-// paramNames 为路径模板中的 {name}/{name?} 参数名集合（无参数段的路由为空集）：对应字段声明为
-// path 参数（in: path）且不再作为 query 参数展示；optionalParams 标记其中可选参数。
+// buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary/deprecated）。
+// paramNames 为路径模板中的 {name}/{name?} 参数名集合（无参数段的路由为空集）：所有方法均声明
+// 未忽略的 path 参数，GET/DELETE/HEAD 不再重复展示为 query；optionalParams 标记其中可选参数。
 func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, paramNames, optionalParams map[string]bool) map[string]any {
 	// 使用注册阶段预计算的类型信息，避免重复反射
 	if entry.reqType == nil || entry.resType == nil {
@@ -317,23 +325,24 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, para
 	if opMeta.description != "" {
 		op["description"] = opMeta.description
 	}
+	if opMeta.deprecated {
+		op["deprecated"] = true
+	}
 
+	var params []any
+	if len(paramNames) > 0 {
+		params = append(params, g.buildPathParams(reqType, entry.reqMeta, paramNames, optionalParams)...)
+	}
 	switch method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
-		var params []any
-		if len(paramNames) > 0 {
-			params = append(params, g.buildPathParams(reqType, entry.reqMeta, paramNames, optionalParams)...)
-		}
-		if qp := g.buildQueryParams(reqType, entry.reqMeta, paramNames); len(qp) > 0 {
-			params = append(params, qp...)
-		}
-		if len(params) > 0 {
-			op["parameters"] = params
-		}
+		params = append(params, g.buildQueryParams(reqType, entry.reqMeta, paramNames)...)
 	default:
 		if body := g.buildRequestBody(reqType, entry.reqMeta); body != nil {
 			op["requestBody"] = body
 		}
+	}
+	if len(params) > 0 {
+		op["parameters"] = params
 	}
 
 	op["responses"] = g.buildResponses(resType, entry.resMeta)
@@ -345,6 +354,7 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, para
 // paramNames 为路径参数名集合：绑定到路径参数的字段不作为 query 参数展示。
 // 跳过非扁平字段（Map 与命名 struct）：query 绑定仅处理扁平字段，展示会误导 API 使用者；
 // 文件字段一并跳过（GET 无 multipart）。
+// 带 deprecated:"true" 的字段在 Parameter Object 顶层输出 deprecated: true。
 func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMeta, paramNames map[string]bool) []any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
@@ -376,20 +386,25 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 		if ft.Kind() == reflect.Map || (ft.Kind() == reflect.Struct && ft != timeType) {
 			continue // 非扁平字段：query 绑定仅处理扁平字段
 		}
-		params = append(params, map[string]any{
+		param := map[string]any{
 			"name":     fm.name,
 			"in":       "query",
 			"required": fm.nonzero && !fm.hasDefault,
 			"schema":   g.typeToSchema(f.Type, f, 0),
-		})
+		}
+		if isDeprecated(f) {
+			param["deprecated"] = true
+		}
+		params = append(params, param)
 	}
 	return params
 }
 
-// buildPathParams 为参数路由的 {name}/{name?} 段声明 path 参数。
+// buildPathParams 为所有方法的参数路由 {name}/{name?} 段声明 path 参数，跳过 ignore 字段。
 // meta 为注册阶段预计算的 structMeta；paramNames 为路径模板中的参数名集合；
 // optionalParams 标记可选参数（{name?}），其 required 为 false，
 // 可选参数被省略时保留字段 default 值或零值。
+// 带 deprecated:"true" 的字段在 Parameter Object 顶层输出 deprecated: true。
 func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta, paramNames, optionalParams map[string]bool) []any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
@@ -404,12 +419,19 @@ func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta
 			continue
 		}
 		f := fm.field
-		params = append(params, map[string]any{
+		if isIgnored(f) {
+			continue
+		}
+		param := map[string]any{
 			"name":     fm.name,
 			"in":       "path",
 			"required": !optionalParams[fm.name],
 			"schema":   g.typeToSchema(f.Type, f, 0),
-		})
+		}
+		if isDeprecated(f) {
+			param["deprecated"] = true
+		}
+		params = append(params, param)
 	}
 	return params
 }
@@ -571,7 +593,7 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta)
 	return refSchema(name)
 }
 
-// typeToSchema 将 Go 类型映射为 JSON Schema；field 提供 default/example/description/time_format 等信息。
+// typeToSchema 将 Go 类型映射为 JSON Schema；field 提供 default/example/description/deprecated/time_format 等信息。
 // depth 为 Ptr/Slice/Map 链的累计嵌套深度：防自引用命名类型（type S []S / type P *P /
 // type A *B 与 type B *A 等）在容器/指针分支无限递归，超限退化为空 schema（与
 // default 分支一致）；上限复用 maxPtrDerefDepth，与 derefType/isDefaultSupportedDepth/
@@ -583,7 +605,7 @@ func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructFiel
 	}
 	if t.Kind() == reflect.Ptr {
 		if t == fileHeaderPtrType {
-			return map[string]any{"type": "string", "format": "binary"}
+			return g.decorate(map[string]any{"type": "string", "format": "binary"}, field)
 		}
 		inner := g.typeToSchema(t.Elem(), field, depth+1)
 		if _, isRef := inner["$ref"]; isRef {
@@ -657,7 +679,7 @@ func (g *openAPIGenerator) timeSchema(field reflect.StructField) map[string]any 
 	}
 }
 
-// decorate 依据字段标签补充 default / example / description。
+// decorate 依据字段标签补充 default / example / description / deprecated。
 // default 展示规则遵循两阶段填充语义：
 //   - 注册阶段：模板预填所有零值字段，但仅限"值嵌套"路径（顶层 + 值类型 struct 字段）能到达的 struct
 //   - 请求阶段（post-bind）：仅 nil 指针字段被填充，值类型跳过
@@ -666,6 +688,10 @@ func (g *openAPIGenerator) timeSchema(field reflect.StructField) map[string]any 
 //   - 指针类型（*int/*string 等）：仅当所属 struct 可被 applyDefaults 到达时展示 default
 //     （reachedByDefaults 追踪，与 applyDefaultsWithVisiting 可达性一致）
 //   - 值类型（int/string 等）：仅当所属 struct 被"值嵌套"到达时才展示 default（注册阶段可靠）
+//
+// deprecated 为纯文档标签，不查可达性，无条件写入字段自身生成的 schema 节点。
+// 嵌套 struct 的 $ref 会先经 decorate 再包装（值嵌套为 $ref 兄弟键、指针嵌套放入 allOf[0]），
+// 故同一批标签在两处各出现一份副本；渲染层忽略 $ref 副本，生效的始终是最外层键。
 func (g *openAPIGenerator) decorate(schema map[string]any, field reflect.StructField) map[string]any {
 	if field.Tag == "" {
 		return schema
@@ -688,6 +714,9 @@ func (g *openAPIGenerator) decorate(schema map[string]any, field reflect.StructF
 	}
 	if d := field.Tag.Get("description"); d != "" {
 		schema["description"] = d
+	}
+	if isDeprecated(field) {
+		schema["deprecated"] = true
 	}
 	return schema
 }
@@ -728,6 +757,16 @@ func coerceExample(schema map[string]any, raw string) any {
 // isIgnored 判定字段是否通过 ignore 标签从文档中排除
 func isIgnored(field reflect.StructField) bool {
 	if v := field.Tag.Get("ignore"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return false
+}
+
+// isDeprecated 判定字段是否通过 deprecated 标签标记为已废弃
+func isDeprecated(field reflect.StructField) bool {
+	if v := field.Tag.Get("deprecated"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			return b
 		}

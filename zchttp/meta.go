@@ -13,6 +13,7 @@ import (
 //   - tags:        以 "/" 分隔的标签，如 "User Management/Account"
 //   - summary:     操作摘要
 //   - description: 操作详细描述
+//   - deprecated:  标记操作为已废弃（"true" 启用），废弃原因写在 description 中
 //
 // 示例：
 //
@@ -54,6 +55,7 @@ type operationMeta struct {
 	tags        []string
 	summary     string
 	description string
+	deprecated  bool // 操作是否已废弃
 }
 
 // maxPtrDerefDepth 指针/元素解引用的最大层数，

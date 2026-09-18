@@ -33,6 +33,12 @@ type CreateUserReq struct {
 zchttp.OpenAPIMeta `tags:"User Management/Account" summary:"创建用户" description:"创建一个新的用户账户"`
 Name string `json:"name" nonzero:"true"`
 }
+
+// 已废弃的操作：deprecated:"true" 标记，废弃原因写在 description 中
+type DeleteUserReq struct {
+zchttp.OpenAPIMeta `tags:"User" summary:"删除用户" deprecated:"true" description:"已废弃，请使用 DELETE /v2/users/{id}"`
+ID int64 `json:"id" nonzero:"true"`
+}
 ```
 
 | 标签            | 说明                                             |
@@ -40,6 +46,7 @@ Name string `json:"name" nonzero:"true"`
 | `tags`        | 操作标签，以 `/` 分隔多个标签，如 `A/B` → `["A", "B"]`       |
 | `summary`     | 操作摘要；缺省时回退为 handler 函数名（`shortFuncName` 去除包路径） |
 | `description` | 操作详细描述                                         |
+| `deprecated`  | `deprecated:"true"` 标记操作为已废弃，生成 `"deprecated": true`；废弃原因写在 `description` 中 |
 
 > `OpenAPIMeta` 是空结构体，仅承载标签信息，对请求参数绑定没有任何副作用。
 
@@ -54,10 +61,60 @@ Name string `json:"name" nonzero:"true"`
 | `ignore:"true"` | ✅   | ✅   | 从文档中**排除**该字段（不影响绑定与校验）                                                  |
 | `default`       | ✅   | 仅文档 | Req 上设置默认值，受类型限制、分两阶段填充，且文档展示有额外约束——详见 [default 文档展示规则](#default-文档展示规则仅-req)；Res 上无运行时效果，仅在文档中展示。    |
 | `nonzero`       | ✅   | 仅文档 | Req 上标记非零值必填，影响运行时校验和 required 推断——详见 [required 推断规则](#required-推断规则仅-req)；Res 上无运行时校验，仅参与 required 推断。       |
+| `deprecated`    | ✅   | ✅   | `deprecated:"true"` 标记字段为已废弃，schema 与 query/path 参数对象均输出 `"deprecated": true`；废弃原因写在 `description` 中——详见 [deprecated 标记](#deprecated-标记) |
 
 > Res 结构体上的 `default` 和 `nonzero` 标签**没有运行时语义**：Res 不参与参数绑定与校验，`applyDefaults` 和 `validateNonzero` 均仅作用于 Req。但它们**参与文档生成**：Res 的 `default` 按与 Req 相同的展示规则在 schema 中展示，Res 的 `nonzero:"true"` 且无 `default` 同样推断为 `required`（用于描述响应结构约束）。
 
 字段名沿用绑定规则：优先 `form` 标签，其次 `json` 标签，最后使用字段名。
+
+## deprecated 标记
+
+`deprecated` 标签用于标记已废弃的操作或字段，生成的文档中输出 `"deprecated": true`，Swagger UI 等工具会以视觉样式（如划线、灰色标签）提示调用方。
+
+### 操作级
+
+在 `OpenAPIMeta` 嵌入字段上声明 `deprecated:"true"`：
+
+```go
+type DeleteUserReq struct {
+    zchttp.OpenAPIMeta `tags:"User" summary:"删除用户" deprecated:"true" description:"已废弃，请使用 DELETE /v2/users/{id}"`
+    ID int64 `json:"id" nonzero:"true"`
+}
+```
+
+生成的 Operation Object 包含 `"deprecated": true`。操作级和字段级均使用 `strconv.ParseBool`：`"1"`、`"t"`、`"T"`、`"TRUE"`、`"true"`、`"True"` 启用；`"0"`、`"f"`、`"F"`、`"FALSE"`、`"false"`、`"False"` 不启用。未设置、空串和非法值不输出标记，不裁剪空白；示例统一使用 `"true"`。
+
+### 字段级
+
+在结构体字段上声明 `deprecated:"true"`，适用于 Req 和 Res 的受支持字段类型（标量、时间、指针、切片/数组、map、`*Struct` 指针嵌套、单文件及文件切片）。**值类型嵌套 struct 字段例外**：其 schema 为纯 `$ref`，`deprecated` 作为 `$ref` 兄弟键会被 OpenAPI 3.0 工具忽略；如需标记整个嵌套结构体废弃，请改用指针嵌套。示例：
+
+```go
+type UpdateUserReq struct {
+    zchttp.OpenAPIMeta `tags:"User" summary:"更新用户"`
+    Name    string `json:"name" nonzero:"true"`
+    OldNick string `json:"old_nick" deprecated:"true" description:"已废弃，请使用 name"`
+}
+```
+
+生成的字段 schema 包含 `"deprecated": true`。GET / DELETE / HEAD 的 query 参数，以及所有 HTTP 方法的 path 参数，均在 Parameter Object 顶层输出同一标记；其余方法仍保留 requestBody，不从 body schema 删除路径对应字段。
+
+`ignore:"true"` 优先排除字段或参数对象，不改变运行时绑定和路径模板。忽略路径字段会留下未声明参数的占位符，因此需要完整、可校验 OpenAPI 文档的接口不应忽略路径字段。
+
+单文件 `*multipart.FileHeader` 的 binary schema 同样保留 `deprecated`、`description` 和 `example`。切片、数组、map 及文件切片的标记只作用于字段自身，不传给元素；内部 struct 字段自身的标记仍正常生成，不受默认值可达性限制。自引用容器在递归保护边界退化为空元素 schema，外层标记保留。
+
+### 废弃原因
+
+OpenAPI 规范的 `deprecated` 仅为布尔标记，无专用原因字段。废弃原因应写在 `description` 中（支持 Markdown），例如：
+
+```go
+type LegacyFields struct {
+    OldField string `json:"old_field" deprecated:"true" description:"~~已废弃~~ 请使用 \x60new_field\x60，本字段将在 v3 移除"`
+}
+```
+
+Go 原始字符串不能用反斜杠转义反引号；这里的 `\x60` 由 `reflect.StructTag.Get` 解码为 Markdown 行内代码所需的反引号。
+
+`deprecated` 是纯文档标签，对参数绑定、校验、默认值填充均无副作用。
 
 ## default 文档展示规则（仅 Req）
 
@@ -79,7 +136,9 @@ Name string `json:"name" nonzero:"true"`
 
 ### 容器嵌套深度
 
-上述规则假设 struct 可被 `applyDefaults` 到达。对于**多层容器**（如 `map[K][]Struct`、`[][]Struct`、`[]map[K]Struct`），框架无法穿透内部元素，即使是指针字段的 `default` 也**不展示**（`reachedByDefaults=false`）。详见 `request.md` 中"容器嵌套深度限制"章节。
+单层容器及其外包一层指针（如 `[]Struct`、`*[N]Struct`、`*[]Struct`、`*map[K]Struct`）中的 struct 可被 `applyDefaults` 到达，指针字段的 `default` 可以展示。对于**多层容器**（如 `map[K][]Struct`、`[][]Struct`、`[]map[K]Struct`），框架无法穿透内部元素；类型仅经这些路径到达时，即使是指针字段的 `default` 也**不展示**（`reachedByDefaults=false`）。
+
+可达性按 struct **类型取并集**：若同一类型还用于单层容器，其指针字段的 `default` 会展示；若另有纯值嵌套路径，其值字段的 `default` 也会展示。这不改变多层容器路径在运行时不填充的限制。详见 `request.md` 中"容器嵌套深度限制"章节。
 
 切片类型字段的 `default` 按逗号切分后，逐元素依据 items schema 递归转换展示（如 `default:"a,b"` 展示为 `["a","b"]`，`[]int` 的 `default:"1,2"` 展示为 `[1,2]`）；Trim 后为空（`default:""`、`default:",,,"`）视为空切片 `[]`，与运行时填充语义一致。
 
@@ -149,8 +208,7 @@ map 的 value 类型通过 `t.Elem()` 递归推断：
 - **GET / DELETE / HEAD**：请求字段生成为 `query` 参数（`in: query`）。**仅扁平字段**（标量、切片、指针标量、`time.Time`）参与生成：命名 struct（`time.Time` 除外）、`map` 与文件字段被跳过——query 绑定仅处理扁平字段，展示无法绑定的参数会误导 API 使用者。
 - **其余方法**：请求字段生成为 `requestBody`；含文件字段（`*multipart.FileHeader` 或 `[]*multipart.FileHeader`，含**嵌入结构体**中的文件字段）时使用
   `multipart/form-data`，否则 `application/json`。
-- **参数路由**（如 `/users/{id}`）：路径模板中的 `{name}` 参数声明为 path 参数（`in: path`，`required: true`）并从 query
-  参数中排除；可选参数 `{name?}` 转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` 语法）并以 `required: false` 声明，路径模板中不再出现 `?`。
+- **参数路由**（如 `/users/{id}`）：所有 HTTP 方法均将未忽略的 `{name}` 字段声明为 path 参数（`in: path`，`required: true`），GET / DELETE / HEAD 不再重复声明为 query，其余方法仍保留既有 body 字段。`ignore:"true"` 仅排除参数声明，不删除占位符，因此忽略路径字段会导致 OpenAPI 文档缺少所需声明。可选参数 `{name?}` 转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` 语法）并沿用 `required: false` 的既有输出，路径模板中不再出现 `?`；OpenAPI 3.0 要求 path 参数必填，此可选参数表示也是既有的规范兼容性限制。
 - **响应**：统一包装为 `Response{data, code, message}` 结构，schema 名称为 `Response_<Type>`；成功时统一返回 `200`（与
   `HttpEngine` 默认响应行为一致）。可通过 `OpenAPIInfo.ResponseWrapper` 指定自定义响应包装结构体样例（如 `MyResponse{}`），为 nil 时使用默认结构；自定义结构体中 `interface{}` 类型字段被视为 data 占位符，替换为实际 Res schema。
 

@@ -168,7 +168,7 @@ func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHan
 }
 
 // buildOperationMeta 从 Req 结构体中查找嵌入的 OpenAPIMeta 字段并解析其标签，
-// 提取 tags（以 "/" 分隔）、summary 和 description 操作级元信息。
+// 提取 tags（以 "/" 分隔）、summary、description 和 deprecated 操作级元信息。
 // 若未嵌入 OpenAPIMeta 或未设置对应标签，则返回零值。
 func buildOperationMeta(reqType reflect.Type) operationMeta {
 	var m operationMeta
@@ -189,6 +189,7 @@ func buildOperationMeta(reqType reflect.Type) operationMeta {
 		}
 		m.summary = f.Tag.Get("summary")
 		m.description = f.Tag.Get("description")
+		m.deprecated = isDeprecated(f)
 		return m
 	}
 	return m

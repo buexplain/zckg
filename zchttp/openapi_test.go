@@ -2732,3 +2732,991 @@ func TestGenerateOpenAPI_UnmappableKindEmptySchema(t *testing.T) {
 		t.Fatalf("chan 字段应退化为空 schema，实际: %v", props["ch"])
 	}
 }
+
+// ========== deprecated 标签测试（行为说明见 docs/openapi.md「deprecated 标记」） ==========
+
+// assertDeprecatedTrue 断言 map 节点含 "deprecated": true（键访问 + 布尔比较）。
+func assertDeprecatedTrue(t *testing.T, m map[string]any, what string) {
+	t.Helper()
+	v, ok := m["deprecated"]
+	if !ok || v != true {
+		t.Errorf("%s 应含 \"deprecated\": true，实际: %v", what, m)
+	}
+}
+
+// assertNoDeprecated 断言 map 节点不存在 deprecated 键（真正不写入的场景）。
+func assertNoDeprecated(t *testing.T, m map[string]any, what string) {
+	t.Helper()
+	if _, ok := m["deprecated"]; ok {
+		t.Errorf("%s 不应含 deprecated 键，实际: %v", what, m)
+	}
+}
+
+// findParam 在 parameters 列表中按 name 查找参数对象，找不到时终止测试。
+func findParam(t *testing.T, params []any, name string) map[string]any {
+	t.Helper()
+	for _, p := range params {
+		pm := p.(map[string]any)
+		if pm["name"] == name {
+			return pm
+		}
+	}
+	t.Fatalf("parameters 中缺少 %q，实际: %v", name, params)
+	return nil
+}
+
+type oaDepOpTrueReq struct {
+	OpenAPIMeta `summary:"op true" deprecated:"true"`
+	Name        string `json:"name"`
+}
+
+type oaDepOpFalseReq struct {
+	OpenAPIMeta `summary:"op false" deprecated:"false"`
+	Name        string `json:"name"`
+}
+
+type oaDepOpUnsetReq struct {
+	OpenAPIMeta `summary:"op unset"`
+	Name        string `json:"name"`
+}
+
+type oaDepOpNoMetaReq struct {
+	Name string `json:"name"`
+}
+
+type oaDepOpRes struct {
+	OK bool `json:"ok"`
+}
+
+// TestGenerateOpenAPI_DeprecatedOperation 覆盖 §8.1 操作级 deprecated：
+// OpenAPIMeta 设置 deprecated:"true" 时 Operation Object 含 "deprecated": true；
+// 设置为 "false"、未设置、以及 Req 未嵌入 OpenAPIMeta 时均不输出 deprecated 键。
+func TestGenerateOpenAPI_DeprecatedOperation(t *testing.T) {
+	r := NewRouter()
+	r.POST("/dep/true", func(_ context.Context, _ oaDepOpTrueReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	r.POST("/dep/false", func(_ context.Context, _ oaDepOpFalseReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	r.POST("/dep/unset", func(_ context.Context, _ oaDepOpUnsetReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	r.POST("/dep/nometa", func(_ context.Context, _ oaDepOpNoMetaReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+	paths := doc["paths"].(map[string]any)
+
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"true", "/dep/true", true},
+		{"false", "/dep/false", false},
+		{"unset", "/dep/unset", false},
+		{"no OpenAPIMeta", "/dep/nometa", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			op := paths[tc.path].(map[string]any)["post"].(map[string]any)
+			if tc.want {
+				assertDeprecatedTrue(t, op, "Operation Object")
+			} else {
+				assertNoDeprecated(t, op, "Operation Object")
+			}
+		})
+	}
+}
+
+type oaDepFieldBodyReq struct {
+	Old   string `json:"old" deprecated:"true"`
+	Off   string `json:"off" deprecated:"false"`
+	Plain string `json:"plain"`
+}
+
+type oaDepFieldBodyRes struct {
+	Legacy string `json:"legacy" deprecated:"true"`
+	Off    string `json:"off" deprecated:"false"`
+	Plain  string `json:"plain"`
+}
+
+type oaDepFieldQueryReq struct {
+	ID    int    `json:"id" deprecated:"true"`
+	Q     string `json:"q" deprecated:"true"`
+	Off   string `json:"off" deprecated:"false"`
+	Plain string `json:"plain"`
+}
+
+// oaDepResolveRef 精确校验引用目标并返回该引用指向的 schema。
+func oaDepResolveRef(t *testing.T, schemas, ref map[string]any, wantName string) map[string]any {
+	t.Helper()
+	wantRef := "#/components/schemas/" + wantName
+	if ref["$ref"] != wantRef {
+		t.Fatalf("schema.$ref = %v, want %q", ref["$ref"], wantRef)
+	}
+	name := strings.TrimPrefix(ref["$ref"].(string), "#/components/schemas/")
+	obj, ok := schemas[name].(map[string]any)
+	if !ok {
+		t.Fatalf("引用 %q 缺少目标 schema，实际: %v", wantRef, schemas[name])
+	}
+	return obj
+}
+
+// TestGenerateOpenAPI_DeprecatedField 验证请求、响应引用链及 query/path 参数的 true 标记与 false/未设置省略。
+func TestGenerateOpenAPI_DeprecatedField(t *testing.T) {
+	cases := []struct {
+		location string
+		field    string
+		want     bool
+	}{
+		{"body", "old", true},
+		{"body", "off", false},
+		{"body", "plain", false},
+		{"response", "legacy", true},
+		{"response", "off", false},
+		{"response", "plain", false},
+		{"query", "q", true},
+		{"query", "off", false},
+		{"query", "plain", false},
+		{"path", "id", true},
+		{"path", "off", false},
+		{"path", "plain", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.location+"/"+tc.field, func(t *testing.T) {
+			r := NewRouter()
+			path, method := "/dep/field", "post"
+			if tc.location == "query" || tc.location == "path" {
+				method = "get"
+				if tc.location == "path" {
+					path += "/{" + tc.field + "}"
+				}
+				r.GET(path, func(_ context.Context, _ oaDepFieldQueryReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+			} else {
+				r.POST(path, func(_ context.Context, _ oaDepFieldBodyReq) (oaDepFieldBodyRes, error) {
+					return oaDepFieldBodyRes{}, nil
+				})
+			}
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+			op := doc["paths"].(map[string]any)[path].(map[string]any)[method].(map[string]any)
+			schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+			var nodes []map[string]any
+			switch tc.location {
+			case "body":
+				ref := op["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+				obj := oaDepResolveRef(t, schemas, ref, "oaDepFieldBodyReq")
+				nodes = append(nodes, obj["properties"].(map[string]any)[tc.field].(map[string]any))
+			case "response":
+				ref := op["responses"].(map[string]any)["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+				wrapper := oaDepResolveRef(t, schemas, ref, "Response_oaDepFieldBodyRes")
+				dataRef := wrapper["properties"].(map[string]any)["data"].(map[string]any)
+				res := oaDepResolveRef(t, schemas, dataRef, "oaDepFieldBodyRes")
+				nodes = append(nodes, res["properties"].(map[string]any)[tc.field].(map[string]any))
+			default:
+				pm := findParam(t, op["parameters"].([]any), tc.field)
+				if pm["in"] != tc.location {
+					t.Fatalf("%s.in = %v, want %s", tc.field, pm["in"], tc.location)
+				}
+				nodes = append(nodes, pm, pm["schema"].(map[string]any))
+			}
+			for i, node := range nodes {
+				what := fmt.Sprintf("%s.%s 节点 %d", tc.location, tc.field, i)
+				if tc.want {
+					assertDeprecatedTrue(t, node, what)
+				} else {
+					assertNoDeprecated(t, node, what)
+				}
+			}
+		})
+	}
+}
+
+type oaDepInteractReq struct {
+	Hidden  string `json:"hidden" ignore:"true" deprecated:"true"`
+	Must    string `json:"must" nonzero:"true" deprecated:"true"`
+	WithDef string `json:"withDef" default:"legacy" deprecated:"true"`
+}
+
+// TestGenerateOpenAPI_DeprecatedTagInteraction 验证 ignore 优先隐藏字段、nonzero/default 与 deprecated 并存。
+func TestGenerateOpenAPI_DeprecatedTagInteraction(t *testing.T) {
+	cases := []struct {
+		name        string
+		field       string
+		hidden      bool
+		required    bool
+		wantDefault any
+	}{
+		{"ignore", "hidden", true, false, nil},
+		{"nonzero", "must", false, true, nil},
+		{"default", "withDef", false, false, "legacy"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRouter()
+			r.POST("/dep/interact", func(_ context.Context, _ oaDepInteractReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+			schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+			obj := schemas["oaDepInteractReq"].(map[string]any)
+			props := obj["properties"].(map[string]any)
+			required, _ := obj["required"].([]any)
+			found := false
+			for _, name := range required {
+				if name == tc.field {
+					found = true
+				}
+			}
+			if found != tc.required {
+				t.Errorf("%s required = %v, want %v; required: %v", tc.field, found, tc.required, required)
+			}
+			if tc.hidden {
+				if _, ok := props[tc.field]; ok {
+					t.Errorf("ignore:true 字段 %s 不应出现在 properties，实际: %v", tc.field, props[tc.field])
+				}
+				return
+			}
+			p := props[tc.field].(map[string]any)
+			assertDeprecatedTrue(t, p, "属性 "+tc.field)
+			if tc.wantDefault == nil {
+				if _, ok := p["default"]; ok {
+					t.Errorf("%s 不应含 default，实际: %v", tc.field, p)
+				}
+			} else if p["default"] != tc.wantDefault {
+				t.Errorf("%s.default = %v, want %v", tc.field, p["default"], tc.wantDefault)
+			}
+		})
+	}
+}
+
+// TestOpenAPIDeprecated_ValueStructField_RefSiblingEmitted 验证值 struct 的 deprecated 作为 $ref 兄弟键写入，即使 OpenAPI 3.0 会忽略它。
+func TestOpenAPIDeprecated_ValueStructField_RefSiblingEmitted(t *testing.T) {
+	type oaDepValSub struct {
+		V string `json:"v"`
+	}
+	type oaDepValReq struct {
+		Sub oaDepValSub `json:"sub" deprecated:"true"`
+	}
+	r := NewRouter()
+	r.POST("/dep/valsub", func(_ context.Context, _ oaDepValReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	sub := schemas["oaDepValReq"].(map[string]any)["properties"].(map[string]any)["sub"].(map[string]any)
+	if sub["$ref"] != "#/components/schemas/oaDepValSub" {
+		t.Fatalf("sub 应为 $ref 引用，实际: %v", sub)
+	}
+	assertDeprecatedTrue(t, sub, "值类型嵌套 struct 字段 sub（$ref 兄弟键）")
+}
+
+// TestOpenAPIDeprecated_PtrStructField_AllOfWrapEffective 验证 *Struct 的 nullable/allOf 包装在外层承载 deprecated，而非顶层 $ref 兄弟键。
+func TestOpenAPIDeprecated_PtrStructField_AllOfWrapEffective(t *testing.T) {
+	type oaDepPtrSub struct {
+		V string `json:"v"`
+	}
+	type oaDepPtrReq struct {
+		Sub *oaDepPtrSub `json:"sub" deprecated:"true"`
+	}
+	r := NewRouter()
+	r.POST("/dep/ptrsub", func(_ context.Context, _ oaDepPtrReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	sub := schemas["oaDepPtrReq"].(map[string]any)["properties"].(map[string]any)["sub"].(map[string]any)
+	if sub["nullable"] != true {
+		t.Errorf("sub.nullable = %v, want true", sub["nullable"])
+	}
+	allOf, ok := sub["allOf"].([]any)
+	if !ok || len(allOf) != 1 {
+		t.Fatalf("sub.allOf 应为单元素列表，实际: %v", sub["allOf"])
+	}
+	if allOf[0].(map[string]any)["$ref"] != "#/components/schemas/oaDepPtrSub" {
+		t.Errorf("sub.allOf[0] 应引用 oaDepPtrSub，实际: %v", allOf[0])
+	}
+	if _, isRef := sub["$ref"]; isRef {
+		t.Errorf("指针嵌套 struct 字段顶层不应出现 $ref，实际: %v", sub)
+	}
+	assertDeprecatedTrue(t, sub, "指针嵌套 struct 字段 sub（allOf 包装顶层）")
+	// allOf[0] 是 $ref 副本：typeToSchema 先 decorate $ref 再包装，同一批标签在此处还写入一份副本。
+	// 该副本作为 $ref 兄弟键被 OpenAPI 3.0 渲染层忽略（与值类型嵌套 struct 的边界同源），
+	// 生效的是外层包装键。此处锁死"两份都物理写入"的现状，调整装饰策略（如递归传 emptyField）时
+	// 必须同步本用例与 docs/openapi.md 的字段级说明。
+	assertDeprecatedTrue(t, allOf[0].(map[string]any), "指针嵌套 allOf[0] 的 $ref 副本（渲染层忽略）")
+}
+
+// TestOpenAPIDeprecated_ContainerField_NodeCarriesElementDoesNot 验证容器字段保留 deprecated，而使用 emptyField 的 items/map value 不继承该标记。
+func TestOpenAPIDeprecated_ContainerField_NodeCarriesElementDoesNot(t *testing.T) {
+	type oaDepContainerReq struct {
+		Tags []string       `json:"tags" deprecated:"true"`
+		M    map[string]int `json:"m" deprecated:"true"`
+	}
+	r := NewRouter()
+	r.POST("/dep/container", func(_ context.Context, _ oaDepContainerReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	props := schemas["oaDepContainerReq"].(map[string]any)["properties"].(map[string]any)
+
+	tags := props["tags"].(map[string]any)
+	if tags["type"] != "array" {
+		t.Fatalf("tags.type = %v, want array", tags["type"])
+	}
+	assertDeprecatedTrue(t, tags, "切片容器顶层节点 tags")
+	assertNoDeprecated(t, tags["items"].(map[string]any), "tags.items 元素")
+
+	m := props["m"].(map[string]any)
+	if m["type"] != "object" {
+		t.Fatalf("m.type = %v, want object", m["type"])
+	}
+	assertDeprecatedTrue(t, m, "map 容器顶层节点 m")
+	assertNoDeprecated(t, m["additionalProperties"].(map[string]any), "m.additionalProperties 元素")
+}
+
+// TestOpenAPIDeprecated_MultiLayerContainer_DeprecatedShownDefaultSuppressed 验证仅经多层容器到达时 int/*int default 均抑制而 deprecated 保留且不传播到元素。
+func TestOpenAPIDeprecated_MultiLayerContainer_DeprecatedShownDefaultSuppressed(t *testing.T) {
+	type oaDepMultiInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	type oaDepMultiReq struct {
+		Deep map[string][]oaDepMultiInner `json:"deep" deprecated:"true"`
+	}
+	r := NewRouter()
+	r.POST("/dep/multi", func(_ context.Context, _ oaDepMultiReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	deep := schemas["oaDepMultiReq"].(map[string]any)["properties"].(map[string]any)["deep"].(map[string]any)
+	assertDeprecatedTrue(t, deep, "多层容器字段 deep")
+	values := deep["additionalProperties"].(map[string]any)
+	assertNoDeprecated(t, values, "deep.additionalProperties")
+	items := values["items"].(map[string]any)
+	assertNoDeprecated(t, items, "deep.additionalProperties.items")
+	inner := oaDepResolveRef(t, schemas, items, "oaDepMultiInner")
+	props := inner["properties"].(map[string]any)
+	assertDeprecatedTrue(t, props["old"].(map[string]any), "多层容器内 Inner.old")
+	for _, name := range []string{"cnt", "ptrCnt"} {
+		field := props[name].(map[string]any)
+		if _, has := field["default"]; has {
+			t.Errorf("多层容器内 Inner.%s 的 default 应被抑制，实际: %v", name, field["default"])
+		}
+	}
+}
+
+// TestOpenAPIDeprecated_SelfReferentialType_DepthGuardKeepsOuter 验证自引用切片深度截断保留外层 deprecated 且不传播到元素。
+func TestOpenAPIDeprecated_SelfReferentialType_DepthGuardKeepsOuter(t *testing.T) {
+	type oaDepSelfRef []oaDepSelfRef
+	type oaDepSelfRefReq struct {
+		Field oaDepSelfRef `json:"field" deprecated:"true"`
+	}
+	r := NewRouter()
+	r.POST("/dep/selfref", func(_ context.Context, _ oaDepSelfRefReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1.0.0"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	field := schemas["oaDepSelfRefReq"].(map[string]any)["properties"].(map[string]any)["field"].(map[string]any)
+	if field["type"] != "array" {
+		t.Fatalf("field.type = %v, want array", field["type"])
+	}
+	assertDeprecatedTrue(t, field, "自引用类型字段最外层 array 节点")
+
+	// 沿 items 下钻直至被深度守卫截断为空 {}，中间节点均不应携带 deprecated。
+	// typeToSchema 在 depth > maxPtrDerefDepth 时返回空 schema：字段自身 depth=0，
+	// 前 maxPtrDerefDepth 层 items 仍为 array，第 maxPtrDerefDepth+1 层为空 {}。
+	cur := field
+	depth := 0
+	for {
+		items, ok := cur["items"].(map[string]any)
+		if !ok {
+			t.Fatalf("第 %d 层缺少 items，实际: %v", depth, cur)
+		}
+		depth++
+		if len(items) == 0 {
+			break
+		}
+		assertNoDeprecated(t, items, fmt.Sprintf("第 %d 层 items 元素", depth))
+		cur = items
+		if depth > maxPtrDerefDepth+2 {
+			t.Fatalf("递归超过 maxPtrDerefDepth 仍未截断为空 schema")
+		}
+	}
+	if depth != maxPtrDerefDepth+1 {
+		t.Errorf("空 schema 出现层级 = %d, want %d（maxPtrDerefDepth+1）", depth, maxPtrDerefDepth+1)
+	}
+}
+
+// oaDepReflectHandler 为动态请求类型构造不引用内部类型的独立响应 handler。
+func oaDepReflectHandler(t *testing.T, reqType reflect.Type) any {
+	t.Helper()
+	resType := reflect.TypeFor[oaDepOpRes]()
+	errType := reflect.TypeFor[error]()
+	fnType := reflect.FuncOf([]reflect.Type{reflect.TypeFor[context.Context](), reqType}, []reflect.Type{resType, errType}, false)
+	return reflect.MakeFunc(fnType, func(_ []reflect.Value) []reflect.Value {
+		return []reflect.Value{reflect.Zero(resType), reflect.Zero(errType)}
+	}).Interface()
+}
+
+// TestOpenAPIDeprecated_IgnoredPathParams 验证 GET/POST 的 ignore:true 路径字段不输出参数或属性但保留路径模板。
+func TestOpenAPIDeprecated_IgnoredPathParams(t *testing.T) {
+	type oaDepIgnoredPathReq struct {
+		Hidden string `json:"hidden" ignore:"true" deprecated:"true"`
+		ID     string `json:"id" deprecated:"true"`
+		Q      string `json:"q"`
+	}
+	cases := []struct {
+		method   string
+		register func(*Router, string, any)
+	}{
+		{http.MethodGet, (*Router).GET},
+		{http.MethodPost, (*Router).POST},
+	}
+	for _, tc := range cases {
+		for _, visiblePath := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/visible_path_%t", tc.method, visiblePath), func(t *testing.T) {
+				r := NewRouter()
+				path := "/dep/ignored/{hidden}"
+				if visiblePath {
+					path += "/{id}"
+				}
+				tc.register(r, path, func(_ context.Context, _ oaDepIgnoredPathReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+				doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
+				paths := doc["paths"].(map[string]any)
+				item, ok := paths[path].(map[string]any)
+				if !ok || len(paths) != 1 {
+					t.Fatalf("路径模板 %q 必须保留，实际: %v", path, paths)
+				}
+				op := item[strings.ToLower(tc.method)].(map[string]any)
+				params, _ := op["parameters"].([]any)
+				for _, p := range params {
+					if p.(map[string]any)["name"] == "hidden" {
+						t.Errorf("ignored 路径参数不应输出，实际: %v", p)
+					}
+				}
+				wantParams := 0
+				if tc.method == http.MethodGet {
+					wantParams = 2
+					if q := findParam(t, params, "q"); q["in"] != "query" {
+						t.Errorf("q.in = %v, want query", q["in"])
+					}
+				} else {
+					if visiblePath {
+						wantParams = 1
+					}
+					schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+					ref := op["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+					props := oaDepResolveRef(t, schemas, ref, "oaDepIgnoredPathReq")["properties"].(map[string]any)
+					if _, exists := props["hidden"]; exists || len(props) != 2 {
+						t.Errorf("body 应仅保留 id/q，实际: %v", props)
+					}
+				}
+				if len(params) != wantParams {
+					t.Errorf("parameters 数量 = %d, want %d; 实际: %v", len(params), wantParams, params)
+				}
+				if wantParams == 0 {
+					if _, exists := op["parameters"]; exists {
+						t.Errorf("无可展示参数时应省略 parameters，实际: %v", op["parameters"])
+					}
+				}
+				if visiblePath || tc.method == http.MethodGet {
+					id := findParam(t, params, "id")
+					wantIn := "query"
+					if visiblePath {
+						wantIn = "path"
+					}
+					if id["in"] != wantIn {
+						t.Errorf("id.in = %v, want %s", id["in"], wantIn)
+					}
+					assertDeprecatedTrue(t, id, "可见参数 id")
+				}
+			})
+		}
+	}
+}
+
+// TestOpenAPIDeprecated_AllMethodsPathParams 验证九种方法先输出 path，GET/DELETE/HEAD 保留 query，其余保留完整 body。
+func TestOpenAPIDeprecated_AllMethodsPathParams(t *testing.T) {
+	type oaDepMethodsReq struct {
+		Q  string `json:"q" nonzero:"true" description:"search text" example:"legacy" deprecated:"true"`
+		ID string `json:"id" description:"resource id" example:"42" deprecated:"true"`
+	}
+	cases := []struct {
+		method   string
+		register func(*Router, string, any)
+		query    bool
+	}{
+		{http.MethodGet, (*Router).GET, true},
+		{http.MethodDelete, (*Router).DELETE, true},
+		{http.MethodHead, (*Router).HEAD, true},
+		{http.MethodPost, (*Router).POST, false},
+		{http.MethodPut, (*Router).PUT, false},
+		{http.MethodPatch, (*Router).PATCH, false},
+		{http.MethodOptions, (*Router).OPTIONS, false},
+		{http.MethodConnect, (*Router).CONNECT, false},
+		{http.MethodTrace, (*Router).TRACE, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			r := NewRouter()
+			path := "/dep/methods/{id}"
+			tc.register(r, path, func(_ context.Context, _ oaDepMethodsReq) (oaDepOpRes, error) { return oaDepOpRes{}, nil })
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
+			op := doc["paths"].(map[string]any)[path].(map[string]any)[strings.ToLower(tc.method)].(map[string]any)
+			params, _ := op["parameters"].([]any)
+			idSchema := map[string]any{"type": "string", "description": "resource id", "example": "42", "deprecated": true}
+			qSchema := map[string]any{"type": "string", "description": "search text", "example": "legacy", "deprecated": true}
+			wantParams := []any{map[string]any{"name": "id", "in": "path", "required": true, "schema": idSchema, "deprecated": true}}
+			if tc.query {
+				wantParams = append(wantParams, map[string]any{"name": "q", "in": "query", "required": true, "schema": qSchema, "deprecated": true})
+			}
+			if !reflect.DeepEqual(params, wantParams) {
+				t.Errorf("parameters 应先 path 后 query 且无重复:\ngot  %#v\nwant %#v", params, wantParams)
+			}
+			if tc.query {
+				if _, exists := op["requestBody"]; exists {
+					t.Errorf("%s 不应生成 requestBody，实际: %v", tc.method, op["requestBody"])
+				}
+				return
+			}
+			wantBody := map[string]any{"required": true, "content": map[string]any{
+				"application/json": map[string]any{"schema": map[string]any{"$ref": "#/components/schemas/oaDepMethodsReq"}},
+			}}
+			if !reflect.DeepEqual(op["requestBody"], wantBody) {
+				t.Fatalf("%s requestBody = %#v, want %#v", tc.method, op["requestBody"], wantBody)
+			}
+			schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+			wantSchema := map[string]any{"type": "object", "properties": map[string]any{"id": idSchema, "q": qSchema}, "required": []any{"q"}}
+			if !reflect.DeepEqual(schemas["oaDepMethodsReq"], wantSchema) {
+				t.Errorf("新增 path 参数不得删改 body 字段:\ngot  %#v\nwant %#v", schemas["oaDepMethodsReq"], wantSchema)
+			}
+		})
+	}
+}
+
+// TestOpenAPIDeprecated_MultipartDecoration 验证文件及文件切片保留描述/示例，true 标记仅在字段上且 false/未设置省略。
+func TestOpenAPIDeprecated_MultipartDecoration(t *testing.T) {
+	cases := []struct {
+		name string
+		tag  string
+		want bool
+	}{
+		{"true", ` deprecated:"true"`, true},
+		{"false", ` deprecated:"false"`, false},
+		{"unset", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqType := reflect.StructOf([]reflect.StructField{
+				{Name: "File", Type: reflect.TypeFor[*multipart.FileHeader](), Tag: reflect.StructTag(`json:"file" description:"legacy upload" example:"legacy.txt"` + tc.tag)},
+				{Name: "Files", Type: reflect.TypeFor[[]*multipart.FileHeader](), Tag: reflect.StructTag(`json:"files" description:"legacy uploads" example:"legacy.txt"` + tc.tag)},
+			})
+			r := NewRouter()
+			r.POST("/dep/files", oaDepReflectHandler(t, reqType))
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
+			op := doc["paths"].(map[string]any)["/dep/files"].(map[string]any)["post"].(map[string]any)
+			content := op["requestBody"].(map[string]any)["content"].(map[string]any)
+			if len(content) != 1 {
+				t.Fatalf("文件请求仅应使用 multipart/form-data，实际: %v", content)
+			}
+			ref := content["multipart/form-data"].(map[string]any)["schema"].(map[string]any)
+			schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+			props := oaDepResolveRef(t, schemas, ref, "AnonymousStruct")["properties"].(map[string]any)
+			for _, name := range []string{"file", "files"} {
+				field := props[name].(map[string]any)
+				if tc.want {
+					assertDeprecatedTrue(t, field, name)
+				} else {
+					assertNoDeprecated(t, field, name)
+				}
+				want := map[string]any{"type": "string", "format": "binary", "description": "legacy upload", "example": "legacy.txt"}
+				if name == "files" {
+					want = map[string]any{"type": "array", "description": "legacy uploads", "example": []any{"legacy.txt"},
+						"items": map[string]any{"type": "string", "format": "binary"}}
+					assertNoDeprecated(t, field["items"].(map[string]any), "files.items")
+				}
+				if tc.want {
+					want["deprecated"] = true
+				}
+				if !reflect.DeepEqual(field, want) {
+					t.Errorf("%s schema = %#v, want %#v", name, field, want)
+				}
+			}
+		})
+	}
+}
+
+// oaDepAssertContainerDefaults 独立生成文档，沿容器引用校验 default 可达性与 deprecated 不向元素传播。
+func oaDepAssertContainerDefaults(t *testing.T, inner reflect.Type, fields []reflect.StructField, wantPtrDefault bool) {
+	t.Helper()
+	reqType := reflect.StructOf(fields)
+	r := NewRouter()
+	r.POST("/dep/defaults", oaDepReflectHandler(t, reqType))
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
+	op := doc["paths"].(map[string]any)["/dep/defaults"].(map[string]any)["post"].(map[string]any)
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	ref := op["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+	props := oaDepResolveRef(t, schemas, ref, "AnonymousStruct")["properties"].(map[string]any)
+	for _, f := range fields {
+		name := f.Tag.Get("json")
+		node := props[name].(map[string]any)
+		assertDeprecatedTrue(t, node, name+" 容器字段")
+		ft := f.Type
+		if ft.Kind() == reflect.Ptr {
+			if node["nullable"] != true {
+				t.Errorf("%s.nullable = %v, want true", name, node["nullable"])
+			}
+			ft = ft.Elem()
+		}
+		for ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array || ft.Kind() == reflect.Map {
+			key, wantType := "items", "array"
+			if ft.Kind() == reflect.Map {
+				key, wantType = "additionalProperties", "object"
+			}
+			if node["type"] != wantType {
+				t.Fatalf("%s.type = %v, want %s", name, node["type"], wantType)
+			}
+			name += "." + key
+			node = node[key].(map[string]any)
+			assertNoDeprecated(t, node, name+" 元素")
+			ft = ft.Elem()
+		}
+		obj := oaDepResolveRef(t, schemas, node, inner.Name())
+		innerProps := obj["properties"].(map[string]any)
+		assertDeprecatedTrue(t, innerProps["old"].(map[string]any), inner.Name()+".old")
+		for _, fieldName := range []string{"cnt", "ptrCnt"} {
+			field := innerProps[fieldName].(map[string]any)
+			if field["type"] != "integer" || field["format"] != "int64" {
+				t.Errorf("%s.%s 应为 integer/int64，实际: %v", inner.Name(), fieldName, field)
+			}
+			if fieldName == "ptrCnt" && field["nullable"] != true {
+				t.Errorf("%s.ptrCnt 应保留 nullable:true，实际: %v", inner.Name(), field)
+			}
+			if fieldName == "ptrCnt" && wantPtrDefault {
+				if field["default"] != int64(1) {
+					t.Errorf("%s.ptrCnt.default = %v, want int64(1)", inner.Name(), field["default"])
+				}
+			} else if _, exists := field["default"]; exists {
+				t.Errorf("%s.%s 不应展示 default，实际: %v", inner.Name(), fieldName, field)
+			}
+		}
+	}
+}
+
+// TestOpenAPIDeprecated_PointerContainerDefaults 验证字段外包单层指针的 slice/array/map 内 *int default 展示而 int default 不展示。
+func TestOpenAPIDeprecated_PointerContainerDefaults(t *testing.T) {
+	type oaDepPtrSliceInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	type oaDepPtrArrayInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	type oaDepPtrMapInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	cases := []struct {
+		name      string
+		inner     reflect.Type
+		container reflect.Type
+	}{
+		{"pointer_slice", reflect.TypeFor[oaDepPtrSliceInner](), reflect.TypeFor[*[]oaDepPtrSliceInner]()},
+		{"pointer_array", reflect.TypeFor[oaDepPtrArrayInner](), reflect.TypeFor[*[2]oaDepPtrArrayInner]()},
+		{"pointer_map", reflect.TypeFor[oaDepPtrMapInner](), reflect.TypeFor[*map[string]oaDepPtrMapInner]()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			oaDepAssertContainerDefaults(t, tc.inner, []reflect.StructField{
+				{Name: "Items", Type: tc.container, Tag: `json:"items" deprecated:"true"`},
+			}, true)
+		})
+	}
+}
+
+// TestOpenAPIDeprecated_ContainerDefaultsReachability 对照单层/多层及同类型两者并存，仅可达的 *int 展示 default 且 deprecated 始终保留。
+func TestOpenAPIDeprecated_ContainerDefaultsReachability(t *testing.T) {
+	type oaDepSingleSliceInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	type oaDepSingleArrayInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	type oaDepSingleMapInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	type oaDepOnlyDeepInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	type oaDepMixedDepthInner struct {
+		Old    string `json:"old" deprecated:"true"`
+		Cnt    int    `json:"cnt" default:"1"`
+		PtrCnt *int   `json:"ptrCnt" default:"1"`
+	}
+	cases := []struct {
+		name           string
+		inner          reflect.Type
+		container      reflect.Type
+		mixed          bool
+		wantPtrDefault bool
+	}{
+		{"single_slice", reflect.TypeFor[oaDepSingleSliceInner](), reflect.TypeFor[[]oaDepSingleSliceInner](), false, true},
+		{"single_array", reflect.TypeFor[oaDepSingleArrayInner](), reflect.TypeFor[[2]oaDepSingleArrayInner](), false, true},
+		{"single_map", reflect.TypeFor[oaDepSingleMapInner](), reflect.TypeFor[map[string]oaDepSingleMapInner](), false, true},
+		{"multi_only", reflect.TypeFor[oaDepOnlyDeepInner](), reflect.TypeFor[map[string][]oaDepOnlyDeepInner](), false, false},
+		{"multi_and_single", reflect.TypeFor[oaDepMixedDepthInner](), reflect.TypeFor[map[string][]oaDepMixedDepthInner](), true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fields := []reflect.StructField{{Name: "Items", Type: tc.container, Tag: `json:"items" deprecated:"true"`}}
+			if tc.mixed {
+				// 先注册多层字段再注册单层字段，防止 schema 首次注册顺序掩盖可达性并集。
+				fields = append(fields, reflect.StructField{Name: "Flat", Type: reflect.SliceOf(tc.inner), Tag: `json:"flat" deprecated:"true"`})
+			}
+			oaDepAssertContainerDefaults(t, tc.inner, fields, tc.wantPtrDefault)
+		})
+	}
+}
+
+// TestOpenAPIDeprecated_ParseBoolInputs 验证 ParseBool 全部合法拼写及空/非法/空白输入在 operation、字段、query/path 上一致。
+func TestOpenAPIDeprecated_ParseBoolInputs(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"true", "true", true},
+		{"one", "1", true},
+		{"lower_t", "t", true},
+		{"upper_T", "T", true},
+		{"upper_TRUE", "TRUE", true},
+		{"title_True", "True", true},
+		{"false", "false", false},
+		{"zero", "0", false},
+		{"lower_f", "f", false},
+		{"upper_F", "F", false},
+		{"upper_FALSE", "FALSE", false},
+		{"title_False", "False", false},
+		{"empty", "", false},
+		{"invalid_word", "yes", false},
+		{"invalid_number", "2", false},
+		{"invalid_case", "tRuE", false},
+		{"space", " ", false},
+		{"tab_newline", "\t\n", false},
+		{"leading_space", " true", false},
+		{"trailing_space", "true ", false},
+		{"padded_false", " false ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tag := fmt.Sprintf("deprecated:%q", tc.input)
+			reqType := reflect.StructOf([]reflect.StructField{
+				{Name: "OpenAPIMeta", Type: reflect.TypeFor[OpenAPIMeta](), Anonymous: true, Tag: reflect.StructTag(tag)},
+				{Name: "ID", Type: reflect.TypeFor[string](), Tag: reflect.StructTag(`json:"id" ` + tag)},
+				{Name: "Q", Type: reflect.TypeFor[string](), Tag: reflect.StructTag(`json:"q" ` + tag)},
+			})
+			r := NewRouter()
+			r.GET("/dep/bool/{id}", oaDepReflectHandler(t, reqType))
+			r.POST("/dep/bool/{id}", oaDepReflectHandler(t, reqType))
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
+			item := doc["paths"].(map[string]any)["/dep/bool/{id}"].(map[string]any)
+			schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+			type target struct {
+				name string
+				node map[string]any
+			}
+			var nodes []target
+			for _, method := range []string{"get", "post"} {
+				op := item[method].(map[string]any)
+				nodes = append(nodes, target{method + " operation", op})
+				params := op["parameters"].([]any)
+				wantParams := 1
+				if method == "get" {
+					wantParams = 2
+				}
+				if len(params) != wantParams {
+					t.Fatalf("%s parameters 数量 = %d, want %d", method, len(params), wantParams)
+				}
+				for _, name := range []string{"id", "q"} {
+					if name == "q" && method == "post" {
+						continue
+					}
+					pm := findParam(t, params, name)
+					wantIn := "path"
+					if name == "q" {
+						wantIn = "query"
+					}
+					if pm["in"] != wantIn {
+						t.Errorf("%s %s.in = %v, want %s", method, name, pm["in"], wantIn)
+					}
+					nodes = append(nodes, target{method + " " + wantIn, pm}, target{method + " " + wantIn + " schema", pm["schema"].(map[string]any)})
+				}
+			}
+			post := item["post"].(map[string]any)
+			ref := post["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+			props := oaDepResolveRef(t, schemas, ref, "AnonymousStruct")["properties"].(map[string]any)
+			for _, name := range []string{"id", "q"} {
+				nodes = append(nodes, target{"body " + name, props[name].(map[string]any)})
+			}
+			for _, n := range nodes {
+				if tc.want {
+					assertDeprecatedTrue(t, n.node, n.name)
+				} else {
+					assertNoDeprecated(t, n.node, n.name)
+				}
+			}
+		})
+	}
+}
+
+// TestOpenAPIDeprecated_OperationFieldIndependence 验证操作与字段标记互不传播，描述保留且标签中的 \x60 还原为 Markdown 反引号。
+func TestOpenAPIDeprecated_OperationFieldIndependence(t *testing.T) {
+	type oaDepOperationOnlyReq struct {
+		OpenAPIMeta `summary:"legacy API" description:"旧接口，请使用 /v2。" deprecated:"true"`
+		Old         string `json:"old" description:"弃用，请改用 \x60new_field\x60。"`
+	}
+	type oaDepFieldOnlyReq struct {
+		OpenAPIMeta `summary:"legacy API" description:"旧接口，请使用 /v2。"`
+		Old         string `json:"old" description:"弃用，请改用 \x60new_field\x60。" deprecated:"true"`
+	}
+	type oaDepBothReq struct {
+		OpenAPIMeta `summary:"legacy API" description:"旧接口，请使用 /v2。" deprecated:"true"`
+		Old         string `json:"old" description:"弃用，请改用 \x60new_field\x60。" deprecated:"true"`
+	}
+	type oaDepNeitherReq struct {
+		OpenAPIMeta `summary:"legacy API" description:"旧接口，请使用 /v2。" deprecated:"false"`
+		Old         string `json:"old" description:"弃用，请改用 \x60new_field\x60。" deprecated:"false"`
+	}
+	cases := []struct {
+		name          string
+		reqType       reflect.Type
+		wantOperation bool
+		wantField     bool
+	}{
+		{"operation_only", reflect.TypeFor[oaDepOperationOnlyReq](), true, false},
+		{"field_only", reflect.TypeFor[oaDepFieldOnlyReq](), false, true},
+		{"both", reflect.TypeFor[oaDepBothReq](), true, true},
+		{"neither", reflect.TypeFor[oaDepNeitherReq](), false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const wantDescription = "弃用，请改用 `new_field`。"
+			field, ok := tc.reqType.FieldByName("Old")
+			if !ok || field.Tag.Get("description") != wantDescription {
+				t.Fatalf("StructTag.Get 应还原反引号，实际: %q", field.Tag.Get("description"))
+			}
+			r := NewRouter()
+			r.POST("/dep/independent", oaDepReflectHandler(t, tc.reqType))
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
+			op := doc["paths"].(map[string]any)["/dep/independent"].(map[string]any)["post"].(map[string]any)
+			if tc.wantOperation {
+				assertDeprecatedTrue(t, op, "operation")
+			} else {
+				assertNoDeprecated(t, op, "operation")
+			}
+			if op["description"] != "旧接口，请使用 /v2。" || op["summary"] != "legacy API" {
+				t.Errorf("操作描述与 summary 必须原样保留，实际: %v", op)
+			}
+			schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+			ref := op["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+			obj := oaDepResolveRef(t, schemas, ref, tc.reqType.Name())
+			assertNoDeprecated(t, obj, "请求对象 schema")
+			old := obj["properties"].(map[string]any)["old"].(map[string]any)
+			if tc.wantField {
+				assertDeprecatedTrue(t, old, "字段 old")
+			} else {
+				assertNoDeprecated(t, old, "字段 old")
+			}
+			if old["description"] != wantDescription {
+				t.Errorf("字段 description = %q, want %q", old["description"], wantDescription)
+			}
+		})
+	}
+}
+
+// TestOpenAPIDeprecated_RuntimeUnchanged 验证生成文档后标签开关不改变绑定、默认值、显式零值、校验失败或路由结果。
+func TestOpenAPIDeprecated_RuntimeUnchanged(t *testing.T) {
+	type result struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Count   int    `json:"count"`
+		Enabled bool   `json:"enabled"`
+	}
+	cases := []struct {
+		name   string
+		body   string
+		query  string
+		path   string
+		status int
+		want   result
+	}{
+		{"defaults", `{"name":"legacy"}`, "?name=legacy", "/dep/runtime/42", http.StatusOK, result{"42", "legacy", 7, true}},
+		{"explicit_zero", `{"name":"legacy","count":0,"enabled":false}`, "?name=legacy&count=0&enabled=false", "/dep/runtime/42", http.StatusOK, result{"42", "legacy", 0, false}},
+		{"missing_nonzero", `{}`, "", "/dep/runtime/42", http.StatusBadRequest, result{}},
+		{"not_found", `{"name":"legacy"}`, "?name=legacy", "/dep/missing/42", http.StatusNotFound, result{}},
+	}
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		for _, tc := range cases {
+			t.Run(method+"/"+tc.name, func(t *testing.T) {
+				var baseline string
+				for _, deprecated := range []bool{false, true} {
+					tag := ""
+					if deprecated {
+						tag = ` deprecated:"true"`
+					}
+					reqType := reflect.StructOf([]reflect.StructField{
+						{Name: "OpenAPIMeta", Type: reflect.TypeFor[OpenAPIMeta](), Anonymous: true, Tag: reflect.StructTag(tag)},
+						{Name: "ID", Type: reflect.TypeFor[string](), Tag: reflect.StructTag(`json:"id" ignore:"true"` + tag)},
+						{Name: "Name", Type: reflect.TypeFor[string](), Tag: reflect.StructTag(`json:"name" nonzero:"true"` + tag)},
+						{Name: "Count", Type: reflect.TypeFor[int](), Tag: reflect.StructTag(`json:"count" default:"7"` + tag)},
+						{Name: "Enabled", Type: reflect.TypeFor[*bool](), Tag: reflect.StructTag(`json:"enabled" default:"true"` + tag)},
+					})
+					calls := 0
+					fnType := reflect.FuncOf([]reflect.Type{reflect.TypeFor[context.Context](), reqType}, []reflect.Type{reflect.TypeFor[result](), reflect.TypeFor[error]()}, false)
+					handler := reflect.MakeFunc(fnType, func(args []reflect.Value) []reflect.Value {
+						calls++
+						req := args[1]
+						res := result{
+							ID:      req.FieldByName("ID").String(),
+							Name:    req.FieldByName("Name").String(),
+							Count:   int(req.FieldByName("Count").Int()),
+							Enabled: req.FieldByName("Enabled").Elem().Bool(),
+						}
+						return []reflect.Value{reflect.ValueOf(res), reflect.Zero(reflect.TypeFor[error]())}
+					}).Interface()
+					r := NewRouter()
+					r.register(method, "/dep/runtime/{id}", handler, nil)
+					GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
+					target, body := tc.path, tc.body
+					if method == http.MethodGet {
+						target += tc.query
+						body = ""
+					}
+					rec := serveRequest(t, r, method, target, body)
+					if rec.Code != tc.status {
+						t.Fatalf("deprecated=%t: status=%d, want %d; body=%s", deprecated, rec.Code, tc.status, rec.Body.String())
+					}
+					wantCalls := 0
+					if tc.status == http.StatusOK {
+						wantCalls = 1
+						var response struct {
+							Data result `json:"data"`
+						}
+						if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+							t.Fatalf("响应 JSON 解码失败: %v", err)
+						}
+						if response.Data != tc.want {
+							t.Errorf("deprecated=%t: data=%+v, want %+v", deprecated, response.Data, tc.want)
+						}
+					}
+					if calls != wantCalls {
+						t.Errorf("deprecated=%t: handler calls=%d, want %d", deprecated, calls, wantCalls)
+					}
+					if !deprecated {
+						baseline = rec.Body.String()
+					} else if rec.Body.String() != baseline {
+						t.Errorf("标签不应改变响应: got %s, want %s", rec.Body.String(), baseline)
+					}
+				}
+			})
+		}
+	}
+}
