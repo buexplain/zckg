@@ -10,6 +10,53 @@ import (
 	"time"
 )
 
+// TestMySQLInteg_SQLCommentLockedCursors 验证 MySQL 带锁流式/分批游标保留注释并绕过从库路由，每批只有一个注释。
+// DSN: root:root@tcp(127.0.0.1:3306)/zckg_test_integ?charset=utf8mb4&parseTime=true&loc=Local；不可达 Skip。
+// docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+func TestMySQLInteg_SQLCommentLockedCursors(t *testing.T) {
+	log := &commentSQLLog{}
+	dao := openMySQLCommentDAO(t, integrationSQLComment, log.collect)
+	setupCommentTable(t, dao, "comment_mysql_cursor_lock")
+	mustExec(t, dao, "INSERT INTO comment_mysql_cursor_lock (id, name, num) VALUES (1, 'one', 10), (2, 'two', 20)")
+	log.calls = nil
+	strategy := &RoundRobinStrategy{}
+	dao.pool.slaveStrategy = strategy
+	b := dao.Builder().Table("comment_mysql_cursor_lock").Where("num", ">", 0).OrderBy("id").LockForUpdate()
+	var row crossDialectItemRow
+	wantRows := []crossDialectItemRow{{1, "one", 10}, {2, "two", 20}}
+	count := 0
+	for err := range b.Cursor(context.Background(), &row) {
+		if err != nil {
+			t.Fatalf("locked Cursor: %v", err)
+		}
+		count++
+		if count > len(wantRows) || row != wantRows[count-1] {
+			t.Fatalf("Cursor row=%#v", row)
+		}
+	}
+	if count != 2 || strategy.counter.Load() != 0 {
+		t.Fatalf("Cursor count=%d replica picks=%d", count, strategy.counter.Load())
+	}
+	log.check(t, commentSQLCall{sql: "SELECT * FROM `comment_mysql_cursor_lock` WHERE `num` > ? ORDER BY `id` ASC FOR UPDATE /* app:comment */", args: []any{0}})
+	count = 0
+	for err := range b.CursorBy(context.Background(), &row, 1, "id") {
+		if err != nil {
+			t.Fatalf("locked CursorBy: %v", err)
+		}
+		count++
+		if count > len(wantRows) || row != wantRows[count-1] {
+			t.Fatalf("CursorBy row=%#v", row)
+		}
+	}
+	if count != 2 || strategy.counter.Load() != 0 {
+		t.Fatalf("CursorBy count=%d replica picks=%d", count, strategy.counter.Load())
+	}
+	log.check(t,
+		commentSQLCall{sql: "SELECT * FROM `comment_mysql_cursor_lock` WHERE `num` > ? ORDER BY `id` ASC LIMIT 2 FOR UPDATE /* app:comment */", args: []any{0}},
+		commentSQLCall{sql: "SELECT * FROM `comment_mysql_cursor_lock` WHERE `num` > ? AND `id` > ? ORDER BY `id` ASC LIMIT 2 FOR UPDATE /* app:comment */", args: []any{0, int64(1)}},
+	)
+}
+
 // TestMySQLInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行读取所有数据。
 func TestMySQLInteg_Cursor_Stream(t *testing.T) {
 	db := openMySQLTestDB(t)
@@ -279,7 +326,7 @@ func TestMySQLInteg_CursorBy_ExactPageBoundary(t *testing.T) {
 	}
 	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		atomic.AddInt32(&sqlCount, 1)
-	}, "")
+	}, "", "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}

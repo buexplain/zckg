@@ -9,6 +9,13 @@ import (
 	"testing"
 )
 
+// TestCrossDialect_MySQL_SQLComment 注册 C07–C10 共享执行不变量。
+// DSN: root:root@tcp(127.0.0.1:3306)/zckg_test_integ?charset=utf8mb4&parseTime=true&loc=Local；不可达 Skip。
+// docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+func TestCrossDialect_MySQL_SQLComment(t *testing.T) {
+	runCrossDialectSQLComment(t, openMySQLCommentDAO)
+}
+
 func TestCrossDialect_MySQL_Integration(t *testing.T) {
 	subtests := []struct {
 		name string

@@ -2,7 +2,9 @@
 
 本文介绍 Builder 的终端查询方法：`Find/First/Value`、`Count/Exists`、聚合、`Pluck`、`Paginate`、游标迭代（`Cursor/CursorBy`）以及原始 Rows 扫描工具（`ScanStruct/ScanStructClose`）。
 
-所有读操作默认路由到从库（见[连接文档](connection.md)）；带锁查询（`LockForUpdate`/`SharedLock`）与 `Primary()` 标记强制走主库——前者因锁在从库不生效，后者用于写后读场景（从库可能因复制延迟无数据）。以下示例统一给出 MySQL 形态 SQL。
+所有读操作默认路由到从库（见[连接文档](connection.md)）；带锁查询（`LockForUpdate`/`SharedLock`）与 `Primary()` 标记强制走主库——前者因锁在从库不生效，后者用于写后读场景（从库可能因复制延迟无数据）。以下示例统一给出 MySQL 形态 SQL，保持 DAO 第五参数为 `""` 的无注释基线。
+
+设置默认注释或 `Builder.Comment` 后，查询终端方法使用最终编译的带注释 SQL，不再次追加；First/Value/Pluck 等内部派生查询保留当前注释，包括显式清空。慢 SQL 回调收到实际执行的 SQL 和原绑定参数。DAO 原始 `Exec` / `Query` / `QueryPrimary` 原文透传（也不剥离手写注释），Schema 查询不自动追加。仅用短业务标识，不透传外部输入或秘密。
 
 ## Find / First / Value
 
@@ -133,7 +135,8 @@ total, err := db.Builder().Table("users").
 内部行为：
 
 - 复用 `Count`（内部走 `ToCount`）统计总数：`ToCount` 临时清除 limit/offset/orders/columns 并 `defer` 恢复，`Paginate` 直接复用原 Builder，原 Builder 状态不受影响；
-- `totalCount == 0` 时不再执行数据查询，直接返回；
+- 设置 DAO 默认注释或 `Builder.Comment` 后，COUNT 与数据 SQL 各在最终编译出口追加一次，不是整个 `Paginate` 调用只追加一次；执行层不再次追加，慢 SQL 回调收到各自实际执行的完整 SQL 和原绑定参数；
+- `totalCount == 0` 时不再执行数据查询，直接返回；若配置了注释与回调，此时仅观测到带注释的 COUNT SQL；
 - 分页范围需预先通过 `ForPage` 或 `Limit+Offset` 设置。
 
 ## Cursor（流式迭代）
@@ -172,6 +175,7 @@ for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
 参数与规则：
 
 - `cursorColumn` 必须是**有序且唯一**的列（通常为主键），结构体必须包含该列对应的字段；
+- 内部 Clone 保留当前 Builder 的注释（包括显式清空），每批实际发出的 SQL 各追加一次，并由慢 SQL 回调分别观测；`Cursor` 则是单条 SQL 追加一次，不是逐行追加。原 Builder 与 DAO 默认值均不被修改；
 - `chunkSize` 为 0 时直接返回（不执行任何查询），小于 0 时使用默认值 100；
 - 每批实际取 `chunkSize + 1` 条（SQL 中为 `LIMIT chunkSize+1`），多取的一条用于探测是否还有下一页：探测行不产出给调用方，下一批从本批最后一行的游标值继续取回该行，不丢数据；这避免了数据量恰为 chunkSize 整数倍时多执行一次返回 0 行的空查询；
 - **忽略**已设置的 ORDER BY，强制按游标列排序；

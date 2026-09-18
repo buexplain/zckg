@@ -10,6 +10,42 @@ import (
 	"time"
 )
 
+// TestMySQLInteg_SQLCommentInsertGetIDAndTruncate 验证自增 ID、TRUNCATE 的最终注释以及序列重置。
+// DSN: root:root@tcp(127.0.0.1:3306)/zckg_test_integ?charset=utf8mb4&parseTime=true&loc=Local；不可达 Skip。
+// docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+func TestMySQLInteg_SQLCommentInsertGetIDAndTruncate(t *testing.T) {
+	log := &commentSQLLog{}
+	dao := openMySQLCommentDAO(t, integrationSQLComment, log.collect)
+	ctx := context.Background()
+	const table = "comment_mysql_identity"
+	setupCommentTable(t, dao, table, "id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(64), num INTEGER NOT NULL DEFAULT 0")
+	log.calls = nil
+	b := dao.Builder().Table(table)
+	data := crossDialectUUpd{Name: "identity"}
+	want := commentSQLCall{sql: "INSERT INTO `comment_mysql_identity` (`name`) VALUES (?) /* app:comment */", args: []any{"identity"}}
+	for _, expectedID := range []int64{1, 2} {
+		if id, err := b.InsertGetId(ctx, data); err != nil || id != expectedID {
+			t.Fatalf("InsertGetId: id=%d want=%d err=%v", id, expectedID, err)
+		}
+		log.check(t, want)
+	}
+	assertCommentRows(t, dao, table, []crossDialectItemRow{{1, "identity", 0}, {2, "identity", 0}})
+	log.calls = nil
+	if err := b.Truncate(ctx); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	log.check(t, commentSQLCall{sql: "TRUNCATE TABLE `comment_mysql_identity` /* app:comment */"})
+	if count, err := b.Count(ctx); err != nil || count != 0 {
+		t.Fatalf("Truncate count=%d err=%v", count, err)
+	}
+	log.calls = nil
+	if id, err := b.InsertGetId(ctx, data); err != nil || id != 1 {
+		t.Fatalf("reset InsertGetId: id=%d err=%v", id, err)
+	}
+	log.check(t, want)
+	assertCommentRows(t, dao, table, []crossDialectItemRow{{1, "identity", 0}})
+}
+
 // TestMySQLInteg_InsertSingle 验证单条结构体插入：传入单个结构体，生成并执行 INSERT，确认数据正确写入。
 func TestMySQLInteg_InsertSingle(t *testing.T) {
 	db := openMySQLTestDB(t)
@@ -1522,7 +1558,7 @@ func TestMySQLInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 
 	panicDao, err := NewDBDao(db.Pool(), "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		panic("callback boom")
-	}, "")
+	}, "", "")
 	assertNoError(t, err)
 	ctx := context.Background()
 

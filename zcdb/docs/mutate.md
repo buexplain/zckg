@@ -2,7 +2,9 @@
 
 本文介绍 Builder 的写入终端方法：Insert 系列、Upsert、Update、Increment/Decrement、Delete/DeleteJoin、Truncate，以及无 WHERE 条件的破坏性操作保护机制。
 
-所有写操作固定走主库（或事务连接），返回受影响行数（`Truncate` 除外）。示例统一给出 MySQL 形态 SQL。
+所有写操作固定走主库（或事务连接），返回受影响行数（`Truncate` 除外）。示例统一给出 MySQL 形态 SQL，保持无注释基线。
+
+设置 DAO 默认注释或 `Builder.Comment` 后，写入方法执行各自 `ToXxx` 的带注释产物，不在执行层二次追加；绑定参数、结果及路由不变。注释只用于短业务标识，不是有效 WHERE/JOIN 条件，也不能替代 `Force()` 授权；DAO 原始 `Exec` 仍原文透传。覆盖、清空与 Clone 生命周期见[查询构造](query-builder.md)的 Comment 小节。
 
 ## Insert
 
@@ -203,6 +205,8 @@ err := db.Builder().Table("users").Truncate(ctx)
 ```
 
 SQLite 特殊处理：`DELETE FROM` 不会重置 AUTOINCREMENT 序列，`Truncate` 会额外清空 `sqlite_sequence` 中该表的记录使自增主键从头开始。`DELETE`、`sqlite_sequence` 存在性预查询与序列清理三步包在**同一事务**中执行（调用方 ctx 已携带事务时自动并入外层事务），避免“数据已删但序列未重置”的中间状态；表从未使用 AUTOINCREMENT 时（`sqlite_sequence` 不存在，经 `sqlite_master` 预查询确认）跳过清理；清理失败如实返回错误。
+
+设置 DAO 默认注释或 `Builder.Comment` 时，SQLite Truncate 仅 `ToTruncate` 生成的 `DELETE FROM` 主语句携带注释；`sqlite_master` 存在性预查询及 `sqlite_sequence` 清理语句**不自动追加**，即使 DAO 有默认注释也如此。慢 SQL 回调仍分别收到这些实际执行的 SQL，不能假定一次 Truncate 内的每条语句都有注释。MySQL 注释位于完整 `TRUNCATE TABLE` 后，PostgreSQL 位于 `RESTART IDENTITY` 后。
 
 ## 破坏性操作保护
 

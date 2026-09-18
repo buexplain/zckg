@@ -1,9 +1,11 @@
 package zcdb_test
 
 // 文档-代码偏离审查 D 类（示例代码可编译性）验证：
-// 将 7 份功能文档中的全部 Go 代码块按原文提取，补齐 import 与占位类型后
-// 拼成本文件，用 go build/vet 验证“照文档写的代码能编译”。
-// 各函数不实际执行（无真实数据库），仅做编译期核对。
+// 手工收录 README、compile、connection、mutate、query-builder、query-exec、schema
+// 等文档示例，以及 SQL 注释（Comment）功能的公开 API 用法，补齐 import、具体类型与变量。
+// 本文件不会自动读取 Markdown；新增/修改示例须显式同步。
+// 通过 go test ./zcdb -run '^$' 使用真实 Go 编译器检查外部包调用，不伪造 API 存根。
+// 各函数不实际执行（无真实数据库），仅做编译期核对，不验证展示的 SQL 输出。
 
 import (
 	"context"
@@ -36,8 +38,8 @@ func readmeQuickStart() {
 		panic(err)
 	}
 
-	// 2. 创建 DAO（dialect 决定 SQL 方言，最后一个参数为列映射标签名，传空串使用默认 db 标签）
-	db, err := zcdb.NewDBDao(pool, "mysql", nil, "")
+	// 2. 创建 DAO（dialect 决定 SQL 方言；第四参数为标签名，空串使用 db；第五参数为 SQL 注释，空串禁用）
+	db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
 	if err != nil {
 		panic(err)
 	}
@@ -163,13 +165,13 @@ func connectionMdExamples(ctx context.Context) error {
 		return err
 	}
 
-	db, err := zcdb.NewDBDao(pool, "mysql", nil, "")
+	db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	dbZc, err := zcdb.NewDBDao(pool, "mysql", nil, "zc")
+	dbZc, err := zcdb.NewDBDao(pool, "mysql", nil, "zc", "")
 	if err != nil {
 		return err
 	}
@@ -246,7 +248,7 @@ func connectionMdExamples(ctx context.Context) error {
 			if elapsed > 200*time.Millisecond {
 				log.Printf("slow sql (%s): %s %v", elapsed, sqlStr, args)
 			}
-		}, "")
+		}, "", "")
 	if err != nil {
 		return err
 	}
@@ -711,4 +713,125 @@ func schemaMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 func schemaMdNewInspector(db *zcdb.DBDao) {
 	inspector, err := db.Schema()
 	_, _ = inspector, err
+}
+
+// ==================== SQL 注释（Comment）公开 API 示例 ====================
+
+// sqlCommentUser 是本节注释示例共用的写入类型；仅更名避免与其他示例冲突，字段及 tag 保持原样。
+type sqlCommentUser struct {
+	Name string `db:"name"`
+}
+
+func sqlCommentDefault(pool *zcdb.Pool) error {
+	db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "app:user-service")
+	if err != nil {
+		return err
+	}
+
+	sql, args, err := db.Builder().Table("users").Where("id", "=", 1).ToSelect()
+	// SQL: SELECT * FROM `users` WHERE `id` = ? /* app:user-service */
+	// args: [1]
+	_, _ = sql, args
+	return err
+}
+
+// sqlCommentOverride 覆盖 `Comment` 的覆盖与清空两种用法（亦见 query-builder.md）。
+func sqlCommentOverride(db *zcdb.DBDao) {
+	sql, _, _ := db.Builder().Table("orders").Comment("report:daily").ToSelect()
+	// SQL: SELECT * FROM `orders` /* report:daily */
+
+	sql, _, _ = db.Builder().Table("logs").Comment("").ToSelect()
+	// SQL: SELECT * FROM `logs`
+	_ = sql
+}
+
+// sqlCommentStatements 覆盖 15 个编译入口的注释形态，包含两个 INSERT SELECT 回调。
+// db 假定已配置 DAO 默认注释；只检查真实外部 API、回调及返回值类型，不执行这些 SQL。
+func sqlCommentStatements(db *zcdb.DBDao) {
+	sql, _, _ := db.Builder().Table("users").Where("age", ">", 18).ToSelect()
+	// SQL: SELECT * FROM `users` WHERE `age` > ? /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").ToInsert(sqlCommentUser{Name: "alice"})
+	// SQL: INSERT INTO `users` (`name`) VALUES (?) /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").ToInsertOrIgnore(sqlCommentUser{Name: "alice"})
+	// SQL: INSERT IGNORE INTO `users` (`name`) VALUES (?) /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").ToUpsert(sqlCommentUser{Name: "alice"}, []string{"name"}, []string{"name"})
+	// SQL: INSERT INTO `users` (`name`) VALUES (?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`) /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("archive").ToInsertUsing([]string{"name"}, func(sub *zcdb.Builder) {
+		sub.Table("users").Select("name")
+	})
+	// SQL: INSERT INTO `archive` (`name`) SELECT `name` FROM `users` /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("archive").ToInsertOrIgnoreUsing([]string{"name"}, func(sub *zcdb.Builder) {
+		sub.Table("users").Select("name")
+	})
+	// SQL: INSERT IGNORE INTO `archive` (`name`) SELECT `name` FROM `users` /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).ToUpdate(sqlCommentUser{Name: "bob"})
+	// SQL: UPDATE `users` SET `name` = ? WHERE `id` = ? /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).ToDelete()
+	// SQL: DELETE FROM `users` WHERE `id` = ? /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").
+		Join("orders", "orders.user_id", "=", "users.id").
+		Where("orders.status", "=", "cancelled").ToDeleteJoin()
+	// SQL: DELETE `users` FROM `users` INNER JOIN `orders` ON `orders`.`user_id` = `users`.`id` WHERE `orders`.`status` = ? /* app:user-service */
+
+	sql, _ = db.Builder().Table("logs").ToTruncate()
+	// SQL: TRUNCATE TABLE `logs` /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").Where("status", "=", "active").ToCount()
+	// SQL: SELECT COUNT(*) FROM `users` WHERE `status` = ? /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).ToExists()
+	// SQL: SELECT 1 FROM `users` WHERE `id` = ? LIMIT 1 /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("orders").ToAggregate("SUM", "amount")
+	// SQL: SELECT SUM(`amount`) AS `aggregate` FROM `orders` /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).ToIncrement([]string{"wallet"}, []any{100})
+	// SQL: UPDATE `users` SET `wallet` = `wallet` + ? WHERE `id` = ? /* app:user-service */
+
+	sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).ToDecrement([]string{"wallet"}, []any{50})
+	// SQL: UPDATE `users` SET `wallet` = `wallet` - ? WHERE `id` = ? /* app:user-service */
+	_ = sql
+}
+
+// sqlCommentSubqueries 覆盖 WHERE/FROM/UNION 结构化子查询的外部调用形态。
+func sqlCommentSubqueries(db *zcdb.DBDao) {
+	sql, _, _ := db.Builder().Table("users").
+		WhereInSub("dept_id", func(q *zcdb.Builder) {
+			q.Table("depts").Select("id").Where("level", ">", 3).Comment("inner:dept")
+		}).ToSelect()
+	// SQL: SELECT * FROM `users` WHERE `dept_id` IN (SELECT `id` FROM `depts` WHERE `level` > ?) /* app:user-service */
+
+	sub := db.Builder().Table("orders").Select("user_id").Where("amount", ">", 100).Comment("inner:orders")
+	sql, _, _ = db.Builder().TableSub(sub, "o").Where("o.user_id", ">", 1).ToSelect()
+	// SQL: SELECT * FROM (SELECT `user_id` FROM `orders` WHERE `amount` > ?) AS `o` WHERE `o`.`user_id` > ? /* app:user-service */
+
+	admins := db.Builder().Table("admins").Select("name").Comment("inner:admins")
+	sql, _, _ = db.Builder().Table("users").Select("name").Union(admins).ToSelect()
+	// SQL: (SELECT `name` FROM `users`) UNION (SELECT `name` FROM `admins`) /* app:user-service */
+	_ = sql
+}
+
+// sqlCommentClone 覆盖副本覆盖、原 Builder 与清空后再次 Clone 三种注释状态。
+func sqlCommentClone(db *zcdb.DBDao) {
+	base := db.Builder().Table("users").Where("status", "active")
+	admins := base.Clone().Comment("report:admin").Where("role", "admin")
+
+	sql, _, _ := admins.ToSelect()
+	// SQL: SELECT * FROM `users` WHERE `status` = ? AND `role` = ? /* report:admin */
+
+	sql, _, _ = base.ToSelect()
+	// SQL: SELECT * FROM `users` WHERE `status` = ? /* app:user-service */
+
+	silent := base.Clone().Comment("")
+	sql, _, _ = silent.Clone().ToSelect()
+	// SQL: SELECT * FROM `users` WHERE `status` = ?
+	_ = sql
 }

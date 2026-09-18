@@ -7,9 +7,12 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 // INSERT/UPDATE 用结构体（字段为 any）
@@ -54,6 +57,243 @@ type orderItem struct {
 	UnitPrice int    // 应转为 unit_price
 }
 
+// TestNormalizeSQLComment 验证精确规范化、两条入口一致、星号/斜杠/反斜杠/控制字符替换、Unicode 截断及幂等性。
+func TestNormalizeSQLComment(t *testing.T) {
+	tests := []struct{ name, input, want string }{
+		{"empty", "", ""},
+		{"whitespace", " \t\r\n ", ""},
+		{"cleaned_empty", "*\x00\r\n", ""},
+		{"slash_only", "/", ""},
+		{"backslash_only", "\\", ""},
+		{"delimiters_only", "*//*\\", ""},
+		{"trim", " app:user-service ", "app:user-service"},
+		{"unicode_placeholders", "普通中文 trace:? $1", "普通中文 trace:? $1"},
+		{"overlapping_terminator", "**// + 41 -- ", "+ 41 --"},
+		{"nested_opener", "a /* b", "a    b"},
+		{"controls", "a\x00b\r\nc", "a b  c"},
+		{"tab_escape", "a\tb\x1bc", "a b c"},
+		{"invalid_utf8", "a\xffb", "a\ufffdb"},
+		{"truncated_utf8", "a\xe4\xb8", "a\ufffd\ufffd"},
+		{"terminator", "*/ + 41 --", "+ 41 --"},
+		{"repeated_delimiters", "a */ */ /* b", "a" + strings.Repeat(" ", 10) + "b"},
+		{"executable", "/*! + 41 */", "! + 41"},
+		{"hint", "/*+ test */", "+ test"},
+		{"leading_bang", "! + 41", "! + 41"},
+		{"leading_plus", "+ 41", "+ 41"},
+		{"quotes_placeholders", "svc:api 'name' \"value\"; ? $1", "svc:api 'name' \"value\"; ? $1"},
+		{"path_flattened", "svc:/api/v1/trace", "svc: api v1 trace"},
+		{"windows_path_flattened", "C:\\svc\\api", "C: svc api"},
+		{"escape_sequence", "a\\nb", "a nb"},
+		{"internal_spaces", "  a  b  ", "a  b"},
+		{"unicode_spaces", "\u3000a\u00a0b\u3000", "a\u00a0b"},
+		{"unicode_non_controls", "a\u2028b\u2029c\u200bd", "a\u2028b\u2029c\u200bd"},
+		{"ascii_254", strings.Repeat("a", 254), strings.Repeat("a", 254)},
+		{"ascii_255", strings.Repeat("a", 255), strings.Repeat("a", 255)},
+		{"ascii_256", strings.Repeat("a", 256), strings.Repeat("a", 255)},
+		{"ascii_300", strings.Repeat("a", 300), strings.Repeat("a", 255)},
+		{"chinese_256", strings.Repeat("中", 256), strings.Repeat("中", 255)},
+		{"four_byte_rune", strings.Repeat("a", 254) + "\U00020000z", strings.Repeat("a", 254) + "\U00020000"},
+		{"trim_after_truncate", strings.Repeat("a", 254) + " b", strings.Repeat("a", 254)},
+		{"control_at_cutoff", strings.Repeat("a", 254) + "\x1bb", strings.Repeat("a", 254)},
+		{"slash_at_cutoff", strings.Repeat("a", 254) + "/b", strings.Repeat("a", 254)},
+		{"backslash_at_cutoff", strings.Repeat("a", 254) + "\\b", strings.Repeat("a", 254)},
+		{"trim_before_truncate", "  " + strings.Repeat("中", 256), strings.Repeat("中", 255)},
+		{"invalid_at_cutoff", strings.Repeat("a", 254) + "\xffb", strings.Repeat("a", 254) + "\ufffd"},
+	}
+	for r := rune(0); r <= 0x9f; r++ {
+		if r <= 0x1f || r >= 0x7f {
+			tests = append(tests, struct{ name, input, want string }{
+				"control_" + strconv.FormatInt(int64(r), 16), "a" + string(r) + "b", "a b",
+			})
+		}
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeSQLComment(tt.input)
+			if got != tt.want {
+				t.Fatalf("normalize(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+			if !utf8.ValidString(got) || utf8.RuneCountInString(got) > 255 || strings.TrimSpace(got) != got || normalizeSQLComment(got) != got {
+				t.Fatalf("normalization properties failed: %q", got)
+			}
+			for _, r := range got {
+				if r == '*' || r == '/' || r == '\\' || unicode.IsControl(r) {
+					t.Fatalf("forbidden rune %U in %q", r, got)
+				}
+			}
+			dao, err := NewDBDao(&Pool{}, "mysql", nil, "", tt.input)
+			assertNoError(t, err)
+			if dao.comment != tt.want {
+				t.Fatalf("DAO comment = %q, want %q", dao.comment, tt.want)
+			}
+			for _, b := range []*Builder{dao.Builder(), NewBuilder(NewMySQLGrammar(), nil).Comment(tt.input)} {
+				if b.comment != tt.want {
+					t.Fatalf("Builder comment = %q, want %q", b.comment, tt.want)
+				}
+				wantSQL := "SELECT * FROM `users` WHERE `id` = ?"
+				if tt.want != "" {
+					wantSQL += " /* " + tt.want + " */"
+				}
+				sql, args, err := b.Table("users").Where("id", 7).ToSelect()
+				// 注释专项用例必须精确相等：容忍式 assertSQL 会放过“正文 + 统一测试注释后缀”，
+				// 令规范化后本应无注释的输入失去约束。
+				assertCommentCompileResult(t, commentCompileExpected{wantSQL, []any{7}}, sql, args, err)
+			}
+		})
+	}
+}
+
+// TestBuilder_CommentLifecycle 验证默认复制、覆盖清空、反复编译及 DAO/Builder 隔离。
+func TestBuilder_CommentLifecycle(t *testing.T) {
+	dao, err := NewDBDao(&Pool{}, "mysql", nil, "custom", " app:one ")
+	assertNoError(t, err)
+	other, err := NewDBDao(&Pool{}, "mysql", nil, "", "app:two")
+	assertNoError(t, err)
+	b := dao.Builder().Table("users").Where("id", 7)
+	untouched := dao.Builder()
+	for _, tt := range []struct{ input, want string }{
+		{"app:one", "app:one"}, {" report:daily ", "report:daily"}, {"last", "last"},
+		{"", ""}, {" \t\n ", ""}, {"*\x00\r\n", ""},
+	} {
+		t.Run(strconv.Quote(tt.input), func(t *testing.T) {
+			if b.Comment(tt.input) != b {
+				t.Fatal("Comment must return the same Builder")
+			}
+			want := "SELECT * FROM `users` WHERE `id` = ?"
+			if tt.want != "" {
+				want += " /* " + tt.want + " */"
+			}
+			for range 2 {
+				sql, args, err := b.ToSelect()
+				assertNoError(t, err)
+				assertSQL(t, want, sql)
+				assertArgs(t, []any{7}, args)
+			}
+			if b.comment != tt.want || dao.comment != "app:one" || untouched.comment != "app:one" || dao.Builder().comment != "app:one" || other.Builder().comment != "app:two" {
+				t.Fatal("comment lifecycle leaked across builders or DAOs")
+			}
+			if b.tagName() != "custom" {
+				t.Fatal("comment changed column tag configuration")
+			}
+		})
+	}
+	plain := NewBuilder(NewMySQLGrammar(), nil).Table("users")
+	sql, args, err := plain.ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, "SELECT * FROM `users`", sql)
+	assertArgs(t, nil, args)
+	broken := dao.Builder().Table("users").Where("id", "INVALID", 1)
+	originalErr := broken.err
+	broken.Comment("report:broken")
+	sql, args, err = broken.ToSelect()
+	if !errors.Is(err, ErrInvalidOperator) || err != originalErr || sql != "" || args != nil {
+		t.Fatalf("Comment lost accumulated error: SQL=%q args=%v error=%v", sql, args, err)
+	}
+}
+
+// TestBuilder_CommentClone 验证默认/覆盖/清空、递归子查询及环错误副本均保留注释。
+func TestBuilder_CommentClone(t *testing.T) {
+	for _, comment := range []string{"app:default", "report:custom", ""} {
+		t.Run(strconv.Quote(comment), func(t *testing.T) {
+			dao, err := NewDBDao(&Pool{}, "mysql", nil, "", "app:default")
+			assertNoError(t, err)
+			b := dao.Builder().Table("users").Where("id", 7)
+			if comment != "app:default" {
+				b.Comment(comment)
+			}
+			clone := b.Clone()
+			if clone == b || clone.comment != comment || clone.Clone().comment != comment {
+				t.Fatal("Clone did not preserve independent comment state")
+			}
+			clone.Comment("clone:changed")
+			if b.comment != comment || dao.comment != "app:default" {
+				t.Fatal("Clone change propagated to source")
+			}
+			b.Comment("original:changed")
+			if clone.comment != "clone:changed" {
+				t.Fatal("source change propagated to Clone")
+			}
+		})
+	}
+	g := NewMySQLGrammar()
+	sub := NewBuilder(g, nil).Table("orders").Comment("inner:orders")
+	b := NewBuilder(g, nil).TableSub(sub, "o").Union(sub).Comment("outer:report")
+	clone := b.Clone()
+	if clone.tableSub == sub || clone.unions[0].Query == sub || clone.tableSub.comment != "inner:orders" || clone.unions[0].Query.comment != "inner:orders" {
+		t.Fatal("recursive Clone lost or shared subquery comment")
+	}
+	clone.tableSub.Comment("")
+	if sub.comment != "inner:orders" || clone.unions[0].Query.comment != "inner:orders" {
+		t.Fatal("cloned subqueries share mutable state")
+	}
+	for _, tt := range []struct {
+		name   string
+		attach func(*Builder, *Builder)
+		child  func(*Builder) *Builder
+	}{
+		{"select", func(b, c *Builder) { b.SelectSub(c, "x") }, func(b *Builder) *Builder { return b.selectSubs[0].Query }},
+		{"from", func(b, c *Builder) { b.TableSub(c, "x") }, func(b *Builder) *Builder { return b.tableSub }},
+		{"union", func(b, c *Builder) { b.Union(c) }, func(b *Builder) *Builder { return b.unions[0].Query }},
+		{"where_nested", func(b, c *Builder) { b.wheres = []WhereClause{{Nested: c}} }, func(b *Builder) *Builder { return b.wheres[0].Nested }},
+		{"where_sub", func(b, c *Builder) { b.wheres = []WhereClause{{Sub: c}} }, func(b *Builder) *Builder { return b.wheres[0].Sub }},
+		{"having_nested", func(b, c *Builder) { b.havings = []HavingClause{{Nested: c}} }, func(b *Builder) *Builder { return b.havings[0].Nested }},
+		{"join_sub", func(b, c *Builder) { b.joins = []JoinClause{{Sub: c}} }, func(b *Builder) *Builder { return b.joins[0].Sub }},
+		{"join_nested", func(b, c *Builder) { b.joins = []JoinClause{{Joins: []JoinClause{{Sub: c}}}} }, func(b *Builder) *Builder { return b.joins[0].Joins[0].Sub }},
+		{"on_sub", func(b, c *Builder) { b.joins = []JoinClause{{Conditions: []JoinCondition{{Sub: c}}}} }, func(b *Builder) *Builder { return b.joins[0].Conditions[0].Sub }},
+		{"on_nested", func(b, c *Builder) {
+			b.joins = []JoinClause{{Conditions: []JoinCondition{{Nested: &JoinBuilder{Conditions: []JoinCondition{{Sub: c}}}}}}}
+		}, func(b *Builder) *Builder { return b.joins[0].Conditions[0].Nested.Conditions[0].Sub }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := NewBuilder(g, nil).Table("users").Comment("parent")
+			child := NewBuilder(g, nil).Table("orders").Comment("child")
+			tt.attach(parent, child)
+			copied := tt.child(parent.Clone())
+			if copied == child || copied.comment != "child" {
+				t.Fatal("recursive Clone did not preserve independent comment")
+			}
+			copied.Comment("copy")
+			if child.comment != "child" || parent.comment != "parent" {
+				t.Fatal("child comment update escaped Clone")
+			}
+			sql, args, err := copied.ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, "SELECT * FROM `orders` /* copy */", sql)
+			assertArgs(t, nil, args)
+		})
+	}
+	cyclic := NewBuilder(g, nil).Table("users").Comment("cycle:report")
+	cyclic.Union(cyclic)
+	broken := cyclic.Clone()
+	if broken.comment != "cycle:report" {
+		t.Fatal("cyclic error clone lost comment")
+	}
+	sql, args, err := broken.ToSelect()
+	if !errors.Is(err, ErrCyclicQuery) || sql != "" || args != nil {
+		t.Fatalf("cyclic clone: SQL=%q args=%v error=%v", sql, args, err)
+	}
+}
+
+// TestNewDBDao_CommentValidationOrder 验证第五参数不改变方言与连接池校验的原错误优先级。
+func TestNewDBDao_CommentValidationOrder(t *testing.T) {
+	for _, tt := range []struct {
+		name, dialect string
+		pool          *Pool
+		want          error
+	}{
+		{"dialect_required", "", nil, ErrDialectRequired},
+		{"dialect_unknown", "missing", nil, ErrUnknownDialect},
+		{"pool_required", "mysql", nil, ErrPoolRequired},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dao, err := NewDBDao(tt.pool, tt.dialect, nil, "", "*\x00\xff")
+			if dao != nil || !errors.Is(err, tt.want) {
+				t.Fatalf("DAO=%v error=%v, want nil and %v", dao, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestSnakeCase(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -76,7 +316,7 @@ func TestSnakeCase(t *testing.T) {
 
 func TestSelectWithSnakeCaseColumns(t *testing.T) {
 	g := NewMySQLGrammar()
-	sql, _, err := NewBuilder(g, nil).
+	sql, _, err := newTestBuilder(g, nil).
 		Table("order_items").
 		Select("item_name", "unit_price").
 		ToSelect()
@@ -96,7 +336,7 @@ func TestInsertWithSnakeCaseStruct(t *testing.T) {
 		ItemName:  "Widget",
 		UnitPrice: 999,
 	}
-	sql, args, err := NewBuilder(g, nil).Table("order_items").ToInsert(data)
+	sql, args, err := newTestBuilder(g, nil).Table("order_items").ToInsert(data)
 	assertNoError(t, err)
 	assertSQL(t, "INSERT INTO `order_items` (`item_name`, `unit_price`) VALUES (?, ?)", sql)
 	assertArgs(t, []any{"Widget", 999}, args)
@@ -109,7 +349,7 @@ func TestInsertBatchWithSnakeCaseStruct(t *testing.T) {
 		{OrderID: 1, ItemName: "Apple", UnitPrice: 300},
 		{OrderID: 2, ItemName: "Banana", UnitPrice: 150},
 	}
-	sql, args, err := NewBuilder(g, nil).Table("order_items").ToInsert(data)
+	sql, args, err := newTestBuilder(g, nil).Table("order_items").ToInsert(data)
 	assertNoError(t, err)
 	assertSQL(t, "INSERT INTO `order_items` (`item_name`, `unit_price`) VALUES (?, ?), (?, ?)", sql)
 	assertArgs(t, []any{"Apple", 300, "Banana", 150}, args)
@@ -123,7 +363,7 @@ func TestUpdateWithSnakeCaseStruct(t *testing.T) {
 		ItemName:  "Gadget",
 		UnitPrice: 1999,
 	}
-	sql, args, err := NewBuilder(g, nil).Table("order_items").Where("order_id", "=", 100).ToUpdate(data)
+	sql, args, err := newTestBuilder(g, nil).Table("order_items").Where("order_id", "=", 100).ToUpdate(data)
 	assertNoError(t, err)
 	assertSQL(t, "UPDATE `order_items` SET `item_name` = ?, `unit_price` = ? WHERE `order_id` = ?", sql)
 	assertArgs(t, []any{"Gadget", 1999, 100}, args)
@@ -138,7 +378,7 @@ func TestInsertWithConcreteTypeStruct(t *testing.T) {
 		Age:   25,
 		Email: "alice@test.com",
 	}
-	sql, args, err := NewBuilder(g, nil).Table("users").ToInsert(data)
+	sql, args, err := newTestBuilder(g, nil).Table("users").ToInsert(data)
 	assertNoError(t, err)
 	assertSQL(t, "INSERT INTO `users` (`id`, `name`, `age`, `email`) VALUES (?, ?, ?, ?)", sql)
 	assertArgs(t, []any{1, "alice", 25, "alice@test.com"}, args)
@@ -153,7 +393,7 @@ func TestUpdateWithConcreteTypeStruct(t *testing.T) {
 		Age:   0,
 		Email: "",
 	}
-	sql, args, err := NewBuilder(g, nil).Table("users").Where("id", "=", 1).ToUpdate(data)
+	sql, args, err := newTestBuilder(g, nil).Table("users").Where("id", "=", 1).ToUpdate(data)
 	assertNoError(t, err)
 	assertSQL(t, "UPDATE `users` SET `id` = ?, `name` = ?, `age` = ?, `email` = ? WHERE `id` = ?", sql)
 	assertArgs(t, []any{0, "bob", 0, "", 1}, args)
@@ -161,7 +401,7 @@ func TestUpdateWithConcreteTypeStruct(t *testing.T) {
 
 func TestErrorEmptyTable(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g, nil).ToSelect()
+	_, _, err := newTestBuilder(g, nil).ToSelect()
 	if !errors.Is(err, ErrEmptyTable) {
 		t.Errorf("expected ErrEmptyTable, got %v", err)
 	}
@@ -169,7 +409,7 @@ func TestErrorEmptyTable(t *testing.T) {
 
 func TestErrorInvalidInsertData(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g, nil).Table("users").ToInsert("not a struct")
+	_, _, err := newTestBuilder(g, nil).Table("users").ToInsert("not a struct")
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -180,8 +420,8 @@ func TestErrorInvalidInsertData(t *testing.T) {
 // 实际：生成 (SELECT COUNT(*) ...) UNION (...)，不是合法的计数查询。
 func TestBug_ToCountWithUnion(t *testing.T) {
 	g := NewMySQLGrammar()
-	union := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
-	b := NewBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union)
+	union := newTestBuilder(g, nil).Table("users").Where("age", ">", 25)
+	b := newTestBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union)
 
 	sql, args, err := b.ToCount()
 	assertNoError(t, err)
@@ -199,11 +439,11 @@ func TestBug_CollectSelectBindings_SubqueryOrder(t *testing.T) {
 	g := NewMySQLGrammar()
 
 	// SELECT 子查询（绑定 "active"）
-	selectSub := NewBuilder(g, nil).Table("orders").Select("amount").Where("status", "=", "active")
+	selectSub := newTestBuilder(g, nil).Table("orders").Select("amount").Where("status", "=", "active")
 	// FROM 子查询（绑定 25）
-	tableSub := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
+	tableSub := newTestBuilder(g, nil).Table("users").Where("age", ">", 25)
 
-	b := NewBuilder(g, nil).
+	b := newTestBuilder(g, nil).
 		SelectSub(selectSub, "sub_amount").
 		TableSub(tableSub, "u")
 
@@ -224,7 +464,7 @@ func TestBug_UpdateJoin_PG_DropsValueCondition(t *testing.T) {
 	type updateData struct {
 		Name string `db:"name"`
 	}
-	b := NewBuilder(g, nil).
+	b := newTestBuilder(g, nil).
 		Table("users").
 		JoinOn("profiles", func(jb *JoinBuilder) {
 			jb.On("users.id", "=", "profiles.user_id")
@@ -261,8 +501,8 @@ func TestBug_ExtractInsertData_NilPtrInSlice(t *testing.T) {
 // TestBug_CloneShallowCopy_Union 验证 Clone 后修改 UNION 子查询不应影响原 Builder。
 func TestBug_CloneShallowCopy_Union(t *testing.T) {
 	g := NewMySQLGrammar()
-	union := NewBuilder(g, nil).Table("admins")
-	b := NewBuilder(g, nil).Table("users").Union(union)
+	union := newTestBuilder(g, nil).Table("admins")
+	b := newTestBuilder(g, nil).Table("users").Union(union)
 
 	clone := b.Clone()
 	// 修改 clone 的 UNION 子查询
@@ -270,7 +510,7 @@ func TestBug_CloneShallowCopy_Union(t *testing.T) {
 
 	// 原 Builder 不应受影响
 	origSQL, _, _ := b.ToSelect()
-	if origSQL != "(SELECT * FROM `users`) UNION (SELECT * FROM `admins`)" {
+	if stripTestComment(origSQL) != "(SELECT * FROM `users`) UNION (SELECT * FROM `admins`)" {
 		t.Errorf("BUG: Clone shares UNION sub-builder reference, original affected:\n  got: %s", origSQL)
 	}
 }
@@ -278,7 +518,7 @@ func TestBug_CloneShallowCopy_Union(t *testing.T) {
 // TestBug_CloneShallowCopy_WhereNested 验证 Clone 后修改嵌套 WHERE 不应影响原 Builder。
 func TestBug_CloneShallowCopy_WhereNested(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").WhereNested(func(sub *Builder) {
+	b := newTestBuilder(g, nil).Table("users").WhereNested(func(sub *Builder) {
 		sub.Where("age", ">", 18)
 	})
 
@@ -289,7 +529,7 @@ func TestBug_CloneShallowCopy_WhereNested(t *testing.T) {
 	// 原 Builder 的嵌套 WHERE 不应受影响
 	origSQL, _, _ := b.ToSelect()
 	expected := "SELECT * FROM `users` WHERE (`age` > ?)"
-	if origSQL != expected {
+	if stripTestComment(origSQL) != expected {
 		t.Errorf("BUG: Clone shares nested WHERE sub-builder reference, original affected:\n  expected: %s\n  got:      %s", expected, origSQL)
 	}
 }
@@ -297,7 +537,7 @@ func TestBug_CloneShallowCopy_WhereNested(t *testing.T) {
 // TestBug_CloneWhereValuesShallowCopy 验证 Clone 后 WhereIn 的 Values 切片不应与原 Builder 共享。
 func TestBug_CloneWhereValuesShallowCopy(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").WhereIn("id", []any{1, 2, 3})
+	b := newTestBuilder(g, nil).Table("users").WhereIn("id", []any{1, 2, 3})
 	clone := b.Clone()
 
 	// 修改 clone 的 WhereIn Values
@@ -316,7 +556,7 @@ func TestBug_CloneWhereValuesShallowCopy(t *testing.T) {
 // TestBug_CloneJoinBindingsShallowCopy 验证 Clone 后 JoinBuilder Raw 的 Bindings 切片不应与原 Builder 共享。
 func TestBug_CloneJoinBindingsShallowCopy(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
 		jb.Raw("orders.amount > ?", 100)
 	})
 	clone := b.Clone()
@@ -334,11 +574,50 @@ func TestBug_CloneJoinBindingsShallowCopy(t *testing.T) {
 	}
 }
 
+// TestBug_CloneJoinNestedErrCopy 验证 Clone 完整复制嵌套 JoinBuilder 的 err 字段。
+// 该状态经公开 API 不可达（addNested 在 err != nil 时提前返回并把错误提升给父级），
+// 因此这里直接构造字段锁定行为：逐字段构造副本时漏字段会让 Clone 静默丢错，
+// 也让 cloneInternal 的"深拷贝全部查询状态"承诺失效。
+func TestBug_CloneJoinNestedErrCopy(t *testing.T) {
+	g := NewMySQLGrammar()
+	nested := &JoinBuilder{
+		grammar: g,
+		err:     ErrInvalidOperator,
+		Conditions: []JoinCondition{{
+			Type: "column", First: "users.id", Operator: "=", Second: "orders.user_id",
+		}},
+	}
+	b := newTestBuilder(g, nil).Table("users")
+	b.joins = []JoinClause{{Type: JoinTypeInner, Table: "orders", Conditions: []JoinCondition{{Type: "nested", Nested: nested}}}}
+
+	clone := b.Clone()
+	got := clone.joins[0].Conditions[0].Nested
+	if got == nil || got == nested {
+		t.Fatalf("Clone 应深拷贝嵌套 JoinBuilder，实际同一指针: %v", got == nested)
+	}
+	if got.err != ErrInvalidOperator {
+		t.Errorf("Clone 未复制嵌套 JoinBuilder.err: got %v want %v", got.err, ErrInvalidOperator)
+	}
+	// 副本与原件隔离：改写副本的错误不影响原件
+	got.err = nil
+	if nested.err != ErrInvalidOperator {
+		t.Error("副本修改影响了原嵌套 JoinBuilder")
+	}
+	// 嵌套 JoinBuilder 的错误只作字段保存，不参与编译（与既有语义一致）
+	want := "SELECT * FROM `users` INNER JOIN `orders` ON (`users`.`id` = `orders`.`user_id`)"
+	origSQL, _, err := b.ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, want, origSQL)
+	cloneSQL, _, err := clone.ToSelect()
+	assertNoError(t, err)
+	assertSQL(t, want, cloneSQL)
+}
+
 // TestBug_OperatorInjection 验证恶意运算符不应被拼入 SQL。
 func TestBug_OperatorInjection(t *testing.T) {
 	g := NewMySQLGrammar()
 	malicious := "= 1; DROP TABLE users; --"
-	b := NewBuilder(g, nil).Table("users").Where("id", malicious, 1)
+	b := newTestBuilder(g, nil).Table("users").Where("id", malicious, 1)
 
 	_, _, err := b.ToSelect()
 	if err == nil {
@@ -350,7 +629,7 @@ func TestBug_OperatorInjection(t *testing.T) {
 // TestBug_OperatorInjection_JoinOn 验证 JoinBuilder.Where 的运算符也应校验。
 func TestBug_OperatorInjection_JoinOn(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
 		jb.Where("users.id", "= 1; DROP TABLE users; --", 1)
 	})
 
@@ -363,7 +642,7 @@ func TestBug_OperatorInjection_JoinOn(t *testing.T) {
 // TestBug_OperatorInjection_Having 验证 Having 的运算符也应校验。
 func TestBug_OperatorInjection_Having(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("orders").
+	b := newTestBuilder(g, nil).Table("orders").
 		Select("user_id").
 		GroupBy("user_id").
 		Having("SUM(amount)", "evil", 500)
@@ -377,7 +656,7 @@ func TestBug_OperatorInjection_Having(t *testing.T) {
 // TestBug_ToCountPanicSafety 验证 ToCount 在内部 panic 时不应污染原 Builder 状态。
 func TestBug_ToCountPanicSafety(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").Select("name", "age").Where("age", ">", 25)
+	b := newTestBuilder(g, nil).Table("users").Select("name", "age").Where("age", ">", 25)
 	b.limit = 10
 
 	// 添加一个会导致 panic 的 WHERE 条件（使用不支持的 WhereType）
@@ -403,8 +682,8 @@ func TestBug_ToCountPanicSafety(t *testing.T) {
 // 修复前 UNION/GROUP BY/DISTINCT 分支手动恢复状态，panic 时残留污染）。
 func TestBug_ToCountUnionPanicSafety(t *testing.T) {
 	g := NewMySQLGrammar()
-	sub := NewBuilder(g, nil).Table("admins").Select("name")
-	b := NewBuilder(g, nil).Table("users").Select("name").Union(sub)
+	sub := newTestBuilder(g, nil).Table("admins").Select("name")
+	b := newTestBuilder(g, nil).Table("users").Select("name").Union(sub)
 	b.limit = 10
 	b.offset = 5
 	b.orders = []OrderClause{{Column: "id", Direction: "ASC"}}
@@ -437,8 +716,8 @@ func TestBug_ToCountUnionPanicSafety(t *testing.T) {
 // 临时状态同样经 defer 完整恢复（ZCDB-06 回归锁定）。
 func TestBug_ToAggregateUnionPanicSafety(t *testing.T) {
 	g := NewMySQLGrammar()
-	sub := NewBuilder(g, nil).Table("admins").Select("age")
-	b := NewBuilder(g, nil).Table("users").Select("age").Union(sub)
+	sub := newTestBuilder(g, nil).Table("admins").Select("age")
+	b := newTestBuilder(g, nil).Table("users").Select("age").Union(sub)
 	b.limit = 20
 	b.orders = []OrderClause{{Column: "age", Direction: "DESC"}}
 
@@ -475,7 +754,7 @@ type UserWithEmbed struct {
 // TestBug_EmbeddedStruct_Insert 验证嵌入结构体的字段应被正确展开为列。
 func TestBug_EmbeddedStruct_Insert(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users")
+	b := newTestBuilder(g, nil).Table("users")
 	user := UserWithEmbed{
 		BaseModel: BaseModel{ID: 1, Name: "alice"},
 		Age:       25,
@@ -520,21 +799,21 @@ func TestBuilder_InvalidOperatorErrorBranch(t *testing.T) {
 		build func() *Builder
 	}{
 		{"OrWhere", func() *Builder {
-			return NewBuilder(g, nil).Table("t").OrWhere("a", invalid, 1)
+			return newTestBuilder(g, nil).Table("t").OrWhere("a", invalid, 1)
 		}},
 		{"WhereColumn", func() *Builder {
-			return NewBuilder(g, nil).Table("t").WhereColumn("a", invalid, "b")
+			return newTestBuilder(g, nil).Table("t").WhereColumn("a", invalid, "b")
 		}},
 		{"OrHaving", func() *Builder {
-			return NewBuilder(g, nil).Table("t").Select("a").GroupBy("a").OrHaving("SUM(a)", invalid, 1)
+			return newTestBuilder(g, nil).Table("t").Select("a").GroupBy("a").OrHaving("SUM(a)", invalid, 1)
 		}},
 		{"WhereSub", func() *Builder {
-			return NewBuilder(g, nil).Table("t").WhereSub("a", invalid, func(sub *Builder) {
+			return newTestBuilder(g, nil).Table("t").WhereSub("a", invalid, func(sub *Builder) {
 				sub.Table("t2")
 			})
 		}},
 		{"OrWhereSub", func() *Builder {
-			return NewBuilder(g, nil).Table("t").OrWhereSub("a", invalid, func(sub *Builder) {
+			return newTestBuilder(g, nil).Table("t").OrWhereSub("a", invalid, func(sub *Builder) {
 				sub.Table("t2")
 			})
 		}},
@@ -577,22 +856,22 @@ func TestJoinBuilder_InvalidOperatorErrorBranch(t *testing.T) {
 		build func() *Builder
 	}{
 		{"LeftJoinOn", func() *Builder {
-			return NewBuilder(g, nil).Table("t").LeftJoinOn("t2", func(jb *JoinBuilder) {
+			return newTestBuilder(g, nil).Table("t").LeftJoinOn("t2", func(jb *JoinBuilder) {
 				jb.On("t.id", invalid, "t2.id")
 			})
 		}},
 		{"RightJoinOn", func() *Builder {
-			return NewBuilder(g, nil).Table("t").RightJoinOn("t2", func(jb *JoinBuilder) {
+			return newTestBuilder(g, nil).Table("t").RightJoinOn("t2", func(jb *JoinBuilder) {
 				jb.On("t.id", invalid, "t2.id")
 			})
 		}},
 		{"JoinOn_OrOn", func() *Builder {
-			return NewBuilder(g, nil).Table("t").JoinOn("t2", func(jb *JoinBuilder) {
+			return newTestBuilder(g, nil).Table("t").JoinOn("t2", func(jb *JoinBuilder) {
 				jb.OrOn("t.id", invalid, "t2.id")
 			})
 		}},
 		{"JoinBuilder_OrWhere", func() *Builder {
-			return NewBuilder(g, nil).Table("t").JoinOn("t2", func(jb *JoinBuilder) {
+			return newTestBuilder(g, nil).Table("t").JoinOn("t2", func(jb *JoinBuilder) {
 				jb.OrWhere("t.id", invalid, 1)
 			})
 		}},
@@ -685,7 +964,7 @@ func TestBuilder_OrderByBranches(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := NewBuilder(g, nil).Table("t").OrderBy("col", tt.direction)
+			b := newTestBuilder(g, nil).Table("t").OrderBy("col", tt.direction)
 			if len(b.orders) != 1 || b.orders[0].Direction != tt.expected {
 				t.Errorf("OrderBy(%q): expected direction %q, got %v", tt.direction, tt.expected, b.orders)
 			}
@@ -694,7 +973,7 @@ func TestBuilder_OrderByBranches(t *testing.T) {
 
 	// 省略 direction 变参时默认升序 ASC
 	t.Run("omitted_defaults_ASC", func(t *testing.T) {
-		b := NewBuilder(g, nil).Table("t").OrderBy("col")
+		b := newTestBuilder(g, nil).Table("t").OrderBy("col")
 		if len(b.orders) != 1 || b.orders[0].Direction != "ASC" {
 			t.Errorf("OrderBy without direction: expected ASC, got %v", b.orders)
 		}
@@ -704,11 +983,11 @@ func TestBuilder_OrderByBranches(t *testing.T) {
 // TestBuilder_ForPage_InvalidPage 验证 ForPage 传入 page < 1 时自动修正为 1。
 func TestBuilder_ForPage_InvalidPage(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("t").ForPage(0, 10)
+	b := newTestBuilder(g, nil).Table("t").ForPage(0, 10)
 	if b.offset != 0 || b.limit != 10 {
 		t.Errorf("ForPage(0, 10): expected offset=0 limit=10, got offset=%d limit=%d", b.offset, b.limit)
 	}
-	b = NewBuilder(g, nil).Table("t").ForPage(-5, 20)
+	b = newTestBuilder(g, nil).Table("t").ForPage(-5, 20)
 	if b.offset != 0 || b.limit != 20 {
 		t.Errorf("ForPage(-5, 20): expected offset=0 limit=20, got offset=%d limit=%d", b.offset, b.limit)
 	}
@@ -728,8 +1007,8 @@ func TestBuilder_TableSubOverridesTable(t *testing.T) {
 		{
 			name: "TableSubAfterTableWins",
 			build: func() *Builder {
-				sub := NewBuilder(g, nil).Table("orders").Where("amount", ">", 100)
-				return NewBuilder(g, nil).Table("users").TableSub(sub, "o")
+				sub := newTestBuilder(g, nil).Table("orders").Where("amount", ">", 100)
+				return newTestBuilder(g, nil).Table("users").TableSub(sub, "o")
 			},
 			expected: "SELECT * FROM (SELECT * FROM `orders` WHERE `amount` > ?) AS `o`",
 			wantArgs: 1,
@@ -737,8 +1016,8 @@ func TestBuilder_TableSubOverridesTable(t *testing.T) {
 		{
 			name: "TableAfterTableSubRevertsToPlainTable",
 			build: func() *Builder {
-				sub := NewBuilder(g, nil).Table("orders").Where("amount", ">", 100)
-				return NewBuilder(g, nil).TableSub(sub, "o").Table("users")
+				sub := newTestBuilder(g, nil).Table("orders").Where("amount", ">", 100)
+				return newTestBuilder(g, nil).TableSub(sub, "o").Table("users")
 			},
 			expected: "SELECT * FROM `users`",
 			wantArgs: 0,
@@ -750,9 +1029,7 @@ func TestBuilder_TableSubOverridesTable(t *testing.T) {
 			b := tt.build()
 			sql, args, err := b.ToSelect()
 			assertNoError(t, err)
-			if sql != tt.expected {
-				t.Errorf("SQL 不匹配：\n期望: %s\n实际: %s", tt.expected, sql)
-			}
+			assertSQL(t, tt.expected, sql)
 			if len(args) != tt.wantArgs {
 				t.Errorf("绑定参数数量不匹配：期望 %d 个，实际 %v", tt.wantArgs, args)
 			}
@@ -765,10 +1042,10 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 	g := NewMySQLGrammar()
 
 	// 构造包含所有可选字段的 Builder
-	tableSub := NewBuilder(g, nil).Table("sub_t")
-	selectSub := NewBuilder(g, nil).Table("orders").Select("amount").Where("status", "=", "active")
+	tableSub := newTestBuilder(g, nil).Table("sub_t")
+	selectSub := newTestBuilder(g, nil).Table("orders").Select("amount").Where("status", "=", "active")
 
-	b := NewBuilder(g, nil).
+	b := newTestBuilder(g, nil).
 		Table("users").
 		Select("name", "age").
 		Distinct().
@@ -789,7 +1066,7 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 		OrderBy("name", "ASC").
 		Limit(10).
 		Offset(5).
-		Union(NewBuilder(g, nil).Table("admins")).
+		Union(newTestBuilder(g, nil).Table("admins")).
 		LockForUpdate()
 
 	clone := b.Clone()
@@ -834,8 +1111,8 @@ func TestBuilder_CloneDeepCopy(t *testing.T) {
 func TestBuilder_PrimaryFlag(t *testing.T) {
 	g := NewMySQLGrammar()
 
-	withPrimary := NewBuilder(g, nil).Table("users").Where("id", "=", 1).Primary()
-	plain := NewBuilder(g, nil).Table("users").Where("id", "=", 1)
+	withPrimary := newTestBuilder(g, nil).Table("users").Where("id", "=", 1).Primary()
+	plain := newTestBuilder(g, nil).Table("users").Where("id", "=", 1)
 
 	if !withPrimary.usePrimary {
 		t.Fatal("Primary() 应置位 usePrimary 标记")
@@ -870,7 +1147,7 @@ func TestBuilder_PrimaryFlag(t *testing.T) {
 // 第三层嵌套的 Conditions/Sub 切片与原 Builder 共享底层数组，违反深拷贝契约。
 func TestBug_CloneJoinDeepNesting(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 		j.On("orders.user_id", "=", "users.id")
 		j.JoinOn("items", func(j2 *JoinBuilder) {
 			j2.On("items.order_id", "=", "orders.id")
@@ -911,7 +1188,7 @@ func TestBug_CloneJoinDeepNesting(t *testing.T) {
 // 违反 Clone 深拷贝契约（克隆后状态与原 Builder 不一致）。
 func TestBug_CloneJoinNestedJoins(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 		j.On("orders.user_id", "=", "users.id")
 		j.OnNested(func(q *JoinBuilder) {
 			q.On("orders.status", "=", "paid")
@@ -1001,7 +1278,7 @@ func TestGrammar_WrapValue_Escaping(t *testing.T) {
 // TestBuilder_WhereExpression 验证 Where 传入 Expression 值时直接嵌入 SQL。
 func TestBuilder_WhereExpression(t *testing.T) {
 	g := NewMySQLGrammar()
-	sql, args, err := NewBuilder(g, nil).
+	sql, args, err := newTestBuilder(g, nil).
 		Table("users").
 		Where("updated_at", ">", NewExpression("created_at")).
 		ToSelect()
@@ -1014,7 +1291,7 @@ func TestBuilder_WhereExpression(t *testing.T) {
 // TestBuilder_ToTruncateEmptyTable 验证 ToTruncate 未设置表名时返回错误。
 func TestBuilder_ToTruncateEmptyTable(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, err := NewBuilder(g, nil).ToTruncate()
+	_, err := newTestBuilder(g, nil).ToTruncate()
 	if !errors.Is(err, ErrEmptyTable) {
 		t.Errorf("expected ErrEmptyTable, got %v", err)
 	}
@@ -1023,7 +1300,7 @@ func TestBuilder_ToTruncateEmptyTable(t *testing.T) {
 // TestBuilder_ToDeleteEmptyTable 验证 ToDelete 未设置表名时返回错误。
 func TestBuilder_ToDeleteEmptyTable(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g, nil).ToDelete()
+	_, _, err := newTestBuilder(g, nil).ToDelete()
 	if !errors.Is(err, ErrEmptyTable) {
 		t.Errorf("expected ErrEmptyTable, got %v", err)
 	}
@@ -1032,7 +1309,7 @@ func TestBuilder_ToDeleteEmptyTable(t *testing.T) {
 // TestBuilder_ToInsertInvalidData 验证 ToInsert 传入非结构体时返回错误。
 func TestBuilder_ToInsertInvalidData(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g, nil).Table("t").ToInsert(123)
+	_, _, err := newTestBuilder(g, nil).Table("t").ToInsert(123)
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -1041,7 +1318,7 @@ func TestBuilder_ToInsertInvalidData(t *testing.T) {
 // TestBuilder_ToInsertUsingEmptyTable 验证 ToInsertUsing 未设置表名时返回错误。
 func TestBuilder_ToInsertUsingEmptyTable(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g, nil).ToInsertUsing([]string{"a"}, func(sub *Builder) {
+	_, _, err := newTestBuilder(g, nil).ToInsertUsing([]string{"a"}, func(sub *Builder) {
 		sub.Table("t2")
 	})
 	if !errors.Is(err, ErrEmptyTable) {
@@ -1059,7 +1336,7 @@ func TestDialectGrammar_Unknown(t *testing.T) {
 
 // TestNewDBDao_UnknownDialect 验证 NewDBDao 传入未知方言时返回错误。
 func TestNewDBDao_UnknownDialect(t *testing.T) {
-	_, err := NewDBDao(nil, "oracle", nil, "")
+	_, err := NewDBDao(nil, "oracle", nil, "", "")
 	if !errors.Is(err, ErrUnknownDialect) {
 		t.Errorf("expected ErrUnknownDialect, got %v", err)
 	}
@@ -1077,7 +1354,7 @@ func TestDBDao_CloseNilPool(t *testing.T) {
 // TestBuilder_CollectJoinBindings_Raw 验证 collectSelectBindings 包含 JOIN Raw 绑定。
 func TestBuilder_CollectJoinBindings_Raw(t *testing.T) {
 	g := NewMySQLGrammar()
-	sql, args, err := NewBuilder(g, nil).
+	sql, args, err := newTestBuilder(g, nil).
 		Table("users").
 		JoinOn("orders", func(jb *JoinBuilder) {
 			jb.Raw("orders.amount > ?", 100)
@@ -1091,7 +1368,7 @@ func TestBuilder_CollectJoinBindings_Raw(t *testing.T) {
 // TestBuilder_WhereInEmpty 验证 WhereIn 空切片生成等价 false 条件。
 func TestBuilder_WhereInEmpty(t *testing.T) {
 	g := NewMySQLGrammar()
-	sql, args, err := NewBuilder(g, nil).
+	sql, args, err := newTestBuilder(g, nil).
 		Table("users").
 		WhereIn("id", []any{}).
 		ToSelect()
@@ -1103,7 +1380,7 @@ func TestBuilder_WhereInEmpty(t *testing.T) {
 // TestBuilder_WhereNotInEmpty 验证 WhereNotIn 空切片生成等价 true 条件。
 func TestBuilder_WhereNotInEmpty(t *testing.T) {
 	g := NewMySQLGrammar()
-	sql, args, err := NewBuilder(g, nil).
+	sql, args, err := newTestBuilder(g, nil).
 		Table("users").
 		WhereNotIn("id", []any{}).
 		ToSelect()
@@ -1126,7 +1403,7 @@ func TestBuilder_WhereInExpression(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := NewBuilder(tt.grammar, nil).
+			sql, args, err := newTestBuilder(tt.grammar, nil).
 				Table("users").
 				WhereIn("id", []any{1, NewExpression("parent_id")}).
 				ToSelect()
@@ -1137,7 +1414,7 @@ func TestBuilder_WhereInExpression(t *testing.T) {
 	}
 
 	// NOT IN 同构（MySQL 形态）
-	sql, args, err := NewBuilder(NewMySQLGrammar(), nil).
+	sql, args, err := newTestBuilder(NewMySQLGrammar(), nil).
 		Table("users").
 		WhereNotIn("id", []any{NewExpression("parent_id"), 2}).
 		ToSelect()
@@ -1162,7 +1439,7 @@ func TestBug_HavingWithExpression(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := NewBuilder(tt.grammar, nil).
+			sql, args, err := newTestBuilder(tt.grammar, nil).
 				Table("users").
 				GroupBy("user_id").
 				Having("SUM(amount)", ">", NewExpression("100")).
@@ -1210,7 +1487,7 @@ func TestBug_RawWithExpressionBindings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := tt.build(NewBuilder(tt.grammar, nil).Table("users")).ToSelect()
+			sql, args, err := tt.build(newTestBuilder(tt.grammar, nil).Table("users")).ToSelect()
 			assertNoError(t, err)
 			assertSQL(t, tt.expected, sql)
 			assertArgs(t, []any{}, args)
@@ -1233,7 +1510,7 @@ func TestBug_ToCountWithDistinct(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := NewBuilder(tt.grammar, nil).
+			sql, args, err := newTestBuilder(tt.grammar, nil).
 				Table("users").
 				Select("name").
 				Distinct().
@@ -1260,7 +1537,7 @@ func TestBug_OffsetWithoutLimit(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sql, _, err := NewBuilder(tt.grammar, nil).
+			sql, _, err := newTestBuilder(tt.grammar, nil).
 				Table("users").
 				Offset(5).
 				ToSelect()
@@ -1274,7 +1551,7 @@ func TestBug_OffsetWithoutLimit(t *testing.T) {
 // 当前行为（BUG）：Clone 只复制 havings 切片，Bindings 数组仍共享，
 // 修改克隆会影响原 Builder（并发复用不安全）。
 func TestBug_CloneHavingsBindings(t *testing.T) {
-	b := NewBuilder(NewMySQLGrammar(), nil).
+	b := newTestBuilder(NewMySQLGrammar(), nil).
 		Table("users").
 		HavingRaw("SUM(amount) > ?", 100)
 	c := b.Clone()
@@ -1358,7 +1635,7 @@ func TestBug_ScanByteSliceToIntSlice(t *testing.T) {
 // 以及编译层 ToDelete/ToUpdate 不受执行层保护影响。
 func TestBug_ForceDeleteUpdateProtection(t *testing.T) {
 	// Force 标记 + Clone 传播
-	b := NewBuilder(NewMySQLGrammar(), nil).Table("users").Force()
+	b := newTestBuilder(NewMySQLGrammar(), nil).Table("users").Force()
 	if !b.force {
 		t.Error("Force should set force flag")
 	}
@@ -1384,25 +1661,25 @@ func TestBug_ForceDeleteUpdateProtection(t *testing.T) {
 // WhereNested 空回调编译后无 WHERE，不能作为有效条件绕过无 WHERE 保护。
 func TestBug_HasEffectiveWhere(t *testing.T) {
 	// 无任何条件
-	b := NewBuilder(NewMySQLGrammar(), nil)
+	b := newTestBuilder(NewMySQLGrammar(), nil)
 	if b.hasEffectiveWhere() {
 		t.Error("empty wheres should not have effective where")
 	}
 
 	// 普通条件
-	b = NewBuilder(NewMySQLGrammar(), nil).Where("id", "=", 1)
+	b = newTestBuilder(NewMySQLGrammar(), nil).Where("id", "=", 1)
 	if !b.hasEffectiveWhere() {
 		t.Error("basic where should be effective")
 	}
 
 	// 空嵌套：应视为无有效条件
-	b = NewBuilder(NewMySQLGrammar(), nil).WhereNested(func(q *Builder) {})
+	b = newTestBuilder(NewMySQLGrammar(), nil).WhereNested(func(q *Builder) {})
 	if b.hasEffectiveWhere() {
 		t.Error("empty nested where should not be effective")
 	}
 
 	// 嵌套含有效条件：应视为有效
-	b = NewBuilder(NewMySQLGrammar(), nil).WhereNested(func(q *Builder) {
+	b = newTestBuilder(NewMySQLGrammar(), nil).WhereNested(func(q *Builder) {
 		q.Where("id", ">", 10)
 	})
 	if !b.hasEffectiveWhere() {
@@ -1410,7 +1687,7 @@ func TestBug_HasEffectiveWhere(t *testing.T) {
 	}
 
 	// 空 JOIN（无 ON/Where 条件）：不应视为有效限定
-	b = NewBuilder(NewMySQLGrammar(), nil).JoinOn("profiles", func(jb *JoinBuilder) {})
+	b = newTestBuilder(NewMySQLGrammar(), nil).JoinOn("profiles", func(jb *JoinBuilder) {})
 	if b.hasEffectiveJoin() {
 		t.Error("empty join should not be effective")
 	}
@@ -1419,7 +1696,7 @@ func TestBug_HasEffectiveWhere(t *testing.T) {
 	}
 
 	// 带 ON 条件的 JOIN：应视为有效限定（UPDATE/DELETE JOIN 场景）
-	b = NewBuilder(NewMySQLGrammar(), nil).JoinOn("profiles", func(jb *JoinBuilder) {
+	b = newTestBuilder(NewMySQLGrammar(), nil).JoinOn("profiles", func(jb *JoinBuilder) {
 		jb.On("users.id", "=", "profiles.user_id")
 	})
 	if !b.hasEffectiveJoin() {
@@ -1431,7 +1708,7 @@ func TestBug_HasEffectiveWhere(t *testing.T) {
 // （而非 COUNT(*) 全表计数），且不破坏原 Builder 状态。
 func TestBug_ToExistsSQL(t *testing.T) {
 	// MySQL
-	b := NewBuilder(NewMySQLGrammar(), nil).Table("users").Where("id", "=", 1)
+	b := newTestBuilder(NewMySQLGrammar(), nil).Table("users").Where("id", "=", 1)
 	sqlStr, args, err := b.ToExists()
 	assertNoError(t, err)
 	assertSQL(t, "SELECT 1 FROM `users` WHERE `id` = ? LIMIT 1", sqlStr)
@@ -1440,13 +1717,13 @@ func TestBug_ToExistsSQL(t *testing.T) {
 	}
 
 	// SQLite
-	b = NewBuilder(NewSQLiteGrammar(), nil).Table("users").Where("id", "=", 1)
+	b = newTestBuilder(NewSQLiteGrammar(), nil).Table("users").Where("id", "=", 1)
 	sqlStr, _, err = b.ToExists()
 	assertNoError(t, err)
 	assertSQL(t, `SELECT 1 FROM "users" WHERE "id" = ? LIMIT 1`, sqlStr)
 
 	// PostgreSQL
-	b = NewBuilder(NewPostgresGrammar(), nil).Table("users").Where("id", "=", 1)
+	b = newTestBuilder(NewPostgresGrammar(), nil).Table("users").Where("id", "=", 1)
 	sqlStr, args, err = b.ToExists()
 	assertNoError(t, err)
 	assertSQL(t, `SELECT 1 FROM "users" WHERE "id" = $1 LIMIT 1`, sqlStr)
@@ -1456,8 +1733,8 @@ func TestBug_ToExistsSQL(t *testing.T) {
 
 	// UNION：整个 UNION 包裹为子查询后附加 LIMIT 1
 	g := NewMySQLGrammar()
-	union := NewBuilder(g, nil).Table("admins").Where("id", ">", 2)
-	b = NewBuilder(g, nil).Table("users").Where("id", ">", 1).Union(union)
+	union := newTestBuilder(g, nil).Table("admins").Where("id", ">", 2)
+	b = newTestBuilder(g, nil).Table("users").Where("id", ">", 1).Union(union)
 	sqlStr, _, err = b.ToExists()
 	assertNoError(t, err)
 	if !strings.Contains(sqlStr, "SELECT 1 FROM (") || !strings.Contains(sqlStr, "LIMIT 1") {
@@ -1465,7 +1742,7 @@ func TestBug_ToExistsSQL(t *testing.T) {
 	}
 
 	// 状态恢复：ToExists 不应破坏原 Builder 的分页/列/锁状态
-	b = NewBuilder(NewMySQLGrammar(), nil).Table("users").
+	b = newTestBuilder(NewMySQLGrammar(), nil).Table("users").
 		Select("name").Where("id", ">", 1).ForPage(2, 10).OrderBy("id", "DESC").LockForUpdate()
 	_, _, err = b.ToExists()
 	assertNoError(t, err)
@@ -1499,7 +1776,7 @@ func TestBug_SelectStarNotWrapped(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sqlStr, _, err := NewBuilder(tt.grammar, nil).Table("users").Select(tt.column).ToSelect()
+			sqlStr, _, err := newTestBuilder(tt.grammar, nil).Table("users").Select(tt.column).ToSelect()
 			assertNoError(t, err)
 			assertSQL(t, tt.expected, sqlStr)
 		})
@@ -1512,13 +1789,13 @@ func TestBug_SelectStarNotWrapped(t *testing.T) {
 func TestBug_JoinSub_SQL(t *testing.T) {
 	codes := []any{"A", "B"}
 	buildSub := func(g Grammar) *Builder {
-		return NewBuilder(g, nil).Table("fund_net_value").
+		return newTestBuilder(g, nil).Table("fund_net_value").
 			Select("fund_code", "MAX(ed) AS ed").
 			WhereIn("fund_code", codes).
 			GroupBy("fund_code")
 	}
 	buildQuery := func(g Grammar) *Builder {
-		return NewBuilder(g, nil).Table("fund_net_value AS t1").
+		return newTestBuilder(g, nil).Table("fund_net_value AS t1").
 			Select("t1.*").
 			JoinSub(buildSub(g), "t2", func(j *JoinBuilder) {
 				j.On("t1.fund_code", "=", "t2.fund_code").
@@ -1551,14 +1828,14 @@ func TestBug_JoinSub_SQL(t *testing.T) {
 func TestBug_CrossJoinSub_SQL(t *testing.T) {
 	codes := []any{"店A", "店B"}
 	buildSub := func(g Grammar) *Builder {
-		return NewBuilder(g, nil).Table("sales").
+		return newTestBuilder(g, nil).Table("sales").
 			Select("store_name").
 			Distinct().
 			WhereIn("store_name", codes)
 	}
 	buildQuery := func(g Grammar) *Builder {
-		m := NewBuilder(g, nil).Table("sales").Select("month").Distinct()
-		return NewBuilder(g, nil).TableSub(m, "m").
+		m := newTestBuilder(g, nil).Table("sales").Select("month").Distinct()
+		return newTestBuilder(g, nil).TableSub(m, "m").
 			Select("m.month", "s.store_name").
 			CrossJoinSub(buildSub(g), "s")
 	}
@@ -1585,7 +1862,7 @@ func TestBug_CrossJoinSub_SQL(t *testing.T) {
 // TestBug_Pluck_ArgValidation 验证 Pluck 参数校验错误路径：
 // dest 必须是非 nil 的切片/map 指针，且列数与目标容器匹配（切片 1 列、map 2 列）。
 func TestBug_Pluck_ArgValidation(t *testing.T) {
-	b := NewBuilder(NewSQLiteGrammar(), nil)
+	b := newTestBuilder(NewSQLiteGrammar(), nil)
 	ctx := context.Background()
 
 	// 非指针 dest
@@ -1645,11 +1922,11 @@ func TestBug_Pluck_ArgValidation(t *testing.T) {
 // TestBug_JoinSub_CloneIsolation 验证 Clone 对 JOIN 派生表子查询做深拷贝：
 // 修改克隆体的子查询不影响原 Builder 的 SQL 生成。
 func TestBug_JoinSub_CloneIsolation(t *testing.T) {
-	sub := NewBuilder(NewMySQLGrammar(), nil).Table("fund_net_value").
+	sub := newTestBuilder(NewMySQLGrammar(), nil).Table("fund_net_value").
 		Select("fund_code", "MAX(ed) AS ed").
 		GroupBy("fund_code")
 
-	b := NewBuilder(NewMySQLGrammar(), nil).Table("fund_net_value AS t1").
+	b := newTestBuilder(NewMySQLGrammar(), nil).Table("fund_net_value AS t1").
 		Select("t1.*").
 		JoinSub(sub, "t2", func(j *JoinBuilder) {
 			j.On("t1.fund_code", "=", "t2.fund_code")
@@ -1688,6 +1965,437 @@ func TestBug_JoinSub_CloneIsolation(t *testing.T) {
 	}
 }
 
+// 以下 helper 仅服务 builder_compile 的三方言单测，不混入执行/连接测试。
+type commentCompileExpected struct {
+	sql  string
+	args []any
+}
+
+type commentCompileFixture struct {
+	name    string
+	b       *Builder
+	compile func(*Builder) (string, []any, error)
+	direct  func(*Builder) string
+}
+
+type commentCompileRow struct {
+	Name string `db:"name"`
+	Age  int    `db:"age"`
+}
+
+func commentCompileFixtures(g Grammar) []commentCompileFixture {
+	base := func() *Builder {
+		return NewBuilder(g, nil).Table("users").Select("name").Where("id", 7).OrderBy("name").Limit(5).Offset(2)
+	}
+	union := func() *Builder {
+		return base().Union(NewBuilder(g, nil).Table("admins").Select("name").Where("rank", ">", 9).Comment("inner:admin"))
+	}
+	joined := func() *Builder {
+		return NewBuilder(g, nil).Table("users").Where("id", 7).JoinOn("profiles", func(j *JoinBuilder) {
+			j.On("users.id", "=", "profiles.user_id").Where("profiles.active", "=", 99)
+		})
+	}
+	using := func(sub *Builder) {
+		sub.Table("source").Select("name").Where("score", ">", 11).Comment("inner:source")
+	}
+	row := commentCompileRow{Name: "alice", Age: 23}
+	columns, rows := []string{"name", "age"}, [][]any{{"alice", 23}}
+	fixtures := []commentCompileFixture{
+		{"select", base(), (*Builder).ToSelect, func(b *Builder) string { return g.CompileSelect(b, b.columns) }},
+		{"select_union", union(), (*Builder).ToSelect, nil},
+		{"insert", base(), func(b *Builder) (string, []any, error) { return b.ToInsert(row) }, func(b *Builder) string { return g.CompileInsert(b, columns, rows) }},
+		{"insert_ignore", base(), func(b *Builder) (string, []any, error) { return b.ToInsertOrIgnore(row) }, func(b *Builder) string { return g.CompileInsertOrIgnore(b, columns, rows) }},
+		{"upsert", base(), func(b *Builder) (string, []any, error) { return b.ToUpsert(row, []string{"name"}, []string{"age"}) }, func(b *Builder) string {
+			return g.CompileUpsert(b, columns, rows, []string{"name"}, []string{"age"}, nil)
+		}},
+		{"upsert_no_update", base(), func(b *Builder) (string, []any, error) {
+			return b.ToUpsert(struct {
+				Name string `db:"name"`
+			}{"alice"}, []string{"name"}, nil)
+		}, nil},
+		{"insert_using", base(), func(b *Builder) (string, []any, error) { return b.ToInsertUsing([]string{"name"}, using) }, func(b *Builder) string {
+			sub := NewBuilder(g, nil)
+			using(sub)
+			return g.CompileInsertUsing(b, []string{"name"}, sub)
+		}},
+		{"insert_ignore_using", base(), func(b *Builder) (string, []any, error) { return b.ToInsertOrIgnoreUsing([]string{"name"}, using) }, func(b *Builder) string {
+			sub := NewBuilder(g, nil)
+			using(sub)
+			return g.CompileInsertOrIgnoreUsing(b, []string{"name"}, sub)
+		}},
+		{"update", joined(), func(b *Builder) (string, []any, error) { return b.ToUpdate(row) }, func(b *Builder) string { return g.CompileUpdate(b, columns, rows[0]) }},
+		{"delete", base(), (*Builder).ToDelete, g.CompileDelete},
+		{"delete_join", joined(), (*Builder).ToDeleteJoin, g.CompileDeleteJoin},
+		{"truncate", base(), func(b *Builder) (string, []any, error) { sql, err := b.ToTruncate(); return sql, nil, err }, g.CompileTruncate},
+		{"count", base().LockForUpdate(), (*Builder).ToCount, nil},
+		{"count_union", union().LockForUpdate(), (*Builder).ToCount, nil},
+		{"count_group", base().GroupBy("name").HavingRaw("COUNT(*) > ?", 2).LockForUpdate(), (*Builder).ToCount, nil},
+		{"count_distinct", base().Distinct().LockForUpdate(), (*Builder).ToCount, nil},
+		{"exists", base().LockForUpdate(), (*Builder).ToExists, nil},
+		{"exists_union", union().LockForUpdate(), (*Builder).ToExists, nil},
+		{"aggregate", base().LockForUpdate(), func(b *Builder) (string, []any, error) { return b.ToAggregate("SUM", "age") }, nil},
+		{"aggregate_union", union().LockForUpdate(), func(b *Builder) (string, []any, error) { return b.ToAggregate("MAX", "name") }, nil},
+		{"increment", joined(), func(b *Builder) (string, []any, error) {
+			return b.ToIncrement([]string{"wallet", "level"}, []any{100, 2})
+		}, nil},
+		{"decrement", joined(), func(b *Builder) (string, []any, error) {
+			return b.ToDecrement([]string{"wallet", "level"}, []any{50, 1})
+		}, nil},
+	}
+	if _, sqlite := g.(*SQLiteGrammar); !sqlite {
+		fixtures = append(fixtures,
+			commentCompileFixture{"select_lock", base().LockForUpdate(), (*Builder).ToSelect, nil},
+			commentCompileFixture{"select_shared_lock", base().SharedLock(), (*Builder).ToSelect, nil})
+	}
+	// 状态恢复后还要普通 ToSelect；此处只保留方言支持的锁组合，错误组合另在 C09 覆盖。
+	for _, tc := range fixtures {
+		if _, sqlite := g.(*SQLiteGrammar); sqlite {
+			tc.b.lockClause = ""
+		}
+		if _, pg := g.(*PostgresGrammar); pg && len(tc.b.unions) > 0 {
+			tc.b.lockClause = ""
+		}
+	}
+	return fixtures
+}
+
+// commentInspectGrammar 在真正 Grammar 开始编译前观察子状态，防止以清空再恢复的方式抑制子注释。
+type commentInspectGrammar struct {
+	Grammar
+	check func()
+}
+
+func (g *commentInspectGrammar) CompileSelect(b *Builder, columns []SelectColumn) string {
+	g.check()
+	return g.Grammar.CompileSelect(b, columns)
+}
+
+func (g *commentInspectGrammar) CompileInsertUsing(b *Builder, columns []string, sub *Builder) string {
+	g.check()
+	return g.Grammar.CompileInsertUsing(b, columns, sub)
+}
+
+func (g *commentInspectGrammar) CompileInsertOrIgnoreUsing(b *Builder, columns []string, sub *Builder) string {
+	g.check()
+	return g.Grammar.CompileInsertOrIgnoreUsing(b, columns, sub)
+}
+
+func assertCommentSubqueries(t *testing.T, g Grammar, dialect string, expected map[string]commentCompileExpected) {
+	t.Helper()
+	names := []string{"select", "from", "where_scalar", "where_in", "where_exists", "where_exists_builder", "join_table", "join_scalar", "join_in", "join_exists", "union", "insert_using", "insert_ignore_using", "select_from_where"}
+	if len(expected) != len(names)+1 {
+		t.Fatalf("子查询期望矩阵数量错误：%d", len(expected))
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			for _, explicit := range []bool{false, true} {
+				childMode, childSuffix := "inherited", " /* dao:default */"
+				if explicit {
+					childMode, childSuffix = "explicit", " /* inner:child */"
+				}
+				t.Run(childMode, func(t *testing.T) {
+					for _, mode := range []struct{ name, suffix string }{
+						{"default", " /* dao:default */"}, {"override", " /* outer:query */"}, {"clear", ""},
+					} {
+						t.Run(mode.name, func(t *testing.T) {
+							// 空 Pool 仅通过构造校验；本测试不打开连接、不执行 SQL。
+							dao, err := NewDBDao(&Pool{}, dialect, nil, "", "dao:default")
+							assertNoError(t, err)
+							type capturedChild struct {
+								b     *Builder
+								state Builder
+							}
+							var children []capturedChild
+							configure := func(q *Builder) {
+								q.Table("source").Select("name").Where("score", ">", 11)
+								if explicit {
+									q.Comment("inner:child")
+								}
+								children = append(children, capturedChild{q, snapshotCommentCompileState(q)})
+							}
+							child := dao.Builder()
+							configure(child)
+							b := dao.Builder().Table("users").Select("name").Where("id", 7)
+							compile := (*Builder).ToSelect
+							switch name {
+							case "select":
+								b.SelectSub(child, "picked")
+							case "from":
+								b.TableSub(child, "s")
+							case "where_scalar":
+								b.WhereSub("name", "=", configure)
+							case "where_in":
+								b.WhereInSub("name", configure)
+							case "where_exists":
+								b.WhereExists(configure)
+							case "where_exists_builder":
+								b.WhereExists(child)
+							case "join_table":
+								b.JoinSub(child, "s", func(j *JoinBuilder) { j.On("users.name", "=", "s.name").Where("s.name", "<>", "blocked") })
+							case "join_scalar":
+								b.JoinOn("profiles", func(j *JoinBuilder) { j.Where("profiles.name", "=", child) })
+							case "join_in":
+								b.JoinOn("profiles", func(j *JoinBuilder) { j.WhereIn("profiles.name", child) })
+							case "join_exists":
+								b.JoinOn("profiles", func(j *JoinBuilder) { j.WhereExists(configure) })
+							case "union":
+								b.Union(child)
+							case "insert_using":
+								compile = func(b *Builder) (string, []any, error) { return b.ToInsertUsing([]string{"name"}, configure) }
+							case "insert_ignore_using":
+								compile = func(b *Builder) (string, []any, error) { return b.ToInsertOrIgnoreUsing([]string{"name"}, configure) }
+							case "select_from_where":
+								b.SelectSub(child, "picked").TableSub(child, "s").WhereInSub("name", configure)
+							}
+							if mode.name == "override" {
+								b.Comment("outer:query")
+							}
+							if mode.name == "clear" {
+								b.Comment("")
+							}
+							checks := 0
+							b.grammar = &commentInspectGrammar{Grammar: g, check: func() {
+								checks++
+								for _, c := range children {
+									assertCommentCompileState(t, c.b, c.state)
+								}
+							}}
+							before := snapshotCommentCompileState(b)
+							want, ok := expected[name]
+							if !ok {
+								t.Fatalf("缺少 %s 期望", name)
+							}
+							childWant, ok := expected["child"]
+							if !ok {
+								t.Fatal("缺少子查询独立编译期望")
+							}
+							for range 2 {
+								sql, args, err := compile(b)
+								assertCommentCompileResult(t, commentCompileExpected{want.sql + mode.suffix, want.args}, sql, args, err)
+								assertCommentCompileState(t, b, before)
+								for _, c := range children {
+									assertCommentCompileState(t, c.b, c.state)
+									sql, args, err := c.b.ToSelect()
+									assertCommentCompileResult(t, commentCompileExpected{childWant.sql + childSuffix, childWant.args}, sql, args, err)
+									assertCommentCompileState(t, c.b, c.state)
+								}
+							}
+							if checks < 2 {
+								t.Fatalf("未观察到两次 Grammar 调用：%d", checks)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func snapshotCommentCompileState(b *Builder) Builder {
+	state := *b
+	state.columns = slices.Clone(b.columns)
+	state.selectSubs = slices.Clone(b.selectSubs)
+	state.orders = slices.Clone(b.orders)
+	state.wheres = slices.Clone(b.wheres)
+	state.groups = slices.Clone(b.groups)
+	state.havings = slices.Clone(b.havings)
+	state.joins = slices.Clone(b.joins)
+	state.unions = slices.Clone(b.unions)
+	return state
+}
+
+func assertCommentCompileState(t *testing.T, b *Builder, want Builder) {
+	t.Helper()
+	if !reflect.DeepEqual(*b, want) {
+		t.Fatalf("编译污染 Builder 状态：\nwant: %#v\n got: %#v", want, *b)
+	}
+}
+
+// assertCommentCompileResult 注释专项断言：SQL 必须与期望值精确相等，不走容忍式 assertSQL，
+// 否则"注释多追加一次"这类缺陷会被容忍规则掩盖。
+func assertCommentCompileResult(t *testing.T, want commentCompileExpected, sql string, args []any, err error) {
+	t.Helper()
+	assertNoError(t, err)
+	if sql != want.sql {
+		t.Errorf("SQL mismatch:\n  expected: %s\n  actual:   %s", want.sql, sql)
+	}
+	// 与通用 assertArgs 不同，此处也锁死无绑定时必须返回 nil。
+	if !reflect.DeepEqual(want.args, args) {
+		t.Fatalf("绑定参数不匹配：want %#v, got %#v", want.args, args)
+	}
+}
+
+func assertCommentCompileError(t *testing.T, want error, sql string, args []any, err error) {
+	t.Helper()
+	if sql != "" || args != nil || !errors.Is(err, want) {
+		t.Fatalf("错误出口应为空 SQL/nil args/%v，实际 (%q, %#v, %v)", want, sql, args, err)
+	}
+}
+
+func assertCommentCompileErrors(t *testing.T, g Grammar) {
+	t.Helper()
+	for _, tc := range commentCompileFixtures(g) {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, path := range []string{"accumulated", "empty_table"} {
+				t.Run(path, func(t *testing.T) {
+					b, want := tc.b.Where("id", "INVALID", 1), ErrInvalidOperator
+					if path == "empty_table" {
+						b, want = NewBuilder(g, nil), ErrEmptyTable
+					}
+					b.Comment("error:compile ? $1")
+					before := snapshotCommentCompileState(b)
+					for range 2 {
+						sql, args, err := tc.compile(b)
+						assertCommentCompileError(t, want, sql, args, err)
+						assertCommentCompileState(t, b, before)
+					}
+				})
+			}
+		})
+	}
+	base := func() *Builder { return NewBuilder(g, nil).Table("users").Comment("error:compile") }
+	row := commentCompileRow{Name: "alice", Age: 23}
+	type errorCase struct {
+		name    string
+		b       *Builder
+		compile func(*Builder) (string, []any, error)
+		want    error
+	}
+	cases := []errorCase{
+		{"insert_invalid", base(), func(b *Builder) (string, []any, error) { return b.ToInsert(7) }, ErrInvalidStruct},
+		{"insert_empty", base(), func(b *Builder) (string, []any, error) { return b.ToInsert([]commentCompileRow{}) }, ErrEmptyData},
+		{"insert_no_fields", base(), func(b *Builder) (string, []any, error) { return b.ToInsert(struct{}{}) }, ErrNoFields},
+		{"ignore_invalid", base(), func(b *Builder) (string, []any, error) { return b.ToInsertOrIgnore(7) }, ErrInvalidStruct},
+		{"upsert_invalid", base(), func(b *Builder) (string, []any, error) { return b.ToUpsert(7, []string{"name"}, nil) }, ErrInvalidStruct},
+		{"update_invalid", base(), func(b *Builder) (string, []any, error) { return b.ToUpdate(7) }, ErrInvalidStruct},
+		{"aggregate_invalid", base(), func(b *Builder) (string, []any, error) { return b.ToAggregate("COUNT;--", "age") }, ErrInvalidAggregate},
+		{"increment_empty", base(), func(b *Builder) (string, []any, error) { return b.ToIncrement(nil, nil) }, ErrIncrementColumns},
+		{"decrement_mismatch", base(), func(b *Builder) (string, []any, error) { return b.ToDecrement([]string{"age"}, nil) }, ErrIncrementColumns},
+		{"delete_join_missing", base(), (*Builder).ToDeleteJoin, ErrDeleteJoinNoJoin},
+		{"where_sub_invalid", base().WhereExists(42), (*Builder).ToSelect, ErrInvalidSubQuery},
+		{"join_in_invalid", base().JoinOn("profiles", func(j *JoinBuilder) { j.WhereIn("id", 42) }), (*Builder).ToSelect, ErrInvalidWhereInValues},
+	}
+	for _, ignore := range []bool{false, true} {
+		prefix := "insert_using_"
+		if ignore {
+			prefix = "insert_ignore_using_"
+		}
+		for _, subCase := range []struct {
+			name      string
+			configure func(*Builder)
+			want      error
+		}{
+			{"empty", func(sub *Builder) { sub.Comment("inner:error") }, ErrEmptyTable},
+			{"invalid", func(sub *Builder) { sub.Table("source").Where("id", "INVALID", 1).Comment("inner:error") }, ErrInvalidOperator},
+			{"mismatch", func(sub *Builder) { sub.Table("source").Select("name", "age").Comment("inner:error") }, ErrInsertUsingColumnMismatch},
+			{"cycle", func(sub *Builder) { sub.Table("source").Select("name").Comment("inner:error").TableSub(sub, "self") }, ErrCyclicQuery},
+		} {
+			cases = append(cases, errorCase{prefix + subCase.name, base(), func(b *Builder) (string, []any, error) {
+				if ignore {
+					return b.ToInsertOrIgnoreUsing([]string{"name"}, subCase.configure)
+				}
+				return b.ToInsertUsing([]string{"name"}, subCase.configure)
+			}, subCase.want})
+		}
+	}
+	// 环错误仅适用于会读取结构化查询图的编译入口，INSERT VALUES/TRUNCATE 不读取它。
+	for _, tc := range commentCompileFixtures(g) {
+		switch tc.name {
+		case "select", "update", "delete", "delete_join", "count", "exists", "aggregate", "increment", "decrement":
+			b := base()
+			b.WhereExists(b)
+			cases = append(cases, errorCase{tc.name + "_cycle", b, tc.compile, ErrCyclicQuery})
+		}
+	}
+	switch g.(type) {
+	case *PostgresGrammar:
+		cases = append(cases, errorCase{"union_lock", base().Union(NewBuilder(g, nil).Table("admins")).LockForUpdate(), (*Builder).ToSelect, ErrPgUnionLockNotSupported})
+	case *SQLiteGrammar:
+		cases = append(cases,
+			errorCase{"lock", base().LockForUpdate(), (*Builder).ToSelect, ErrSQLiteLockNotSupported},
+			errorCase{"shared_lock", base().SharedLock(), (*Builder).ToSelect, ErrSQLiteLockNotSupported})
+	}
+	if _, mysql := g.(*MySQLGrammar); !mysql {
+		cases = append(cases, errorCase{"upsert_unique_required", base(), func(b *Builder) (string, []any, error) { return b.ToUpsert(row, nil, nil) }, ErrUpsertUniqueByRequired})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := snapshotCommentCompileState(tc.b)
+			for range 2 {
+				sql, args, err := tc.compile(tc.b)
+				assertCommentCompileError(t, tc.want, sql, args, err)
+				assertCommentCompileState(t, tc.b, before)
+			}
+		})
+	}
+}
+
+func assertCommentCompileCases(t *testing.T, g Grammar, expected map[string]commentCompileExpected) {
+	t.Helper()
+	fixtures := commentCompileFixtures(g)
+	if len(expected) != len(fixtures)+2 {
+		t.Fatalf("期望矩阵应为编译用例加两条恢复基线：%d != %d", len(expected), len(fixtures)+2)
+	}
+	for _, tc := range fixtures {
+		t.Run(tc.name, func(t *testing.T) {
+			want, ok := expected[tc.name]
+			if !ok {
+				t.Fatalf("缺少 %s 的字面量期望", tc.name)
+			}
+			for _, mode := range []struct{ name, comment, suffix string }{
+				{"baseline", "", ""},
+				{"comment", "app:compile ? $1", " /* app:compile ? $1 */"},
+				{"cleared", "", ""},
+			} {
+				t.Run(mode.name, func(t *testing.T) {
+					// 每个模式独立初始化，单独筛选 cleared 也确实从有注释状态开始。
+					tc := tc
+					tc.b = tc.b.Clone().Primary()
+					if mode.name == "cleared" {
+						tc.b.Comment("previous:query")
+					}
+					before := snapshotCommentCompileState(tc.b)
+					before.comment = mode.comment
+					tc.b.Comment(mode.comment)
+					assertCommentCompileState(t, tc.b, before)
+					for range 2 {
+						sql, args, err := tc.compile(tc.b)
+						assertCommentCompileResult(t, commentCompileExpected{want.sql + mode.suffix, want.args}, sql, args, err)
+						assertCommentCompileState(t, tc.b, before)
+						switch tc.name {
+						case "count", "count_union", "count_group", "count_distinct", "exists", "exists_union", "aggregate", "aggregate_union":
+							selectName := "select"
+							switch tc.name {
+							case "count_union", "exists_union", "aggregate_union":
+								selectName = "select_union"
+							case "count_group":
+								selectName = "select_group"
+							case "count_distinct":
+								selectName = "select_distinct"
+							}
+							selectWant, ok := expected[selectName]
+							if !ok {
+								t.Fatalf("缺少 %s 恢复基线", selectName)
+							}
+							if before.lockClause != "" {
+								selectWant.sql += " FOR UPDATE"
+							}
+							sql, args, err = tc.b.ToSelect()
+							assertCommentCompileResult(t, commentCompileExpected{selectWant.sql + mode.suffix, selectWant.args}, sql, args, err)
+							assertCommentCompileState(t, tc.b, before)
+						}
+					}
+					if tc.direct != nil {
+						// C10：十个公开 Grammar 编译方法均不读取 Builder 注释。
+						assertSQL(t, want.sql, tc.direct(tc.b))
+						assertCommentCompileState(t, tc.b, before)
+					}
+				})
+			}
+		})
+	}
+}
+
 func assertNoError(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
@@ -1695,11 +2403,37 @@ func assertNoError(t *testing.T, err error) {
 	}
 }
 
+// testComment 是整套测试统一注入的短业务标识。除注释专项用例外，所有通过 Builder 构造 SQL 的
+// 用例都携带它（DAO 默认值或 newTestBuilder），用于顺带验证 Comment 不干扰既有行为；
+// 这些用例不断言注释本身，只要求注释之外的正文字节不变（见 assertSQL 的容忍规则）。
+const testComment = "zcdb:test"
+
+// testCommentSuffix 是 testComment 规范化后的固定后缀，供容忍式断言与期望值拼接使用。
+const testCommentSuffix = " /* " + testComment + " */"
+
+// newTestBuilder 等价 NewBuilder + Comment(testComment)：语法路径（无 DAO）的测试统一经此构造，
+// 使编译产物始终带注释；注释专项用例不得使用它，以免掩盖注释状态。
+func newTestBuilder(g Grammar, dao *DBDao) *Builder {
+	return NewBuilder(g, dao).Comment(testComment)
+}
+
+// stripTestComment 剥离统一测试注释后缀：非注释专项用例中未走 assertSQL 的本地 SQL 比较
+// （直接 !=、HasSuffix 等）先剥离再比对正文。后缀被重复追加或插错位置时剥离一次后仍不相等，
+// 因此这些比较仍能发现注释干扰。
+func stripTestComment(sql string) string {
+	return strings.TrimSuffix(sql, testCommentSuffix)
+}
+
+// assertSQL 比较 SQL 正文：接受"正文"或"正文 + 统一测试注释后缀"两种形式。
+// 非注释专项用例只校验正文不受干扰，因此不重复书写注释文本；注释被插错位置、
+// 重复追加或泄漏进子查询都会导致正文不一致而失败。注释专项用例自带完整期望值，
+// 走第一分支精确匹配（其 builder 不携带 testComment）。
 func assertSQL(t *testing.T, expected, actual string) {
 	t.Helper()
-	if expected != actual {
-		t.Errorf("SQL mismatch:\n  expected: %s\n  actual:   %s", expected, actual)
+	if actual == expected || actual == expected+testCommentSuffix {
+		return
 	}
+	t.Errorf("SQL mismatch:\n  expected: %s\n      or: %s\n  actual:   %s", expected, expected+testCommentSuffix, actual)
 }
 
 // assertArgs 类型敏感地断言参数列表：长度与每个位置的值、动态类型都必须一致。
@@ -1804,7 +2538,7 @@ func TestArgsEqual_TypeSensitiveAndPanicSafe(t *testing.T) {
 func assertInsertUsingColumnMismatch(t *testing.T, g Grammar) {
 	t.Helper()
 	checkUsing := func(columns []string, subFn func(*Builder)) error {
-		b := NewBuilder(g, nil).Table("archive")
+		b := newTestBuilder(g, nil).Table("archive")
 		_, _, err := b.ToInsertUsing(columns, subFn)
 		return err
 	}
@@ -1833,7 +2567,7 @@ func assertInsertUsingColumnMismatch(t *testing.T, g Grammar) {
 		t.Errorf("ToInsertUsing 默认列: unexpected error %v", err)
 	}
 	// ToInsertOrIgnoreUsing 同样校验
-	b := NewBuilder(g, nil).Table("archive")
+	b := newTestBuilder(g, nil).Table("archive")
 	_, _, err := b.ToInsertOrIgnoreUsing([]string{"name", "age"}, func(sub *Builder) {
 		sub.Table("users").Select("name")
 	})
@@ -1868,7 +2602,7 @@ func TestBuilder_WhereExpression_AllGrammars(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sql, args, err := NewBuilder(tt.grammar, nil).
+			sql, args, err := newTestBuilder(tt.grammar, nil).
 				Table("users").
 				Where("updated_at", ">", NewExpression("created_at")).
 				ToSelect()
@@ -1914,7 +2648,7 @@ func TestGrammar_WrapColumn_AllGrammars(t *testing.T) {
 // TestBuilder_ToUpsertInvalidData 验证 ToUpsert 传入非结构体时返回错误。
 func TestBuilder_ToUpsertInvalidData(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g, nil).Table("t").ToUpsert("not a struct", []string{"id"}, nil)
+	_, _, err := newTestBuilder(g, nil).Table("t").ToUpsert("not a struct", []string{"id"}, nil)
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -1923,7 +2657,7 @@ func TestBuilder_ToUpsertInvalidData(t *testing.T) {
 // TestBuilder_ToInsertOrIgnoreInvalidData 验证 ToInsertOrIgnore 传入非结构体时返回错误。
 func TestBuilder_ToInsertOrIgnoreInvalidData(t *testing.T) {
 	g := NewMySQLGrammar()
-	_, _, err := NewBuilder(g, nil).Table("t").ToInsertOrIgnore(123)
+	_, _, err := newTestBuilder(g, nil).Table("t").ToInsertOrIgnore(123)
 	if !errors.Is(err, ErrInvalidStruct) {
 		t.Errorf("expected ErrInvalidStruct, got %v", err)
 	}
@@ -1935,7 +2669,7 @@ func TestBuilder_ToUpdateEmptyTable(t *testing.T) {
 	type d struct {
 		Name string `db:"name"`
 	}
-	_, _, err := NewBuilder(g, nil).ToUpdate(d{Name: "x"})
+	_, _, err := newTestBuilder(g, nil).ToUpdate(d{Name: "x"})
 	if !errors.Is(err, ErrEmptyTable) {
 		t.Errorf("expected ErrEmptyTable, got %v", err)
 	}
@@ -1944,7 +2678,7 @@ func TestBuilder_ToUpdateEmptyTable(t *testing.T) {
 // TestBuilder_ToDeleteWithError 验证 ToDelete 携带累积错误时返回错误。
 func TestBuilder_ToDeleteWithError(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("t").Where("id", "EVIL", 1)
+	b := newTestBuilder(g, nil).Table("t").Where("id", "EVIL", 1)
 	_, _, err := b.ToDelete()
 	if !errors.Is(err, ErrInvalidOperator) {
 		t.Errorf("expected ErrInvalidOperator, got %v", err)
@@ -1989,43 +2723,43 @@ func TestSelectRaw_BypassWrapColumn(t *testing.T) {
 		{
 			name:     "MySQL_SelectRaw_数字字面量",
 			grammar:  &MySQLGrammar{},
-			builder:  NewBuilder(&MySQLGrammar{}, nil).Table("users").SelectRaw("1"),
+			builder:  newTestBuilder(&MySQLGrammar{}, nil).Table("users").SelectRaw("1"),
 			expected: "SELECT 1 FROM `users`",
 		},
 		{
 			name:     "MySQL_SelectRaw_算术表达式",
 			grammar:  &MySQLGrammar{},
-			builder:  NewBuilder(&MySQLGrammar{}, nil).Table("users").SelectRaw("age + 1 AS age_plus"),
+			builder:  newTestBuilder(&MySQLGrammar{}, nil).Table("users").SelectRaw("age + 1 AS age_plus"),
 			expected: "SELECT age + 1 AS age_plus FROM `users`",
 		},
 		{
 			name:     "MySQL_SelectRaw_混合普通列",
 			grammar:  &MySQLGrammar{},
-			builder:  NewBuilder(&MySQLGrammar{}, nil).Table("users").Select("name", "age").SelectRaw("1"),
+			builder:  newTestBuilder(&MySQLGrammar{}, nil).Table("users").Select("name", "age").SelectRaw("1"),
 			expected: "SELECT `name`, `age`, 1 FROM `users`",
 		},
 		{
 			name:     "PostgreSQL_SelectRaw_数字字面量",
 			grammar:  &PostgresGrammar{},
-			builder:  NewBuilder(&PostgresGrammar{}, nil).Table("users").SelectRaw("1"),
+			builder:  newTestBuilder(&PostgresGrammar{}, nil).Table("users").SelectRaw("1"),
 			expected: `SELECT 1 FROM "users"`,
 		},
 		{
 			name:     "PostgreSQL_SelectRaw_混合普通列",
 			grammar:  &PostgresGrammar{},
-			builder:  NewBuilder(&PostgresGrammar{}, nil).Table("users").Select("name").SelectRaw("1"),
+			builder:  newTestBuilder(&PostgresGrammar{}, nil).Table("users").Select("name").SelectRaw("1"),
 			expected: `SELECT "name", 1 FROM "users"`,
 		},
 		{
 			name:     "SQLite_SelectRaw_数字字面量",
 			grammar:  &SQLiteGrammar{},
-			builder:  NewBuilder(&SQLiteGrammar{}, nil).Table("users").SelectRaw("1"),
+			builder:  newTestBuilder(&SQLiteGrammar{}, nil).Table("users").SelectRaw("1"),
 			expected: `SELECT 1 FROM "users"`,
 		},
 		{
 			name:     "SQLite_SelectRaw_混合普通列",
 			grammar:  &SQLiteGrammar{},
-			builder:  NewBuilder(&SQLiteGrammar{}, nil).Table("users").Select("name").SelectRaw("1"),
+			builder:  newTestBuilder(&SQLiteGrammar{}, nil).Table("users").Select("name").SelectRaw("1"),
 			expected: `SELECT "name", 1 FROM "users"`,
 		},
 	}
@@ -2043,7 +2777,7 @@ func TestSelectRaw_BypassWrapColumn(t *testing.T) {
 // TestSelectRaw_ColumnOrder 验证 Select 和 SelectRaw 混合调用时列顺序保持正确。
 func TestSelectRaw_ColumnOrder(t *testing.T) {
 	g := &MySQLGrammar{}
-	b := NewBuilder(g, nil).Table("users").
+	b := newTestBuilder(g, nil).Table("users").
 		Select("name", "age").
 		SelectRaw("COUNT(*) AS cnt").
 		SelectRaw("1")
@@ -2058,7 +2792,7 @@ func TestSelectRaw_ColumnOrder(t *testing.T) {
 // TestSelectRaw_ClonePreservesRawFlag 验证 Clone 后 SelectColumn 的 Raw 标志被正确复制。
 func TestSelectRaw_ClonePreservesRawFlag(t *testing.T) {
 	g := &MySQLGrammar{}
-	b := NewBuilder(g, nil).Table("users").Select("name").SelectRaw("1")
+	b := newTestBuilder(g, nil).Table("users").Select("name").SelectRaw("1")
 	clone := b.Clone()
 
 	if len(clone.columns) != 2 {
@@ -2089,27 +2823,27 @@ func TestNewApi_WhereNotAllNoneCompile(t *testing.T) {
 		args    []any
 	}{
 		{"WhereNot", func() *Builder {
-			return NewBuilder(g, nil).Table("users").WhereNot(func(q *Builder) {
+			return newTestBuilder(g, nil).Table("users").WhereNot(func(q *Builder) {
 				q.Where("status", "=", "active")
 			})
 		}, "SELECT * FROM `users` WHERE NOT (`status` = ?)", []any{"active"}},
 		{"OrWhereNot", func() *Builder {
-			return NewBuilder(g, nil).Table("users").
+			return newTestBuilder(g, nil).Table("users").
 				Where("id", "=", 1).
 				OrWhereNot(func(q *Builder) { q.Where("age", ">", 18) })
 		}, "SELECT * FROM `users` WHERE `id` = ? OR NOT (`age` > ?)", []any{1, 18}},
 		{"WhereAll", func() *Builder {
-			return NewBuilder(g, nil).Table("users").WhereAll(func(q *Builder) {
+			return newTestBuilder(g, nil).Table("users").WhereAll(func(q *Builder) {
 				q.Where("a", 1).Where("b", 2)
 			})
 		}, "SELECT * FROM `users` WHERE (`a` = ? AND `b` = ?)", []any{1, 2}},
 		{"WhereAny", func() *Builder {
-			return NewBuilder(g, nil).Table("users").WhereAny(func(q *Builder) {
+			return newTestBuilder(g, nil).Table("users").WhereAny(func(q *Builder) {
 				q.Where("a", 1).Where("b", 2)
 			})
 		}, "SELECT * FROM `users` WHERE (`a` = ? OR `b` = ?)", []any{1, 2}},
 		{"WhereNone", func() *Builder {
-			return NewBuilder(g, nil).Table("users").WhereNone(func(q *Builder) {
+			return newTestBuilder(g, nil).Table("users").WhereNone(func(q *Builder) {
 				q.Where("a", 1).Where("b", 2)
 			})
 		}, "SELECT * FROM `users` WHERE NOT (`a` = ? OR `b` = ?)", []any{1, 2}},
@@ -2135,25 +2869,25 @@ func TestNewApi_HavingCompile(t *testing.T) {
 		args    []any
 	}{
 		{"HavingShorthand", func() *Builder {
-			return NewBuilder(g, nil).Table("users").SelectRaw("status, COUNT(*) AS cnt").
+			return newTestBuilder(g, nil).Table("users").SelectRaw("status, COUNT(*) AS cnt").
 				GroupBy("status").Having("cnt", 5)
 		}, "SELECT status, COUNT(*) AS cnt FROM `users` GROUP BY `status` HAVING `cnt` = ?", []any{5}},
 		{"HavingNested", func() *Builder {
-			return NewBuilder(g, nil).Table("orders").GroupBy("user_id").
+			return newTestBuilder(g, nil).Table("orders").GroupBy("user_id").
 				HavingNested(func(q *Builder) {
 					q.Having("total", ">", 100).Having("count", "<", 10)
 				})
 		}, "SELECT * FROM `orders` GROUP BY `user_id` HAVING (`total` > ? AND `count` < ?)", []any{100, 10}},
 		{"OrHavingNested", func() *Builder {
-			return NewBuilder(g, nil).Table("orders").GroupBy("user_id").
+			return newTestBuilder(g, nil).Table("orders").GroupBy("user_id").
 				Having("total", ">", 250).
 				OrHavingNested(func(q *Builder) { q.Having("total", "=", 30) })
 		}, "SELECT * FROM `orders` GROUP BY `user_id` HAVING `total` > ? OR (`total` = ?)", []any{250, 30}},
 		{"HavingNull", func() *Builder {
-			return NewBuilder(g, nil).Table("users").GroupBy("dept_id").HavingNull("email")
+			return newTestBuilder(g, nil).Table("users").GroupBy("dept_id").HavingNull("email")
 		}, "SELECT * FROM `users` GROUP BY `dept_id` HAVING `email` IS NULL", nil},
 		{"HavingNotNullMulti", func() *Builder {
-			return NewBuilder(g, nil).Table("users").GroupBy("dept_id").HavingNotNull("email", "age")
+			return newTestBuilder(g, nil).Table("users").GroupBy("dept_id").HavingNotNull("email", "age")
 		}, "SELECT * FROM `users` GROUP BY `dept_id` HAVING `email` IS NOT NULL AND `age` IS NOT NULL", nil},
 	}
 	for _, tt := range tests {
@@ -2192,19 +2926,19 @@ func TestNewApi_HavingNil(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := NewBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", "=", nil)
+			b := newTestBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", "=", nil)
 			sql, args, err := b.ToSelect()
 			assertNoError(t, err)
 			assertSQL(t, tt.eqSQL, sql)
 			assertArgs(t, nil, args)
 
-			b = NewBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", "!=", nil)
+			b = newTestBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", "!=", nil)
 			sql, args, err = b.ToSelect()
 			assertNoError(t, err)
 			assertSQL(t, tt.neSQL, sql)
 			assertArgs(t, nil, args)
 
-			b = NewBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", ">", nil)
+			b = newTestBuilder(tt.grammar, nil).Table("users").GroupBy("dept_id").Having("email", ">", nil)
 			sql, args, err = b.ToSelect()
 			assertNoError(t, err)
 			assertSQL(t, tt.gtSQL, sql)
@@ -2217,7 +2951,7 @@ func TestNewApi_HavingNil(t *testing.T) {
 func TestNewApi_ToAggregate(t *testing.T) {
 	t.Run("MySQL", func(t *testing.T) {
 		g := NewMySQLGrammar()
-		sql, args, err := NewBuilder(g, nil).Table("users").ToAggregate("MAX", "age")
+		sql, args, err := newTestBuilder(g, nil).Table("users").ToAggregate("MAX", "age")
 		assertNoError(t, err)
 		assertSQL(t, "SELECT MAX(`age`) AS `aggregate` FROM `users`", sql)
 		assertArgs(t, nil, args)
@@ -2225,21 +2959,21 @@ func TestNewApi_ToAggregate(t *testing.T) {
 
 	t.Run("Postgres", func(t *testing.T) {
 		g := NewPostgresGrammar()
-		sql, _, err := NewBuilder(g, nil).Table("users").ToAggregate("MIN", "age")
+		sql, _, err := newTestBuilder(g, nil).Table("users").ToAggregate("MIN", "age")
 		assertNoError(t, err)
 		assertSQL(t, `SELECT MIN("age") AS "aggregate" FROM "users"`, sql)
 	})
 
 	t.Run("SQLite", func(t *testing.T) {
 		g := NewSQLiteGrammar()
-		sql, _, err := NewBuilder(g, nil).Table("users").ToAggregate("AVG", "age")
+		sql, _, err := newTestBuilder(g, nil).Table("users").ToAggregate("AVG", "age")
 		assertNoError(t, err)
 		assertSQL(t, `SELECT AVG("age") AS "aggregate" FROM "users"`, sql)
 	})
 
 	t.Run("WithWhere", func(t *testing.T) {
 		g := NewMySQLGrammar()
-		sql, args, err := NewBuilder(g, nil).Table("users").
+		sql, args, err := newTestBuilder(g, nil).Table("users").
 			Where("status", "=", "active").ToAggregate("SUM", "age")
 		assertNoError(t, err)
 		assertSQL(t, "SELECT SUM(`age`) AS `aggregate` FROM `users` WHERE `status` = ?", sql)
@@ -2248,8 +2982,8 @@ func TestNewApi_ToAggregate(t *testing.T) {
 
 	t.Run("UnionWrap", func(t *testing.T) {
 		g := NewMySQLGrammar()
-		b := NewBuilder(g, nil).Table("orders_a").
-			Union(NewBuilder(g, nil).Table("orders_b"))
+		b := newTestBuilder(g, nil).Table("orders_a").
+			Union(newTestBuilder(g, nil).Table("orders_b"))
 		sql, _, err := b.ToAggregate("SUM", "amount")
 		assertNoError(t, err)
 		assertSQL(t,
@@ -2259,7 +2993,7 @@ func TestNewApi_ToAggregate(t *testing.T) {
 
 	t.Run("InvalidAggregate", func(t *testing.T) {
 		g := NewMySQLGrammar()
-		_, _, err := NewBuilder(g, nil).Table("users").ToAggregate("COUNT", "age")
+		_, _, err := newTestBuilder(g, nil).Table("users").ToAggregate("COUNT", "age")
 		if !errors.Is(err, ErrInvalidAggregate) {
 			t.Errorf("expected ErrInvalidAggregate, got %v", err)
 		}
@@ -2268,7 +3002,7 @@ func TestNewApi_ToAggregate(t *testing.T) {
 	t.Run("StateRestored", func(t *testing.T) {
 		// 编译后 Builder 状态应恢复，不影响后续 ToSelect
 		g := NewMySQLGrammar()
-		b := NewBuilder(g, nil).Table("users").Select("name").Limit(10)
+		b := newTestBuilder(g, nil).Table("users").Select("name").Limit(10)
 		_, _, err := b.ToAggregate("MAX", "age")
 		assertNoError(t, err)
 		sql, _, err := b.ToSelect()
@@ -2281,7 +3015,7 @@ func TestNewApi_ToAggregate(t *testing.T) {
 func TestNewApi_ToIncDec(t *testing.T) {
 	t.Run("MySQL_NoJoin", func(t *testing.T) {
 		g := NewMySQLGrammar()
-		sql, args, err := NewBuilder(g, nil).Table("wallets").
+		sql, args, err := newTestBuilder(g, nil).Table("wallets").
 			Where("id", "=", 1).
 			ToIncrement([]string{"balance", "points"}, []any{10, 5})
 		assertNoError(t, err)
@@ -2292,7 +3026,7 @@ func TestNewApi_ToIncDec(t *testing.T) {
 	t.Run("MySQL_JoinSetAfterJoin", func(t *testing.T) {
 		// MySQL：JOIN → SET → WHERE 绑定顺序
 		g := NewMySQLGrammar()
-		sql, args, err := NewBuilder(g, nil).Table("users").
+		sql, args, err := newTestBuilder(g, nil).Table("users").
 			Join("orders", "users.id", "=", "orders.user_id").
 			Where("orders.amount", ">", 100).
 			ToIncrement([]string{"age"}, []any{1})
@@ -2306,7 +3040,7 @@ func TestNewApi_ToIncDec(t *testing.T) {
 	t.Run("Postgres_SetBeforeJoin", func(t *testing.T) {
 		// PG：SET → JOIN(FROM) → WHERE 绑定顺序，$N 自动转换
 		g := NewPostgresGrammar()
-		sql, args, err := NewBuilder(g, nil).Table("users").
+		sql, args, err := newTestBuilder(g, nil).Table("users").
 			Join("orders", "users.id", "=", "orders.user_id").
 			Where("orders.amount", ">", 100).
 			ToIncrement([]string{"age"}, []any{1})
@@ -2319,7 +3053,7 @@ func TestNewApi_ToIncDec(t *testing.T) {
 
 	t.Run("Decrement", func(t *testing.T) {
 		g := NewSQLiteGrammar()
-		sql, args, err := NewBuilder(g, nil).Table("wallets").
+		sql, args, err := newTestBuilder(g, nil).Table("wallets").
 			Where("id", "=", 1).
 			ToDecrement([]string{"balance"}, []any{30})
 		assertNoError(t, err)
@@ -2329,12 +3063,12 @@ func TestNewApi_ToIncDec(t *testing.T) {
 
 	t.Run("ColumnsMismatch", func(t *testing.T) {
 		g := NewMySQLGrammar()
-		_, _, err := NewBuilder(g, nil).Table("wallets").
+		_, _, err := newTestBuilder(g, nil).Table("wallets").
 			ToIncrement([]string{"balance"}, []any{10, 5})
 		if !errors.Is(err, ErrIncrementColumns) {
 			t.Errorf("expected ErrIncrementColumns, got %v", err)
 		}
-		_, _, err = NewBuilder(g, nil).Table("wallets").ToIncrement(nil, nil)
+		_, _, err = newTestBuilder(g, nil).Table("wallets").ToIncrement(nil, nil)
 		if !errors.Is(err, ErrIncrementColumns) {
 			t.Errorf("expected ErrIncrementColumns, got %v", err)
 		}
@@ -2346,13 +3080,13 @@ func TestNewApi_ToDeleteJoin(t *testing.T) {
 	g := NewMySQLGrammar()
 
 	// 无 JOIN → ErrDeleteJoinNoJoin
-	_, _, err := NewBuilder(g, nil).Table("users").Where("id", "=", 1).ToDeleteJoin()
+	_, _, err := newTestBuilder(g, nil).Table("users").Where("id", "=", 1).ToDeleteJoin()
 	if !errors.Is(err, ErrDeleteJoinNoJoin) {
 		t.Errorf("expected ErrDeleteJoinNoJoin, got %v", err)
 	}
 
 	// 无表名 → ErrEmptyTable
-	_, _, err = NewBuilder(g, nil).Join("orders", "a", "=", "b").ToDeleteJoin()
+	_, _, err = newTestBuilder(g, nil).Join("orders", "a", "=", "b").ToDeleteJoin()
 	if !errors.Is(err, ErrEmptyTable) {
 		t.Errorf("expected ErrEmptyTable, got %v", err)
 	}
@@ -2363,13 +3097,13 @@ func TestNewApi_WhereShorthandInvalid(t *testing.T) {
 	g := NewMySQLGrammar()
 
 	// 三参形式 op 非 string → ErrInvalidOperator
-	_, _, err := NewBuilder(g, nil).Table("users").Where("age", 25, 30).ToSelect()
+	_, _, err := newTestBuilder(g, nil).Table("users").Where("age", 25, 30).ToSelect()
 	if !errors.Is(err, ErrInvalidOperator) {
 		t.Errorf("expected ErrInvalidOperator, got %v", err)
 	}
 
 	// 三参形式非法运算符 → ErrInvalidOperator
-	_, _, err = NewBuilder(g, nil).Table("users").Where("age", "DROP", 30).ToSelect()
+	_, _, err = newTestBuilder(g, nil).Table("users").Where("age", "DROP", 30).ToSelect()
 	if !errors.Is(err, ErrInvalidOperator) {
 		t.Errorf("expected ErrInvalidOperator, got %v", err)
 	}
@@ -2379,8 +3113,8 @@ func TestNewApi_WhereShorthandInvalid(t *testing.T) {
 func TestNewApi_SelectSubCompile(t *testing.T) {
 	t.Run("Postgres", func(t *testing.T) {
 		g := NewPostgresGrammar()
-		sub := NewBuilder(g, nil).Table("orders").SelectRaw("COUNT(*)").WhereRaw("orders.user_id = users.id")
-		sql, _, err := NewBuilder(g, nil).Table("users").
+		sub := newTestBuilder(g, nil).Table("orders").SelectRaw("COUNT(*)").WhereRaw("orders.user_id = users.id")
+		sql, _, err := newTestBuilder(g, nil).Table("users").
 			Select("id").SelectSub(sub, "order_count").ToSelect()
 		assertNoError(t, err)
 		assertSQL(t,
@@ -2390,8 +3124,8 @@ func TestNewApi_SelectSubCompile(t *testing.T) {
 
 	t.Run("MySQL", func(t *testing.T) {
 		g := NewMySQLGrammar()
-		sub := NewBuilder(g, nil).Table("orders").SelectRaw("COUNT(*)").Where("amount", ">", 100)
-		sql, args, err := NewBuilder(g, nil).Table("users").
+		sub := newTestBuilder(g, nil).Table("orders").SelectRaw("COUNT(*)").Where("amount", ">", 100)
+		sql, args, err := newTestBuilder(g, nil).Table("users").
 			Select("id").SelectSub(sub, "order_count").ToSelect()
 		assertNoError(t, err)
 		assertSQL(t,
@@ -2406,7 +3140,7 @@ func TestNewApi_SelectSubCompile(t *testing.T) {
 // TestBuilder_CyclicTableSub 自引用 FROM 子查询（TableSub 传入自身）应在编译前返回
 // ErrCyclicQuery，而非陷入无限递归导致栈溢出。
 func TestBuilder_CyclicTableSub(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil)
+	b := newTestBuilder(&MySQLGrammar{}, nil)
 	b.TableSub(b, "x")
 	if _, _, err := b.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
 		t.Fatalf("expected ErrCyclicQuery for self-referential TableSub, got %v", err)
@@ -2415,7 +3149,7 @@ func TestBuilder_CyclicTableSub(t *testing.T) {
 
 // TestBuilder_CyclicUnion 自引用 UNION（Union 传入自身）应返回 ErrCyclicQuery。
 func TestBuilder_CyclicUnion(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.Union(b)
 	if _, _, err := b.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
 		t.Fatalf("expected ErrCyclicQuery for self-referential Union, got %v", err)
@@ -2425,7 +3159,7 @@ func TestBuilder_CyclicUnion(t *testing.T) {
 // TestBuilder_CyclicClone Clone 遇环引用时不应递归崩溃，而应返回携带错误的副本，
 // 使后续编译方法经 b.err 前置检查返回 ErrCyclicQuery。
 func TestBuilder_CyclicClone(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil)
+	b := newTestBuilder(&MySQLGrammar{}, nil)
 	b.TableSub(b, "x")
 	clone := b.Clone()
 	if _, _, err := clone.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
@@ -2435,8 +3169,8 @@ func TestBuilder_CyclicClone(t *testing.T) {
 
 // TestBuilder_CyclicMutual 互引用（a.TableSub(b) 且 b.Union(a)）应返回 ErrCyclicQuery。
 func TestBuilder_CyclicMutual(t *testing.T) {
-	a := NewBuilder(&MySQLGrammar{}, nil).Table("users")
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("orders")
+	a := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("orders")
 	a.TableSub(b, "o")
 	b.Union(a)
 	if _, _, err := a.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
@@ -2447,7 +3181,7 @@ func TestBuilder_CyclicMutual(t *testing.T) {
 // TestBuilder_CyclicJoinSubUpdate 写路径（UPDATE）经 JoinSub 自引用也应返回 ErrCyclicQuery，
 // 覆盖非 SELECT 编译入口的环检测。
 func TestBuilder_CyclicJoinSubUpdate(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.JoinSub(b, "x", nil)
 	if _, _, err := b.ToUpdate(userInsert{Name: "alice"}); !errors.Is(err, ErrCyclicQuery) {
 		t.Fatalf("expected ErrCyclicQuery for cyclic join sub in UPDATE, got %v", err)
@@ -2457,8 +3191,8 @@ func TestBuilder_CyclicJoinSubUpdate(t *testing.T) {
 // TestBuilder_AcyclicSharedSubquery 同一子查询被多次引用（菱形引用，非环）不应误报，应正常编译。
 func TestBuilder_AcyclicSharedSubquery(t *testing.T) {
 	g := NewMySQLGrammar()
-	shared := NewBuilder(g, nil).Table("orders").Where("status", "=", "paid")
-	b := NewBuilder(g, nil).Table("users").
+	shared := newTestBuilder(g, nil).Table("orders").Where("status", "=", "paid")
+	b := newTestBuilder(g, nil).Table("users").
 		SelectSub(shared, "cnt_a").
 		SelectSub(shared, "cnt_b")
 	sql, args, err := b.ToSelect()

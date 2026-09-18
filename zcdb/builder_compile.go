@@ -8,6 +8,14 @@ import (
 // 本文件包含 Builder 的 ToXxx 编译系列（只生成 SQL 与绑定参数、不执行）：
 // ToSelect/ToInsert/ToUpdate/ToDelete/ToCount/ToAggregate 等，
 // 以及配套的绑定参数收集内部方法（collectXxxBindings）。
+// 成功产物在外层包装和方言后缀完成后追加当前 Builder 注释，内部 Grammar 编译不追加。
+
+func (b *Builder) appendSQLComment(sql string) string {
+	if b.comment == "" {
+		return sql
+	}
+	return sql + " /* " + b.comment + " */"
+}
 
 // ==================== 终端方法：编译 SQL ====================
 
@@ -49,7 +57,7 @@ func (b *Builder) ToSelect() (string, []any, error) {
 	sql := b.grammar.CompileSelect(b, b.columns)
 	args := b.collectSelectBindings()
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // ToInsert 编译 INSERT 语句。
@@ -119,7 +127,7 @@ func (b *Builder) ToInsert(data any) (string, []any, error) {
 		}
 	}
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // ToInsertOrIgnore 编译 INSERT OR IGNORE 语句。
@@ -166,7 +174,7 @@ func (b *Builder) ToInsertOrIgnore(data any) (string, []any, error) {
 		}
 	}
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // ToUpsert 编译 UPSERT（插入或更新）语句。
@@ -248,7 +256,7 @@ func (b *Builder) ToUpsert(data any, uniqueBy []string, updateColumns []string) 
 		}
 	}
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // ToInsertUsing 编译 INSERT INTO ... SELECT 语句，将一个 SELECT 查询的结果插入目标表。
@@ -300,7 +308,7 @@ func (b *Builder) ToInsertUsing(columns []string, callback func(*Builder)) (stri
 	sql := b.grammar.CompileInsertUsing(b, columns, sub)
 	args := sub.collectSelectBindings()
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // ToInsertOrIgnoreUsing 编译忽略冲突的 INSERT INTO ... SELECT 语句，
@@ -352,7 +360,7 @@ func (b *Builder) ToInsertOrIgnoreUsing(columns []string, callback func(*Builder
 	sql := b.grammar.CompileInsertOrIgnoreUsing(b, columns, sub)
 	args := sub.collectSelectBindings()
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // countSubSelectColumns 统计子查询 SELECT 的列数（Select/AddSelect/SelectRaw 列 + SelectSub 子查询列）。
@@ -451,7 +459,7 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 	}
 	args = append(args, b.collectWhereBindings()...)
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // ToDelete 编译 DELETE 语句。
@@ -481,7 +489,7 @@ func (b *Builder) ToDelete() (string, []any, error) {
 	sql := b.grammar.CompileDelete(b)
 	args := b.collectWhereBindings()
 
-	return sql, args, nil
+	return b.appendSQLComment(sql), args, nil
 }
 
 // ToDeleteJoin 编译按关联条件删除主表行的 DELETE 语句。
@@ -532,7 +540,7 @@ func (b *Builder) ToDeleteJoin() (string, []any, error) {
 	}
 	args = append(args, b.collectWhereBindings()...)
 
-	return sqlStr, args, nil
+	return b.appendSQLComment(sqlStr), args, nil
 }
 
 // ToTruncate 编译 TRUNCATE 语句（清空表数据）。
@@ -553,7 +561,7 @@ func (b *Builder) ToTruncate() (string, error) {
 	if b.table == "" {
 		return "", ErrEmptyTable
 	}
-	return b.grammar.CompileTruncate(b), nil
+	return b.appendSQLComment(b.grammar.CompileTruncate(b)), nil
 }
 
 // saveTransientState 保存 Builder 编译期临时变动的状态（分页/排序/锁/列），
@@ -612,7 +620,7 @@ func (b *Builder) ToCount() (string, []any, error) {
 		args := b.collectSelectBindings()
 
 		countSQL := "SELECT COUNT(*) FROM (" + unionSQL + ") AS " + b.grammar.WrapTable("t")
-		return countSQL, args, nil
+		return b.appendSQLComment(countSQL), args, nil
 	}
 
 	// GROUP BY 查询：COUNT(*) 与分组列组合时返回每组一行，
@@ -634,7 +642,7 @@ func (b *Builder) ToCount() (string, []any, error) {
 		args := b.collectSelectBindings()
 
 		countSQL := "SELECT COUNT(*) FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t")
-		return countSQL, args, nil
+		return b.appendSQLComment(countSQL), args, nil
 	}
 
 	// DISTINCT 查询：SELECT DISTINCT COUNT(*) 中 DISTINCT 对聚合结果无效，
@@ -651,7 +659,7 @@ func (b *Builder) ToCount() (string, []any, error) {
 		args := b.collectSelectBindings()
 
 		countSQL := "SELECT COUNT(*) FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t")
-		return countSQL, args, nil
+		return b.appendSQLComment(countSQL), args, nil
 	}
 
 	// 普通分支：列替换为 COUNT(*)，清除分页/排序/锁（对计数无意义）；
@@ -668,7 +676,7 @@ func (b *Builder) ToCount() (string, []any, error) {
 	// 由于 selectSubs 已清空，不会包含 SELECT 子查询的参数
 	args := b.collectSelectBindings()
 
-	return sqlStr, args, nil
+	return b.appendSQLComment(sqlStr), args, nil
 }
 
 // ToExists 编译存在性查询：SELECT 1 ... LIMIT 1。
@@ -705,9 +713,9 @@ func (b *Builder) ToExists() (string, []any, error) {
 
 	// UNION 查询：整个 UNION 作为子查询后附加 LIMIT 1
 	if len(b.unions) > 0 {
-		return "SELECT 1 FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t") + " LIMIT 1", args, nil
+		return b.appendSQLComment("SELECT 1 FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t") + " LIMIT 1"), args, nil
 	}
-	return subSQL + " LIMIT 1", args, nil
+	return b.appendSQLComment(subSQL + " LIMIT 1"), args, nil
 }
 
 // ToAggregate 编译聚合查询（MAX/MIN/SUM/AVG），生成 SELECT AGG(col) AS aggregate FROM ...。
@@ -749,7 +757,7 @@ func (b *Builder) ToAggregate(aggregate string, column string) (string, []any, e
 		unionSQL := b.grammar.CompileSelect(b, b.columns)
 		args := b.collectSelectBindings()
 
-		return "SELECT " + aggExpr + " FROM (" + unionSQL + ") AS " + b.grammar.WrapTable("t"), args, nil
+		return b.appendSQLComment("SELECT " + aggExpr + " FROM (" + unionSQL + ") AS " + b.grammar.WrapTable("t")), args, nil
 	}
 
 	// 替换为聚合列并清除分页/排序/锁/SELECT 子查询；
@@ -764,7 +772,7 @@ func (b *Builder) ToAggregate(aggregate string, column string) (string, []any, e
 	sqlStr := b.grammar.CompileSelect(b, b.columns)
 	args := b.collectSelectBindings()
 
-	return sqlStr, args, nil
+	return b.appendSQLComment(sqlStr), args, nil
 }
 
 // ToIncrement 编译原子自增 UPDATE：SET col = col + ?（多列一次更新）。
@@ -828,7 +836,7 @@ func (b *Builder) toIncDec(columns []string, amounts []any, op string) (string, 
 	}
 	args = append(args, b.collectWhereBindings()...)
 
-	return sqlStr, args, nil
+	return b.appendSQLComment(sqlStr), args, nil
 }
 
 // ==================== 内部方法：收集绑定参数 ====================

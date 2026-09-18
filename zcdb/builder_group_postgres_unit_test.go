@@ -9,7 +9,7 @@ import (
 // TestBug_PgHavingRawPlaceholder 验证 PostgreSQL HavingRaw 中 ? 应转换为 $N。
 func TestBug_PgHavingRawPlaceholder(t *testing.T) {
 	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("orders").
+	b := newTestBuilder(g, nil).Table("orders").
 		Select("user_id").
 		GroupBy("user_id").
 		HavingRaw("SUM(amount) > ?", 500)

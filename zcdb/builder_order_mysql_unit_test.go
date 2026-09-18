@@ -17,12 +17,12 @@ func TestMySQLGrammar_LockSQL(t *testing.T) {
 	}{
 		{
 			name:     "LockForUpdate",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
+			builder:  newTestBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
 			expected: "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE",
 		},
 		{
 			name:     "SharedLock",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
+			builder:  newTestBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
 			expected: "SELECT * FROM `users` WHERE `id` = ? LOCK IN SHARE MODE",
 		},
 	}

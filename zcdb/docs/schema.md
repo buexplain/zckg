@@ -2,6 +2,8 @@
 
 `DBDao.Schema()` 返回 `SchemaInspector` 接口，用于查询当前数据库的表列表与字段信息（按 DAO 的 Grammar 类型自动选择 MySQL/PostgreSQL/SQLite 实现），常用于代码生成、运维巡检等场景。
 
+Schema 元数据查询**不自动追加 SQL 注释**，即使 DAO 第五参数配置了默认短业务标识也不追加；默认注释仅影响 Builder 的最终编译 SQL。`TableInfo.Comment` / `ColumnInfo.Comment` 是数据库中的表/列说明，与 `Builder.Comment` 的 SQL 尾部业务标识不同，模型生成行为不受影响。慢 SQL 回调仍可观察 Schema 实际执行的原始 SQL。
+
 ```go
 inspector, err := db.Schema()
 if err != nil {

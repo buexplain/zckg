@@ -13,6 +13,78 @@ import (
 	"time"
 )
 
+// TestSQLiteInteg_SQLCommentTruncateSequenceStates 验证 sqlite_sequence 存在/不存在时仅主 DELETE 自动注释，辅助查询/清理保持原文。
+// 每个子测试独立纯 Go SQLite 共享内存库（DSN 见 openSQLiteCommentDAO），无外部服务，不 Skip；真实验证 ID 重置。
+func TestSQLiteInteg_SQLCommentTruncateSequenceStates(t *testing.T) {
+	for _, tc := range []struct {
+		name, identity string
+		sequence       int
+	}{
+		{"without_sequence", "INTEGER PRIMARY KEY", 0},
+		{"with_sequence", "INTEGER PRIMARY KEY AUTOINCREMENT", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := &commentSQLLog{}
+			dao := openSQLiteCommentDAO(t, integrationSQLComment, log.collect)
+			ctx := context.Background()
+			const table = "comment_sqlite_identity"
+			setupCommentTable(t, dao, table, "id "+tc.identity+", name TEXT, num INTEGER NOT NULL DEFAULT 0")
+			mustExec(t, dao, "INSERT INTO "+table+" (id, name) VALUES (41, 'seed')")
+			b := dao.Builder().Table(table)
+			log.calls = nil
+			data := crossDialectUUpd{Name: "identity"}
+			insert := commentSQLCall{sql: `INSERT INTO "comment_sqlite_identity" ("name") VALUES (?) /* app:comment */`, args: []any{"identity"}}
+			if id, err := b.InsertGetId(ctx, data); err != nil || id != 42 {
+				t.Fatalf("InsertGetId: id=%d err=%v", id, err)
+			}
+			log.check(t, insert)
+			assertCommentRows(t, dao, table, []crossDialectItemRow{{41, "seed", 0}, {42, "identity", 0}})
+			const sequenceQuery = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+			rows, err := dao.Query(ctx, sequenceQuery)
+			if err != nil {
+				t.Fatalf("sequence precondition: %v", err)
+			}
+			assertCommentScalarRows(t, rows, tc.sequence)
+			log.calls = nil
+			if err := b.Truncate(ctx); err != nil {
+				t.Fatalf("Truncate: %v", err)
+			}
+			want := []commentSQLCall{{sql: `DELETE FROM "comment_sqlite_identity" /* app:comment */`}, {sql: sequenceQuery}}
+			if tc.sequence == 1 {
+				want = append(want, commentSQLCall{sql: "DELETE FROM sqlite_sequence WHERE name = ?", args: []any{table}})
+			}
+			if len(log.calls) > 0 {
+				tx := log.calls[0].tx
+				if tx == nil {
+					t.Fatal("Truncate not transactional")
+				}
+				for i, call := range log.calls {
+					if call.tx != tx {
+						t.Errorf("Truncate call %d lost transaction", i)
+					}
+				}
+			}
+			log.check(t, want...)
+			if count, err := b.Count(ctx); err != nil || count != 0 {
+				t.Fatalf("Truncate count=%d err=%v", count, err)
+			}
+			if tc.sequence == 1 {
+				rows, err := dao.Query(ctx, "SELECT COUNT(*) FROM sqlite_sequence WHERE name = ?", table)
+				if err != nil {
+					t.Fatalf("sequence cleanup readback: %v", err)
+				}
+				assertCommentScalarRows(t, rows, 0)
+			}
+			log.calls = nil
+			if id, err := b.InsertGetId(ctx, data); err != nil || id != 1 {
+				t.Fatalf("reset InsertGetId: id=%d err=%v", id, err)
+			}
+			log.check(t, insert)
+			assertCommentRows(t, dao, table, []crossDialectItemRow{{1, "identity", 0}})
+		})
+	}
+}
+
 // TestSQLiteInteg_InsertSingle 验证单条结构体插入：传入单个结构体，生成并执行 INSERT，确认数据正确写入。
 func TestSQLiteInteg_InsertSingle(t *testing.T) {
 	db := openSQLiteTestDB(t)
@@ -993,7 +1065,7 @@ func TestSQLiteInteg_Truncate_NoSequenceSkipsDelete(t *testing.T) {
 		mu.Lock()
 		executed = append(executed, sqlStr)
 		mu.Unlock()
-	}, "")
+	}, "", "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}
@@ -1043,7 +1115,7 @@ func TestSQLiteInteg_Truncate_ReadOnlyDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite failed: %v", err)
 	}
-	dao, err := NewDBDao(pool, "sqlite", nil, "")
+	dao, err := NewDBDao(pool, "sqlite", nil, "", "")
 	if err != nil {
 		t.Fatalf("create dao failed: %v", err)
 	}
@@ -1056,7 +1128,7 @@ func TestSQLiteInteg_Truncate_ReadOnlyDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open readonly sqlite failed: %v", err)
 	}
-	roDAO, err := NewDBDao(roPool, "sqlite", nil, "")
+	roDAO, err := NewDBDao(roPool, "sqlite", nil, "", "")
 	if err != nil {
 		t.Fatalf("create readonly dao failed: %v", err)
 	}
@@ -1553,7 +1625,7 @@ func TestSQLiteInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 
 	panicDao, err := NewDBDao(db.Pool(), "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		panic("callback boom")
-	}, "")
+	}, "", "")
 	assertNoError(t, err)
 	ctx := context.Background()
 

@@ -10,8 +10,8 @@ import (
 // TestBug_PgUnionLock 验证 PostgreSQL UNION + LOCK 返回错误（PostgreSQL 不支持此组合）。
 func TestBug_PgUnionLock(t *testing.T) {
 	g := NewPostgresGrammar()
-	union := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
-	b := NewBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union).LockForUpdate()
+	union := newTestBuilder(g, nil).Table("users").Where("age", ">", 25)
+	b := newTestBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union).LockForUpdate()
 
 	_, _, err := b.ToSelect()
 	if !errors.Is(err, ErrPgUnionLockNotSupported) {
@@ -22,8 +22,8 @@ func TestBug_PgUnionLock(t *testing.T) {
 // TestBug_PgUnionSharedLock 验证 PostgreSQL UNION + SharedLock 返回错误。
 func TestBug_PgUnionSharedLock(t *testing.T) {
 	g := NewPostgresGrammar()
-	union := NewBuilder(g, nil).Table("users").Where("age", ">", 25)
-	b := NewBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union).SharedLock()
+	union := newTestBuilder(g, nil).Table("users").Where("age", ">", 25)
+	b := newTestBuilder(g, nil).Table("users").Where("status", "=", "active").Union(union).SharedLock()
 
 	_, _, err := b.ToSelect()
 	if !errors.Is(err, ErrPgUnionLockNotSupported) {
@@ -42,12 +42,12 @@ func TestPostgresGrammar_LockSQL(t *testing.T) {
 	}{
 		{
 			name:     "LockForUpdate",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
+			builder:  newTestBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
 			expected: "SELECT * FROM \"users\" WHERE \"id\" = $1 FOR UPDATE",
 		},
 		{
 			name:     "SharedLock",
-			builder:  NewBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
+			builder:  newTestBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
 			expected: "SELECT * FROM \"users\" WHERE \"id\" = $1 FOR SHARE",
 		},
 	}

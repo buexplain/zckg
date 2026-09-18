@@ -44,8 +44,8 @@ var joinAllConditionsArgs = []any{"paid", "a", "b", 1, 1000}
 // SQL 做关键形态抽查，args 做全量类型敏感断言，并验证 $N 编号与 args 索引一一对应。
 func TestPgGrammar_JoinConditionsAllTypes(t *testing.T) {
 	g := NewPostgresGrammar()
-	sub := NewBuilder(g, nil).Table("depts").Select("id")
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
+	sub := newTestBuilder(g, nil).Table("depts").Select("id")
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
 		joinAllConditions(jb, sub)
 	})
 	sql, args, err := b.ToSelect()
@@ -78,8 +78,8 @@ func TestPgGrammar_JoinConditionsAllTypes(t *testing.T) {
 // SQL 做关键形态抽查，args 做全量类型敏感断言。
 func TestMyGrammar_JoinConditionsAllTypes(t *testing.T) {
 	g := NewMySQLGrammar()
-	sub := NewBuilder(g, nil).Table("depts").Select("id")
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
+	sub := newTestBuilder(g, nil).Table("depts").Select("id")
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
 		joinAllConditions(jb, sub)
 	})
 	sql, args, err := b.ToSelect()
@@ -107,8 +107,8 @@ func TestMyGrammar_JoinConditionsAllTypes(t *testing.T) {
 // SQL 做关键形态抽查，args 做全量类型敏感断言。
 func TestSQLiteGrammar_JoinConditionsAllTypes(t *testing.T) {
 	g := NewSQLiteGrammar()
-	sub := NewBuilder(g, nil).Table("depts").Select("id")
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
+	sub := newTestBuilder(g, nil).Table("depts").Select("id")
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
 		joinAllConditions(jb, sub)
 	})
 	sql, args, err := b.ToSelect()
@@ -137,7 +137,7 @@ func TestSQLiteGrammar_JoinConditionsAllTypes(t *testing.T) {
 // 仅覆盖 PG 方言，MySQL/SQLite 的 HAVING 编译差异仅在标识符包裹与占位符形式。
 func TestPgGrammar_HavingAllTypes(t *testing.T) {
 	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("orders").Select("status").SelectRaw("COUNT(*) AS cnt").
+	b := newTestBuilder(g, nil).Table("orders").Select("status").SelectRaw("COUNT(*) AS cnt").
 		GroupBy("status").
 		Having("cnt", ">", 100).                            // basic
 		Having("remark", "=", nil).                         // basic-nil
@@ -180,21 +180,21 @@ func TestPgGrammar_WhereBasicNilAndExpression(t *testing.T) {
 		{
 			name: "eq_nil",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("deleted_at", "=", nil)
+				return newTestBuilder(g, nil).Table("users").Where("deleted_at", "=", nil)
 			},
 			expected: `SELECT * FROM "users" WHERE "deleted_at" IS NULL`,
 		},
 		{
 			name: "neq_nil",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("deleted_at", "!=", nil)
+				return newTestBuilder(g, nil).Table("users").Where("deleted_at", "!=", nil)
 			},
 			expected: `SELECT * FROM "users" WHERE "deleted_at" IS NOT NULL`,
 		},
 		{
 			name: "expression",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("id", "=", NewExpression("parent_id"))
+				return newTestBuilder(g, nil).Table("users").Where("id", "=", NewExpression("parent_id"))
 			},
 			expected: `SELECT * FROM "users" WHERE "id" = parent_id`,
 		},
@@ -221,7 +221,7 @@ func TestGrammar_JoinConditionsColumnAndRaw(t *testing.T) {
 		{"sqlite", NewSQLiteGrammar(), `"orders"."user_id" = "users"."id" AND orders.amount > ?`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b := NewBuilder(tc.g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
+			b := newTestBuilder(tc.g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
 				jb.On("orders.user_id", "=", "users.id").
 					Raw("orders.amount > ?", 100)
 			})
@@ -270,7 +270,7 @@ func TestGrammar_JoinConditionNotInVariants(t *testing.T) {
 			if s := cond([]JoinCondition{{Type: "in", First: "a", Values: []any{}}}); s != "0 = 1" {
 				t.Errorf("IN 空列表应编译为 %q，实际 %q", "0 = 1", s)
 			}
-			sub := NewBuilder(newGrammar(), nil).Table("t").Select("id")
+			sub := newTestBuilder(newGrammar(), nil).Table("t").Select("id")
 			if s := cond([]JoinCondition{{Type: "in", First: "a", Values: []any{1, 2}, Not: true}}); s != want.notInList {
 				t.Errorf("NOT IN 列表编译结果不符:\n got:  %s\n want: %s", s, want.notInList)
 			}

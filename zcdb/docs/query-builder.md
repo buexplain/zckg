@@ -2,7 +2,28 @@
 
 `db.Builder()` 返回 `*Builder`，所有构造方法均返回自身以支持链式调用；调用 `ToSelect()` 编译为 SQL，或调用终端方法（Find/First 等，见[查询执行文档](query-exec.md)）直接执行。
 
-所有示例以 MySQL 方言给出（反引号包裹、`?` 占位符）；PostgreSQL/SQLite 仅标识符改为双引号、PG 占位符为 `$1..$N`，语义差异处会单独说明。
+所有示例以 MySQL 方言给出（反引号包裹、`?` 占位符）；PostgreSQL/SQLite 仅标识符改为双引号、PG 占位符为 `$1..$N`，语义差异处会单独说明。除显式设置注释的示例外，SQL 输出均假定 DAO 第五参数为 `""`。
+
+## Comment（短业务标识）
+
+`NewDBDao` 的第四参数为列映射标签名，第五参数为默认 SQL 注释。默认值在 DAO 构造时规范化并固定，每次 `db.Builder()` 复制该值；`Comment(text)` 规范化后覆盖当前 Builder 并返回自身，不改变 DAO 或其他 Builder。
+
+```go
+sql, _, _ := db.Builder().Table("orders").Comment("report:daily").ToSelect()
+// SQL: SELECT * FROM `orders` /* report:daily */
+
+sql, _, _ = db.Builder().Table("logs").Comment("").ToSelect()
+// SQL: SELECT * FROM `logs`
+```
+
+- 注释仅承载服务名、模块名、报表名等**短业务标识**；不得透传外部输入、请求体、URL 参数、密码、令牌或其他秘密。注释可能进入慢 SQL 回调、数据库日志和监控，本功能不脱敏。
+- 所有 `*`、`/`、`\` 和 `unicode.IsControl` 为真的控制字符逐 rune 替换为 ASCII 空格；非法 UTF-8 转 U+FFFD，`strings.TrimSpace` 去首尾空白，内部空格不合并；超过 255 rune 时截断，再次去首尾空白。此为有损保存，不能依赖完整回显：URL/Unix 路径中的 `/` 与 Windows 路径中的 `\` 都会被替换为空格。
+- 多次调用以最后一次为准；空串、纯空白或规范化后为空均清空注释，清空后不回退 DAO 默认值。编译/执行不会消费注释，不是仅下一次生效。
+- `NewBuilder(grammar, nil)` 可纯编译，初始无注释，仍可显式调用 `Comment`。规范化不新增错误，也不清除已有错误。
+- `Clone` 保留默认、覆盖或已清空的注释状态，修改副本不影响原 Builder 或 DAO。不要跨请求共享可变 Builder；注释不改变并发安全性。
+- 结构化子查询的注释不进入外层产物，也不会被清除；只有外层追加一次。原始 SQL、Schema 与直接 Grammar 调用不自动添加注释；Raw/Expression 中的手工注释不在去重范围内。
+
+推荐固定、低基数标识：动态高基数文本可能影响预编译缓存或监控聚合，不能承诺零性能影响。
 
 ## 表与列
 
@@ -531,7 +552,7 @@ err := db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &o
 
 ## Clone（查询复用）
 
-`Clone` 深拷贝 Builder 的全部查询状态（列、子查询、JOIN 含嵌套组、WHERE 含嵌套与切片、GROUP/HAVING、ORDER、UNION、锁、force 标记与强制主库标记），副本与原 Builder 完全隔离。适合基于公共条件派生多个查询：
+`Clone` 深拷贝 Builder 的全部查询状态（列、子查询、JOIN 含嵌套组与嵌套条件的错误字段、WHERE 含嵌套与切片、GROUP/HAVING、ORDER、UNION、锁、force 标记、强制主库标记与 SQL 注释），副本与原 Builder 完全隔离。绑定值本身（`Value`/`Min`/`Max` 与 `Bindings` 元素，类型为 `any`）不做深拷贝：传入切片、map 或指针时副本与原 Builder 共享同一份底层数据，编译与执行不会修改它们。默认注释、显式覆盖和显式清空均被保留，修改副本的 `Comment` 不影响原 Builder 或 DAO；递归克隆的子 Builder 也保留自身注释，环引用仍返回携带 `ErrCyclicQuery` 的副本，编译不生成 SQL。适合基于公共条件派生多个查询：
 
 ```go
 base := db.Builder().Table("users").Where("status", "active")

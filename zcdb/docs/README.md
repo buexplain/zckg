@@ -64,6 +64,10 @@ zcdb 测试使用的驱动组合（可按需替换为任意 `database/sql` 驱�
 
 ## 快速上手
 
+`NewDBDao(pool, dialect, onSQL, tagName, comment)` 必须传五个参数：第四参数控制列映射标签（空串使用 `db`），第五参数是 DAO 默认 SQL **短业务标识**（空串禁用）；旧四参数调用末尾补 `""` 保持无注释 SQL 不变。注释只在 Builder 的最终 SQL 后追加，DAO 原始 SQL 与 Schema 查询不自动追加。
+
+默认值随新 Builder 复制，`Comment` 可覆盖或用空文本清除，`Clone` 保留当前值。注释会把 `unicode.IsControl` 控制字符、`*`、`/` 与 `\` 替换为空格、去首尾空白并按 255 rune 截断，属于有损保存；不得透传外部输入、请求体或秘密。完整生命周期见[查询构造](query-builder.md)的 Comment 小节，DAO 级别的默认值与不可变语义见[连接与 DAO](connection.md)。
+
 ```go
 package main
 
@@ -92,8 +96,8 @@ func main() {
 		panic(err)
 	}
 
-	// 2. 创建 DAO（dialect 决定 SQL 方言，最后一个参数为列映射标签名，传空串使用默认 db 标签）
-	db, err := zcdb.NewDBDao(pool, "mysql", nil, "")
+	// 2. 创建 DAO（dialect 决定 SQL 方言；第四参数为标签名，空串使用 db；第五参数为 SQL 注释，空串禁用）
+	db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
 	if err != nil {
 		panic(err)
 	}
@@ -131,7 +135,7 @@ func main() {
 | 文档 | 内容 |
 |---|---|
 | [connection.md](connection.md) | 连接池、读写分离、事务、原始 SQL、慢 SQL 回调、自定义列映射标签 |
-| [query-builder.md](query-builder.md) | SELECT 构造：表与列、WHERE、JOIN、分组、排序分页、UNION、锁、Clone |
+| [query-builder.md](query-builder.md) | SELECT 构造：表与列、WHERE、JOIN、分组、排序分页、UNION、锁、Comment、Clone |
 | [query-exec.md](query-exec.md) | 查询执行：Find/First/Value/Count/Exists/聚合/Pluck/Paginate/游标迭代 |
 | [mutate.md](mutate.md) | 写操作：Insert/Upsert/Update/Increment/Delete/DeleteJoin/Truncate 与安全防护 |
 | [compile.md](compile.md) | ToXxx 纯编译系列与 Expression 原始表达式 |

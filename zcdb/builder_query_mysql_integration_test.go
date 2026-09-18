@@ -10,6 +10,44 @@ import (
 	"testing"
 )
 
+// TestMySQLInteg_SQLCommentLockRouting 验证尾部注释位于 MySQL 锁子句之后，带锁 First 绕过从库选择。
+// DSN: root:root@tcp(127.0.0.1:3306)/zckg_test_integ?charset=utf8mb4&parseTime=true&loc=Local；不可达 Skip。
+// docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+func TestMySQLInteg_SQLCommentLockRouting(t *testing.T) {
+	for _, tc := range []struct {
+		lock  string
+		apply func(*Builder) *Builder
+	}{{"FOR UPDATE", (*Builder).LockForUpdate}, {"LOCK IN SHARE MODE", (*Builder).SharedLock}} {
+		t.Run(tc.lock, func(t *testing.T) {
+			log := &commentSQLLog{}
+			dao := openMySQLCommentDAO(t, integrationSQLComment, log.collect)
+			setupCommentTable(t, dao, "comment_mysql_lock")
+			mustExec(t, dao, "INSERT INTO comment_mysql_lock (id, name, num) VALUES (1, 'locked', 7)")
+			log.calls = nil
+			strategy := &RoundRobinStrategy{}
+			dao.pool.slaveStrategy = strategy
+			ctx := context.Background()
+			var replicaRow crossDialectItemRow
+			base := dao.Builder().Table("comment_mysql_lock").Where("id", 1)
+			if err := base.First(ctx, &replicaRow); err != nil || replicaRow != (crossDialectItemRow{1, "locked", 7}) {
+				t.Fatalf("replica First: row=%#v err=%v", replicaRow, err)
+			}
+			if strategy.counter.Load() != 1 {
+				t.Fatal("read route did not select replica")
+			}
+			log.check(t, commentSQLCall{sql: "SELECT * FROM `comment_mysql_lock` WHERE `id` = ? LIMIT 1 /* app:comment */", args: []any{1}})
+			var lockedRow crossDialectItemRow
+			if err := tc.apply(base.Clone()).First(ctx, &lockedRow); err != nil || lockedRow != (crossDialectItemRow{1, "locked", 7}) {
+				t.Fatalf("locked First: row=%#v err=%v", lockedRow, err)
+			}
+			if strategy.counter.Load() != 1 {
+				t.Fatal("locked query selected replica")
+			}
+			log.check(t, commentSQLCall{sql: "SELECT * FROM `comment_mysql_lock` WHERE `id` = ? LIMIT 1 " + tc.lock + " /* app:comment */", args: []any{1}})
+		})
+	}
+}
+
 // TestMySQLInteg_First 验证 First 查询第一条记录：有数据时填充结构体并返回 nil。
 func TestMySQLInteg_First(t *testing.T) {
 	db := openMySQLTestDB(t)

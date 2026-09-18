@@ -11,6 +11,32 @@ import (
 	"time"
 )
 
+// openPgCommentDAO 在 postgres 库建立独立主从池，不触碰既有基线表。
+// DSN: host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres。
+// 外部数据库不可达时 Skip，成功建连后的错误均失败。
+// docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+func openPgCommentDAO(t *testing.T, comment string, callback SlowSQLCallback) *DBDao {
+	t.Helper()
+	const dsn = "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres"
+	pool, err := NewPool(PoolConfig{DriverName: "postgres", DSN: dsn, MaxOpenConns: 1})
+	if err != nil {
+		t.Skipf("postgres unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := pool.Close(); err != nil {
+			t.Errorf("close postgres comment pool: %v", err)
+		}
+	})
+	if err := pool.AddSlave(dsn); err != nil {
+		t.Fatalf("add postgres read connection after successful probe: %v", err)
+	}
+	dao, err := NewDBDao(pool, "postgres", callback, "", comment)
+	if err != nil {
+		t.Fatalf("create postgres comment DAO: %v", err)
+	}
+	return dao
+}
+
 // openPgTestDB 打开 PostgreSQL 连接，自动创建测试数据库（若不存在），然后清理并重建 users/orders 相关表，保证测试隔离。
 // docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
 func openPgTestDB(t *testing.T) *DBDao {
@@ -26,7 +52,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 	}
 	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
-	}, "")
+	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
@@ -56,7 +82,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 	}
 	dao, err = NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
-	}, "")
+	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}

@@ -9,7 +9,7 @@ import (
 // TestBug_PgWhereRawPlaceholder 验证 PostgreSQL WhereRaw 中 ? 应转换为 $N。
 func TestBug_PgWhereRawPlaceholder(t *testing.T) {
 	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("users").WhereRaw("age > ? AND name LIKE ?", 25, "alice%")
+	b := newTestBuilder(g, nil).Table("users").WhereRaw("age > ? AND name LIKE ?", 25, "alice%")
 
 	sql, args, err := b.ToSelect()
 	assertNoError(t, err)
@@ -34,20 +34,20 @@ func TestPgGrammar_WhereNullSafe(t *testing.T) {
 	}{
 		{
 			name:      "equals_nil",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeEquals("email", nil) },
+			build:     func() *Builder { return newTestBuilder(g, nil).Table("users").WhereNullSafeEquals("email", nil) },
 			expected:  `SELECT * FROM "users" WHERE "email" IS NOT DISTINCT FROM $1`,
 			expectedA: []any{nil},
 		},
 		{
 			name:      "not_equals",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeNotEquals("email", "a@b.c") },
+			build:     func() *Builder { return newTestBuilder(g, nil).Table("users").WhereNullSafeNotEquals("email", "a@b.c") },
 			expected:  `SELECT * FROM "users" WHERE "email" IS DISTINCT FROM $1`,
 			expectedA: []any{"a@b.c"},
 		},
 		{
 			name: "param_numbering_after_prior_binding",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("id", "=", 1).WhereNullSafeEquals("email", nil)
+				return newTestBuilder(g, nil).Table("users").Where("id", "=", 1).WhereNullSafeEquals("email", nil)
 			},
 			expected:  `SELECT * FROM "users" WHERE "id" = $1 AND "email" IS NOT DISTINCT FROM $2`,
 			expectedA: []any{1, nil},

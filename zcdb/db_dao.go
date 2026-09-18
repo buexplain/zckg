@@ -43,6 +43,7 @@ type DBDao struct {
 	grammar Grammar                                                                     // SQL 编译器（由 dialect 推导）
 	onSQL   func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) //SQL 回调函数
 	tagName string                                                                      // 列映射结构体标签名，创建时确定、不可变更，空值使用默认的 db 标签
+	comment string
 }
 
 // NewDBDao 创建数据库访问对象。
@@ -56,9 +57,9 @@ type DBDao struct {
 // 传入执行耗时、SQL 文本与绑定参数，阈值判断由回调内部自行决定；为 nil 时不计时（零开销）。
 // 回调内 panic 会被 recover 隔离，不影响主流程。
 //
-// tagName 指定结构体与数据库列映射使用的标签名（如 "zc"），
-// 空字符串使用默认的 db 标签；初始化后不可变更。
-func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any), tagName string) (*DBDao, error) {
+// tagName（第四参数）指定不可变的列映射标签名，空串使用 db。
+// comment（第五参数）仅为 Builder 提供不可变的默认短业务标识，按 Comment 规则有损规范化（星号/斜杠/反斜杠/控制字符替换空格、上限 255 rune）；空值无注释，禁止透传外部输入、请求体或密钥，不负责脱敏。
+func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any), tagName string, comment string) (*DBDao, error) {
 	grammar, err := dialectGrammar(dialect)
 	if err != nil {
 		return nil, err
@@ -74,10 +75,11 @@ func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapse
 		grammar: grammar,
 		onSQL:   onSQL,
 		tagName: tagName,
+		comment: normalizeSQLComment(comment),
 	}, nil
 }
 
-// Builder 创建 SQL 构造器，链式调用的起点。
+// Builder 创建独立构造器并复制 NewDBDao 第五参数的规范化短业务标识（星号/斜杠/反斜杠/控制字符替换空格、上限 255 rune，禁止透传外部输入/密钥）；可用 Comment 覆盖或清空。
 func (d *DBDao) Builder() *Builder {
 	return NewBuilder(d.grammar, d)
 }

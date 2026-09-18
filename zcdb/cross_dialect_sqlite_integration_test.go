@@ -10,6 +10,12 @@ import (
 	"testing"
 )
 
+// TestCrossDialect_SQLite_SQLComment 注册 C07–C10 共享执行不变量。
+// 纯 Go SQLite、每例唯一共享内存 DSN（见 openSQLiteCommentDAO），无需 Docker，不跳过。
+func TestCrossDialect_SQLite_SQLComment(t *testing.T) {
+	runCrossDialectSQLComment(t, openSQLiteCommentDAO)
+}
+
 func TestCrossDialect_SQLite_Integration(t *testing.T) {
 	subtests := []struct {
 		name string

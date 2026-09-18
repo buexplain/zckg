@@ -9,7 +9,7 @@ import (
 // TestBug_PgJoinRawPlaceholder 验证 PostgreSQL JOIN ON Raw 中 ? 应转换为 $N。
 func TestBug_PgJoinRawPlaceholder(t *testing.T) {
 	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
+	b := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(jb *JoinBuilder) {
 		jb.On("users.id", "=", "orders.user_id").
 			Raw("orders.amount > ?", 100)
 	})
@@ -29,7 +29,7 @@ func TestBug_PgJoinRawPlaceholder(t *testing.T) {
 // TestPgGrammar_JoinBuilderValueParamNumbering 验证 JoinBuilder 值条件与 WHERE 绑定混合时 $N 编号全局递增。
 func TestPgGrammar_JoinBuilderValueParamNumbering(t *testing.T) {
 	g := NewPostgresGrammar()
-	b := NewBuilder(g, nil).Table("users").
+	b := newTestBuilder(g, nil).Table("users").
 		Where("users.status", "=", "active").
 		JoinOn("orders", func(jb *JoinBuilder) {
 			jb.On("users.id", "=", "orders.user_id").
@@ -58,7 +58,7 @@ func TestPgGrammar_JoinBuilderNullAndNested(t *testing.T) {
 		{
 			name: "where_null_and_not_null",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
 					j.On("profiles.user_id", "=", "users.id").WhereNull("profiles.avatar").WhereNotNull("profiles.bio")
 				})
 			},
@@ -68,7 +68,7 @@ func TestPgGrammar_JoinBuilderNullAndNested(t *testing.T) {
 		{
 			name: "on_nested",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").OnNested(func(q *JoinBuilder) {
 						q.Where("orders.status", "=", "paid").OrWhere("orders.vip", "=", 1)
 					})
@@ -80,7 +80,7 @@ func TestPgGrammar_JoinBuilderNullAndNested(t *testing.T) {
 		{
 			name: "where_not_in_empty_values",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").WhereNotIn("orders.status", []any{})
 				})
 			},

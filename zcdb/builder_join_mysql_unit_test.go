@@ -19,7 +19,7 @@ func TestMySQLGrammar_JoinBuilderNullConditions(t *testing.T) {
 		{
 			name: "where_null_multi_columns",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
 					j.On("profiles.user_id", "=", "users.id").WhereNull("profiles.avatar", "profiles.bio")
 				})
 			},
@@ -28,7 +28,7 @@ func TestMySQLGrammar_JoinBuilderNullConditions(t *testing.T) {
 		{
 			name: "where_not_null",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
 					j.On("profiles.user_id", "=", "users.id").WhereNotNull("profiles.avatar")
 				})
 			},
@@ -59,7 +59,7 @@ func TestMySQLGrammar_JoinBuilderInConditions(t *testing.T) {
 		{
 			name: "where_in_values",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").WhereIn("orders.status", []any{"paid", "shipped"})
 				})
 			},
@@ -69,7 +69,7 @@ func TestMySQLGrammar_JoinBuilderInConditions(t *testing.T) {
 		{
 			name: "where_not_in_values",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").WhereNotIn("orders.status", []any{"cancelled"})
 				})
 			},
@@ -79,7 +79,7 @@ func TestMySQLGrammar_JoinBuilderInConditions(t *testing.T) {
 		{
 			name: "where_in_empty_values",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").WhereIn("orders.status", []any{})
 				})
 			},
@@ -89,7 +89,7 @@ func TestMySQLGrammar_JoinBuilderInConditions(t *testing.T) {
 		{
 			name: "where_not_in_empty_values",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").WhereNotIn("orders.status", []any{})
 				})
 			},
@@ -99,8 +99,8 @@ func TestMySQLGrammar_JoinBuilderInConditions(t *testing.T) {
 		{
 			name: "where_in_subquery",
 			build: func() *Builder {
-				sub := NewBuilder(g, nil).Table("vip_orders").Select("user_id")
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				sub := newTestBuilder(g, nil).Table("vip_orders").Select("user_id")
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").WhereIn("orders.user_id", sub)
 				})
 			},
@@ -124,8 +124,8 @@ func TestMySQLGrammar_JoinBuilderWhereExists(t *testing.T) {
 	g := NewMySQLGrammar()
 
 	t.Run("builder_argument", func(t *testing.T) {
-		sub := NewBuilder(g, nil).Table("orders").SelectRaw("1").WhereColumn("orders.user_id", "=", "users.id")
-		sql, args, err := NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+		sub := newTestBuilder(g, nil).Table("orders").SelectRaw("1").WhereColumn("orders.user_id", "=", "users.id")
+		sql, args, err := newTestBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
 			j.On("profiles.user_id", "=", "users.id").WhereExists(sub)
 		}).ToSelect()
 		assertNoError(t, err)
@@ -134,7 +134,7 @@ func TestMySQLGrammar_JoinBuilderWhereExists(t *testing.T) {
 	})
 
 	t.Run("callback_argument", func(t *testing.T) {
-		sql, _, err := NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+		sql, _, err := newTestBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
 			j.On("profiles.user_id", "=", "users.id").WhereExists(func(q *Builder) {
 				q.Table("orders").SelectRaw("1").WhereColumn("orders.user_id", "=", "users.id")
 			})
@@ -144,7 +144,7 @@ func TestMySQLGrammar_JoinBuilderWhereExists(t *testing.T) {
 	})
 
 	t.Run("invalid_argument_type", func(t *testing.T) {
-		_, _, err := NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+		_, _, err := newTestBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
 			j.On("profiles.user_id", "=", "users.id").WhereExists(123)
 		}).ToSelect()
 		if !errors.Is(err, ErrInvalidSubQuery) {
@@ -163,7 +163,7 @@ func TestMySQLGrammar_JoinBuilderWhereInInvalid(t *testing.T) {
 			name = "WhereNotIn"
 		}
 		t.Run(name, func(t *testing.T) {
-			_, _, err := NewBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
+			_, _, err := newTestBuilder(g, nil).Table("users").JoinOn("profiles", func(j *JoinBuilder) {
 				j.On("profiles.user_id", "=", "users.id")
 				if not {
 					j.WhereNotIn("profiles.status", 123)
@@ -191,7 +191,7 @@ func TestMySQLGrammar_JoinBuilderNested(t *testing.T) {
 		{
 			name: "on_nested",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").OnNested(func(q *JoinBuilder) {
 						q.Where("orders.status", "=", "paid").OrWhere("orders.vip", "=", 1)
 					})
@@ -203,7 +203,7 @@ func TestMySQLGrammar_JoinBuilderNested(t *testing.T) {
 		{
 			name: "or_where_nested",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").OrWhereNested(func(q *JoinBuilder) {
 						q.Where("orders.gift", "=", 1)
 					})
@@ -215,7 +215,7 @@ func TestMySQLGrammar_JoinBuilderNested(t *testing.T) {
 		{
 			name: "empty_nested_skipped",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 					j.On("orders.user_id", "=", "users.id").OnNested(func(q *JoinBuilder) {})
 				})
 			},
@@ -238,7 +238,7 @@ func TestMySQLGrammar_JoinBuilderNested(t *testing.T) {
 func TestMySQLGrammar_JoinBuilderNestedJoin(t *testing.T) {
 	g := NewMySQLGrammar()
 
-	sql, args, err := NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+	sql, args, err := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 		j.On("orders.user_id", "=", "users.id").JoinOn("items", func(q *JoinBuilder) {
 			q.On("items.order_id", "=", "orders.id")
 		})
@@ -248,7 +248,7 @@ func TestMySQLGrammar_JoinBuilderNestedJoin(t *testing.T) {
 	assertArgs(t, []any{}, args)
 
 	// CrossJoinOn 在 JoinBuilder 内嵌套 CROSS JOIN 带 ON 条件
-	sql2, _, err2 := NewBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+	sql2, _, err2 := newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
 		j.On("orders.user_id", "=", "users.id").CrossJoinOn("items", "items.order_id", "=", "orders.id")
 	}).ToSelect()
 	assertNoError(t, err2)
@@ -261,7 +261,7 @@ func TestMySQLGrammar_JoinBuilderNestedJoin(t *testing.T) {
 func TestMySQLGrammar_JoinConditionAcyclicNested(t *testing.T) {
 	g := NewMySQLGrammar()
 
-	b := NewBuilder(g, nil).Table("users")
+	b := newTestBuilder(g, nil).Table("users")
 	b.JoinOn("orders", func(j *JoinBuilder) {
 		j.On("orders.user_id", "=", "users.id").
 			WhereNested(func(n *JoinBuilder) {

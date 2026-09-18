@@ -69,7 +69,7 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
 
 **元规则**：新增或修改测试前，先判断用例属于以下哪个维度，再对照对应条目执行；若与既有测试文件的写法冲突，**以既有写法为准**，违反时必须在提交说明（commit message 或 PR 描述）中注明冲突点与理由。
 
-以下五点适用于全部模块的测试编写与审查：
+以下六点适用于全部模块的测试编写与审查（第 6 点为 zcdb 专项）：
 
 1. **测试独立性**
   - **文件隔离**：产出文件的测试使用 `t.TempDir()`，禁止依赖仓库固定目录或其他测试的副作用；每个子测试自行写入完整初始内容，单独运行时具备完整前置条件。权限类测试用 `t.Cleanup` 恢复，平台不支持时明确 `t.Skip`。
@@ -100,6 +100,11 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
   - **边界测试注释**：必须指出覆盖的具体错误阶段（如"`os.Stat` 返回非 NotExist 错误时直接上报"、"`CreateTemp` 阶段失败"），不能仅写"测试失败情况"而无法判断覆盖价值；不能声称覆盖实际未进入的分支。
   - **集成测试前置说明**：注释应包含环境依赖（本地数据库/内存 SQLite）、默认 DSN、不可达时的跳过行为、Docker 启动命令；配置变更时同步更新注释。
   - **易过时标识**：引用具体实现细节的注释（gofmt 对齐规则、AST Spec 粒度、别名 import 判重、命名风格转换规则等）应逐项与源码核对；历史回归编号若已无追踪上下文，改写为直接描述回归风险；"代表性覆盖"不得误写为"全覆盖"。
+
+6. **注释注入（zcdb 专项）**
+  - 只要测试通过 Builder 构造 SQL，就必须让产物携带统一测试注释：DAO 路径由 `open*TestDB` helper 的第五参数注入，语法路径统一用 `newTestBuilder` 而非 `NewBuilder`。目的是让整套测试顺带验证 `Comment` 不干扰既有行为。
+  - 测试目标不是注释本身时**无须断言注释**：`assertSQL` 容忍固定后缀，未走该 helper 的本地比较先 `stripTestComment` 再比对正文。注释被插错位置、重复追加或泄漏进子查询仍会导致正文不一致而失败。
+  - 注释专项用例（`TestNormalizeSQLComment`、`TestBuilder_Comment*`、`*Compile_SQLComment*`、`crossDialectComment*` 等）不得使用 `newTestBuilder`，也不得注入 DAO 默认注释，其断言必须精确相等（不走容忍规则），否则会掩盖注释状态缺陷。
 
 ## 文档约定
 

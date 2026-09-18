@@ -12,6 +12,27 @@ import (
 	"time"
 )
 
+// TestSQLiteInteg_SQLCommentLockRejected 验证有注释时 SQLite 锁限制不变：空 SQL/args，First 不执行回调。
+// 使用 openSQLiteCommentDAO 的独立纯 Go 共享内存库，无外部服务，不 Skip。
+func TestSQLiteInteg_SQLCommentLockRejected(t *testing.T) {
+	log := &commentSQLLog{}
+	dao := openSQLiteCommentDAO(t, integrationSQLComment, log.collect)
+	setupCommentTable(t, dao, "comment_sqlite_lock")
+	log.calls = nil
+	base := dao.Builder().Table("comment_sqlite_lock")
+	for _, b := range []*Builder{base.Clone().LockForUpdate(), base.Clone().SharedLock()} {
+		query, args, err := b.ToSelect()
+		if !errors.Is(err, ErrSQLiteLockNotSupported) || query != "" || args != nil {
+			t.Fatalf("lock compile: SQL=%q args=%#v err=%v", query, args, err)
+		}
+		var row crossDialectItemRow
+		if err := b.First(context.Background(), &row); !errors.Is(err, ErrSQLiteLockNotSupported) {
+			t.Fatalf("lock First: %v", err)
+		}
+		log.check(t)
+	}
+}
+
 // TestSQLiteInteg_First 验证 First 查询第一条记录：有数据时填充结构体并返回 nil。
 func TestSQLiteInteg_First(t *testing.T) {
 	db := openSQLiteTestDB(t)
@@ -103,7 +124,7 @@ func TestSQLiteInteg_ExistsUsesLimit1(t *testing.T) {
 	var captured []string
 	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		captured = append(captured, sqlStr)
-	}, "")
+	}, "", "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}

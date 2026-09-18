@@ -17,7 +17,7 @@ func TestMySQLGrammar_WhereBetweenColumns(t *testing.T) {
 		{
 			name: "between_columns",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("products").WhereBetweenColumns("price", "min_price", "max_price")
+				return newTestBuilder(g, nil).Table("products").WhereBetweenColumns("price", "min_price", "max_price")
 			},
 			expected:  "SELECT * FROM `products` WHERE `price` BETWEEN `min_price` AND `max_price`",
 			expectedA: []any{},
@@ -25,7 +25,7 @@ func TestMySQLGrammar_WhereBetweenColumns(t *testing.T) {
 		{
 			name: "not_between_columns",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("products").WhereNotBetweenColumns("price", "min_price", "max_price")
+				return newTestBuilder(g, nil).Table("products").WhereNotBetweenColumns("price", "min_price", "max_price")
 			},
 			expected:  "SELECT * FROM `products` WHERE `price` NOT BETWEEN `min_price` AND `max_price`",
 			expectedA: []any{},
@@ -33,21 +33,23 @@ func TestMySQLGrammar_WhereBetweenColumns(t *testing.T) {
 		{
 			name: "or_not_between_columns",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("products").Where("id", "=", 1).OrWhereNotBetweenColumns("price", "min_price", "max_price")
+				return newTestBuilder(g, nil).Table("products").Where("id", "=", 1).OrWhereNotBetweenColumns("price", "min_price", "max_price")
 			},
 			expected:  "SELECT * FROM `products` WHERE `id` = ? OR `price` NOT BETWEEN `min_price` AND `max_price`",
 			expectedA: []any{1},
 		},
 		{
-			name:      "value_between",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereValueBetween(25, "min_age", "max_age") },
+			name: "value_between",
+			build: func() *Builder {
+				return newTestBuilder(g, nil).Table("users").WhereValueBetween(25, "min_age", "max_age")
+			},
 			expected:  "SELECT * FROM `users` WHERE ? BETWEEN `min_age` AND `max_age`",
 			expectedA: []any{25},
 		},
 		{
 			name: "or_value_between",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("vip", "=", 1).OrWhereValueBetween(25, "min_age", "max_age")
+				return newTestBuilder(g, nil).Table("users").Where("vip", "=", 1).OrWhereValueBetween(25, "min_age", "max_age")
 			},
 			expected:  "SELECT * FROM `users` WHERE `vip` = ? OR ? BETWEEN `min_age` AND `max_age`",
 			expectedA: []any{1, 25},
@@ -76,19 +78,19 @@ func TestMySQLGrammar_WhereNullSafe(t *testing.T) {
 	}{
 		{
 			name:      "equals_nil",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeEquals("email", nil) },
+			build:     func() *Builder { return newTestBuilder(g, nil).Table("users").WhereNullSafeEquals("email", nil) },
 			expected:  "SELECT * FROM `users` WHERE `email` <=> ?",
 			expectedA: []any{nil},
 		},
 		{
 			name:      "equals_value",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeEquals("email", "a@b.c") },
+			build:     func() *Builder { return newTestBuilder(g, nil).Table("users").WhereNullSafeEquals("email", "a@b.c") },
 			expected:  "SELECT * FROM `users` WHERE `email` <=> ?",
 			expectedA: []any{"a@b.c"},
 		},
 		{
 			name:      "not_equals",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeNotEquals("email", "a@b.c") },
+			build:     func() *Builder { return newTestBuilder(g, nil).Table("users").WhereNullSafeNotEquals("email", "a@b.c") },
 			expected:  "SELECT * FROM `users` WHERE NOT `email` <=> ?",
 			expectedA: []any{"a@b.c"},
 		},
@@ -117,7 +119,7 @@ func TestMySQLGrammar_WhereNotAnyNone(t *testing.T) {
 		{
 			name: "or_where_not",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("vip", "=", 1).
+				return newTestBuilder(g, nil).Table("users").Where("vip", "=", 1).
 					OrWhereNot(func(q *Builder) { q.Where("status", "banned") })
 			},
 			expected:  "SELECT * FROM `users` WHERE `vip` = ? OR NOT (`status` = ?)",
@@ -126,7 +128,7 @@ func TestMySQLGrammar_WhereNotAnyNone(t *testing.T) {
 		{
 			name: "or_where_any",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("status", "active").
+				return newTestBuilder(g, nil).Table("users").Where("status", "active").
 					OrWhereAny(func(q *Builder) { q.Where("age", ">", 60).Where("vip", "=", 1) })
 			},
 			expected:  "SELECT * FROM `users` WHERE `status` = ? OR (`age` > ? OR `vip` = ?)",
@@ -135,7 +137,7 @@ func TestMySQLGrammar_WhereNotAnyNone(t *testing.T) {
 		{
 			name: "or_where_none",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Where("vip", "=", 1).
+				return newTestBuilder(g, nil).Table("users").Where("vip", "=", 1).
 					OrWhereNone(func(q *Builder) { q.Where("status", "banned").Where("age", "<", 18) })
 			},
 			expected:  "SELECT * FROM `users` WHERE `vip` = ? OR NOT (`status` = ? OR `age` < ?)",

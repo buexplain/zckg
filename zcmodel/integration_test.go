@@ -32,7 +32,7 @@ func openSQLiteDAO(t *testing.T) *zcdb.DBDao {
 	}
 	// 连接池创建成功即注册清理，避免后续 NewDBDao 失败时泄漏；Pool.Close 幂等，可与 dao.Close 共存
 	t.Cleanup(func() { _ = pool.Close() })
-	dao, err := zcdb.NewDBDao(pool, "sqlite", nil, "")
+	dao, err := zcdb.NewDBDao(pool, "sqlite", nil, "", "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}
@@ -53,7 +53,7 @@ func openMySQLDAO(t *testing.T) *zcdb.DBDao {
 	}
 	// 连接池创建成功即注册清理，避免后续 NewDBDao 失败时泄漏；Pool.Close 幂等，可与 dao.Close 共存
 	t.Cleanup(func() { _ = pool.Close() })
-	dao, err := zcdb.NewDBDao(pool, "mysql", nil, "")
+	dao, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
 	if err != nil {
 		t.Fatalf("failed to create mysql dao: %v", err)
 	}
@@ -81,7 +81,7 @@ func openPgDAO(t *testing.T) *zcdb.DBDao {
 	}
 	// 连接池创建成功即注册清理，避免后续 NewDBDao 失败时泄漏；Pool.Close 幂等，可与 dao.Close 共存
 	t.Cleanup(func() { _ = adminPool.Close() })
-	dao, err := zcdb.NewDBDao(adminPool, "postgres", nil, "")
+	dao, err := zcdb.NewDBDao(adminPool, "postgres", nil, "", "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}
@@ -108,7 +108,7 @@ func openPgDAO(t *testing.T) *zcdb.DBDao {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
 	t.Cleanup(func() { _ = testPool.Close() })
-	dao, err = zcdb.NewDBDao(testPool, "postgres", nil, "")
+	dao, err = zcdb.NewDBDao(testPool, "postgres", nil, "", "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}

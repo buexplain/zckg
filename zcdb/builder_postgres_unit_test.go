@@ -17,25 +17,25 @@ func TestPostgresGrammar_RawPlaceholderEscape(t *testing.T) {
 	}{
 		{
 			name:     "DoubleQuestionMarkEscapesToLiteral",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw(`"options" ?? ?`, "foo"),
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw(`"options" ?? ?`, "foo"),
 			expected: `SELECT * FROM "users" WHERE "options" ? $1`,
 			args:     []any{"foo"},
 		},
 		{
 			name:     "DoubleQuestionMarkWithoutBinding",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw(`"options" ?? 'foo'`),
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw(`"options" ?? 'foo'`),
 			expected: `SELECT * FROM "users" WHERE "options" ? 'foo'`,
 			args:     []any{},
 		},
 		{
 			name:     "ExpressionInlinedNotConsumingParam",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw("age > ? AND age < ?", 20, NewExpression("40")),
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw("age > ? AND age < ?", 20, NewExpression("40")),
 			expected: `SELECT * FROM "users" WHERE age > $1 AND age < 40`,
 			args:     []any{20},
 		},
 		{
 			name:     "MixedLiteralOperatorAndBindings",
-			builder:  NewBuilder(g, nil).Table("users").WhereRaw("\"a\" ?? ? AND \"b\" = ?", "k", 1),
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw("\"a\" ?? ? AND \"b\" = ?", "k", 1),
 			expected: `SELECT * FROM "users" WHERE "a" ? $1 AND "b" = $2`,
 			args:     []any{"k", 1},
 		},

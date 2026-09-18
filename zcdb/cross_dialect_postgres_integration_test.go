@@ -8,6 +8,13 @@ import (
 	"testing"
 )
 
+// TestCrossDialect_PostgreSQL_SQLComment 注册 C07–C10 共享执行不变量。
+// DSN: host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres；不可达 Skip。
+// docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+func TestCrossDialect_PostgreSQL_SQLComment(t *testing.T) {
+	runCrossDialectSQLComment(t, openPgCommentDAO)
+}
+
 func TestCrossDialect_PostgreSQL_Integration(t *testing.T) {
 	subtests := []struct {
 		name string

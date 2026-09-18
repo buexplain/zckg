@@ -27,6 +27,8 @@ go get github.com/buexplain/zckg
 
 以下示例展示五个模块组合成一个最小可运行的 HTTP + 数据库应用（以 Sqlite 为例）：
 
+`zcdb.NewDBDao` 必须传五个参数：第四参数为列映射标签名（空串使用 `db`），第五参数为默认 SQL **短业务标识**（空串禁用）；旧调用末尾补 `""` 保留无注释基线。默认值由新 Builder 复制，`Comment` 可覆盖/清空，`Clone` 保留当前值；DAO 原始 SQL 与 Schema 不自动追加。控制字符（`unicode.IsControl`）、`*`、`/` 与 `\` 会替换为空格、去首尾空白并按 255 rune 截断，不得透传外部输入、请求体或秘密。
+
 ```go
 package main
 
@@ -62,9 +64,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// 第四参数为列映射标签名（空串使用 db），第五参数为 SQL 注释（空串禁用）
 	db, err := zcdb.NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		slog.Default().Info(sqlStr, "args", args)
-	}, "")
+	}, "", "")
 	if err != nil {
 		panic(err)
 	}
@@ -154,7 +157,7 @@ CREATE TABLE users (
 ### 各模块独立示例
 
 - **zcconfig**：`.env` 加载与泛型读取 → [zcconfig.md](zcconfig/docs/zcconfig.md)
-- **zcdb**：Builder 查询、写入、事务、读写分离 → [zcdb/docs/README.md](zcdb/docs/README.md) 及分主题文档
+- **zcdb**：Builder 查询、写入、事务、读写分离 → [zcdb/docs/README.md](zcdb/docs/README.md)
 - **zchttp**：路由注册、参数绑定、中间件、OpenAPI → [zchttp/docs](zchttp/docs)
 - **zcmodel**：从表结构生成模型代码 → [zcmodel.md](zcmodel/docs/zcmodel.md)
 - **zcquit**：信号监听与分级清理 → [zcquit.md](zcquit/docs/zcquit.md)

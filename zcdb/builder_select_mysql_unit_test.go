@@ -19,28 +19,28 @@ func TestMySQLGrammar_AddSelectDedup(t *testing.T) {
 		{
 			name: "dedup_existing_column",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Select("id").AddSelect("name", "id")
+				return newTestBuilder(g, nil).Table("users").Select("id").AddSelect("name", "id")
 			},
 			expected: "SELECT `id`, `name` FROM `users`",
 		},
 		{
 			name: "raw_column_not_deduped",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").SelectRaw("name").AddSelect("name")
+				return newTestBuilder(g, nil).Table("users").SelectRaw("name").AddSelect("name")
 			},
 			expected: "SELECT name, `name` FROM `users`",
 		},
 		{
 			name: "append_without_prior_select",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").AddSelect("id")
+				return newTestBuilder(g, nil).Table("users").AddSelect("id")
 			},
 			expected: "SELECT `id` FROM `users`",
 		},
 		{
 			name: "append_after_select_raw",
 			build: func() *Builder {
-				return NewBuilder(g, nil).Table("users").Select("id").SelectRaw("COUNT(*) AS c").AddSelect("name")
+				return newTestBuilder(g, nil).Table("users").Select("id").SelectRaw("COUNT(*) AS c").AddSelect("name")
 			},
 			expected: "SELECT `id`, COUNT(*) AS c, `name` FROM `users`",
 		},

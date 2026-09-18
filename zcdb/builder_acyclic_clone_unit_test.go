@@ -12,7 +12,7 @@ import (
 
 // TestBuilder_CyclicSelectSub 自引用 SELECT 子查询（SelectSub 传入自身）应返回 ErrCyclicQuery。
 func TestBuilder_CyclicSelectSub(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.SelectSub(b, "x")
 	if _, _, err := b.ToSelect(); !errors.Is(err, ErrCyclicQuery) {
 		t.Fatalf("expected ErrCyclicQuery for self-referential SelectSub, got %v", err)
@@ -21,7 +21,7 @@ func TestBuilder_CyclicSelectSub(t *testing.T) {
 
 // TestBuilder_CyclicWhereNested 经 WhereNested 回调引用外层 Builder 应返回 ErrCyclicQuery。
 func TestBuilder_CyclicWhereNested(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.WhereNested(func(q *Builder) {
 		q.Where("x", "=", 1).TableSub(b, "x")
 	})
@@ -32,7 +32,7 @@ func TestBuilder_CyclicWhereNested(t *testing.T) {
 
 // TestBuilder_CyclicWhereSub 经 WhereSub 回调引用外层 Builder 应返回 ErrCyclicQuery。
 func TestBuilder_CyclicWhereSub(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.WhereSub("id", "=", func(q *Builder) {
 		q.TableSub(b, "x")
 	})
@@ -43,7 +43,7 @@ func TestBuilder_CyclicWhereSub(t *testing.T) {
 
 // TestBuilder_CyclicHavingNested 经 HavingNested 回调引用外层 Builder 应返回 ErrCyclicQuery。
 func TestBuilder_CyclicHavingNested(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.HavingNested(func(q *Builder) {
 		q.Having("cnt", ">", 1).TableSub(b, "x")
 	})
@@ -55,7 +55,7 @@ func TestBuilder_CyclicHavingNested(t *testing.T) {
 // TestBuilder_CyclicJoinConditionSub JoinBuilder.Where 传入自身 Builder 生成 subValue 环，
 // 应经 checkJoinConditionAcyclic 的 Sub 分支返回 ErrCyclicQuery。
 func TestBuilder_CyclicJoinConditionSub(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.JoinOn("orders", func(jb *JoinBuilder) {
 		jb.On("orders.user_id", "=", "users.id").
 			Where("orders.ref", "=", b) // *Builder 值 → subValue 类型，Sub 指向 b 自身
@@ -68,7 +68,7 @@ func TestBuilder_CyclicJoinConditionSub(t *testing.T) {
 // TestBuilder_CyclicJoinConditionNested JoinBuilder.WhereNested 回调内引用外层 Builder，
 // 应经 checkJoinConditionAcyclic 的 Nested 分支返回 ErrCyclicQuery。
 func TestBuilder_CyclicJoinConditionNested(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.JoinOn("orders", func(jb *JoinBuilder) {
 		jb.On("orders.user_id", "=", "users.id").
 			WhereNested(func(q *JoinBuilder) {
@@ -83,7 +83,7 @@ func TestBuilder_CyclicJoinConditionNested(t *testing.T) {
 // TestBuilder_CyclicJoinNestedGroup JoinBuilder.JoinOn 嵌套 join 组内引用外层 Builder，
 // 应经 checkJoinClauseAcyclic 的 Joins 分支返回 ErrCyclicQuery。
 func TestBuilder_CyclicJoinNestedGroup(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.JoinOn("orders", func(jb *JoinBuilder) {
 		jb.On("orders.user_id", "=", "users.id").
 			JoinOn("order_items", func(inner *JoinBuilder) {
@@ -98,7 +98,7 @@ func TestBuilder_CyclicJoinNestedGroup(t *testing.T) {
 // TestBuilder_CyclicJoinSubCondition JoinSub 的派生表为自身，且带 ON 条件，
 // 应经 checkJoinClauseAcyclic 的 Sub + Conditions 分支返回 ErrCyclicQuery。
 func TestBuilder_CyclicJoinSubCondition(t *testing.T) {
-	b := NewBuilder(&MySQLGrammar{}, nil).Table("users")
+	b := newTestBuilder(&MySQLGrammar{}, nil).Table("users")
 	b.JoinSub(b, "x", func(jb *JoinBuilder) {
 		jb.On("x.id", "=", "users.id")
 	})
@@ -111,7 +111,7 @@ func TestBuilder_CyclicJoinSubCondition(t *testing.T) {
 // 等子状态：副本修改不影响原 Builder。
 func TestBuilder_CloneDeepCopySubs(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").
+	b := newTestBuilder(g, nil).Table("users").
 		WhereSub("age", ">", func(q *Builder) { q.Table("stats").SelectRaw("AVG(age)") }).
 		GroupByRaw("YEAR(created_at)", 2026).
 		HavingNested(func(q *Builder) { q.Having("cnt", ">", 1) })
@@ -136,7 +136,7 @@ func TestBuilder_CloneDeepCopySubs(t *testing.T) {
 // Values/Bindings/Sub/Nested 分支（经 JoinBuilder.WhereIn/Where/WhereExists/WhereNested 构造）。
 func TestBuilder_CloneDeepCopyJoinConditions(t *testing.T) {
 	g := NewMySQLGrammar()
-	b := NewBuilder(g, nil).Table("users").
+	b := newTestBuilder(g, nil).Table("users").
 		JoinOn("orders", func(jb *JoinBuilder) {
 			jb.On("orders.user_id", "=", "users.id").
 				Where("orders.status", "=", "paid").

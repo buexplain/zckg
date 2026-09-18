@@ -11,6 +11,53 @@ import (
 	"time"
 )
 
+// TestPgInteg_SQLCommentInsertGetIDAndTruncate 锁死 PG InsertGetId 拒绝执行与输入错误优先级，以及 TRUNCATE RESTART IDENTITY。
+// DSN: host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres；不可达 Skip。
+// docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+func TestPgInteg_SQLCommentInsertGetIDAndTruncate(t *testing.T) {
+	log := &commentSQLLog{}
+	dao := openPgCommentDAO(t, integrationSQLComment, log.collect)
+	ctx := context.Background()
+	const table = "comment_pg_identity"
+	setupCommentTable(t, dao, table, "id BIGSERIAL PRIMARY KEY, name VARCHAR(64), num INTEGER NOT NULL DEFAULT 0")
+	log.calls = nil
+	b := dao.Builder().Table(table)
+	if id, err := b.InsertGetId(ctx, 123); id != 0 || !errors.Is(err, ErrInvalidStruct) {
+		t.Fatalf("InsertGetId input priority: id=%d err=%v", id, err)
+	}
+	data := crossDialectUUpd{Name: "identity"}
+	if id, err := b.InsertGetId(ctx, data); id != 0 || err == nil || !strings.Contains(err.Error(), "InsertGetId is not supported on postgres dialect") {
+		t.Fatalf("InsertGetId postgres: id=%d err=%v", id, err)
+	}
+	log.check(t)
+	if count, err := b.Count(ctx); err != nil || count != 0 {
+		t.Fatalf("unsupported InsertGetId inserted rows: count=%d err=%v", count, err)
+	}
+	log.calls = nil
+	want := commentSQLCall{sql: `INSERT INTO "comment_pg_identity" ("name") VALUES ($1) /* app:comment */`, args: []any{"identity"}}
+	for range 2 {
+		if n, err := b.Insert(ctx, data); err != nil || n != 1 {
+			t.Fatalf("Insert: affected=%d err=%v", n, err)
+		}
+		log.check(t, want)
+	}
+	assertCommentRows(t, dao, table, []crossDialectItemRow{{1, "identity", 0}, {2, "identity", 0}})
+	log.calls = nil
+	if err := b.Truncate(ctx); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	log.check(t, commentSQLCall{sql: `TRUNCATE TABLE "comment_pg_identity" RESTART IDENTITY /* app:comment */`})
+	if count, err := b.Count(ctx); err != nil || count != 0 {
+		t.Fatalf("Truncate count=%d err=%v", count, err)
+	}
+	log.calls = nil
+	if n, err := b.Insert(ctx, data); err != nil || n != 1 {
+		t.Fatalf("reset Insert: affected=%d err=%v", n, err)
+	}
+	log.check(t, want)
+	assertCommentRows(t, dao, table, []crossDialectItemRow{{1, "identity", 0}})
+}
+
 // TestPgInteg_InsertSingle 验证单条结构体插入：传入单个结构体，生成并执行 INSERT，确认数据正确写入。
 func TestPgInteg_InsertSingle(t *testing.T) {
 	db := openPgTestDB(t)
@@ -1444,7 +1491,7 @@ func TestPgInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 
 	panicDao, err := NewDBDao(db.Pool(), "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		panic("callback boom")
-	}, "")
+	}, "", "")
 	assertNoError(t, err)
 	ctx := context.Background()
 

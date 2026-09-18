@@ -56,7 +56,7 @@ err := pool.AddSlave("user:pass@tcp(127.0.0.1:3308)/test?parseTime=true")
 `DBDao` 是面向用户的唯一入口，由方言名推导 SQL 编译器：
 
 ```go
-db, err := zcdb.NewDBDao(pool, "mysql", nil, "")
+db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
 // dialect 取值：
 //   "mysql"                        → MySQLGrammar
 //   "postgresql"/"postgres"/"pgsql" → PostgresGrammar
@@ -64,16 +64,20 @@ db, err := zcdb.NewDBDao(pool, "mysql", nil, "")
 defer db.Close()
 ```
 
-第三个参数为慢 SQL 回调（见下文），第四个参数为列映射标签名（见下节，传空串使用默认 `db` 标签）。`dialect` 为空返回 `ErrDialectRequired`，未知方言返回 `ErrUnknownDialect`，`pool` 为 nil 返回 `ErrPoolRequired`。
+第三个参数为慢 SQL 回调（见下文），第四个参数为列映射标签名（见下节，传空串使用默认 `db` 标签），第五个参数 `comment` 为默认 SQL **短业务标识**（例如服务名，空串表示无注释）。这是五参数接口，不兼容旧四参数调用；迁移时在末尾补 `""` 即可保留原 SQL 基线，函数值引用也需同步更新签名。`dialect` 为空返回 `ErrDialectRequired`，未知方言返回 `ErrUnknownDialect`，`pool` 为 nil 返回 `ErrPoolRequired`。
+
+默认注释在 DAO 创建时规范化并保存，之后不可变：将 `*`、`/`、`\` 和全部 `unicode.IsControl` 控制字符（含 C0、DEL、C1）替换为 ASCII 空格，非法 UTF-8 转 U+FFFD，去首尾空白但保留内部空格；超过 255 rune 时截断并再次去首尾空白。结果为空则不追加。规范化有损且不做脱敏，**不得透传外部输入、请求体、密码、令牌或其他秘密**；推荐固定低基数标识，避免影响 SQL 文本缓存与监控聚合。
+
+每个新 Builder 复制 DAO 默认值；`Comment` 可覆盖，传空串/纯空白/规范化后空文本则清空且不回退默认值，编译或执行不自动消费。`Clone` 保留当前注释，副本修改不影响原件或 DAO。默认注释仅影响 Builder 的最终编译 SQL，DAO 原始 `Exec` / `Query` / `QueryPrimary`、Schema 查询及直接 Grammar 调用不自动追加。
 
 `db.Pool()` 返回 DAO 持有的底层连接池，供调用方直接管理生命周期（`AddSlave`/`Ping`/`Close`）或获取 `*sql.DB`；`db.Close()` 即委托给该池的 `Close`。
 
 ## 自定义列映射标签
 
-结构体与数据库列的映射默认读取 `db` 标签，可在创建 DAO 时通过 `NewDBDao` 的最后一个参数改为任意标签名（如与其它 ORM 共用结构体时复用其标签），初始化后不可变更：
+结构体与数据库列的映射默认读取 `db` 标签，可在创建 DAO 时通过 `NewDBDao` 的第四个参数改为任意标签名（如与其它 ORM 共用结构体时复用其标签），初始化后不可变更：
 
 ```go
-db, err := zcdb.NewDBDao(pool, "mysql", nil, "zc") // 该 DAO 下的结构体映射读取 zc 标签
+db, err := zcdb.NewDBDao(pool, "mysql", nil, "zc", "") // 该 DAO 下的结构体映射读取 zc 标签，不添加 SQL 注释
 
 type User struct {
 	Name string `zc:"user_name"` // 映射到 user_name 列
@@ -145,7 +149,7 @@ err := db.Transaction(ctx, func(ctx context.Context) error {
 
 ## 原始 SQL
 
-不适合用 Builder 表达的语句可直接走 DAO：
+不适合用 Builder 表达的语句可直接走 DAO。`Exec`、`Query`、`QueryPrimary` 均原文透传：不会添加 DAO 默认注释，也不剥离调用方手工添加的注释。
 
 ```go
 // Exec：写语句（走写库或事务连接）
@@ -185,10 +189,12 @@ db, err := zcdb.NewDBDao(pool, "mysql",
 		if elapsed > 200*time.Millisecond {
 			log.Printf("slow sql (%s): %s %v", elapsed, sqlStr, args)
 		}
-	}, "")
+	}, "", "")
 ```
 
 `NewDBDao` 的回调参数语义与 Builder 链式构造无关，作用于所有经 DAO 执行的 SQL。`slowSQLMillis` 概念由回调内部自行判断；回调为 nil 时不计时（零开销）。
+
+回调收到实际执行的 SQL 与原绑定参数：Builder 语句包含最终编译时追加的注释，执行层不重复追加；DAO 原始 SQL、Schema 查询及 SQLite Truncate 辅助语句不自动添加注释。分页或分批游标每条业务 SQL 分别触发回调，不能把一次方法调用当作一条 SQL。
 
 ## 连接探活
 

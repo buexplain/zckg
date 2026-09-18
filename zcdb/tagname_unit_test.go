@@ -26,16 +26,14 @@ type userCustomTag struct {
 // zc 标签生效、db 标签被忽略、无标签字段走 snake_case、"-" 字段跳过。
 func TestNewDBDao_TagName_Insert(t *testing.T) {
 	dao := newTagDao("zc")
-	sql, args, err := NewBuilder(dao.grammar, dao).
+	sql, args, err := newTestBuilder(dao.grammar, dao).
 		Table("users").
 		ToInsert(userCustomTag{Name: "alice", Age: 25, EmailAddress: "a@t.com", Secret: "x"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	expected := "INSERT INTO `users` (`user_name`, `user_age`, `email_address`) VALUES (?, ?, ?)"
-	if sql != expected {
-		t.Errorf("sql mismatch:\ngot:  %s\nwant: %s", sql, expected)
-	}
+	assertSQL(t, expected, sql)
 	if len(args) != 3 || args[0] != "alice" || args[1] != 25 || args[2] != "a@t.com" {
 		t.Errorf("args mismatch: %v", args)
 	}
@@ -44,7 +42,7 @@ func TestNewDBDao_TagName_Insert(t *testing.T) {
 // TestNewDBDao_TagName_Update 验证自定义标签下的 UPDATE 编译。
 func TestNewDBDao_TagName_Update(t *testing.T) {
 	dao := newTagDao("zc")
-	sql, args, err := NewBuilder(dao.grammar, dao).
+	sql, args, err := newTestBuilder(dao.grammar, dao).
 		Table("users").
 		Where("user_name", "=", "alice").
 		ToUpdate(userCustomTag{Name: "alice", Age: 26})
@@ -52,9 +50,7 @@ func TestNewDBDao_TagName_Update(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	expected := "UPDATE `users` SET `user_name` = ?, `user_age` = ?, `email_address` = ? WHERE `user_name` = ?"
-	if sql != expected {
-		t.Errorf("sql mismatch:\ngot:  %s\nwant: %s", sql, expected)
-	}
+	assertSQL(t, expected, sql)
 	if len(args) != 4 {
 		t.Errorf("args mismatch: %v", args)
 	}
@@ -67,19 +63,17 @@ func TestNewDBDao_TagName_EmptyDefaults(t *testing.T) {
 	type u struct {
 		Name string `db:"name" zc:"zc_name"`
 	}
-	sql, _, err := NewBuilder(dao.grammar, dao).Table("users").ToInsert(u{Name: "alice"})
+	sql, _, err := newTestBuilder(dao.grammar, dao).Table("users").ToInsert(u{Name: "alice"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	expected := "INSERT INTO `users` (`name`) VALUES (?)"
-	if sql != expected {
-		t.Errorf("sql mismatch:\ngot:  %s\nwant: %s", sql, expected)
-	}
+	assertSQL(t, expected, sql)
 }
 
 // TestBuilder_TagName_NilDao 验证 dao 为 nil 时回退默认 db 标签。
 func TestBuilder_TagName_NilDao(t *testing.T) {
-	b := NewBuilder(NewMySQLGrammar(), nil)
+	b := newTestBuilder(NewMySQLGrammar(), nil)
 	if got := b.tagName(); got != defaultTagName {
 		t.Errorf("tagName() = %q, want %q", got, defaultTagName)
 	}

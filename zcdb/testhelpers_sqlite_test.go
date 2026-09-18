@@ -5,6 +5,7 @@ package zcdb
 
 import (
 	"context"
+	"fmt"
 	"log"
 	_ "modernc.org/sqlite"
 	"testing"
@@ -26,12 +27,51 @@ func openSQLiteTestDB(t *testing.T) *DBDao {
 	}
 	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
-	}, "")
+	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
 	t.Cleanup(func() { _ = dao.Close() })
 	return dao
+}
+
+// openSQLiteCommentDAO 为每个测试建立唯一共享内存库和独立主从连接，以便验证路由。
+// 纯 Go 驱动，无外部服务或跳过分支；DSN 为 file:sql_comment_<testing.T地址>?mode=memory&cache=shared。
+func openSQLiteCommentDAO(t *testing.T, comment string, callback SlowSQLCallback) *DBDao {
+	t.Helper()
+	dsn := fmt.Sprintf("file:sql_comment_%p?mode=memory&cache=shared", t)
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: dsn, SlaveDSNs: []string{dsn}, MaxOpenConns: 1})
+	if err != nil {
+		t.Fatalf("open sqlite comment pool: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := pool.Close(); err != nil {
+			t.Errorf("close sqlite comment pool: %v", err)
+		}
+	})
+	dao, err := NewDBDao(pool, "sqlite", callback, "", comment)
+	if err != nil {
+		t.Fatalf("create sqlite comment DAO: %v", err)
+	}
+	return dao
+}
+
+// setupCommentTable 为跨方言注释用例创建隔离表，注册后置 DROP（先于 DAO cleanup 执行）。
+func setupCommentTable(t *testing.T, dao *DBDao, table string, definition ...string) {
+	t.Helper()
+	wrapped := dao.grammar.WrapTable(table)
+	drop := "DROP TABLE IF EXISTS " + wrapped
+	mustExec(t, dao, drop)
+	t.Cleanup(func() {
+		if _, err := dao.Exec(context.Background(), drop); err != nil {
+			t.Errorf("cleanup %s: %v", table, err)
+		}
+	})
+	columns := "id INTEGER PRIMARY KEY, name VARCHAR(64), num INTEGER"
+	if len(definition) > 0 {
+		columns = definition[0]
+	}
+	mustExec(t, dao, "CREATE TABLE "+wrapped+" ("+columns+")")
 }
 
 // mustExec 执行 SQL，失败则 Fatal。

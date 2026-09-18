@@ -17,11 +17,11 @@ func TestSQLiteGrammar_LockSQL(t *testing.T) {
 	}{
 		{
 			name:    "LockForUpdate_error",
-			builder: NewBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
+			builder: newTestBuilder(g, nil).Table("users").Where("id", "=", 1).LockForUpdate(),
 		},
 		{
 			name:    "SharedLock_error",
-			builder: NewBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
+			builder: newTestBuilder(g, nil).Table("users").Where("id", "=", 1).SharedLock(),
 		},
 	}
 

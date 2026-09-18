@@ -22,7 +22,7 @@ var (
 )
 
 // docBuilder 创建无 DAO 的纯编译用 Builder。
-func docBuilder(g Grammar) *Builder { return NewBuilder(g, nil) }
+func docBuilder(g Grammar) *Builder { return newTestBuilder(g, nil) }
 
 // docAssertSQL 断言编译出的 SQL 与 args 是否与文档示例一致。
 // 参数比较刻意使用 fmt.Sprint 的字符串形式而非类型敏感比较：本文件的定位是
@@ -31,7 +31,7 @@ func docBuilder(g Grammar) *Builder { return NewBuilder(g, nil) }
 // 需要校验参数 Go 类型精度时应改用 builder_unit_test.go 的 assertArgs（类型敏感）。
 func docAssertSQL(t *testing.T, label string, gotSQL string, gotArgs []any, wantSQL string, wantArgs []any) {
 	t.Helper()
-	if gotSQL != wantSQL {
+	if stripTestComment(gotSQL) != wantSQL {
 		t.Errorf("%s SQL 不符:\n got:  %s\n want: %s", label, gotSQL, wantSQL)
 	}
 	if len(gotArgs) != len(wantArgs) {
@@ -100,38 +100,38 @@ func TestDocReview_ReadmeDialectTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(sqlStr, " FOR UPDATE") {
+	if !strings.HasSuffix(stripTestComment(sqlStr), " FOR UPDATE") {
 		t.Errorf("UNION+锁/MySQL 锁应置于 UNION 之后: %s", sqlStr)
 	}
 
 	// CROSS JOIN ON：PG 转 INNER JOIN，MySQL/SQLite 直译
 	sqlStr, _, _ = docBuilder(docPostgres).Table("users").CrossJoinOn("colors", "colors.id", "=", "users.id").ToSelect()
-	if sqlStr != `SELECT * FROM "users" INNER JOIN "colors" ON "colors"."id" = "users"."id"` {
+	if stripTestComment(sqlStr) != `SELECT * FROM "users" INNER JOIN "colors" ON "colors"."id" = "users"."id"` {
 		t.Errorf("CrossJoinOn/PG 应转 INNER JOIN: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").CrossJoinOn("colors", "colors.id", "=", "users.id").ToSelect()
-	if sqlStr != "SELECT * FROM `users` CROSS JOIN `colors` ON `colors`.`id` = `users`.`id`" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` CROSS JOIN `colors` ON `colors`.`id` = `users`.`id`" {
 		t.Errorf("CrossJoinOn/MySQL 应直译: %s", sqlStr)
 	}
 
 	// UNION 子查询括号：MySQL/PG 加括号，SQLite 不加
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").Select("name").Union(docBuilder(docMySQL).Table("admins").Select("name")).ToSelect()
-	if sqlStr != "(SELECT `name` FROM `users`) UNION (SELECT `name` FROM `admins`)" {
+	if stripTestComment(sqlStr) != "(SELECT `name` FROM `users`) UNION (SELECT `name` FROM `admins`)" {
 		t.Errorf("UNION 括号/MySQL: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docSQLite).Table("users").Select("name").Union(docBuilder(docSQLite).Table("admins").Select("name")).ToSelect()
-	if sqlStr != `SELECT "name" FROM "users" UNION SELECT "name" FROM "admins"` {
+	if stripTestComment(sqlStr) != `SELECT "name" FROM "users" UNION SELECT "name" FROM "admins"` {
 		t.Errorf("UNION 括号/SQLite 应不加括号: %s", sqlStr)
 	}
 
 	// Truncate 三方言（README 表：PG 带 RESTART IDENTITY、SQLite DELETE FROM）
-	if s, err := docBuilder(docMySQL).Table("users").ToTruncate(); err != nil || s != "TRUNCATE TABLE `users`" {
+	if s, err := docBuilder(docMySQL).Table("users").ToTruncate(); err != nil || stripTestComment(s) != "TRUNCATE TABLE `users`" {
 		t.Errorf("Truncate/MySQL: %s, %v", s, err)
 	}
-	if s, err := docBuilder(docPostgres).Table("users").ToTruncate(); err != nil || s != `TRUNCATE TABLE "users" RESTART IDENTITY` {
+	if s, err := docBuilder(docPostgres).Table("users").ToTruncate(); err != nil || stripTestComment(s) != `TRUNCATE TABLE "users" RESTART IDENTITY` {
 		t.Errorf("Truncate/PG 应为 TRUNCATE TABLE \"users\" RESTART IDENTITY: %s, %v", s, err)
 	}
-	if s, err := docBuilder(docSQLite).Table("users").ToTruncate(); err != nil || s != `DELETE FROM "users"` {
+	if s, err := docBuilder(docSQLite).Table("users").ToTruncate(); err != nil || stripTestComment(s) != `DELETE FROM "users"` {
 		t.Errorf("Truncate/SQLite: %s, %v", s, err)
 	}
 
@@ -191,11 +191,11 @@ func TestDocReview_CompileMd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sqlStr != "SELECT COUNT(*) FROM (SELECT 1 FROM `orders` GROUP BY `user_id`) AS `t`" {
+	if stripTestComment(sqlStr) != "SELECT COUNT(*) FROM (SELECT 1 FROM `orders` GROUP BY `user_id`) AS `t`" {
 		t.Errorf("ToCount GROUP BY 包裹: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").Select("city").Distinct().ToCount()
-	if sqlStr != "SELECT COUNT(*) FROM (SELECT DISTINCT `city` FROM `users`) AS `t`" {
+	if stripTestComment(sqlStr) != "SELECT COUNT(*) FROM (SELECT DISTINCT `city` FROM `users`) AS `t`" {
 		t.Errorf("ToCount DISTINCT 包裹: %s", sqlStr)
 	}
 
@@ -231,21 +231,21 @@ func TestDocReview_CompileMd(t *testing.T) {
 	docAssertSQL(t, "InsertOrIgnore/MySQL", sqlStr, args,
 		"INSERT IGNORE INTO `users` (`name`, `age`, `email`) VALUES (?, ?, ?)", []any{"alice", 25, "a@t.com"})
 	sqlStr, _, _ = docBuilder(docPostgres).Table("users").ToInsertOrIgnore(u3)
-	if sqlStr != `INSERT INTO "users" ("name", "age", "email") VALUES ($1, $2, $3) ON CONFLICT DO NOTHING` {
+	if stripTestComment(sqlStr) != `INSERT INTO "users" ("name", "age", "email") VALUES ($1, $2, $3) ON CONFLICT DO NOTHING` {
 		t.Errorf("InsertOrIgnore/PG: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docSQLite).Table("users").ToInsertOrIgnore(u3)
-	if sqlStr != `INSERT OR IGNORE INTO "users" ("name", "age", "email") VALUES (?, ?, ?)` {
+	if stripTestComment(sqlStr) != `INSERT OR IGNORE INTO "users" ("name", "age", "email") VALUES (?, ?, ?)` {
 		t.Errorf("InsertOrIgnore/SQLite: %s", sqlStr)
 	}
 
 	// ToUpsert MySQL / PG
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").ToUpsert(u3, []string{"email"}, []string{"name", "age"})
-	if sqlStr != "INSERT INTO `users` (`name`, `age`, `email`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`)" {
+	if stripTestComment(sqlStr) != "INSERT INTO `users` (`name`, `age`, `email`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`)" {
 		t.Errorf("Upsert/MySQL: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docPostgres).Table("users").ToUpsert(u3, []string{"email"}, []string{"name", "age"})
-	if sqlStr != `INSERT INTO "users" ("name", "age", "email") VALUES ($1, $2, $3) ON CONFLICT ("email") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"` {
+	if stripTestComment(sqlStr) != `INSERT INTO "users" ("name", "age", "email") VALUES ($1, $2, $3) ON CONFLICT ("email") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"` {
 		t.Errorf("Upsert/PG: %s", sqlStr)
 	}
 
@@ -254,11 +254,11 @@ func TestDocReview_CompileMd(t *testing.T) {
 		Email string `db:"email"`
 	}{"a@t.com"}
 	sqlStr, _, _ = docBuilder(docPostgres).Table("users").ToUpsert(onlyEmail, []string{"email"}, nil)
-	if !strings.HasSuffix(sqlStr, " DO NOTHING") {
+	if !strings.HasSuffix(stripTestComment(sqlStr), " DO NOTHING") {
 		t.Errorf("Upsert 退化/PG 应为 DO NOTHING: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").ToUpsert(onlyEmail, []string{"email"}, nil)
-	if !strings.HasSuffix(sqlStr, "ON DUPLICATE KEY UPDATE `email` = VALUES(`email`)") {
+	if !strings.HasSuffix(stripTestComment(sqlStr), "ON DUPLICATE KEY UPDATE `email` = VALUES(`email`)") {
 		t.Errorf("Upsert 退化/MySQL 应为自赋值 no-op: %s", sqlStr)
 	}
 	// PG/SQLite 缺 uniqueBy 报错；MySQL 可省略
@@ -300,7 +300,7 @@ func TestDocReview_CompileMd(t *testing.T) {
 
 	// ToTruncate：PG 实际输出带 RESTART IDENTITY（compile.md/mutate.md 示例注释漏写，已修订文档）
 	sqlTrunc, err := docBuilder(docPostgres).Table("users").ToTruncate()
-	if err != nil || sqlTrunc != `TRUNCATE TABLE "users" RESTART IDENTITY` {
+	if err != nil || stripTestComment(sqlTrunc) != `TRUNCATE TABLE "users" RESTART IDENTITY` {
 		t.Errorf("ToTruncate/PG: %s, %v", sqlTrunc, err)
 	}
 
@@ -341,12 +341,12 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 
 	// Select 替换 / AddSelect 追加去重 / SelectRaw / SelectSub
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").Select("id").AddSelect("name", "id").ToSelect()
-	if sqlStr != "SELECT `id`, `name` FROM `users`" {
+	if stripTestComment(sqlStr) != "SELECT `id`, `name` FROM `users`" {
 		t.Errorf("AddSelect 去重: %s", sqlStr)
 	}
 	cnt := docBuilder(docMySQL).Table("orders").SelectRaw("COUNT(*)").WhereColumn("orders.user_id", "=", "users.id")
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").Select("id").SelectSub(cnt, "order_count").ToSelect()
-	if sqlStr != "SELECT `id`, (SELECT COUNT(*) FROM `orders` WHERE `orders`.`user_id` = `users`.`id`) AS `order_count` FROM `users`" {
+	if stripTestComment(sqlStr) != "SELECT `id`, (SELECT COUNT(*) FROM `orders` WHERE `orders`.`user_id` = `users`.`id`) AS `order_count` FROM `users`" {
 		t.Errorf("SelectSub: %s", sqlStr)
 	}
 
@@ -364,17 +364,17 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 
 	// WhereIn/WhereNotIn 空切片
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").WhereIn("id", []any{}).ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE 0 = 1" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE 0 = 1" {
 		t.Errorf("WhereIn 空切片应恒假: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").WhereNotIn("id", []any{}).ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE 1 = 1" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE 1 = 1" {
 		t.Errorf("WhereNotIn 空切片应恒真: %s", sqlStr)
 	}
 
 	// WhereNull 多列 AND 展开
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").WhereNull("deleted_at", "remark").ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE `deleted_at` IS NULL AND `remark` IS NULL" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE `deleted_at` IS NULL AND `remark` IS NULL" {
 		t.Errorf("WhereNull 多列: %s", sqlStr)
 	}
 
@@ -385,7 +385,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	docAssertSQL(t, "WhereValueBetween", sqlStr, args,
 		"SELECT * FROM `users` WHERE ? BETWEEN `min_age` AND `max_age`", []any{25})
 	sqlStr, _, _ = docBuilder(docMySQL).Table("products").WhereBetweenColumns("price", "min_price", "max_price").ToSelect()
-	if sqlStr != "SELECT * FROM `products` WHERE `price` BETWEEN `min_price` AND `max_price`" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `products` WHERE `price` BETWEEN `min_price` AND `max_price`" {
 		t.Errorf("WhereBetweenColumns: %s", sqlStr)
 	}
 
@@ -411,7 +411,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 		"SELECT * FROM `users` WHERE NOT (`status` = ? OR `age` < ?)", []any{"banned", 18})
 	// 空回调组被忽略
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").Where("id", "=", 1).WhereNested(func(q *Builder) {}).ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE `id` = ?" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE `id` = ?" {
 		t.Errorf("空嵌套组应忽略: %s", sqlStr)
 	}
 
@@ -428,19 +428,19 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 
 	// WhereLike 三方言（默认与 caseSensitive）
 	sqlStr, _, _ = docBuilder(docPostgres).Table("users").WhereLike("name", "%alice%").ToSelect()
-	if sqlStr != `SELECT * FROM "users" WHERE "name" ILIKE $1` {
+	if stripTestComment(sqlStr) != `SELECT * FROM "users" WHERE "name" ILIKE $1` {
 		t.Errorf("WhereLike/PG 默认应 ILIKE: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").WhereLike("name", "a%", true).ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE BINARY `name` LIKE ?" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE BINARY `name` LIKE ?" {
 		t.Errorf("WhereLike/MySQL 区分大小写: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docSQLite).Table("users").WhereLike("name", "a%", true).ToSelect()
-	if sqlStr != `SELECT * FROM "users" WHERE "name" GLOB ?` {
+	if stripTestComment(sqlStr) != `SELECT * FROM "users" WHERE "name" GLOB ?` {
 		t.Errorf("WhereLike/SQLite 区分大小写应 GLOB: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docPostgres).Table("users").WhereNotLike("name", "%test%").ToSelect()
-	if sqlStr != `SELECT * FROM "users" WHERE "name" NOT ILIKE $1` {
+	if stripTestComment(sqlStr) != `SELECT * FROM "users" WHERE "name" NOT ILIKE $1` {
 		t.Errorf("WhereNotLike/PG: %s", sqlStr)
 	}
 
@@ -448,15 +448,15 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	sqlStr, args, _ = docBuilder(docMySQL).Table("users").WhereNullSafeEquals("remark", nil).ToSelect()
 	docAssertSQL(t, "NullSafe/MySQL", sqlStr, args, "SELECT * FROM `users` WHERE `remark` <=> ?", []any{nil})
 	sqlStr, _, _ = docBuilder(docPostgres).Table("users").WhereNullSafeEquals("remark", nil).ToSelect()
-	if sqlStr != `SELECT * FROM "users" WHERE "remark" IS NOT DISTINCT FROM $1` {
+	if stripTestComment(sqlStr) != `SELECT * FROM "users" WHERE "remark" IS NOT DISTINCT FROM $1` {
 		t.Errorf("NullSafe/PG: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docSQLite).Table("users").WhereNullSafeEquals("remark", nil).ToSelect()
-	if sqlStr != `SELECT * FROM "users" WHERE "remark" IS ?` {
+	if stripTestComment(sqlStr) != `SELECT * FROM "users" WHERE "remark" IS ?` {
 		t.Errorf("NullSafe/SQLite: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").WhereNullSafeNotEquals("remark", "x").ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE NOT `remark` <=> ?" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE NOT `remark` <=> ?" {
 		t.Errorf("NullSafeNot/MySQL: %s", sqlStr)
 	}
 
@@ -464,7 +464,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").WhereExists(func(q *Builder) {
 		q.Table("orders").SelectRaw("1").WhereColumn("orders.user_id", "=", "users.id")
 	}).ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE EXISTS (SELECT 1 FROM `orders` WHERE `orders`.`user_id` = `users`.`id`)" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE EXISTS (SELECT 1 FROM `orders` WHERE `orders`.`user_id` = `users`.`id`)" {
 		t.Errorf("WhereExists: %s", sqlStr)
 	}
 	// 非法子查询类型
@@ -474,7 +474,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").WhereSub("age", ">", func(q *Builder) {
 		q.Table("stats").SelectRaw("AVG(age)")
 	}).ToSelect()
-	if sqlStr != "SELECT * FROM `users` WHERE `age` > (SELECT AVG(age) FROM `stats`)" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` WHERE `age` > (SELECT AVG(age) FROM `stats`)" {
 		t.Errorf("WhereSub: %s", sqlStr)
 	}
 	sqlStr, args, _ = docBuilder(docMySQL).Table("users").WhereInSub("dept_id", func(q *Builder) {
@@ -486,7 +486,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	// JOIN 简写与嵌套 join 组
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").Select("users.name", "orders.amount").
 		Join("orders", "users.id", "=", "orders.user_id").ToSelect()
-	if sqlStr != "SELECT `users`.`name`, `orders`.`amount` FROM `users` INNER JOIN `orders` ON `users`.`id` = `orders`.`user_id`" {
+	if stripTestComment(sqlStr) != "SELECT `users`.`name`, `orders`.`amount` FROM `users` INNER JOIN `orders` ON `users`.`id` = `orders`.`user_id`" {
 		t.Errorf("Join 简写: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").JoinOn("orders", func(j *JoinBuilder) {
@@ -494,7 +494,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 			q.On("order_items.order_id", "=", "orders.id")
 		})
 	}).ToSelect()
-	if sqlStr != "SELECT * FROM `users` INNER JOIN (`orders` INNER JOIN `order_items` ON `order_items`.`order_id` = `orders`.`id`) ON `orders`.`user_id` = `users`.`id`" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` INNER JOIN (`orders` INNER JOIN `order_items` ON `order_items`.`order_id` = `orders`.`id`) ON `orders`.`user_id` = `users`.`id`" {
 		t.Errorf("嵌套 join 组: %s", sqlStr)
 	}
 
@@ -520,7 +520,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	// GroupByRaw / Having / HavingRaw
 	sqlStr, _, _ = docBuilder(docMySQL).Table("orders").
 		SelectRaw("DATE(created_at) AS d, COUNT(*) AS cnt").GroupByRaw("DATE(created_at)").ToSelect()
-	if sqlStr != "SELECT DATE(created_at) AS d, COUNT(*) AS cnt FROM `orders` GROUP BY DATE(created_at)" {
+	if stripTestComment(sqlStr) != "SELECT DATE(created_at) AS d, COUNT(*) AS cnt FROM `orders` GROUP BY DATE(created_at)" {
 		t.Errorf("GroupByRaw: %s", sqlStr)
 	}
 	sqlStr, args, _ = docBuilder(docMySQL).Table("orders").Select("user_id").
@@ -530,22 +530,22 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 
 	// OrderBy 方向规则与 ForPage
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").OrderBy("age", "DESC").OrderBy("name").ToSelect()
-	if sqlStr != "SELECT * FROM `users` ORDER BY `age` DESC, `name` ASC" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` ORDER BY `age` DESC, `name` ASC" {
 		t.Errorf("OrderBy: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").ForPage(2, 20).ToSelect()
-	if sqlStr != "SELECT * FROM `users` LIMIT 20 OFFSET 20" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` LIMIT 20 OFFSET 20" {
 		t.Errorf("ForPage: %s", sqlStr)
 	}
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").ForPage(0, 20).ToSelect()
-	if sqlStr != "SELECT * FROM `users` LIMIT 20" {
+	if stripTestComment(sqlStr) != "SELECT * FROM `users` LIMIT 20" {
 		t.Errorf("ForPage page<1 应修正为 1: %s", sqlStr)
 	}
 
 	// Union/UnionAll（MySQL 括号形态；SQLite 例外见方言表测试）
 	admins := docBuilder(docMySQL).Table("admins").Select("name")
 	sqlStr, _, _ = docBuilder(docMySQL).Table("users").Select("name").UnionAll(admins).ToSelect()
-	if sqlStr != "(SELECT `name` FROM `users`) UNION ALL (SELECT `name` FROM `admins`)" {
+	if stripTestComment(sqlStr) != "(SELECT `name` FROM `users`) UNION ALL (SELECT `name` FROM `admins`)" {
 		t.Errorf("UnionAll: %s", sqlStr)
 	}
 
@@ -561,7 +561,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	}
 	cl.Where("role", "admin")
 	sqlBase, _, _ := base.ToSelect()
-	if sqlBase != "SELECT * FROM `users` WHERE `status` = ?" {
+	if stripTestComment(sqlBase) != "SELECT * FROM `users` WHERE `status` = ?" {
 		t.Errorf("Clone 隔离性: %s", sqlBase)
 	}
 }
@@ -673,7 +673,7 @@ func TestDocReview_ConnectionMd_Lifecycle(t *testing.T) {
 	}
 
 	// NewDBDao 参数校验
-	if _, err := NewDBDao(nil, "mysql", nil, ""); !errors.Is(err, ErrPoolRequired) {
+	if _, err := NewDBDao(nil, "mysql", nil, "", ""); !errors.Is(err, ErrPoolRequired) {
 		t.Errorf("pool 为 nil 应报 ErrPoolRequired: %v", err)
 	}
 }
@@ -686,7 +686,7 @@ func docReviewSQLiteDAO(t *testing.T, onSQL SlowSQLCallback) *DBDao {
 		t.Fatalf("open sqlite pool: %v", err)
 	}
 	t.Cleanup(func() { _ = pool.Close() })
-	dao, err := NewDBDao(pool, "sqlite", onSQL, "")
+	dao, err := NewDBDao(pool, "sqlite", onSQL, "", "")
 	if err != nil {
 		t.Fatalf("new dao: %v", err)
 	}

@@ -1,8 +1,14 @@
 package zcdb
 
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
 // 本文件包含 Builder 查询构造器的核心定义：
 // Builder 结构体与构造函数 NewBuilder、运算符白名单校验，
-// 以及状态管理类方法 Force（全表操作授权）与 Clone（深拷贝）。
+// 以及状态管理类方法 Force（全表操作授权）、Comment（短业务标识）与 Clone（深拷贝）。
 // 其余方法按功能分类拆分到 builder_select.go / builder_where.go / builder_join.go /
 // builder_group.go / builder_order.go / builder_compile.go / builder_query.go /
 // builder_exec.go / builder_cursor.go。
@@ -29,17 +35,44 @@ type Builder struct {
 	offset     int
 	unions     []UnionClause
 	lockClause string
+	comment    string
 	force      bool  // 允许执行无 WHERE 条件的 Delete/Update（全表操作）
 	usePrimary bool  // 强制读查询走写（主库）连接（写后读场景），仅影响执行层路由、不影响 SQL 编译
 	err        error // 累积错误（如无效运算符）
 }
 
-// NewBuilder 创建一个新的sql构造器。
+// NewBuilder 创建独立 SQL 构造器并复制 DAO 默认注释；dao 为 nil 时仅编译且默认无注释。
 func NewBuilder(grammar Grammar, dao *DBDao) *Builder {
-	return &Builder{
+	b := &Builder{
 		grammar: grammar,
 		dao:     dao,
 	}
+	if dao != nil {
+		b.comment = dao.comment
+	}
+	return b
+}
+
+const maxSQLCommentRunes = 255
+
+// 星号、斜杠与反斜杠全部替换，正文才既不能重组出终止符、形成 PostgreSQL 嵌套注释，也不含可能被下游转义链路重新解释的字符。
+func normalizeSQLComment(text string) string {
+	cleaned := strings.TrimSpace(strings.Map(func(r rune) rune {
+		if r == '*' || r == '/' || r == '\\' || unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, text))
+	if utf8.RuneCountInString(cleaned) > maxSQLCommentRunes {
+		cleaned = strings.TrimSpace(string([]rune(cleaned)[:maxSQLCommentRunes]))
+	}
+	return cleaned
+}
+
+// Comment 覆盖短业务标识：星号、斜杠、反斜杠及全部控制字符替换为空格，修剪首尾、非法 UTF-8 转 U+FFFD、截断至 255 rune 后再修剪；空值清空且不回退默认，编译执行后保留；禁止透传外部输入、请求体或密钥，不负责脱敏。
+func (b *Builder) Comment(text string) *Builder {
+	b.comment = normalizeSQLComment(text)
+	return b
 }
 
 // tagName 返回列映射使用的结构体标签名：
@@ -97,7 +130,7 @@ func toUpperASCII(s string) string {
 // Force 标记允许执行无 WHERE 条件的 Delete/Update（全表操作）。
 // Update/Increment/Decrement/Delete/DeleteJoin 默认拒绝无 WHERE 条件，防止误操作清空/更新整张表；
 // 确需全表操作时显式调用 Force 表示已知意图，或使用 WhereRaw("1=1") 作为逃生口。
-// 该标记仅影响执行层保护逻辑，不影响 SQL 编译结果。
+// 该标记仅影响执行层保护逻辑，不影响 SQL 编译结果；经 Clone 保留。
 //
 //	affected, err := db.Builder().Table("users").Force().Delete(ctx)
 //	// 无 Force() 时返回 ErrDeleteWithoutWhere；加了 Force() 后执行：
@@ -121,9 +154,11 @@ func (b *Builder) Primary() *Builder {
 }
 
 // Clone 克隆当前 Builder，返回一个独立副本。
-// 深拷贝全部查询状态：列、FROM 子查询、JOIN（含派生表与嵌套 join 组）、
-// WHERE（含 Values/Bindings 切片与嵌套子查询）、GROUP BY、HAVING、ORDER BY、
-// UNION、锁子句与强制主库标记；副本上继续链式修改不会影响原 Builder，反之亦然。
+// 深拷贝全部查询状态：列、FROM 子查询、JOIN（含派生表、嵌套 join 组与嵌套条件的累积错误字段）、
+// WHERE（含 Values/Bindings 切片与嵌套子查询）、GROUP BY、HAVING、ORDER BY、UNION、锁子句、
+// Force 全表操作标记、强制主库标记与注释（含显式清空）；副本上继续链式修改不会影响原 Builder，反之亦然。
+// 绑定值本身（Value/Min/Max 及 Bindings 元素，类型为 any）不做深拷贝：若传入切片、map 或指针，
+// 副本与原 Builder 共享同一份底层数据；编译与执行不会修改它们，因此无需复制。
 // First/Value/Paginate/CursorBy 等终端方法内部即用 Clone 避免污染调用方的 Builder。
 // 若子查询图存在环（自引用/互引用，如 TableSub/Union 传入自身），深拷贝会无限递归，
 // 此时返回携带 ErrCyclicQuery 的副本（经后续编译方法报错）而非递归崩溃。
@@ -136,7 +171,7 @@ func (b *Builder) Clone() *Builder {
 	if err := b.validateAcyclic(); err != nil {
 		// 环引用无法深拷贝（会无限递归），返回携带错误的浅副本，
 		// 后续 ToXxx 编译方法经 b.err 前置检查返回 ErrCyclicQuery。
-		return &Builder{grammar: b.grammar, dao: b.dao, err: err}
+		return &Builder{grammar: b.grammar, dao: b.dao, comment: b.comment, err: err}
 	}
 	return b.cloneInternal()
 }
@@ -152,6 +187,7 @@ func (b *Builder) cloneInternal() *Builder {
 		limit:      b.limit,
 		offset:     b.offset,
 		lockClause: b.lockClause,
+		comment:    b.comment,
 		tableAlias: b.tableAlias,
 		force:      b.force,
 		usePrimary: b.usePrimary,
@@ -285,8 +321,11 @@ func cloneJoinConditions(conditions []JoinCondition) []JoinCondition {
 			inner := &JoinBuilder{
 				Conditions: cloneJoinConditions(conds[j].Nested.Conditions),
 				Joins:      cloneJoinClauses(conds[j].Nested.Joins),
-				grammar:    conds[j].Nested.grammar,
-				dao:        conds[j].Nested.dao,
+				// err 经公开 API 恒为 nil（addNested 在 err != nil 时提前返回并提升给父级），
+				// 但逐字段构造副本时必须完整复制，避免将来改动前置检查后 Clone 静默丢错。
+				err:     conds[j].Nested.err,
+				grammar: conds[j].Nested.grammar,
+				dao:     conds[j].Nested.dao,
 			}
 			conds[j].Nested = inner
 		}

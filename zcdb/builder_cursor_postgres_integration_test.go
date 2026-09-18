@@ -10,6 +10,53 @@ import (
 	"time"
 )
 
+// TestPgInteg_SQLCommentLockedCursors 验证 PG 带锁游标最终 SQL/绑定顺序及每批 Clone 注释，禁止走从库。
+// DSN: host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres；不可达 Skip。
+// docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+func TestPgInteg_SQLCommentLockedCursors(t *testing.T) {
+	log := &commentSQLLog{}
+	dao := openPgCommentDAO(t, integrationSQLComment, log.collect)
+	setupCommentTable(t, dao, "comment_pg_cursor_lock")
+	mustExec(t, dao, "INSERT INTO comment_pg_cursor_lock (id, name, num) VALUES (1, 'one', 10), (2, 'two', 20)")
+	log.calls = nil
+	strategy := &RoundRobinStrategy{}
+	dao.pool.slaveStrategy = strategy
+	b := dao.Builder().Table("comment_pg_cursor_lock").Where("num", ">", 0).OrderBy("id").LockForUpdate()
+	var row crossDialectItemRow
+	wantRows := []crossDialectItemRow{{1, "one", 10}, {2, "two", 20}}
+	count := 0
+	for err := range b.Cursor(context.Background(), &row) {
+		if err != nil {
+			t.Fatalf("locked Cursor: %v", err)
+		}
+		count++
+		if count > len(wantRows) || row != wantRows[count-1] {
+			t.Fatalf("Cursor row=%#v", row)
+		}
+	}
+	if count != 2 || strategy.counter.Load() != 0 {
+		t.Fatalf("Cursor count=%d replica picks=%d", count, strategy.counter.Load())
+	}
+	log.check(t, commentSQLCall{sql: `SELECT * FROM "comment_pg_cursor_lock" WHERE "num" > $1 ORDER BY "id" ASC FOR UPDATE /* app:comment */`, args: []any{0}})
+	count = 0
+	for err := range b.CursorBy(context.Background(), &row, 1, "id") {
+		if err != nil {
+			t.Fatalf("locked CursorBy: %v", err)
+		}
+		count++
+		if count > len(wantRows) || row != wantRows[count-1] {
+			t.Fatalf("CursorBy row=%#v", row)
+		}
+	}
+	if count != 2 || strategy.counter.Load() != 0 {
+		t.Fatalf("CursorBy count=%d replica picks=%d", count, strategy.counter.Load())
+	}
+	log.check(t,
+		commentSQLCall{sql: `SELECT * FROM "comment_pg_cursor_lock" WHERE "num" > $1 ORDER BY "id" ASC LIMIT 2 FOR UPDATE /* app:comment */`, args: []any{0}},
+		commentSQLCall{sql: `SELECT * FROM "comment_pg_cursor_lock" WHERE "num" > $1 AND "id" > $2 ORDER BY "id" ASC LIMIT 2 FOR UPDATE /* app:comment */`, args: []any{0, int64(1)}},
+	)
+}
+
 // TestPgInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行读取所有数据。
 func TestPgInteg_Cursor_Stream(t *testing.T) {
 	db := openPgTestDB(t)
@@ -279,7 +326,7 @@ func TestPgInteg_CursorBy_ExactPageBoundary(t *testing.T) {
 	}
 	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		atomic.AddInt32(&sqlCount, 1)
-	}, "")
+	}, "", "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}

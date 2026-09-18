@@ -8,6 +8,17 @@ Builder 的所有终端执行方法（Find/Insert/Update 等）内部都是"先 
 
 所有 ToXxx 方法返回 `(sql string, args []any, err error)` 三元组（`ToTruncate` 只返回 `(sql, err)`）。Builder 状态在链式构造中已产生的错误（如非法运算符）会在编译时统一返回。
 
+## SQL 注释的最终编译边界
+
+全部 15 个公开编译入口（`ToSelect`、`ToInsert`、`ToInsertOrIgnore`、`ToUpsert`、`ToInsertUsing`、`ToInsertOrIgnoreUsing`、`ToUpdate`、`ToDelete`、`ToDeleteJoin`、`ToTruncate`、`ToCount`、`ToExists`、`ToAggregate`、`ToIncrement`、`ToDecrement`）均在成功生成完整 SQL 后，按当前 Builder 的注释追加一次 ` /* 短业务标识 */`。无注释时原 SQL 逐字节不变，本文原有输出均为无注释基线。
+
+- 注释位于完整外层语句的最后：在 UNION 包装、别名、排序/分页、锁子句、冲突处理后缀及 PostgreSQL `RESTART IDENTITY` 之后；`ToCount` 的普通/UNION/GROUP BY/DISTINCT 四种分支、`ToExists` 与 `ToAggregate` 的普通/UNION 分支均如此。SQLite `ToDeleteJoin` 在主键 IN 包装之后追加。
+- 结构化子查询（SELECT/FROM/WHERE/JOIN/ON/UNION/INSERT SELECT）忽略子 Builder 注释，仅外层决定注释；独立编译子 Builder 时仍保留其自身注释，不修改子查询状态。
+- 不改变占位符、绑定参数顺序、编译后的状态恢复与原有错误；错误出口仍返回空 SQL/参数和原错误，不返回仅含注释的 SQL。重复编译不累积注释。
+- 直接调用 Grammar、DAO 原始 SQL 及 Schema 不自动添加注释。本功能不解析、去重或清理 Raw/Expression 中的手工注释；把已带注释的 SQL 作为 Raw 子查询不属于结构化子查询保证。
+
+DAO 第五参数与 `Comment` 仅用于短业务标识，不得透传外部输入、请求体或秘密；控制字符（`unicode.IsControl`）、`*`、`/` 与 `\` 替换为空格、去首尾空白、按 255 rune 截断，属于有损规范化。覆盖、清空与 Clone 生命周期见[查询构造](query-builder.md)的 Comment 小节。
+
 ## 查询类编译
 
 ### ToSelect

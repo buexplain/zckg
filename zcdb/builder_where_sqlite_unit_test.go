@@ -16,13 +16,13 @@ func TestSQLiteGrammar_WhereNullSafe(t *testing.T) {
 	}{
 		{
 			name:      "equals_nil",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeEquals("email", nil) },
+			build:     func() *Builder { return newTestBuilder(g, nil).Table("users").WhereNullSafeEquals("email", nil) },
 			expected:  `SELECT * FROM "users" WHERE "email" IS ?`,
 			expectedA: []any{nil},
 		},
 		{
 			name:      "not_equals",
-			build:     func() *Builder { return NewBuilder(g, nil).Table("users").WhereNullSafeNotEquals("email", "a@b.c") },
+			build:     func() *Builder { return newTestBuilder(g, nil).Table("users").WhereNullSafeNotEquals("email", "a@b.c") },
 			expected:  `SELECT * FROM "users" WHERE "email" IS NOT ?`,
 			expectedA: []any{"a@b.c"},
 		},

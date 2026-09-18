@@ -15,6 +15,40 @@ import (
 // mysqlTestMasterDSN 集成测试共用的主库 DSN。
 const mysqlTestMasterDSN = "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local"
 
+// openMySQLCommentDAO 独立建连，不清理既有基线表；主从池连接同一测试库，供路由观测。
+// 默认探测 DSN 为 mysqlTestMasterDSN，不可达时 Skip；建连后的 DDL/构造错误均失败。
+// docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+func openMySQLCommentDAO(t *testing.T, comment string, callback SlowSQLCallback) *DBDao {
+	t.Helper()
+	probe, err := NewPool(PoolConfig{DriverName: "mysql", DSN: mysqlTestMasterDSN})
+	if err != nil {
+		t.Skipf("mysql unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := probe.Close(); err != nil {
+			t.Errorf("close mysql probe: %v", err)
+		}
+	})
+	if _, err := probe.PickWriteDB().ExecContext(context.Background(), "CREATE DATABASE IF NOT EXISTS zckg_test_integ DEFAULT CHARACTER SET utf8mb4"); err != nil {
+		t.Fatalf("create mysql test database: %v", err)
+	}
+	const dsn = "root:root@tcp(127.0.0.1:3306)/zckg_test_integ?charset=utf8mb4&parseTime=true&loc=Local"
+	pool, err := NewPool(PoolConfig{DriverName: "mysql", DSN: dsn, SlaveDSNs: []string{dsn}, MaxOpenConns: 1})
+	if err != nil {
+		t.Fatalf("open mysql comment pool after successful probe: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := pool.Close(); err != nil {
+			t.Errorf("close mysql comment pool: %v", err)
+		}
+	})
+	dao, err := NewDBDao(pool, "mysql", callback, "", comment)
+	if err != nil {
+		t.Fatalf("create mysql comment DAO: %v", err)
+	}
+	return dao
+}
+
 // requireMySQLAvailable 探测 MySQL 主库是否可达：不可达时跳过测试（门控），
 // 保证无数据库环境下 go test ./... 不误报。
 func requireMySQLAvailable(t *testing.T) {
@@ -45,7 +79,7 @@ func openMySQLTestDB(t *testing.T) *DBDao {
 	}
 	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		log.Default().Println(sqlStr, args)
-	}, "")
+	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open mysql: %v", err)
 	}

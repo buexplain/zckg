@@ -357,6 +357,8 @@ func main() {
 
 ### 配合 zcdb Schema 从真实数据库生成
 
+`NewDBDao` 必须传五个参数：第四参数为列映射标签名（空串使用 `db`），第五参数为默认 SQL 短业务标识（此处传 `""` 保持无注释基线）。默认注释仅影响 Builder 的最终编译 SQL，DAO 原始 SQL 和 Schema 元数据查询不会自动追加，表/列注释读取及模型生成行为不变。第五参数不是表/列说明，不得透传外部输入、请求体或秘密；覆盖、清空及 Clone 行为见 [zcdb 查询构造](../../zcdb/docs/query-builder.md)的 Comment 小节。
+
 ```go
 package main
 
@@ -376,7 +378,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	dao, err := zcdb.NewDBDao(pool, "mysql", nil, "")
+	dao, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
 	if err != nil {
 		panic(err)
 	}

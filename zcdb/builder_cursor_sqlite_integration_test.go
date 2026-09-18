@@ -11,6 +11,43 @@ import (
 	"time"
 )
 
+// TestSQLiteInteg_SQLCommentLockedCursorsRejected 验证 SQLite 带锁游标/分批 Clone 各返回一次原错误且没有回调，零批量仍不执行。
+// 独立纯 Go SQLite 共享内存库（DSN 见 openSQLiteCommentDAO），不依赖 Docker，不 Skip。
+func TestSQLiteInteg_SQLCommentLockedCursorsRejected(t *testing.T) {
+	log := &commentSQLLog{}
+	dao := openSQLiteCommentDAO(t, integrationSQLComment, log.collect)
+	setupCommentTable(t, dao, "comment_sqlite_cursor_lock")
+	log.calls = nil
+	b := dao.Builder().Table("comment_sqlite_cursor_lock").LockForUpdate()
+	var row crossDialectItemRow
+	count := 0
+	for err := range b.Cursor(context.Background(), &row) {
+		count++
+		if !errors.Is(err, ErrSQLiteLockNotSupported) {
+			t.Fatalf("locked Cursor: %v", err)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("Cursor error count=%d", count)
+	}
+	log.check(t)
+	count = 0
+	for err := range b.CursorBy(context.Background(), &row, 1, "id") {
+		count++
+		if !errors.Is(err, ErrSQLiteLockNotSupported) {
+			t.Fatalf("locked CursorBy: %v", err)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("CursorBy error count=%d", count)
+	}
+	log.check(t)
+	for err := range b.CursorBy(context.Background(), &row, 0, "id") {
+		t.Fatalf("zero chunk yielded: %v", err)
+	}
+	log.check(t)
+}
+
 // TestSQLiteInteg_Cursor_Stream 验证 Cursor 流式迭代：逐行扫描，break 时自动释放连接。
 // 同时验证 NULL 安全扫描：eve 的 age 为 NULL，扫描到 int 类型时保留零值 0。
 func TestSQLiteInteg_Cursor_Stream(t *testing.T) {
@@ -445,7 +482,7 @@ func TestSQLiteInteg_Cursor_InvalidDestNoQuery(t *testing.T) {
 	}
 	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		atomic.AddInt32(&sqlCount, 1)
-	}, "")
+	}, "", "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}
@@ -488,7 +525,7 @@ func TestSQLiteInteg_CursorBy_ExactPageBoundary(t *testing.T) {
 	}
 	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		atomic.AddInt32(&sqlCount, 1)
-	}, "")
+	}, "", "")
 	if err != nil {
 		t.Fatalf("failed to create dao: %v", err)
 	}

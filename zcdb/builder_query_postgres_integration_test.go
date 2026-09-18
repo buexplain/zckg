@@ -10,6 +10,59 @@ import (
 	"testing"
 )
 
+// TestPgInteg_SQLCommentLockRouting 验证 PG 两种锁 SQL 末尾注释和主库路由，UNION+锁仍在编译阶段拒绝。
+// DSN: host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres；不可达 Skip。
+// docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+func TestPgInteg_SQLCommentLockRouting(t *testing.T) {
+	for _, tc := range []struct {
+		lock  string
+		apply func(*Builder) *Builder
+	}{{"FOR UPDATE", (*Builder).LockForUpdate}, {"FOR SHARE", (*Builder).SharedLock}} {
+		t.Run(tc.lock, func(t *testing.T) {
+			log := &commentSQLLog{}
+			dao := openPgCommentDAO(t, integrationSQLComment, log.collect)
+			setupCommentTable(t, dao, "comment_pg_lock")
+			mustExec(t, dao, "INSERT INTO comment_pg_lock (id, name, num) VALUES (1, 'locked', 7)")
+			log.calls = nil
+			strategy := &RoundRobinStrategy{}
+			dao.pool.slaveStrategy = strategy
+			ctx := context.Background()
+			var replicaRow crossDialectItemRow
+			base := dao.Builder().Table("comment_pg_lock").Where("id", 1)
+			if err := base.First(ctx, &replicaRow); err != nil || replicaRow != (crossDialectItemRow{1, "locked", 7}) {
+				t.Fatalf("replica First: row=%#v err=%v", replicaRow, err)
+			}
+			if strategy.counter.Load() != 1 {
+				t.Fatal("read route did not select replica")
+			}
+			log.check(t, commentSQLCall{sql: `SELECT * FROM "comment_pg_lock" WHERE "id" = $1 LIMIT 1 /* app:comment */`, args: []any{1}})
+			var lockedRow crossDialectItemRow
+			if err := tc.apply(base.Clone()).First(ctx, &lockedRow); err != nil || lockedRow != (crossDialectItemRow{1, "locked", 7}) {
+				t.Fatalf("locked First: row=%#v err=%v", lockedRow, err)
+			}
+			if strategy.counter.Load() != 1 {
+				t.Fatal("locked query selected replica")
+			}
+			log.check(t, commentSQLCall{sql: `SELECT * FROM "comment_pg_lock" WHERE "id" = $1 LIMIT 1 ` + tc.lock + " /* app:comment */", args: []any{1}})
+		})
+	}
+	t.Run("union_rejected", func(t *testing.T) {
+		log := &commentSQLLog{}
+		dao := openPgCommentDAO(t, integrationSQLComment, log.collect)
+		base := dao.Builder().Table("comment_pg_lock")
+		invalid := base.Clone().Union(base.Clone()).LockForUpdate()
+		query, args, err := invalid.ToSelect()
+		if !errors.Is(err, ErrPgUnionLockNotSupported) || query != "" || args != nil {
+			t.Fatalf("UNION lock compile: SQL=%q args=%#v err=%v", query, args, err)
+		}
+		var row crossDialectItemRow
+		if err := invalid.First(context.Background(), &row); !errors.Is(err, ErrPgUnionLockNotSupported) {
+			t.Fatalf("UNION lock First: %v", err)
+		}
+		log.check(t)
+	})
+}
+
 // TestPgInteg_First 验证 First 查询第一条记录：有数据时填充结构体并返回 nil。
 func TestPgInteg_First(t *testing.T) {
 	db := openPgTestDB(t)
