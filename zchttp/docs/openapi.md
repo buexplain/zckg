@@ -58,7 +58,7 @@ ID int64 `json:"id" nonzero:"true"`
 |-----------------|-----|-----|--------------------------------------------------------------------------|
 | `description`   | ✅   | ✅   | 字段描述                                                                     |
 | `example`       | ✅   | ✅   | 字段示例值（按字段类型自动转换为对应 JSON 类型：整数→`int64`、浮点→`float64`、布尔→`bool`，无法转换时保留字符串） |
-| `ignore:"true"` | ✅   | ✅   | 从文档中**排除**该字段（不影响绑定与校验）                                                  |
+| `ignore:"true"` | ✅   | ✅   | 从文档中**排除**该字段（不影响绑定与校验；path 参数声明除外，见 [参数位置与响应](#参数位置与响应)）                                                  |
 | `default`       | ✅   | 仅文档 | Req 上设置默认值，受类型限制、分两阶段填充，且文档展示有额外约束——详见 [default 文档展示规则](#default-文档展示规则仅-req)；Res 上无运行时效果，仅在文档中展示。    |
 | `nonzero`       | ✅   | 仅文档 | Req 上标记非零值必填，影响运行时校验和 required 推断——详见 [required 推断规则](#required-推断规则仅-req)；Res 上无运行时校验，仅参与 required 推断。       |
 | `deprecated`    | ✅   | ✅   | `deprecated:"true"` 标记字段为已废弃，schema 与 query/path 参数对象均输出 `"deprecated": true`；废弃原因写在 `description` 中——详见 [deprecated 标记](#deprecated-标记) |
@@ -96,9 +96,9 @@ type UpdateUserReq struct {
 }
 ```
 
-生成的字段 schema 包含 `"deprecated": true`。GET / DELETE / HEAD 的 query 参数，以及所有 HTTP 方法的 path 参数，均在 Parameter Object 顶层输出同一标记；其余方法仍保留 requestBody，不从 body schema 删除路径对应字段。
+生成的字段 schema 包含 `"deprecated": true`。GET / DELETE / HEAD 的 query 参数，以及所有 HTTP 方法的 path 参数，均在 Parameter Object 顶层输出同一标记；其余方法仍保留 requestBody，不从 body schema 删除路径对应字段——如需把路径对应字段从 body schema 移除，可对其加 `ignore:"true"`，此时 path 声明仍会保留。
 
-`ignore:"true"` 优先排除字段或参数对象，不改变运行时绑定和路径模板。忽略路径字段会留下未声明参数的占位符，因此需要完整、可校验 OpenAPI 文档的接口不应忽略路径字段。
+`ignore:"true"` 把字段从文档的 **body schema 与 query** 中排除，不改变运行时绑定和路径模板。**path 参数声明不受 ignore 影响**：OpenAPI 要求路径模板的每个占位符都有对应 `in: path` 参数，因此即使字段被 ignore，也仍会声明为 path 参数（字段级 `deprecated` 等标记照常生效），以保证生成的文档始终可校验。
 
 单文件 `*multipart.FileHeader` 的 binary schema 同样保留 `deprecated`、`description` 和 `example`。切片、数组、map 及文件切片的标记只作用于字段自身，不传给元素；内部 struct 字段自身的标记仍正常生成，不受默认值可达性限制。自引用容器在递归保护边界退化为空元素 schema，外层标记保留。
 
@@ -208,7 +208,7 @@ map 的 value 类型通过 `t.Elem()` 递归推断：
 - **GET / DELETE / HEAD**：请求字段生成为 `query` 参数（`in: query`）。**仅扁平字段**（标量、切片、指针标量、`time.Time`）参与生成：命名 struct（`time.Time` 除外）、`map` 与文件字段被跳过——query 绑定仅处理扁平字段，展示无法绑定的参数会误导 API 使用者。
 - **其余方法**：请求字段生成为 `requestBody`；含文件字段（`*multipart.FileHeader` 或 `[]*multipart.FileHeader`，含**嵌入结构体**中的文件字段）时使用
   `multipart/form-data`，否则 `application/json`。
-- **参数路由**（如 `/users/{id}`）：所有 HTTP 方法均将未忽略的 `{name}` 字段声明为 path 参数（`in: path`，`required: true`），GET / DELETE / HEAD 不再重复声明为 query，其余方法仍保留既有 body 字段。`ignore:"true"` 仅排除参数声明，不删除占位符，因此忽略路径字段会导致 OpenAPI 文档缺少所需声明。可选参数 `{name?}` 转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` 语法）并沿用 `required: false` 的既有输出，路径模板中不再出现 `?`；OpenAPI 3.0 要求 path 参数必填，此可选参数表示也是既有的规范兼容性限制。
+- **参数路由**（如 `/users/{id}`）：所有 HTTP 方法均将 `{name}` 对应的字段声明为 path 参数（`in: path`，`required: true`）——**不受 `ignore` 影响**：OpenAPI 要求每个模板占位符都有对应声明，缺失即产生非法文档；GET / DELETE / HEAD 不再重复声明为 query，其余方法仍保留既有 body 字段（其中 `ignore:"true"` 的字段仍从 body schema 排除）。可选参数 `{name?}` 转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` 语法）并沿用 `required: false` 的既有输出，路径模板中不再出现 `?`；OpenAPI 3.0 要求 path 参数必填，此可选参数表示也是既有的规范兼容性限制。
 - **响应**：统一包装为 `Response{data, code, message}` 结构，schema 名称为 `Response_<Type>`；成功时统一返回 `200`（与
   `HttpEngine` 默认响应行为一致）。可通过 `OpenAPIInfo.ResponseWrapper` 指定自定义响应包装结构体样例（如 `MyResponse{}`），为 nil 时使用默认结构；自定义结构体中 `interface{}` 类型字段被视为 data 占位符，替换为实际 Res schema。
 

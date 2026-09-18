@@ -298,7 +298,8 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 
 // buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary/deprecated）。
 // paramNames 为路径模板中的 {name}/{name?} 参数名集合（无参数段的路由为空集）：所有方法均声明
-// 未忽略的 path 参数，GET/DELETE/HEAD 不再重复展示为 query；optionalParams 标记其中可选参数。
+// path 参数（含被 ignore 的字段——path 声明受规范强制，见 buildPathParams），
+// GET/DELETE/HEAD 不再重复展示为 query；optionalParams 标记其中可选参数。
 func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, paramNames, optionalParams map[string]bool) map[string]any {
 	// 使用注册阶段预计算的类型信息，避免重复反射
 	if entry.reqType == nil || entry.resType == nil {
@@ -400,7 +401,10 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 	return params
 }
 
-// buildPathParams 为所有方法的参数路由 {name}/{name?} 段声明 path 参数，跳过 ignore 字段。
+// buildPathParams 为所有方法的参数路由 {name}/{name?} 段声明 path 参数。
+// path 声明受 OpenAPI 规范强制（每个模板表达式都必须有对应参数），因此**不受 ignore 影响**：
+// 被 ignore 的路径字段仍声明为 path 参数，只是不再出现在 body schema 与 query 中，
+// 从而避免生成"占位符无对应声明"的非法文档。
 // meta 为注册阶段预计算的 structMeta；paramNames 为路径模板中的参数名集合；
 // optionalParams 标记可选参数（{name?}），其 required 为 false，
 // 可选参数被省略时保留字段 default 值或零值。
@@ -419,9 +423,6 @@ func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta
 			continue
 		}
 		f := fm.field
-		if isIgnored(f) {
-			continue
-		}
 		param := map[string]any{
 			"name":     fm.name,
 			"in":       "path",
@@ -754,7 +755,8 @@ func coerceExample(schema map[string]any, raw string) any {
 	return raw
 }
 
-// isIgnored 判定字段是否通过 ignore 标签从文档中排除
+// isIgnored 判定字段是否通过 ignore 标签从文档中排除（body schema 与 query）。
+// path 参数声明不受其影响：规范要求每个路径模板表达式都有对应参数，见 buildPathParams。
 func isIgnored(field reflect.StructField) bool {
 	if v := field.Tag.Get("ignore"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

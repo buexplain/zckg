@@ -3144,13 +3144,16 @@ func oaDepReflectHandler(t *testing.T, reqType reflect.Type) any {
 	}).Interface()
 }
 
-// TestOpenAPIDeprecated_IgnoredPathParams 验证 GET/POST 的 ignore:true 路径字段不输出参数或属性但保留路径模板。
-func TestOpenAPIDeprecated_IgnoredPathParams(t *testing.T) {
+// TestOpenAPIIgnoredPathParamsDeclared 验证 ignore:"true" 不抑制 path 参数声明：
+// OpenAPI 要求路径模板的每个占位符都有对应 in: path 参数，故被 ignore 的路径字段仍声明为
+// path 参数（并沿用 deprecated 标记），同时仍从 body schema 排除，GET 下也不重复声明为 query。
+func TestOpenAPIIgnoredPathParamsDeclared(t *testing.T) {
 	type oaDepIgnoredPathReq struct {
 		Hidden string `json:"hidden" ignore:"true" deprecated:"true"`
 		ID     string `json:"id" deprecated:"true"`
 		Q      string `json:"q"`
 	}
+	type wantParam struct{ name, in string }
 	cases := []struct {
 		method   string
 		register func(*Router, string, any)
@@ -3175,46 +3178,42 @@ func TestOpenAPIDeprecated_IgnoredPathParams(t *testing.T) {
 				}
 				op := item[strings.ToLower(tc.method)].(map[string]any)
 				params, _ := op["parameters"].([]any)
-				for _, p := range params {
-					if p.(map[string]any)["name"] == "hidden" {
-						t.Errorf("ignored 路径参数不应输出，实际: %v", p)
+
+				// 模板占位符必须全部有声明：hidden 恒为 path（ignore 不抑制），
+				// id 仅在模板含 {id} 时才是 path，否则作为 GET 的 query。
+				want := []wantParam{{"hidden", "path"}}
+				if visiblePath {
+					want = append(want, wantParam{"id", "path"})
+				}
+				if tc.method == http.MethodGet {
+					if !visiblePath {
+						want = append(want, wantParam{"id", "query"})
+					}
+					want = append(want, wantParam{"q", "query"})
+				}
+				if len(params) != len(want) {
+					t.Fatalf("parameters 数量 = %d, want %d; 实际: %v", len(params), len(want), params)
+				}
+				for i, w := range want {
+					pm := params[i].(map[string]any)
+					if pm["name"] != w.name || pm["in"] != w.in {
+						t.Errorf("parameters[%d] = (%v, %v), want (%s, %s)", i, pm["name"], pm["in"], w.name, w.in)
 					}
 				}
-				wantParams := 0
-				if tc.method == http.MethodGet {
-					wantParams = 2
-					if q := findParam(t, params, "q"); q["in"] != "query" {
-						t.Errorf("q.in = %v, want query", q["in"])
-					}
-				} else {
-					if visiblePath {
-						wantParams = 1
-					}
+				hidden := findParam(t, params, "hidden")
+				if hidden["required"] != true {
+					t.Errorf("hidden 是必填 path 参数，required = %v, want true", hidden["required"])
+				}
+				assertDeprecatedTrue(t, hidden, "被 ignore 的 path 参数 hidden")
+
+				if tc.method == http.MethodPost {
+					// ignore 仍作用于 body schema：hidden 被排除，但 path 声明保留。
 					schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
 					ref := op["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
 					props := oaDepResolveRef(t, schemas, ref, "oaDepIgnoredPathReq")["properties"].(map[string]any)
 					if _, exists := props["hidden"]; exists || len(props) != 2 {
-						t.Errorf("body 应仅保留 id/q，实际: %v", props)
+						t.Errorf("body schema 仍应排除 hidden 且仅保留 id/q，实际: %v", props)
 					}
-				}
-				if len(params) != wantParams {
-					t.Errorf("parameters 数量 = %d, want %d; 实际: %v", len(params), wantParams, params)
-				}
-				if wantParams == 0 {
-					if _, exists := op["parameters"]; exists {
-						t.Errorf("无可展示参数时应省略 parameters，实际: %v", op["parameters"])
-					}
-				}
-				if visiblePath || tc.method == http.MethodGet {
-					id := findParam(t, params, "id")
-					wantIn := "query"
-					if visiblePath {
-						wantIn = "path"
-					}
-					if id["in"] != wantIn {
-						t.Errorf("id.in = %v, want %s", id["in"], wantIn)
-					}
-					assertDeprecatedTrue(t, id, "可见参数 id")
 				}
 			})
 		}

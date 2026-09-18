@@ -56,7 +56,7 @@ type Req struct {
 | `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，详见 `parameter-binding.md` |
 | `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`；解析失败降级并输出 `slog.Warn` |
 | `nonzero` | 非零值校验 | `"true"` 校验非零值、`"false"` 不校验；详见 `parameter-validate.md` |
-| `ignore` | 文档排除 | `ignore:"true"` 仅将字段从 OpenAPI 文档中排除，不影响绑定与校验 |
+| `ignore` | 文档排除 | `ignore:"true"` 将字段从 OpenAPI 文档的 body schema 与 query 中排除，不影响绑定与校验；path 参数声明受规范强制、不受其影响，详见 `openapi.md` |
 | `example` / `description` | 文档信息 | 仅用于 OpenAPI 文档生成，详见 `openapi.md` |
 
 此外，可在 `Req` 中嵌入 `zchttp.OpenAPIMeta` 声明操作级元信息（`tags`/`summary`/`description`），它是空结构体，不参与绑定与校验，详见 `openapi.md`。
@@ -295,12 +295,22 @@ type Req struct {
 
 ### `ignore` — 文档排除
 
-`ignore:"true"` 将字段从 OpenAPI 文档中排除，不影响绑定与校验。
+`ignore:"true"` 将字段从 OpenAPI 文档的 body schema 与 query 中排除，不影响绑定与校验。
+
+**例外**：路径绑定字段的 `ignore` 无法抑制 path 参数声明 —— OpenAPI 要求路径模板的每个占位符都有对应 `in: path` 参数，抑制声明会产生非法文档。此时 `ignore` 的作用只剩"从 body schema 排除"（GET / DELETE / HEAD 的路径字段本就不会重复进入 query，故 `ignore` 对其无额外效果）。
 
 ```go
 type Req struct {
     Name   string `json:"name" nonzero:"true"`
     Secret string `json:"secret" ignore:"true"` // 文档中不展示，但绑定与校验正常
+}
+```
+
+```go
+// 路径字段：路由 /orders/{id} 绑定 ID。ignore 只把 id 从 body schema 移除，path 声明仍生成。
+type Req struct {
+    ID string `json:"id" ignore:"true"`
+    Q  string `json:"q"`
 }
 ```
 
