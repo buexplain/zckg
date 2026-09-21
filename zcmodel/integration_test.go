@@ -3,6 +3,7 @@ package zcmodel
 import (
 	"context"
 	"fmt"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
@@ -484,9 +485,10 @@ func generateAndVerify(t *testing.T, dao *zcdb.DBDao, dialect Dialect, database 
 		}
 	}
 
-	columns := make([]*Column, 0, len(cols))
-	for _, c := range cols {
-		columns = append(columns, &Column{Name: c.Name, Type: c.Type, Comment: c.Comment})
+	columns := bridgeColumns(cols)
+	indexes, err := inspector.Indexes(context.Background(), "all_types")
+	if err != nil {
+		t.Fatalf("读取表索引失败: %v", err)
 	}
 
 	// 输出目录名需为合法 Go 包名（writeOrReplaceStruct 以目录名推导包名）
@@ -499,6 +501,7 @@ func generateAndVerify(t *testing.T, dao *zcdb.DBDao, dialect Dialect, database 
 		ColumnTagName:    "db",
 		JsonTagValueCase: NameCaseLowerCamel,
 		Columns:          columns,
+		Indexes:          bridgeIndexes(indexes),
 	}
 	if err := Generate(input); err != nil {
 		t.Fatalf("Generate() error = %v", err)
@@ -547,6 +550,20 @@ func generateAndVerify(t *testing.T, dao *zcdb.DBDao, dialect Dialect, database 
 			}
 		}
 	}
+
+	// ddl 片段必须取方言元数据原样（类型即锚点），且 NULL 标记与元数据一致：
+	// 桥接显式传入 Nullable，故真实库路径恒渲染 NULL / NOT NULL（nil 未知只出现在手工构造场景）。
+	for _, c := range cols {
+		marker := "NULL"
+		if !c.Nullable {
+			marker = "NOT NULL"
+		}
+		// 标记之后可能是片段结束、DEFAULT 段或 EXTRA 白名单项，故只断言到标记之后的分隔处
+		re := regexp.MustCompile(`ddl:"` + regexp.QuoteMeta(c.Type) + " " + marker + `[ "]`)
+		if !re.MatchString(got) {
+			t.Errorf("列 %s 的 ddl 片段应含类型 %q 与标记 %s", c.Name, c.Type, marker)
+		}
+	}
 }
 
 // fieldNameOf 将列名 c_tinyint 转换为生成的字段名 CTinyint。
@@ -554,4 +571,141 @@ func generateAndVerify(t *testing.T, dao *zcdb.DBDao, dialect Dialect, database 
 // （如 id → ID 的特例、连字符/驼峰混合输入）。
 func fieldNameOf(colName string) string {
 	return toPascalCase(colName)
+}
+
+// ==================== §3.4 样板：真实元数据一键生成 ====================
+
+// sampleUserOrderDDL 是设计稿 §3.4 的样板表（MySQL 方言）：覆盖自增主键、双唯一索引、
+// 联合索引、decimal 精度、enum 值域、默认值（含表达式默认值）与可空列。
+const sampleUserOrderDDL = "CREATE TABLE `user_order` (\n" +
+	"  `id`         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT       COMMENT '主键',\n" +
+	"  `order_no`   VARCHAR(32)     NOT NULL                      COMMENT '订单号',\n" +
+	"  `user_id`    BIGINT          NOT NULL                      COMMENT '用户ID',\n" +
+	"  `email`      VARCHAR(64)     NOT NULL                      COMMENT '用户邮箱',\n" +
+	"  `amount`     DECIMAL(10,2)   NOT NULL DEFAULT 0.00         COMMENT '订单金额（保留两位小数）',\n" +
+	"  `status`     ENUM('pending','paid','refunded') NOT NULL DEFAULT 'pending' COMMENT '订单状态',\n" +
+	"  `remark`     VARCHAR(255)    NULL                          COMMENT '备注（可为空）',\n" +
+	"  `created_at` DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',\n" +
+	"  PRIMARY KEY (`id`),\n" +
+	"  UNIQUE KEY `uk_order_no` (`order_no`),\n" +
+	"  UNIQUE KEY `uk_email` (`email`),\n" +
+	"  KEY `idx_user_status` (`user_id`, `status`)\n" +
+	") ENGINE=InnoDB COMMENT = '订单表'"
+
+// bridgeColumns 把 zcdb 的列元数据桥接为 zcmodel 的 Column 列表（文档「配合 zcdb Schema」示例的落地形态）：
+// Nullable 取副本地址（Column.Nullable 为 *bool，nil 表示未知，而 SchemaInspector 给出的可空性恒已知），
+// PrimaryKey 与 Extra 原样透传。
+func bridgeColumns(cols []zcdb.ColumnInfo) []*Column {
+	columns := make([]*Column, 0, len(cols))
+	for _, c := range cols {
+		nullable := c.Nullable
+		columns = append(columns, &Column{
+			Name: c.Name, Type: c.Type, Comment: c.Comment,
+			Nullable: &nullable, Default: c.Default, PrimaryKey: c.PrimaryKey, Extra: c.Extra,
+		})
+	}
+	return columns
+}
+
+// bridgeIndexes 把 zcdb 的索引元数据桥接为 zcmodel 的 IndexInfo 列表。
+func bridgeIndexes(indexes []zcdb.IndexInfo) []IndexInfo {
+	bridged := make([]IndexInfo, 0, len(indexes))
+	for _, idx := range indexes {
+		bridged = append(bridged, IndexInfo{
+			Name: idx.Name, Columns: idx.Columns, Unique: idx.Unique, Primary: idx.Primary,
+		})
+	}
+	return bridged
+}
+
+// TestInteg_MySQL_SampleBridge 是阶段三的端到端验收：用 §3.4 样板表在真实 MySQL 上
+// 一键生成（SchemaInspector → Input → Generate），逐列核对 ddl/primary_key/description tag
+// 与索引块，证明「从真实库一键生成即得完整面貌样板」。
+func TestInteg_MySQL_SampleBridge(t *testing.T) {
+	dao := openMySQLDAO(t)
+	mustExec(t, dao, "DROP TABLE IF EXISTS `user_order`")
+	mustExec(t, dao, sampleUserOrderDDL)
+	t.Cleanup(func() { mustExec(t, dao, "DROP TABLE IF EXISTS `user_order`") })
+
+	inspector, err := dao.Schema()
+	if err != nil {
+		t.Fatalf("Schema() 失败: %v", err)
+	}
+	ctx := context.Background()
+	cols, err := inspector.Columns(ctx, "user_order")
+	if err != nil {
+		t.Fatalf("Columns() 失败: %v", err)
+	}
+	indexes, err := inspector.Indexes(ctx, "user_order")
+	if err != nil {
+		t.Fatalf("Indexes() 失败: %v", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := Generate(Input{
+		OutputDir:        dir,
+		Database:         "zckg_test_integ",
+		Dialect:          DialectMysql,
+		TableName:        "user_order",
+		TableComment:     "订单表",
+		ColumnTagName:    "db",
+		JsonTagValueCase: NameCaseLowerCamel,
+		Columns:          bridgeColumns(cols),
+		Indexes:          bridgeIndexes(indexes),
+	}); err != nil {
+		t.Fatalf("Generate() 失败: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_order.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	got := string(content)
+
+	// 说明头 + 索引块（Entity 与 DO 各一次，顺序固定）
+	assertContainsAll(t, got, []string{
+		fileHeaderComment,
+		"// 索引:",
+		"//   - PRIMARY KEY (id)",
+		"//   - UNIQUE KEY uk_email (email)",
+		"//   - UNIQUE KEY uk_order_no (order_no)",
+		"//   - KEY idx_user_status (user_id, status)",
+	}, "§3.4 样板产物（头部与索引块）")
+	if n := strings.Count(got, "//   - PRIMARY KEY (id)"); n != 2 {
+		t.Errorf("索引块应在 Entity 与 DO 各出现一次，实际 %d 次:\n%s", n, got)
+	}
+
+	// 逐列核对完整字段行：tag 顺序 json → db → primary_key → ddl → description，
+	// ddl 片段取值必须与真实元数据逐字一致（字面量经 QuoteMeta：含括号与单引号）
+	entityFields := map[string]string{
+		"ID":        "`json:\"id\" db:\"id\" primary_key:\"true\" ddl:\"bigint unsigned NOT NULL AUTO_INCREMENT\" description:\"主键\"`",
+		"OrderNo":   "`json:\"orderNo\" db:\"order_no\" ddl:\"varchar(32) NOT NULL\" description:\"订单号\"`",
+		"UserID":    "`json:\"userId\" db:\"user_id\" ddl:\"bigint NOT NULL\" description:\"用户ID\"`",
+		"Email":     "`json:\"email\" db:\"email\" ddl:\"varchar(64) NOT NULL\" description:\"用户邮箱\"`",
+		"Amount":    "`json:\"amount\" db:\"amount\" ddl:\"decimal(10,2) NOT NULL DEFAULT 0.00\" description:\"订单金额（保留两位小数）\"`",
+		"Status":    "`json:\"status\" db:\"status\" ddl:\"enum('pending','paid','refunded') NOT NULL DEFAULT pending\" description:\"订单状态\"`",
+		"Remark":    "`json:\"remark\" db:\"remark\" ddl:\"varchar(255) NULL\" description:\"备注（可为空）\"`",
+		"CreatedAt": "`json:\"createdAt\" db:\"created_at\" ddl:\"datetime NOT NULL DEFAULT CURRENT_TIMESTAMP\" description:\"创建时间\"`",
+	}
+	for field, tag := range entityFields {
+		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+\S+\s+` + regexp.QuoteMeta(tag))
+		if !re.MatchString(got) {
+			t.Errorf("Entity 字段 %s 未匹配 §3.4 期望 tag: %s", field, tag)
+		}
+	}
+	// DO 侧类型为 any，tag 与 Entity 一致
+	for field, tag := range entityFields {
+		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+any\s+` + regexp.QuoteMeta(tag))
+		if !re.MatchString(got) {
+			t.Errorf("DO 字段 %s 未匹配 §3.4 期望 tag: %s", field, tag)
+		}
+	}
+
+	// 产物与 gofmt 输出逐字节一致（索引块的三空格清单形态与 gofmt 规范一致）
+	formatted, err := format.Source(content)
+	if err != nil {
+		t.Fatalf("生成产物无法通过 gofmt: %v", err)
+	}
+	if string(formatted) != got {
+		t.Errorf("生成产物与 gofmt 输出不一致\ngot:\n%s\nwant:\n%s", got, formatted)
+	}
 }

@@ -47,9 +47,9 @@ func TestGenerate(t *testing.T) {
 		// TableComment 非空时拼入结构体注释（空时回退“表”）
 		"// UserInfoEntity test_db.user_info 用户信息表，entity结构体，常用于数据库读取操作。",
 		"type UserInfoEntity struct {",
-		"`json:\"id\" db:\"id\" description:\"主键\"`",
-		"`json:\"userName\" db:\"user_name\" description:\"用户名\"`",
-		"`json:\"createdAt\" db:\"created_at\"`",
+		"`json:\"id\" db:\"id\" ddl:\"bigint(20)\" description:\"主键\"`",
+		"`json:\"userName\" db:\"user_name\" ddl:\"VARCHAR(255)\" description:\"用户名\"`",
+		"`json:\"createdAt\" db:\"created_at\" ddl:\"datetime\"`",
 		"type UserInfoDO struct {",
 		"func (e *UserInfoEntity) ToDO(userInfoDO ...*UserInfoDO) *UserInfoDO {",
 		"func (d *UserInfoDO) ToEntity(userInfoEntity ...*UserInfoEntity) *UserInfoEntity {",
@@ -59,13 +59,15 @@ func TestGenerate(t *testing.T) {
 		"if v, ok := d.UserName.(string); ok {",
 	}
 	assertContainsAll(t, got, want, "Generate 产物")
-	// 字段行按 gofmt 风格对齐，用正则匹配字段名、类型、tag 的组合
+	// 字段行按 gofmt 风格对齐，用正则匹配字段名、类型、tag 的组合（tag 顺序 json → db → ddl → description，
+	// Nullable 为 nil 时 ddl 片段不含 NULL 标记）。
+	// tag 字面量经 regexp.QuoteMeta 转义：ddl 片段含括号/引号等正则元字符（如 bigint(20)），不转义会被当作捕获组。
 	wantRegex := []*regexp.Regexp{
-		regexp.MustCompile(`ID\s+int64\s+` + "`json:\"id\" db:\"id\" description:\"主键\"`"),
-		regexp.MustCompile(`UserName\s+string\s+` + "`json:\"userName\" db:\"user_name\" description:\"用户名\"`"),
-		regexp.MustCompile(`CreatedAt\s+time\.Time\s+` + "`json:\"createdAt\" db:\"created_at\"`"),
-		regexp.MustCompile(`ID\s+any\s+` + "`json:\"id\" db:\"id\" description:\"主键\"`"),
-		regexp.MustCompile(`UserName\s+any\s+` + "`json:\"userName\" db:\"user_name\" description:\"用户名\"`"),
+		regexp.MustCompile(`ID\s+int64\s+` + regexp.QuoteMeta("`json:\"id\" db:\"id\" ddl:\"bigint(20)\" description:\"主键\"`")),
+		regexp.MustCompile(`UserName\s+string\s+` + regexp.QuoteMeta("`json:\"userName\" db:\"user_name\" ddl:\"VARCHAR(255)\" description:\"用户名\"`")),
+		regexp.MustCompile(`CreatedAt\s+time\.Time\s+` + regexp.QuoteMeta("`json:\"createdAt\" db:\"created_at\" ddl:\"datetime\"`")),
+		regexp.MustCompile(`ID\s+any\s+` + regexp.QuoteMeta("`json:\"id\" db:\"id\" ddl:\"bigint(20)\" description:\"主键\"`")),
+		regexp.MustCompile(`UserName\s+any\s+` + regexp.QuoteMeta("`json:\"userName\" db:\"user_name\" ddl:\"VARCHAR(255)\" description:\"用户名\"`")),
 	}
 	for _, re := range wantRegex {
 		if !re.MatchString(got) {
@@ -202,10 +204,10 @@ func TestGenerate_KeepUserCode(t *testing.T) {
 		"return \"custom\"",
 	}, "重新生成后用户自定义代码应完整保留")
 	// 新增列应同时进入 Entity（具体类型）与 DO（any）
-	if !regexp.MustCompile(`Extra\s+string\s+` + "`json:\"extra\" db:\"extra\"`").MatchString(got) {
+	if !regexp.MustCompile(`Extra\s+string\s+` + "`json:\"extra\" db:\"extra\" ddl:\"text\"`").MatchString(got) {
 		t.Errorf("重新生成后 Entity 缺少新增字段 Extra")
 	}
-	if !regexp.MustCompile(`Extra\s+any\s+` + "`json:\"extra\" db:\"extra\"`").MatchString(got) {
+	if !regexp.MustCompile(`Extra\s+any\s+` + "`json:\"extra\" db:\"extra\" ddl:\"text\"`").MatchString(got) {
 		t.Errorf("重新生成后 DO 缺少新增字段 Extra")
 	}
 	// 生成声明各只保留一份：重新生成为替换而非追加
@@ -341,7 +343,8 @@ func TestGenerate_CustomTypeImport(t *testing.T) {
 		`"github.com/shopspring/decimal"`,
 		"\t\"time\"\n",
 	}, "自定义 import 与自动补全的 time 应同时出现")
-	if !regexp.MustCompile(`Amount\s+decimal\.Decimal\s+` + "`json:\"amount\" db:\"amount\"`").MatchString(got) {
+	// tag 字面量经 regexp.QuoteMeta 转义：ddl 片段含括号（numeric(10,2)），不转义会被当作捕获组
+	if !regexp.MustCompile(`Amount\s+decimal\.Decimal\s+` + regexp.QuoteMeta("`json:\"amount\" db:\"amount\" ddl:\"numeric(10,2)\"`")).MatchString(got) {
 		t.Errorf("自定义类型字段生成错误:\n%s", got)
 	}
 	// 自定义 Import 显式指定后不会被 Generate 覆盖，调用方数据整体不被原地修改
@@ -742,7 +745,8 @@ func TestGenerate_KeepBuildTags(t *testing.T) {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
 	got := string(content)
-	wantHeader := "//go:build ignore\n// +build ignore\n\n// Package model 包文档注释。\npackage model\n"
+	// 说明头补写于最顶，其后为文件头（build tags + package 注释 + 原 package 行），逐字节保留
+	wantHeader := fileHeaderPrefix + "//go:build ignore\n// +build ignore\n\n// Package model 包文档注释。\npackage model\n"
 	if !strings.HasPrefix(got, wantHeader) {
 		t.Errorf("文件头 build tags/package 注释未保留\nwant prefix:\n%s\ngot:\n%s", wantHeader, got)
 	}
@@ -807,5 +811,189 @@ func (e *UserInfoEntity) Now() mytime.Time {
 	}
 	if !regexp.MustCompile(`CreatedAt\s+time\.Time`).MatchString(got) {
 		t.Errorf("新增列 CreatedAt 生成错误:\n%s", got)
+	}
+}
+
+// sampleColumns 返回 §3.4 样板的列定义（MySQL 8 元数据形态：Nullable/Default/PrimaryKey/Extra 均显式给出）。
+func sampleColumns() []*Column {
+	return []*Column{
+		{Name: "id", Type: "bigint unsigned", Nullable: boolPtr(false), PrimaryKey: true, Extra: "auto_increment", Comment: "主键"},
+		{Name: "order_no", Type: "varchar(32)", Nullable: boolPtr(false), Comment: "订单号"},
+		{Name: "user_id", Type: "bigint", Nullable: boolPtr(false), Comment: "用户ID"},
+		{Name: "email", Type: "varchar(64)", Nullable: boolPtr(false), Comment: "用户邮箱"},
+		{Name: "amount", Type: "decimal(10,2)", Nullable: boolPtr(false), Default: strPtr("0.00"), Comment: "订单金额（保留两位小数）"},
+		{Name: "status", Type: "enum('pending','paid','refunded')", Nullable: boolPtr(false), Default: strPtr("pending"), Comment: "订单状态"},
+		{Name: "remark", Type: "varchar(255)", Nullable: boolPtr(true), Comment: "备注（可为空）"},
+		{Name: "created_at", Type: "datetime", Nullable: boolPtr(false), Default: strPtr("CURRENT_TIMESTAMP"), Extra: "DEFAULT_GENERATED", Comment: "创建时间"},
+	}
+}
+
+// sampleIndexes 返回 §3.4 样板的索引（刻意打乱传入顺序，验证渲染端自行排序）。
+func sampleIndexes() []IndexInfo {
+	return []IndexInfo{
+		{Name: "idx_user_status", Columns: []string{"user_id", "status"}},
+		{Name: "uk_email", Columns: []string{"email"}, Unique: true},
+		{Name: "PRIMARY", Columns: []string{"id"}, Unique: true, Primary: true},
+		{Name: "uk_order_no", Columns: []string{"order_no"}, Unique: true},
+	}
+}
+
+// TestGenerate_SampleWithMetadataGolden 端到端 golden 锁定 §3.4 样板产物：
+// 说明头、索引块（排序后固定顺序 + gofmt 三空格清单形态）、字段 tag 顺序与 ddl 片段取值逐行核对，
+// 索引块在 Entity 与 DO 各出现一次，产物与 gofmt 输出逐字节一致并可被 go/parser 解析。
+func TestGenerate_SampleWithMetadataGolden(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	err := Generate(Input{
+		OutputDir: dir, Database: "test_db", Dialect: DialectMysql,
+		TableName: "user_order", TableComment: "订单表", ColumnTagName: "db",
+		JsonTagValueCase: NameCaseLowerCamel, Columns: sampleColumns(), Indexes: sampleIndexes(),
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_order.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	got := string(content)
+
+	assertContainsAll(t, got, []string{
+		fileHeaderComment,
+		"\n\npackage model\n",
+		`import "time"`,
+		"// UserOrderEntity test_db.user_order 订单表，entity结构体，常用于数据库读取操作。",
+		"//",
+		"// 索引:",
+		"//   - PRIMARY KEY (id)",
+		"//   - UNIQUE KEY uk_email (email)",
+		"//   - UNIQUE KEY uk_order_no (order_no)",
+		"//   - KEY idx_user_status (user_id, status)",
+		"type UserOrderEntity struct {",
+		"type UserOrderDO struct {",
+	}, "§3.4 样板产物")
+
+	// tag 顺序 json → db → primary_key → ddl → description；ddl 片段取值逐列核对
+	// （字面量经 QuoteMeta：ddl 含括号与单引号，不转义会被当作正则元字符）
+	entityFields := map[string]string{
+		"ID":        "`json:\"id\" db:\"id\" primary_key:\"true\" ddl:\"bigint unsigned NOT NULL AUTO_INCREMENT\" description:\"主键\"`",
+		"OrderNo":   "`json:\"orderNo\" db:\"order_no\" ddl:\"varchar(32) NOT NULL\" description:\"订单号\"`",
+		"UserID":    "`json:\"userId\" db:\"user_id\" ddl:\"bigint NOT NULL\" description:\"用户ID\"`",
+		"Email":     "`json:\"email\" db:\"email\" ddl:\"varchar(64) NOT NULL\" description:\"用户邮箱\"`",
+		"Amount":    "`json:\"amount\" db:\"amount\" ddl:\"decimal(10,2) NOT NULL DEFAULT 0.00\" description:\"订单金额（保留两位小数）\"`",
+		"Status":    "`json:\"status\" db:\"status\" ddl:\"enum('pending','paid','refunded') NOT NULL DEFAULT pending\" description:\"订单状态\"`",
+		"Remark":    "`json:\"remark\" db:\"remark\" ddl:\"varchar(255) NULL\" description:\"备注（可为空）\"`",
+		"CreatedAt": "`json:\"createdAt\" db:\"created_at\" ddl:\"datetime NOT NULL DEFAULT CURRENT_TIMESTAMP\" description:\"创建时间\"`",
+	}
+	for field, tag := range entityFields {
+		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+\S+\s+` + regexp.QuoteMeta(tag))
+		if !re.MatchString(got) {
+			t.Errorf("Entity 字段 %s 未匹配期望 tag: %s", field, tag)
+		}
+	}
+	// DO 侧字段类型为 any，tag 与 Entity 完全一致
+	for field, tag := range entityFields {
+		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+any\s+` + regexp.QuoteMeta(tag))
+		if !re.MatchString(got) {
+			t.Errorf("DO 字段 %s 未匹配期望 tag: %s", field, tag)
+		}
+	}
+	// 索引块在 Entity 与 DO 的 doc 注释中各出现一次
+	if n := strings.Count(got, "//   - PRIMARY KEY (id)"); n != 2 {
+		t.Errorf("索引块应在 Entity 与 DO 各出现一次，实际 %d 次:\n%s", n, got)
+	}
+	// 断言精度：主键行不得显示传入的物理索引名（渲染端隐藏）
+	assertNotContains(t, got, "KEY PRIMARY", "主键行不应渲染为普通 KEY 行")
+
+	// 产物必须与 gofmt 标准输出逐字节一致（三空格清单形态已按 gofmt 规范书写）
+	formatted, err := format.Source(content)
+	if err != nil {
+		t.Fatalf("生成产物无法通过 gofmt: %v\n%s", err, got)
+	}
+	if string(formatted) != got {
+		t.Errorf("生成产物与 gofmt 输出不一致\ngot:\n%s\nwant:\n%s", got, formatted)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "user_order.go", got, parser.AllErrors); err != nil {
+		t.Errorf("生成产物存在语法错误: %v", err)
+	}
+}
+
+// TestGenerate_LegacyInputDelta 验证老式 Input（不填任何新字段）的产物差异恰为 `ddl` tag 与文件说明头：
+// Nullable 未设置时 ddl 片段只含类型（不误标 NOT NULL），不生成 primary_key tag，索引块因数据为空自然省略。
+func TestGenerate_LegacyInputDelta(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	err := Generate(Input{
+		OutputDir: dir, Database: "test_db", Dialect: DialectMysql,
+		TableName: "user_info", TableComment: "用户信息表", ColumnTagName: "db",
+		JsonTagValueCase: NameCaseLowerCamel,
+		Columns: []*Column{
+			{Name: "id", Type: "bigint(20)", Comment: "主键"},
+			{Name: "user_name", Type: "VARCHAR(255)", Comment: "用户名"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	got := string(content)
+
+	assertContains(t, got, fileHeaderComment, "老式 Input 也应补写文件说明头")
+	assertContains(t, got, "// UserInfoEntity test_db.user_info 用户信息表，entity结构体，常用于数据库读取操作。\ntype UserInfoEntity struct {", "无索引时不生成索引块")
+	for _, tc := range []struct{ field, tag string }{
+		{"ID", "`json:\"id\" db:\"id\" ddl:\"bigint(20)\" description:\"主键\"`"},
+		{"UserName", "`json:\"userName\" db:\"user_name\" ddl:\"VARCHAR(255)\" description:\"用户名\"`"},
+	} {
+		re := regexp.MustCompile(regexp.QuoteMeta(tc.field) + `\s+\S+\s+` + regexp.QuoteMeta(tc.tag))
+		if !re.MatchString(got) {
+			t.Errorf("老式 Input 字段 %s 的 ddl tag 应为「仅类型」，实际未匹配: %s", tc.field, tc.tag)
+		}
+	}
+	// 未提供元数据时不产生任何推断：无 NULL 标记、无 primary_key tag、无索引块
+	assertNotContains(t, got, "NOT NULL", "Nullable 未知时不应渲染 NOT NULL")
+	assertNotContains(t, got, "primary_key", "未标记主键时不应生成 primary_key tag")
+	assertNotContains(t, got, "索引:", "未提供索引时不应生成索引块")
+}
+
+// TestGenerate_FileHeaderTextAndOfficialMarker 锁定说明头字面文本，并验证它不匹配 Go 官方生成标记正则：
+// 官方标记（^// Code generated .* DO NOT EDIT\.$）会使 staticcheck/golangci-lint 等工具整体跳过该文件，
+// 而本文件含用户代码、不应被整体豁免静态检查（刻意不采用的决策见设计稿 §3.3）。
+func TestGenerate_FileHeaderTextAndOfficialMarker(t *testing.T) {
+	want := []string{
+		"// 本文件由 zcmodel 部分生成：Entity/DO 结构体及 ToDO/ToEntity 方法在再次调用",
+		"// Generate 时会被替换，其余用户代码会被完整保留。表结构变更请重新调用",
+		"// zcmodel.Generate，勿手改生成区。",
+	}
+	if got := strings.Split(fileHeaderComment, "\n"); !reflect.DeepEqual(got, want) {
+		t.Errorf("说明头文本变更\ngot:  %q\nwant: %q", got, want)
+	}
+	official := regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
+	for _, line := range want {
+		if official.MatchString(line) {
+			t.Errorf("说明头不得匹配官方生成标记正则（会致文件被工具链整体跳过）: %q", line)
+		}
+	}
+
+	// 产物全文中同样不出现官方生成标记（防止后续改动误加）
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := Generate(Input{
+		OutputDir: dir, Database: "test_db", Dialect: DialectMysql,
+		TableName: "user_info", ColumnTagName: "db",
+		Columns: []*Column{{Name: "id", Type: "bigint(20)"}},
+	}); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	for i, line := range strings.Split(string(content), "\n") {
+		if official.MatchString(line) {
+			t.Errorf("产物第 %d 行匹配官方生成标记正则: %q", i+1, line)
+		}
+	}
+	if !strings.HasPrefix(string(content), fileHeaderPrefix) {
+		t.Errorf("产物应以说明头 + 空行起始:\n%s", content)
 	}
 }

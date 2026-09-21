@@ -24,7 +24,7 @@ func testColumns() []Column {
 
 // TestBuildStruct_Entity 验证 Entity 结构体生成：具体类型、tag 顺序为 json/db/description
 func TestBuildStruct_Entity(t *testing.T) {
-	got := buildStruct("UserInfoEntity", testColumns(), false, "UserInfoEntity 用户表", "db")
+	got := buildStruct("UserInfoEntity", testColumns(), false, "UserInfoEntity 用户表", "db", nil)
 	want := []string{
 		"// UserInfoEntity 用户表",
 		"type UserInfoEntity struct {",
@@ -52,7 +52,7 @@ func TestBuildStruct_Entity(t *testing.T) {
 
 // TestBuildStruct_DO 验证 DO 结构体生成：字段类型统一为 any
 func TestBuildStruct_DO(t *testing.T) {
-	got := buildStruct("UserInfoDO", testColumns(), true, "", "db")
+	got := buildStruct("UserInfoDO", testColumns(), true, "", "db", nil)
 	if !strings.Contains(got, "type UserInfoDO struct {") {
 		t.Errorf("buildStruct 输出缺少结构体声明:\n%s", got)
 	}
@@ -66,7 +66,7 @@ func TestBuildStruct_DO(t *testing.T) {
 
 // TestBuildStruct_CustomTagName 验证自定义 tag 名称（如 "column"）
 func TestBuildStruct_CustomTagName(t *testing.T) {
-	got := buildStruct("UserInfoEntity", testColumns(), false, "", "column")
+	got := buildStruct("UserInfoEntity", testColumns(), false, "", "column", nil)
 	if !strings.Contains(got, "`json:\"id\" column:\"id\" description:\"主键\"`") {
 		t.Errorf("buildStruct 自定义 tag 名称输出错误:\n%s", got)
 	}
@@ -77,7 +77,7 @@ func TestBuildStruct_EmptyComment(t *testing.T) {
 	cols := []Column{
 		{Name: "id", StructFieldInfo: StructFieldInfo{Name: "ID", Type: "int64"}},
 	}
-	got := buildStruct("Entity", cols, false, "", "db")
+	got := buildStruct("Entity", cols, false, "", "db", nil)
 	if strings.Contains(got, "description:") {
 		t.Errorf("无注释字段不应生成 description tag:\n%s", got)
 	}
@@ -169,7 +169,7 @@ func TestBuildStruct_CommentWithSpecialChars(t *testing.T) {
 	cols := []Column{
 		{Name: "list_cover", Comment: comment, StructFieldInfo: StructFieldInfo{Name: "ListCover", Type: "string", JsonTagValue: "listCover"}},
 	}
-	got := buildStruct("TEntity", cols, false, "", "db")
+	got := buildStruct("TEntity", cols, false, "", "db", nil)
 	// 语法可解析（反引号字符串不会被提前终止、tag 为单行）
 	fset := token.NewFileSet()
 	if _, err := parser.ParseFile(fset, "", "package model\n"+got, parser.AllErrors); err != nil {
@@ -225,7 +225,7 @@ func TestBuildStruct_JsonTagValueWithSpecialChars(t *testing.T) {
 	cols := []Column{
 		{Name: "list_cover", StructFieldInfo: StructFieldInfo{Name: "ListCover", Type: "string", JsonTagValue: jsonTag}},
 	}
-	got := buildStruct("TEntity", cols, false, "", "db")
+	got := buildStruct("TEntity", cols, false, "", "db", nil)
 	// 语法可解析（双引号/换行/反斜杠均被转义，反引号字符串不会被提前终止）
 	file, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors)
 	if err != nil {
@@ -245,7 +245,7 @@ func TestBuildStruct_JsonTagValueWithBacktick(t *testing.T) {
 	cols := []Column{
 		{Name: "list_cover", StructFieldInfo: StructFieldInfo{Name: "ListCover", Type: "string", JsonTagValue: "列表`封面`"}},
 	}
-	got := buildStruct("TEntity", cols, false, "", "db")
+	got := buildStruct("TEntity", cols, false, "", "db", nil)
 	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
 		t.Fatalf("生成代码存在语法错误: %v\n%s", err, got)
 	}
@@ -259,7 +259,7 @@ func TestWriteOrReplaceStruct_NewFile(t *testing.T) {
 	entityCode := "type UserEntity struct {\n\tID int\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
 	got := writeAndVerify(t, "", entityCode, doCode, nil)
-	want := "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
+	want := fileHeaderPrefix + "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
 	if got != want {
 		t.Errorf("新建文件内容错误\nwant:\n%s\ngot:\n%s", want, got)
 	}
@@ -270,7 +270,7 @@ func TestWriteOrReplaceStruct_EmptyFile(t *testing.T) {
 	entityCode := "type UserEntity struct {\n\tID int\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
 	got := writeAndVerify(t, "  \n", entityCode, doCode, nil)
-	want := "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
+	want := fileHeaderPrefix + "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
 	if got != want {
 		t.Errorf("空文件重建内容错误\nwant:\n%s\ngot:\n%s", want, got)
 	}
@@ -409,7 +409,7 @@ func TestWriteOrReplaceStruct_NewFile_NeededImports(t *testing.T) {
 	got := writeAndVerify(t, "", entityCode, doCode, []string{"time"})
 	// import "time" 自动引入，且位于 package 与生成代码之间
 	assertContains(t, got, "import \"time\"", "需要 time 包时新建文件应自动引入 import")
-	if !strings.HasPrefix(got, "package model\n\nimport \"time\"\n\ntype UserEntity struct {") {
+	if !strings.HasPrefix(got, fileHeaderPrefix+"package model\n\nimport \"time\"\n\ntype UserEntity struct {") {
 		t.Errorf("import 位置错误:\n%s", got)
 	}
 }
@@ -518,7 +518,7 @@ func TestWriteOrReplaceStruct_MultipleNeededImports(t *testing.T) {
 
 	// 新建文件：多个 import 组装为排序后的 import (…) 块
 	got := writeAndVerify(t, "", entityCode, doCode, needed)
-	want := "package model\n\nimport (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)\n\n"
+	want := fileHeaderPrefix + "package model\n\nimport (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)\n\n"
 	if !strings.HasPrefix(got, want) {
 		t.Errorf("多 import 块格式错误\nwant prefix:\n%s\ngot:\n%s", want, got)
 	}
@@ -571,8 +571,8 @@ var Extra = 1
 	doCode := "type UserDO struct {\n\tID  any\n\tAge any\n}\n\nfunc (d *UserDO) ToEntity() {}"
 	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
-	// 文件头（build tags + package 注释 + 原 package 行）逐字节保留
-	wantHeader := "//go:build ignore\n// +build ignore\n\n// Package custompkg 包文档注释。\npackage custompkg\n"
+	// 说明头补写于最顶，其后为文件头（build tags + package 注释 + 原 package 行），逐字节保留
+	wantHeader := fileHeaderPrefix + "//go:build ignore\n// +build ignore\n\n// Package custompkg 包文档注释。\npackage custompkg\n"
 	if !strings.HasPrefix(got, wantHeader) {
 		t.Errorf("文件头 build tags/package 注释未逐字节保留\nwant prefix:\n%s\ngot:\n%s", wantHeader, got)
 	}
@@ -681,7 +681,7 @@ func TestBuildStruct_EmptyColumnTagName(t *testing.T) {
 		{Name: "id", Comment: "主键", StructFieldInfo: StructFieldInfo{Name: "ID", Type: "int64", JsonTagValue: "id"}},
 		{Name: "user_name", StructFieldInfo: StructFieldInfo{Name: "UserName", Type: "string"}},
 	}
-	got := buildStruct("UserInfoEntity", cols, false, "", "")
+	got := buildStruct("UserInfoEntity", cols, false, "", "", nil)
 	// 不生成空 tag 名（反引号后直接跟冒号的 `:"id"` 模式）
 	if strings.Contains(got, "`:\"") {
 		t.Errorf("ColumnTagName 为空时不应生成空 tag 名:\n%s", got)
@@ -890,7 +890,7 @@ func TestWriteOrReplaceStruct_PkgNameFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
-	if !strings.HasPrefix(string(content), "package main\n") {
+	if !strings.HasPrefix(string(content), fileHeaderPrefix+"package main\n") {
 		t.Fatalf("无目录部分的相对路径应回退为 package main，实际:\n%s", content)
 	}
 }
@@ -1007,4 +1007,303 @@ type UserEntity struct {
 	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
 	assertContainsAll(t, got, []string{"// fmt alias doc", `f "fmt"`, `"time"`},
 		"带文档注释的别名导入应保留且缺失的标准导入应追加")
+}
+
+// ==================== ddl 片段组装（assembleDDLFragment） ====================
+
+// TestAssembleDDLFragment_NullableTriState 验证 NULL 标记的三态语义：
+// true → NULL、false → NOT NULL、nil（未知）→ 整段省略。
+// nil 省略是有意为之——手工构造 Input 未设置该字段时，若缺省渲染 NOT NULL 会把可空列静默误标。
+func TestAssembleDDLFragment_NullableTriState(t *testing.T) {
+	cases := []struct {
+		name     string
+		nullable *bool
+		want     string
+	}{
+		{"未知省略标记", nil, "varchar(255)"},
+		{"可空渲染 NULL", boolPtr(true), "varchar(255) NULL"},
+		{"非空渲染 NOT NULL", boolPtr(false), "varchar(255) NOT NULL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := assembleDDLFragment(Column{Type: "varchar(255)", Nullable: tc.nullable})
+			if got != tc.want {
+				t.Errorf("assembleDDLFragment() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAssembleDDLFragment_Default 验证 DEFAULT 段的在场判定与渲染：
+// 判定只看指针不看值——nil 无段、空串补一对单引号还原字面量、其余值方言原样（裸值/表达式/带引号字面量）。
+func TestAssembleDDLFragment_Default(t *testing.T) {
+	cases := []struct {
+		name string
+		col  Column
+		want string
+	}{
+		{"无默认值", Column{Type: "varchar(10)", Nullable: boolPtr(false)}, "varchar(10) NOT NULL"},
+		{"空串默认值补引号还原字面量", Column{Type: "varchar(10)", Nullable: boolPtr(false), Default: strPtr("")}, "varchar(10) NOT NULL DEFAULT ''"},
+		{"MySQL 裸值原样", Column{Type: "varchar(10)", Nullable: boolPtr(false), Default: strPtr("pending")}, "varchar(10) NOT NULL DEFAULT pending"},
+		{"数值原样", Column{Type: "decimal(10,2)", Nullable: boolPtr(false), Default: strPtr("0.00")}, "decimal(10,2) NOT NULL DEFAULT 0.00"},
+		{"PG 表达式原样", Column{Type: "character varying(20)", Nullable: boolPtr(false), Default: strPtr("'pending'::character varying")}, "character varying(20) NOT NULL DEFAULT 'pending'::character varying"},
+		{"SQLite 带引号字面量原样", Column{Type: "text", Nullable: boolPtr(true), Default: strPtr("'x'")}, "text NULL DEFAULT 'x'"},
+		{"可空性未知时默认值仍追加", Column{Type: "text", Default: strPtr("1.5")}, "text DEFAULT 1.5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := assembleDDLFragment(tc.col); got != tc.want {
+				t.Errorf("assembleDDLFragment() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAssembleDDLFragment_ExtraWhiteList 验证 MySQL EXTRA 的白名单过滤与固定输出顺序：
+// 仅 auto_increment、on update CURRENT_TIMESTAMP、VIRTUAL GENERATED、STORED GENERATED 四项保留，
+// 按白名单顺序以大写形态输出；DEFAULT_GENERATED 是噪音、其余标记（如 NDB 的 STORAGE DISK）不在白名单，一律过滤。
+func TestAssembleDDLFragment_ExtraWhiteList(t *testing.T) {
+	cases := []struct {
+		name  string
+		typ   string
+		extra string
+		want  string
+	}{
+		{"自增小写转大写", "bigint", "auto_increment", "bigint NOT NULL AUTO_INCREMENT"},
+		{"DEFAULT_GENERATED 过滤（默认值已由 DEFAULT 段呈现）", "datetime", "DEFAULT_GENERATED", "datetime NOT NULL"},
+		{"虚拟生成列保留（该列不可写）", "int", "VIRTUAL GENERATED", "int NOT NULL VIRTUAL GENERATED"},
+		{"存储生成列保留", "int", "STORED GENERATED", "int NOT NULL STORED GENERATED"},
+		{"多项按白名单顺序而非输入顺序", "timestamp", "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", "timestamp NOT NULL ON UPDATE CURRENT_TIMESTAMP"},
+		{"非白名单标记过滤", "varchar(10)", "STORAGE DISK", "varchar(10) NOT NULL"},
+		{"匹配大小写不敏感", "bigint", "AUTO_INCREMENT", "bigint NOT NULL AUTO_INCREMENT"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			col := Column{Type: tc.typ, Nullable: boolPtr(false), Extra: tc.extra}
+			if got := assembleDDLFragment(col); got != tc.want {
+				t.Errorf("assembleDDLFragment() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAssembleDDLFragment_TypePreservedVerbatim 验证类型原样透传：
+// enum 值域的单引号、括号与 unsigned 修饰符不被改写（片段是重组的类 DDL 文本，不做归一化）。
+func TestAssembleDDLFragment_TypePreservedVerbatim(t *testing.T) {
+	col := Column{Type: "enum('pending','paid')", Nullable: boolPtr(false), Extra: "auto_increment"}
+	want := "enum('pending','paid') NOT NULL AUTO_INCREMENT"
+	if got := assembleDDLFragment(col); got != want {
+		t.Errorf("assembleDDLFragment() = %q, want %q", got, want)
+	}
+}
+
+// ==================== 索引注释块（buildIndexCommentBlock） ====================
+
+// TestBuildIndexCommentBlock_Ordering 验证排序固定为 PRIMARY → UNIQUE（索引名字典序）→ 普通（索引名字典序），
+// 输出稳定以利于 git diff 与 golden 断言；并验证排序在副本上进行，不改动调用方传入的切片。
+func TestBuildIndexCommentBlock_Ordering(t *testing.T) {
+	indexes := []IndexInfo{
+		{Name: "idx_b", Columns: []string{"c"}},
+		{Name: "uk_zzz", Columns: []string{"b"}, Unique: true},
+		{Name: "user_order_pkey", Columns: []string{"id"}, Unique: true, Primary: true},
+		{Name: "idx_a", Columns: []string{"d"}},
+		{Name: "uk_aaa", Columns: []string{"a"}, Unique: true},
+	}
+	want := []string{
+		"//   - PRIMARY KEY (id)",
+		"//   - UNIQUE KEY uk_aaa (a)",
+		"//   - UNIQUE KEY uk_zzz (b)",
+		"//   - KEY idx_a (d)",
+		"//   - KEY idx_b (c)",
+	}
+	got := buildIndexCommentBlock(indexes)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("索引块排序错误\ngot:  %q\nwant: %q", got, want)
+	}
+	// 渲染不得改动调用方传入的切片（generate.go 直接透传 Input.Indexes）
+	if indexes[0].Name != "idx_b" || indexes[2].Name != "user_order_pkey" {
+		t.Errorf("渲染改动了调用方切片顺序: %v", indexes)
+	}
+}
+
+// TestBuildIndexCommentBlock_Format 验证渲染格式：主键行不显示方言内部物理索引名（PG 的 xxx_pkey、
+// SQLite 的 sqlite_autoindex_* 即使出现在传入的 Name 中也不被渲染）、多列按定义顺序以逗号加空格连接、
+// 非主键索引名原样呈现、表达式列占位符 #expr 透传；索引名与列文本中的换行净化为空格，防止注释行断裂。
+// 排序键为净化前的原始索引名（真实索引名不含换行，此处 "idx\nnewline" 因 '\n' 的字节序小于 '_' 而排在前面）。
+func TestBuildIndexCommentBlock_Format(t *testing.T) {
+	got := buildIndexCommentBlock([]IndexInfo{
+		{Name: "user_order_pkey", Columns: []string{"id"}, Unique: true, Primary: true},
+		{Name: "uk_multi", Columns: []string{"user_id", "status"}, Unique: true},
+		{Name: "idx_expr", Columns: []string{"#expr"}},
+		{Name: "idx\nnewline", Columns: []string{"a\nb"}},
+	})
+	want := []string{
+		"//   - PRIMARY KEY (id)",
+		"//   - UNIQUE KEY uk_multi (user_id, status)",
+		"//   - KEY idx newline (a b)",
+		"//   - KEY idx_expr (#expr)",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("索引块渲染错误\ngot:  %q\nwant: %q", got, want)
+	}
+	assertNotContains(t, strings.Join(got, "\n"), "user_order_pkey", "主键行不应显示方言内部物理索引名")
+}
+
+// TestBuildIndexCommentBlock_Empty 验证无索引时整块省略：nil 与空切片均返回空结果，
+// 供 buildStructDocComment 只渲染首行（数据驱动，无数据自然省略）。
+func TestBuildIndexCommentBlock_Empty(t *testing.T) {
+	if got := buildIndexCommentBlock(nil); len(got) != 0 {
+		t.Errorf("nil 索引应返回空结果，实际: %q", got)
+	}
+	if got := buildIndexCommentBlock([]IndexInfo{}); len(got) != 0 {
+		t.Errorf("空索引切片应返回空结果，实际: %q", got)
+	}
+}
+
+// ==================== doc 注释组装（buildStructDocComment） ====================
+
+// TestBuildStructDocComment 验证注释组装规则：首行为既有 comment，索引块前插空注释行与「索引:」标题；
+// comment 与索引均为空时不生成注释；仅有索引（comment 为空）时只渲染索引块。
+func TestBuildStructDocComment(t *testing.T) {
+	indexes := []IndexInfo{{Name: "user_order_pkey", Columns: []string{"id"}, Unique: true, Primary: true}}
+	cases := []struct {
+		name    string
+		comment string
+		indexes []IndexInfo
+		want    string
+	}{
+		{"两者皆空不生成注释", "", nil, ""},
+		{"仅索引块", "", indexes, "//\n// 索引:\n//   - PRIMARY KEY (id)\n"},
+		{"首行加索引块", "T 表", indexes, "// T 表\n//\n// 索引:\n//   - PRIMARY KEY (id)\n"},
+		{"仅首行", "T 表", nil, "// T 表\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildStructDocComment(tc.comment, tc.indexes); got != tc.want {
+				t.Errorf("buildStructDocComment() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeCommentLine 验证换行净化：LF、CRLF、CR 均替换为单个空格（CRLF 不被拆成两个空格），
+// 无换行的文本原样返回。
+func TestSanitizeCommentLine(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"LF", "a\nb", "a b"},
+		{"CRLF 只替换为一个空格", "a\r\nb", "a b"},
+		{"CR", "a\rb", "a b"},
+		{"无换行原样", "正常 文本", "正常 文本"},
+		{"空串", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeCommentLine(tc.in); got != tc.want {
+				t.Errorf("sanitizeCommentLine(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildStruct_TableCommentNewlineRegression 回归锁死：TableComment 含换行/回车时
+// doc 注释被净化为单行，不再生成裸行（裸行会让落盘语法自校验报错且根因难定位）。
+func TestBuildStruct_TableCommentNewlineRegression(t *testing.T) {
+	cols := []Column{{Name: "id", StructFieldInfo: StructFieldInfo{Name: "ID", Type: "int64"}}}
+	got := buildStruct("TEntity", cols, false, "订单表\n第二行\r\n第三行", "db", nil)
+	if !strings.HasPrefix(got, "// 订单表 第二行 第三行\ntype TEntity struct {") {
+		t.Errorf("TableComment 换行应净化为空格并保持单行注释:\n%s", got)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
+		t.Errorf("净化后的产物应可解析: %v\n%s", err, got)
+	}
+}
+
+// ==================== 说明头判定与补写（hasFileHeaderComment / writeOrReplaceStruct） ====================
+
+// TestHasFileHeaderComment 验证说明头判定按整行精确匹配：头部含首行即命中（兼容 CRLF 行尾），
+// 用户改写说明块其余行但首行仍在时不重复补写；首行被改动则不命中。
+func TestHasFileHeaderComment(t *testing.T) {
+	firstLine := strings.SplitN(fileHeaderComment, "\n", 2)[0]
+	cases := []struct {
+		name   string
+		header string
+		want   bool
+	}{
+		{"空头部", "", false},
+		{"仅有用户文件级注释", "// 用户注释\n\n", false},
+		{"说明头整块在头部", fileHeaderComment + "\n\n", true},
+		{"CRLF 行尾仍命中", firstLine + "\r\n\r\n", true},
+		{"用户改写说明块其余行但首行在", firstLine + "\n// 用户改写的第二行\n", true},
+		{"首行被用户改动则不命中", "// 本文件由 zcmodel 生成：用户改写了首行\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasFileHeaderComment(tc.header); got != tc.want {
+				t.Errorf("hasFileHeaderComment(%q) = %v, want %v", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWriteOrReplaceStruct_HeaderIdempotentOnRegenerate 验证说明头补写的幂等性：
+// 连续多次再生成后说明头首行只出现一次（不叠加），且用户自定义方法完整保留。
+func TestWriteOrReplaceStruct_HeaderIdempotentOnRegenerate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	filePath := filepath.Join(dir, "user.go")
+	entityCode := "type UserEntity struct {\n\tID int64\n}"
+	doCode := "type UserDO struct {\n\tID any\n}"
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
+		t.Fatalf("首次生成失败: %v", err)
+	}
+	first, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	assertContains(t, string(first), fileHeaderComment, "新建文件应带说明头")
+
+	// 追加用户代码后再次生成（走存量路径的说明头判定）
+	withUser := append(first, []byte("\n// 用户自定义方法\nfunc (e *UserEntity) Hello() string { return \"hi\" }\n")...)
+	if err := os.WriteFile(filePath, withUser, 0644); err != nil {
+		t.Fatalf("写入用户代码失败: %v", err)
+	}
+	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
+		t.Fatalf("再生成失败: %v", err)
+	}
+	second, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("读取文件失败: %v", err)
+	}
+	firstLine := strings.SplitN(fileHeaderComment, "\n", 2)[0]
+	if n := strings.Count(string(second), firstLine); n != 1 {
+		t.Errorf("再生成后说明头首行应只出现一次，实际 %d 次:\n%s", n, second)
+	}
+	if !strings.HasPrefix(string(second), fileHeaderPrefix) {
+		t.Errorf("存量文件产物应以说明头起始:\n%s", second)
+	}
+	assertContains(t, string(second), "func (e *UserEntity) Hello() string", "用户自定义方法应保留")
+}
+
+// TestWriteOrReplaceStruct_HeaderScopeLimitedToFileHead 验证说明头判定范围限定于 package 声明之前的头部：
+// 说明块文本仅出现在文件中段（用户代码里）时，仍应在文件最顶补写说明头（不误判为已存在）。
+func TestWriteOrReplaceStruct_HeaderScopeLimitedToFileHead(t *testing.T) {
+	orig := "package model\n\nvar userText = 1\n\n// 本文件由 zcmodel 部分生成：Entity/DO 结构体及 ToDO/ToEntity 方法在再次调用\nvar headFirstLineInBody = 2\n"
+	got := writeAndVerify(t, orig, "type UserEntity struct {\n\tID int\n}", "type UserDO struct {\n\tID any\n}", nil)
+	if !strings.HasPrefix(got, fileHeaderPrefix+"package model\n") {
+		t.Errorf("文件中段出现说明块文本时仍应在最顶补写说明头:\n%s", got)
+	}
+	assertContains(t, got, "var headFirstLineInBody = 2", "中段的用户代码应原样保留")
+}
+
+// TestWriteOrReplaceStruct_HeaderSeparatedFromPackageDoc 验证说明头与 package 文档注释之间以空行分隔
+// （否则说明头会被 godoc 当作 package doc 的一部分），package 文档注释仍紧邻 package 行。
+func TestWriteOrReplaceStruct_HeaderSeparatedFromPackageDoc(t *testing.T) {
+	orig := "// Package model 包文档注释。\npackage model\n\ntype UserEntity struct {\n\tID int\n}\n"
+	got := writeAndVerify(t, orig, "type UserEntity struct {\n\tID int64\n}", "type UserDO struct {\n\tID any\n}", nil)
+	wantPrefix := fileHeaderPrefix + "// Package model 包文档注释。\npackage model\n"
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Errorf("说明头应与 package 文档注释以空行分隔且 package doc 紧邻 package 行\nwant prefix:\n%s\ngot:\n%s", wantPrefix, got)
+	}
 }

@@ -13,7 +13,9 @@ zcmodel 是一个数据库模型代码生成模块：输入一张表的结构信
 - **三种方言**：内置 MySQL / PostgreSQL / SQLite 的列类型 → Go 类型映射表；
 - **命名自动转换**：任意风格的表名/列名（snake_case、camelCase、kebab-case 等）自动转为 Go 规范的 PascalCase，`id` 统一转为 `ID`；
 - **增量再生成**：目标文件已存在时，通过 AST 解析移除旧的生成代码并重新生成，**用户自定义代码（含自定义方法）完整保留**；
-- **注释安全**：字段注释写入 `description` tag 前经过转义净化，含反引号、换行、双引号的注释不会破坏生成代码的语法。
+- **注释安全**：字段注释写入 `description` tag 前经过转义净化，含反引号、换行、双引号的注释不会破坏生成代码的语法；
+- **元数据快照**：可选的 `ddl` tag 呈现该列的类 DDL 列定义片段（类型 / 可空 / 默认值 / MySQL EXTRA），`primary_key` tag 标记主键列，`Input.Indexes` 渲染为结构体 doc 注释中的索引清单——使读模型文件的人与 AI 编码代理不必回查数据库即可看到表的面貌。元数据是**生成时刻的快照**，表结构变更后需重新生成才会刷新（不做运行时校验）；
+- **混合文件声明**：文件首部写入说明头，声明「生成区在再生成时被替换、用户代码被完整保留」的分区规则（刻意不使用 Go 官方的 `// Code generated ... DO NOT EDIT.` 标记，理由见下方「文件说明头」）。
 
 zcmodel 是纯代码生成工具，不连接数据库、不依赖数据库驱动。表结构信息可由调用方手工构造，也可通过 [zcdb](../../zcdb/docs/schema.md) 的 Schema 能力从真实数据库读取。
 
@@ -21,7 +23,7 @@ zcmodel 是纯代码生成工具，不连接数据库、不依赖数据库驱动
 
 ```
 zcmodel/
-├── input.go                # 对外数据结构：Input、Column、StructFieldInfo、NameCase、Dialect
+├── input.go                # 对外数据结构：Input、Column、StructFieldInfo、IndexInfo、NameCase、Dialect
 ├── generate.go             # 入口 Generate：校验、补全字段信息、组装生成代码并写文件
 ├── build.go                # 代码拼装：结构体/方法字符串生成、AST 增量写文件（writeOrReplaceStruct）
 ├── toCase.go               # 命名风格转换：splitWords、toPascalCase、formatJSONTag 等
@@ -59,7 +61,7 @@ zcmodel/
       ⑤ 生成代码字符串
          ├─ buildStruct：Entity（具体类型）/ DO（any 类型）
          ├─ buildToDOMethod / buildToEntityMethod：互转方法
-         └─ 注释：表注释生成到结构体上方的 // 注释
+         └─ doc 注释：表注释 + 索引块（Input.Indexes）生成到结构体上方
                                  │
       ⑥ 写文件 {OutputDir}/{TableName}.go
          ├─ 自动创建输出目录，并二次校验输出路径不逃逸输出目录
@@ -110,14 +112,19 @@ func Generate(input Input) error
 | `ColumnTagName` | `string` | 列映射 tag 的名称（如 `"column"`、`"db"`），与 zcdb 的列映射标签对应 |
 | `JsonTagValueCase` | `NameCase` | JSON tag 的命名风格；**空值表示不生成 json tag** |
 | `Columns` | `[]*Column` | 表的所有字段；为空时生成仅含空结构体与互转方法的文件 |
+| `Indexes` | `[]IndexInfo` | 表索引；为空时不生成结构体 doc 注释中的索引块 |
 
-### Column / StructFieldInfo
+### Column / StructFieldInfo / IndexInfo
 
 ```go
 type Column struct {
     Name            string          // 列名
-    Type            string          // 列类型（如 "VARCHAR(255)"、"bigint(20)"、"text"）
+    Type            string          // 列类型（如 "VARCHAR(255)"、"bigint(20)"、"text"），ddl 片段的锚点
     Comment         string          // 列注释，生成 description tag
+    Nullable        *bool           // 是否可空；nil 表示未知（ddl 片段省略 NULL 标记）
+    Default         *string         // 默认值；nil 表示无默认值（方言原生格式，见「ddl 片段」）
+    PrimaryKey      bool            // 是否主键列（联合主键多列均为 true），生成 primary_key tag
+    Extra           string          // MySQL information_schema 的 EXTRA 列原样（PG/SQLite 恒空）
     StructFieldInfo StructFieldInfo // 生成结构体字段时的信息
 }
 
@@ -127,9 +134,21 @@ type StructFieldInfo struct {
     Import       string // Type 对应的 import 路径（如 time.Time 需 "time"）；留空不引入包
     JsonTagValue string // json tag 的值；留空时按 JsonTagValueCase 自动推导
 }
+
+type IndexInfo struct {
+    Name    string   // 索引名（仅唯一/普通索引渲染该名字；主键行渲染为 PRIMARY KEY (cols)）
+    Columns []string // 索引列，按定义顺序
+    Unique  bool     // 是否唯一索引
+    Primary bool     // 是否主键索引
+}
 ```
 
 **显式优先**：`StructFieldInfo` 的每个字段都允许调用方预先指定，`Generate` 只对留空的字段做自动推导。这使得特殊列（如 JSON 列想映射为自定义结构体类型）可以完全手工控制。
+
+**指针字段的语义**：`Nullable` 与 `Default` 用指针而非值类型，以便区分「未知 / 无默认值」与零值——
+`Nullable` 为 `nil` 时 `ddl` 片段**省略** NULL 标记（而不是假定 `NOT NULL` 而误标可空列）；
+`Default` 为 `nil` 表示无默认值，非 `nil` 一律追加 DEFAULT 段（含空串，判定只看指针不看值）。
+手工构造时建议显式填写这两个字段（如 `Nullable: &nullable`、`Default: &defaultVal`）。
 
 ### NameCase
 
@@ -165,6 +184,8 @@ JSON tag 值的命名风格枚举，`IsValid()` 判断合法性：
 文件最终布局（增量再生成时同样遵守）：
 
 ```
+文件说明头（部分生成声明；新建文件写入，存量文件缺失时在文件最顶补写、已含则不重复）
+
 原文件头（build tags、文件级注释，存量文件按原文保留；新建文件无）
 package 行（存量文件尊重原声明；新建文件取 OutputDir 目录名）
 
@@ -179,32 +200,106 @@ imports（原有 import + 缺失的生成代码所需 import）
 // 其他用户代码（保留）
 ```
 
+#### 文件说明头
+
+新建文件在首行写入说明头；存量文件再生成时若头部缺失则于文件最顶补写（已含则不重复）：
+
+```go
+// 本文件由 zcmodel 部分生成：Entity/DO 结构体及 ToDO/ToEntity 方法在再次调用
+// Generate 时会被替换，其余用户代码会被完整保留。表结构变更请重新调用
+// zcmodel.Generate，勿手改生成区。
+```
+
+三行分别声明文件性质（部分生成）、分区规则（生成区被替换 / 用户区被保留）与行为指引（表结构变更走再生成）。
+说明头与 `package` 声明之间以空行分隔，避免被 godoc 识别为 package 文档注释；它位于用户 build tags（`//go:build`）之前是合法的——Go 规定 build 约束之前仅允许空行与其他行注释。
+
+**刻意不使用** Go 官方的生成标记 `// Code generated ... DO NOT EDIT.`：官方标记的社区共识是「整个文件是生成物、手改会丢失」，与本模块「用户代码是文件的一等公民、再生成时被完整保留」的契约恰好相反；且匹配官方正则（`^// Code generated .* DO NOT EDIT\.$`）会使 staticcheck、golangci-lint 等工具**整体跳过该文件**，而本文件包含用户代码，不应被豁免静态检查。
+
 ### Entity 与 DO 结构体
 
-- tag 顺序固定为：**json → {ColumnTagName} → description**；
-- `json` tag 仅在 `JsonTagValue` 非空时生成；`{ColumnTagName}` tag 仅在 `ColumnTagName` 非空时生成（避免产生空 tag 名 `:"colname"`）；`description` tag 仅在列注释非空时生成；
+- tag 顺序固定为：**json → {ColumnTagName} → primary_key → ddl → description**，各 tag 数据为空时跳过：
+  - `json` tag 仅在 `JsonTagValue` 非空时生成；
+  - `{ColumnTagName}` tag 仅在 `ColumnTagName` 非空时生成（避免产生空 tag 名 `:"colname"`）；
+  - `primary_key:"true"` 仅在 `Column.PrimaryKey` 为 true 时生成（联合主键多列均标记）；主键在 DDL 中是表级约束，不并入 `ddl` 片段，另由 doc 注释的索引块呈现；
+  - `ddl` tag 仅在 `Column.Type` 非空时生成（规则见下方「ddl 片段」）；
+  - `description` tag 仅在列注释非空时生成；
 - 字段名与类型按 gofmt 风格对齐（宽度取最长者）；
 - DO 的字段类型统一为 `any`，tag 与 Entity 完全一致。
 
-示例（表 `user_order`，`ColumnTagName` 为 `db`，JSON tag 风格 `lowerCamel`）：
+示例（表 `user_order`，`ColumnTagName` 为 `db`，JSON tag 风格 `lowerCamel`，元数据取自 MySQL）：
 
 ```go
 // UserOrderEntity test_db.user_order 订单表，entity结构体，常用于数据库读取操作。
+//
+// 索引:
+//   - PRIMARY KEY (id)
+//   - UNIQUE KEY uk_email (email)
+//   - KEY idx_user_status (user_id, status)
 type UserOrderEntity struct {
-	ID        int64     `json:"id" db:"id" description:"主键"`
-	OrderNo   string    `json:"orderNo" db:"order_no" description:"订单号"`
-	Amount    float64   `json:"amount" db:"amount"`
-	CreatedAt time.Time `json:"createdAt" db:"created_at" description:"创建时间"`
+	ID        int64     `json:"id" db:"id" primary_key:"true" ddl:"bigint unsigned NOT NULL AUTO_INCREMENT" description:"主键"`
+	OrderNo   string    `json:"orderNo" db:"order_no" ddl:"varchar(32) NOT NULL" description:"订单号"`
+	Amount    float64   `json:"amount" db:"amount" ddl:"decimal(10,2) NOT NULL DEFAULT 0.00" description:"订单金额（保留两位小数）"`
+	Status    string    `json:"status" db:"status" ddl:"enum('pending','paid','refunded') NOT NULL DEFAULT pending" description:"订单状态"`
+	Remark    string    `json:"remark" db:"remark" ddl:"varchar(255) NULL" description:"备注（可为空）"`
+	CreatedAt time.Time `json:"createdAt" db:"created_at" ddl:"datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" description:"创建时间"`
 }
 
 // UserOrderDO test_db.user_order 订单表，do结构体，常用于数据库写入操作。
+//
+// 索引:
+//   - PRIMARY KEY (id)
+//   - UNIQUE KEY uk_email (email)
+//   - KEY idx_user_status (user_id, status)
 type UserOrderDO struct {
-	ID        any `json:"id" db:"id" description:"主键"`
-	OrderNo   any `json:"orderNo" db:"order_no" description:"订单号"`
-	Amount    any `json:"amount" db:"amount"`
-	CreatedAt any `json:"createdAt" db:"created_at" description:"创建时间"`
+	ID        any `json:"id" db:"id" primary_key:"true" ddl:"bigint unsigned NOT NULL AUTO_INCREMENT" description:"主键"`
+	OrderNo   any `json:"orderNo" db:"order_no" ddl:"varchar(32) NOT NULL" description:"订单号"`
+	Amount    any `json:"amount" db:"amount" ddl:"decimal(10,2) NOT NULL DEFAULT 0.00" description:"订单金额（保留两位小数）"`
+	Status    any `json:"status" db:"status" ddl:"enum('pending','paid','refunded') NOT NULL DEFAULT pending" description:"订单状态"`
+	Remark    any `json:"remark" db:"remark" ddl:"varchar(255) NULL" description:"备注（可为空）"`
+	CreatedAt any `json:"createdAt" db:"created_at" ddl:"datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" description:"创建时间"`
 }
 ```
+
+#### ddl 片段
+
+`ddl` 是**重组的类 DDL 文本**（目标是让人与 AI 准确理解该列，而非可直接执行的 DDL），按
+`{Type} [{NULL|NOT NULL}] [DEFAULT 值] [EXTRA 白名单项]` 组装：
+
+| 段 | 取值规则 |
+|---|---|
+| `Type` | `Column.Type` 方言原样，不归一化（保留 `unsigned`、`enum` 值域、长度/精度等） |
+| NULL 标记 | `Nullable` 为 `*bool`：`true` → `NULL`、`false` → `NOT NULL`、`nil`（未知）→ **整段省略**。已知值一律显式书写，不模拟各方言 `SHOW CREATE` 的省略习惯；未知时省略而非假定 `NOT NULL`，避免误标可空列 |
+| DEFAULT | `Default` 非 `nil` 时追加（判定只看指针不看值）；值为空串时渲染为 `DEFAULT ''`（MySQL 元数据对空串默认值给出裸空串，补一对单引号还原为合法的字符串字面量）；其余值方言原样：MySQL 裸值（`pending`）、PostgreSQL 表达式（`'pending'::character varying`、`nextval(...)`）、SQLite 带引号字面量 |
+| EXTRA | 仅 MySQL：`Column.Extra` 透传 information_schema 的 `EXTRA`，按白名单过滤并以大写形态输出，顺序固定为 `AUTO_INCREMENT` → `ON UPDATE CURRENT_TIMESTAMP` → `VIRTUAL GENERATED` → `STORED GENERATED`。`DEFAULT_GENERATED` 属噪音（默认值已由 DEFAULT 段呈现）被过滤；`VIRTUAL/STORED GENERATED` 必须保留——该列不可写，片段是 DO 侧唯一能提示这一点的位置（EXTRA 不含生成表达式本身，完整表达式仍需回查 DDL） |
+
+**已知局限**：
+
+- 元数据是**生成时刻的快照**，表结构变更后未重新生成即过期；`ddl` 只呈现单个列定义片段，不含索引与约束（索引见索引块，约束请回查建表语句）；
+- 各段的值形态因方言而异（裸值 / 带引号字面量 / 带 cast 表达式），这是「方言原样」决策的自然结果，不抹平方言与版本差异；
+- MySQL 版本间差异（如 8.0.13+ 才支持表达式默认值）未逐一验证（测试基准为 MySQL 8.4）；
+- SQLite 的 `INTEGER PRIMARY KEY` 在 `table_info` 中 `notnull=0`，会渲染为 `INTEGER NULL`——该列实为 rowid 别名、不可能为 NULL，属元数据固有局限，不做特判修正。
+
+#### 索引块
+
+`Input.Indexes` 非空时，Entity 与 DO 的 doc 注释中追加索引清单（upsert 是写操作，DO 侧对读者同样关键）：
+
+```go
+// UserOrderDO test_db.user_order 订单表，do结构体，常用于数据库写入操作。
+//
+// 索引:
+//   - PRIMARY KEY (id)
+//   - UNIQUE KEY uk_email (email)
+//   - UNIQUE KEY uk_order_no (order_no)
+//   - KEY idx_user_status (user_id, status)
+type UserOrderDO struct {
+```
+
+- **排序固定**：PRIMARY → UNIQUE（索引名字典序）→ 普通（索引名字典序），输出稳定利于 git diff 与 golden 断言；
+- **渲染格式**：主键行 `PRIMARY KEY (cols)`，不显示方言内部物理索引名（如 PG 的 `user_order_pkey`、SQLite 的 `sqlite_autoindex_*`）；唯一与普通索引为 `UNIQUE KEY name (cols)` / `KEY name (cols)`，列按定义顺序以逗号加空格连接；
+- **清单前缀**：`//` + 三个空格 + `- `，即 gofmt 对 doc 注释清单的规范形态，产物与落盘前 gofmt 输出一致；
+- **表达式列**：列位可能是表达式文本或占位符（如 `#expr`，由元数据来源决定），生成端不校验列名合法性——索引块是提示性元数据，严格校验会误报表达式索引；
+- **净化**：索引名与列文本中的换行/回车替换为空格，防止注释行断裂；
+- `Input.Indexes` 为空时整块省略（数据驱动，无数据自然不生成）。
 
 ### ToDO / ToEntity 互转方法
 
@@ -307,7 +402,7 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 5. 按固定布局重写整个文件；
 6. **落盘保障**：全部处理成功后，对完整内容执行 `go/format.Source` 语法自校验，再经同目录临时文件 + rename 原子替换目标文件（见下方“落盘安全三重防线”）。
 
-特殊情形：文件不存在或内容为空白时，按新建处理（包名取输出目录名，无法推导时回退 `main`）。存量文件再生成时：package 声明之前的原文（build tags、文件级注释）与原 package 行按原文前置保留，包名不强制改为目录推导值。
+特殊情形：文件不存在或内容为空白时，按新建处理（包名取输出目录名，无法推导时回退 `main`）。存量文件再生成时：package 声明之前的原文（build tags、文件级注释）与原 package 行按原文前置保留，包名不强制改为目录推导值；若 package 声明之前的头部区域没有说明块首行（整行精确匹配），则在文件最顶补写「说明头 + 空行」（见「文件说明头」）。
 
 ### 落盘安全三重防线
 
@@ -323,6 +418,10 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 - 换行、回车等控制字符转为 `\n`、`\r` 转义序列，`reflect.StructTag.Lookup` 可完整还原原值；
 - 双引号转义为 `\"`，不会被误认为 tag 值的分隔符。
 
+`ddl` 片段的 tag 值同样经此净化（enum 值域的单引号在 tag 值中合法、原样保留；双引号与反斜杠被转义）。
+
+此外，进入 **doc 注释**的表注释、索引名与索引列文本经换行净化（`\n`/`\r` → 空格）：注释无法转义，含换行的文本会被撑断成裸行而导致生成代码语法错误（落盘自校验会报错，但根因难定位），故在组装注释时统一净化。
+
 ## 使用示例
 
 ### 手工构造 Input 生成
@@ -333,6 +432,10 @@ package main
 import "github.com/buexplain/zckg/zcmodel"
 
 func main() {
+	// Nullable 与 Default 为指针：nil 表示「未知 / 无默认值」，需辅助函数取字面量地址
+	nullable := func(v bool) *bool { return &v }
+	strPtr := func(v string) *string { return &v }
+
 	err := zcmodel.Generate(zcmodel.Input{
 		OutputDir:        "./model",   // 目录名 "model" 即生成文件的包名
 		Database:         "test_db",
@@ -342,10 +445,16 @@ func main() {
 		ColumnTagName:    "db",                  // 与 zcdb 的列映射标签保持一致
 		JsonTagValueCase: zcmodel.NameCaseLowerCamel,
 		Columns: []*zcmodel.Column{
-			{Name: "id", Type: "bigint(20)", Comment: "主键"},
-			{Name: "order_no", Type: "varchar(64)", Comment: "订单号"},
-			{Name: "amount", Type: "decimal(10,2)"},
-			{Name: "created_at", Type: "datetime", Comment: "创建时间"},
+			{Name: "id", Type: "bigint unsigned", Nullable: nullable(false), PrimaryKey: true, Extra: "auto_increment", Comment: "主键"},
+			{Name: "order_no", Type: "varchar(64)", Nullable: nullable(false), Comment: "订单号"},
+			{Name: "amount", Type: "decimal(10,2)", Nullable: nullable(false), Default: strPtr("0.00")},
+			{Name: "remark", Type: "varchar(255)", Nullable: nullable(true), Comment: "备注"},
+			{Name: "created_at", Type: "datetime", Nullable: nullable(false), Default: strPtr("CURRENT_TIMESTAMP"), Comment: "创建时间"},
+		},
+		// 索引块（可选）：留空则结构体 doc 注释中不生成索引清单
+		Indexes: []zcmodel.IndexInfo{
+			{Name: "PRIMARY", Columns: []string{"id"}, Unique: true, Primary: true},
+			{Name: "uk_order_no", Columns: []string{"order_no"}, Unique: true},
 		},
 	})
 	if err != nil {
@@ -384,7 +493,7 @@ func main() {
 	}
 	defer dao.Close()
 
-	// 1. 读取表结构（列名、列类型、列注释）
+	// 1. 读取表结构（列名、列类型、列注释、可空性、主键标记与 MySQL EXTRA）
 	inspector, err := dao.Schema()
 	if err != nil {
 		panic(err)
@@ -395,10 +504,26 @@ func main() {
 	}
 	columns := make([]*zcmodel.Column, 0, len(cols))
 	for _, c := range cols {
-		columns = append(columns, &zcmodel.Column{Name: c.Name, Type: c.Type, Comment: c.Comment})
+		nullable := c.Nullable // 取副本地址：Column.Nullable 为 *bool，而 SchemaInspector 给出的可空性恒已知
+		columns = append(columns, &zcmodel.Column{
+			Name: c.Name, Type: c.Type, Comment: c.Comment,
+			Nullable: &nullable, Default: c.Default, PrimaryKey: c.PrimaryKey, Extra: c.Extra,
+		})
 	}
 
-	// 2. 生成模型代码
+	// 2. 读取索引（主键、唯一、普通索引）——生成结构体 doc 注释中的索引块
+	indexes, err := inspector.Indexes(context.Background(), "user_order")
+	if err != nil {
+		panic(err)
+	}
+	idxInfos := make([]zcmodel.IndexInfo, 0, len(indexes))
+	for _, i := range indexes {
+		idxInfos = append(idxInfos, zcmodel.IndexInfo{
+			Name: i.Name, Columns: i.Columns, Unique: i.Unique, Primary: i.Primary,
+		})
+	}
+
+	// 3. 生成模型代码
 	err = zcmodel.Generate(zcmodel.Input{
 		OutputDir:        "./model",
 		Database:         "test",
@@ -407,12 +532,15 @@ func main() {
 		ColumnTagName:    "db",
 		JsonTagValueCase: zcmodel.NameCaseLowerCamel,
 		Columns:          columns,
+		Indexes:          idxInfos,
 	})
 	if err != nil {
 		panic(err)
 	}
 }
 ```
+
+一键生成的产物即「表的完整面貌」：每列的 `ddl` 片段（类型 / 可空 / 默认值 / MySQL `EXTRA`）、主键列的 `primary_key` tag，以及 Entity 与 DO 的 doc 注释中的索引块。索引列的特殊形态（MySQL 前缀索引 `col(n)`、表达式索引 `#expr`、PG 的 INCLUDE 列不输出、SQLite 合成主键行）见 [zcdb Schema 元数据查询](../../zcdb/docs/schema.md)的 Indexes 小节。
 
 ### 显式指定字段信息（覆盖自动推导）
 
@@ -450,3 +578,7 @@ columns := []*zcmodel.Column{
 8. **json tag 可选**：`JsonTagValueCase` 传空串则不生成任何 json tag；单列也可通过显式指定 `StructFieldInfo.JsonTagValue` 覆盖全局风格。
 9. **生成代码按名称识别**：增量再生成按名称匹配 Entity/DO 类型与 ToDO/ToEntity 方法，请勿在同一文件中定义与它们同名的其他类型，否则再生成时会被一并移除。
 10. **列名须能推导出合法标识符**：数字开头的列名（如 `2fa_code`）会报“不是合法的 Go 标识符”错误，请通过 `StructFieldInfo.Name` 显式指定合法字段名；中文列名是合法 Go 标识符，可正常生成。
+11. **`Nullable` 未知时刻意省略 NULL 标记**：手工构造 `Input` 且未设置 `Nullable` 时，`ddl` 片段只输出类型（如 `ddl:"varchar(255)"`）——缺省渲染 `NOT NULL` 会把可空列误标，故用 `*bool` 的 `nil` 表达「未知」并整段省略；需要完整的 NULL/NOT NULL 标记请显式设置（桥接 zcdb Schema 时该值恒已知）。
+12. **元数据是生成时刻的快照**：`ddl` tag、`primary_key` tag 与索引块均来自生成时传入的元数据，表结构或索引变更后必须重新调用 `Generate` 才会刷新；本模块不做运行时校验，也不会回查数据库。
+13. **MySQL 生成列的呈现**：生成列在 `ddl` 片段中以 `VIRTUAL GENERATED` / `STORED GENERATED` 结尾（提示该列**不可写**，DO 侧尤其重要），但片段不含生成表达式——需要表达式本身时请回查建表语句。
+14. **请勿改动文件说明头的首行**：再生成时按首行判定是否需要补写说明头，改动首行会导致下次再生成时重复补写一次（说明块其余行可自由修改，不影响判定）。

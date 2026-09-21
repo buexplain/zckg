@@ -97,8 +97,8 @@ func Generate(input Input) error {
 	entityComment := fmt.Sprintf("%s %s.%s %sentity结构体，常用于数据库读取操作。", entityName, input.Database, input.TableName, tableComment)
 	doComment := fmt.Sprintf("%s %s.%s %sdo结构体，常用于数据库写入操作。", doName, input.Database, input.TableName, tableComment)
 
-	entityStruct := buildStruct(entityName, columns, false, entityComment, input.ColumnTagName)
-	doStruct := buildStruct(doName, columns, true, doComment, input.ColumnTagName)
+	entityStruct := buildStruct(entityName, columns, false, entityComment, input.ColumnTagName, input.Indexes)
+	doStruct := buildStruct(doName, columns, true, doComment, input.ColumnTagName, input.Indexes)
 	toDOMethod := buildToDOMethod(entityName, doName, columns)
 	toEntityMethod := buildToEntityMethod(entityName, doName, columns)
 

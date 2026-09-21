@@ -1,6 +1,8 @@
 package zcmodel
 
 import (
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -105,5 +107,66 @@ func TestIsPathWithinDir_RelError(t *testing.T) {
 	}
 	if isPathWithinDir(relDir, absPath) {
 		t.Fatal("相对目录与绝对路径混用时 Rel 报错，应返回 false")
+	}
+}
+
+// TestBuildStruct_CompositePrimaryKey 验证联合主键：多列均生成 primary_key:"true"
+// （主键在 DDL 中是表级约束而非列内联属性，故不并入 ddl 片段，仅由该 tag 与索引块呈现）。
+func TestBuildStruct_CompositePrimaryKey(t *testing.T) {
+	cols := []Column{
+		{Name: "user_id", Type: "bigint", Nullable: boolPtr(false), PrimaryKey: true, StructFieldInfo: StructFieldInfo{Name: "UserID", Type: "int64"}},
+		{Name: "role_id", Type: "bigint", Nullable: boolPtr(false), PrimaryKey: true, StructFieldInfo: StructFieldInfo{Name: "RoleID", Type: "int64"}},
+		{Name: "granted_at", Type: "datetime", Nullable: boolPtr(false), StructFieldInfo: StructFieldInfo{Name: "GrantedAt", Type: "time.Time"}},
+	}
+	got := buildStruct("UserRoleEntity", cols, false, "", "db", nil)
+	if n := strings.Count(got, `primary_key:"true"`); n != 2 {
+		t.Errorf("联合主键应标记两列，实际标记 %d 处:\n%s", n, got)
+	}
+	if strings.Contains(got, "granted_at\" primary_key") {
+		t.Errorf("非主键列不应带 primary_key tag:\n%s", got)
+	}
+	// 主键标记位于 ddl 之前（tag 顺序 json → db → primary_key → ddl → description）
+	assertContains(t, got, "`db:\"user_id\" primary_key:\"true\" ddl:\"bigint NOT NULL\"`", "主键列的 tag 顺序")
+	// ddl 片段不含 PRIMARY KEY 约束文本（表级信息由 primary_key tag 与索引块承载）
+	assertNotContains(t, got, "ddl:\"bigint NOT NULL PRIMARY KEY", "ddl 片段不应内联主键约束")
+}
+
+// TestBuildStruct_EmptyColumnsWithIndexes 覆盖「空列 + 非空索引」组合：
+// 结构体为空但索引块照常渲染（数据驱动，两者各自独立），且产物可被 go/parser 解析。
+func TestBuildStruct_EmptyColumnsWithIndexes(t *testing.T) {
+	indexes := []IndexInfo{{Name: "PRIMARY", Columns: []string{"id"}, Unique: true, Primary: true}}
+	got := buildStruct("EmptyEntity", nil, false, "空表", "db", indexes)
+	want := "// 空表\n//\n// 索引:\n//   - PRIMARY KEY (id)\ntype EmptyEntity struct {\n}"
+	if got != want {
+		t.Errorf("空列 + 非空索引的产物错误\ngot:  %q\nwant: %q", got, want)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
+		t.Errorf("产物应可解析: %v\n%s", err, got)
+	}
+}
+
+// TestBuildIndexCommentBlock_SymbolOnlyName 覆盖纯符号索引名（如 MySQL 函数索引的内部名、用户自造的符号名）：
+// 不校验列名/索引名合法性，原样呈现（索引块是提示性元数据，严格校验会误报表达式索引），
+// 且符号文本不会破坏注释行结构（产物仍可解析）。
+func TestBuildIndexCommentBlock_SymbolOnlyName(t *testing.T) {
+	got := buildIndexCommentBlock([]IndexInfo{
+		{Name: "-|-", Columns: []string{"a"}},
+		{Name: "#expr_idx", Columns: []string{"#expr"}, Unique: true},
+	})
+	want := []string{
+		"//   - UNIQUE KEY #expr_idx (#expr)",
+		"//   - KEY -|- (a)",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("索引块行数错误\ngot:  %q\nwant: %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("索引块第 %d 行错误\ngot:  %q\nwant: %q", i+1, got[i], want[i])
+		}
+	}
+	structCode := buildStruct("TEntity", []Column{{Name: "a", Type: "text", StructFieldInfo: StructFieldInfo{Name: "A", Type: "string"}}}, false, "T 表", "db", []IndexInfo{{Name: "-|-", Columns: []string{"a"}}})
+	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+structCode, parser.AllErrors); err != nil {
+		t.Errorf("含符号索引名的产物应可解析: %v\n%s", err, structCode)
 	}
 }

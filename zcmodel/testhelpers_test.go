@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+// fileHeaderPrefix 是新建文件或存量文件补写说明头后，文件应有的起始内容（说明头 + 空行）。
+// 复用被测的 fileHeaderComment 常量而非复制文本：说明头的字面内容由专门的用例锁死，
+// 各布局用例（新建/空文件/import 位置/build tags 保留等）只需断言「说明头在前」这一结构事实，
+// 避免说明头文案调整时波及十余处断言。
+const fileHeaderPrefix = fileHeaderComment + "\n\n"
+
+// boolPtr / strPtr 构造指针字面量：Column.Nullable 与 Column.Default 用指针区分
+// 「未知 / 无默认值」与零值，测试需显式区分这两种状态。
+func boolPtr(v bool) *bool { return &v }
+
+func strPtr(v string) *string { return &v }
+
 // writeAndVerify 执行 writeOrReplaceStruct 的标准流程并返回产物内容：
 // 在独立临时目录下建立包目录 model（目录名即新建文件的包名推导来源），
 // initialContent 非空时先落盘为存量文件（模拟再生成场景），空串表示新建文件场景；

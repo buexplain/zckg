@@ -48,7 +48,7 @@ gofmt -l .   # 输出应为空
 | `*_mysql_integration_test.go` / `*_postgres_integration_test.go` / `*_sqlite_integration_test.go` | 按数据库方言拆分的集成测试 |
 | `{模块}_extra_test.go` / `{模块}_extra_unit_test.go` | 同一被测模块内的扩展/边界用例（允许；不得跨模块聚合） |
 | `*_regression_test.go` | 回归锁死测试（如 zchttp `recursion_regression_test.go`） |
-| `docs_examples_compile_test.go` | 文档示例代码的编译级校验（zcdb） |
+| `docs_examples_compile_test.go` | 文档示例代码的编译级校验（zcdb、zchttp、zcmodel） |
 | `docs_deviation_review_test.go` | 文档-代码偏离审查的回归锁死测试 |
 
 **各模块布局**：
