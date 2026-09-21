@@ -584,7 +584,7 @@ func crossDialectCommentErrors(t *testing.T, open commentDAOOpener) {
 	})
 }
 
-// crossDialectCommentRawAndSchema 锁死原始 DAO 三入口与 Schema 的原文边界；Grammar 不读取注释。
+// crossDialectCommentRawAndSchema 锁死原始 DAO 三入口与 Schema（Tables/Columns/Indexes）的原文边界；Grammar 不读取注释。
 func crossDialectCommentRawAndSchema(t *testing.T, open commentDAOOpener) {
 	t.Helper()
 	log := &commentSQLLog{}
@@ -630,18 +630,26 @@ func crossDialectCommentRawAndSchema(t *testing.T, open commentDAOOpener) {
 	}
 	var tableSQL, columnsSQL string
 	var columnArgs []any
+	var indexesCalls []commentSQLCall
 	switch dao.grammar.(type) {
 	case *MySQLGrammar:
 		tableSQL = "SELECT TABLE_NAME, IFNULL(TABLE_COMMENT, '') FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME"
-		columnsSQL = "SELECT COLUMN_NAME, COLUMN_TYPE, IFNULL(COLUMN_COMMENT, ''), IS_NULLABLE, COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+		columnsSQL = "SELECT COLUMN_NAME, COLUMN_TYPE, IFNULL(COLUMN_COMMENT, ''), IS_NULLABLE, COLUMN_DEFAULT, IFNULL(COLUMN_KEY, ''), IFNULL(EXTRA, '') FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
 		columnArgs = []any{table}
+		indexesCalls = []commentSQLCall{{sql: "SELECT INDEX_NAME, COLUMN_NAME, SUB_PART, NON_UNIQUE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX", args: []any{table}}}
 	case *PostgresGrammar:
 		tableSQL = "SELECT c.relname, COALESCE(obj_description(c.oid, 'pg_class'), '') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname = 'public' ORDER BY c.relname"
-		columnsSQL = "SELECT a.attname, format_type(a.atttypid, a.atttypmod), COALESCE(col_description(c.oid, a.attnum), ''), NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid) FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum WHERE c.relname = $1 AND n.nspname = 'public' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+		columnsSQL = "SELECT a.attname, format_type(a.atttypid, a.atttypmod), COALESCE(col_description(c.oid, a.attnum), ''), NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid), EXISTS (SELECT 1 FROM pg_catalog.pg_index ix WHERE ix.indrelid = c.oid AND ix.indisprimary AND a.attnum = ANY(ix.indkey)) FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum WHERE c.relname = $1 AND n.nspname = 'public' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
 		columnArgs = []any{table}
+		indexesCalls = []commentSQLCall{{sql: "SELECT i.relname, ix.indisunique, ix.indisprimary, a.attname, k.ord FROM pg_catalog.pg_index ix JOIN pg_catalog.pg_class c ON c.oid = ix.indrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum WHERE n.nspname = 'public' AND c.relname = $1 AND k.ord <= ix.indnkeyatts ORDER BY i.relname, k.ord", args: []any{table}}}
 	case *SQLiteGrammar:
 		tableSQL = `SELECT "name", '' FROM "sqlite_master" WHERE "type" = 'table' AND "name" NOT LIKE 'sqlite_%' ORDER BY "name"`
 		columnsSQL = `PRAGMA table_info("comment_raw_items")`
+		// 两段式：先 table_info 合成主键行，再 index_list；该表无二级索引故不再发 index_info
+		indexesCalls = []commentSQLCall{
+			{sql: `PRAGMA table_info("comment_raw_items")`},
+			{sql: `PRAGMA index_list("comment_raw_items")`},
+		}
 	}
 	tables, err := inspector.Tables(ctx)
 	if err != nil {
@@ -669,6 +677,15 @@ func crossDialectCommentRawAndSchema(t *testing.T, open commentDAOOpener) {
 		t.Fatalf("Schema.Columns names: %#v", names)
 	}
 	log.check(t, commentSQLCall{sql: columnsSQL, args: columnArgs})
+	// Indexes 同样走原始 DAO 查询，不追加注释：此处锁死其实际执行的 SQL 与调用次数
+	indexes, err := inspector.Indexes(ctx, table)
+	if err != nil {
+		t.Fatalf("Schema.Indexes: %v", err)
+	}
+	if len(indexes) == 0 {
+		t.Fatalf("Schema.Indexes 应至少返回主键索引: %#v", indexes)
+	}
+	log.check(t, indexesCalls...)
 }
 
 // assertCommentScalarRows 处理所有 rows I/O 错误，验证恰好一行一个常量。

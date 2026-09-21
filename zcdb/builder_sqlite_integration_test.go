@@ -5,6 +5,7 @@ package zcdb
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1299,5 +1300,184 @@ func TestSQLiteInteg_ExistsStateRestore(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].Name != "alice" || rows[1].Name != "bob" {
 		t.Errorf("状态未恢复：期望 [alice bob]，实际 %v", rows)
+	}
+}
+
+// ==================== SchemaInspector：PrimaryKey / Extra / Indexes ====================
+
+// TestSQLiteInteg_SchemaInspector_ColumnsPrimaryKey 验证 SQLite 的主键标记与恒空的 Extra：
+// rowid 表的 INTEGER PRIMARY KEY（含 AUTOINCREMENT，PRAGMA 中 notnull=0）、TEXT 主键、
+// 联合主键的各列均标记 PrimaryKey；无主键表不标记；EXTRA 恒为空。
+func TestSQLiteInteg_SchemaInspector_ColumnsPrimaryKey(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	tables := map[string]struct {
+		ddl   string
+		prims map[string]bool
+	}{
+		"test_pk_rowid": {
+			ddl:   `CREATE TABLE test_pk_rowid (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)`,
+			prims: map[string]bool{"id": true, "name": false},
+		},
+		"test_pk_text": {
+			ddl:   `CREATE TABLE test_pk_text (id TEXT PRIMARY KEY, name TEXT)`,
+			prims: map[string]bool{"id": true, "name": false},
+		},
+		"test_pk_composite": {
+			ddl:   `CREATE TABLE test_pk_composite (a INT NOT NULL, b INT NOT NULL, c TEXT, PRIMARY KEY (b, a))`,
+			prims: map[string]bool{"a": true, "b": true, "c": false},
+		},
+		"test_pk_none": {
+			ddl:   `CREATE TABLE test_pk_none (a TEXT, b TEXT)`,
+			prims: map[string]bool{"a": false, "b": false},
+		},
+	}
+	for name, tc := range tables {
+		mustExec(t, db, tc.ddl)
+		tableName := name
+		t.Cleanup(func() { mustExec(t, db, "DROP TABLE IF EXISTS "+tableName) })
+	}
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	for name, tc := range tables {
+		columns, err := inspector.Columns(context.Background(), name)
+		if err != nil {
+			t.Fatalf("Columns(%s) error: %v", name, err)
+		}
+		byName := make(map[string]ColumnInfo, len(columns))
+		for _, c := range columns {
+			byName[c.Name] = c
+		}
+		for col, wantPrimary := range tc.prims {
+			got, ok := byName[col]
+			if !ok {
+				t.Errorf("表 %s 缺少列 %s", name, col)
+				continue
+			}
+			if got.PrimaryKey != wantPrimary {
+				t.Errorf("表 %s 列 %s: PrimaryKey 期望 %v，实际 %v", name, col, wantPrimary, got.PrimaryKey)
+			}
+			if got.Extra != "" {
+				t.Errorf("表 %s 列 %s: SQLite 的 Extra 应恒为空，实际 %q", name, col, got.Extra)
+			}
+		}
+	}
+}
+
+// TestSQLiteInteg_SchemaInspector_Indexes 验证 SQLite 两段式索引查询：
+//   - 主键行由 table_info 的 pk 序合成（rowid 表的 INTEGER PRIMARY KEY 在 index_list 中没有对应行），
+//     联合主键按 pk 值升序给列；
+//   - origin='pk' 的自动索引被跳过（TEXT 主键触发的 sqlite_autoindex_*），不产生重复主键行；
+//   - UNIQUE 约束的自动索引（origin='u'）保留，原样呈现其自动名；
+//   - 表达式索引列以 #expr 占位；部分索引 v1 忽略谓词，按普通索引呈现。
+func TestSQLiteInteg_SchemaInspector_Indexes(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	mustExec(t, db, `CREATE TABLE test_indexes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		email TEXT NOT NULL UNIQUE,
+		user_id INTEGER NOT NULL,
+		status TEXT NOT NULL
+	)`)
+	mustExec(t, db, `CREATE INDEX idx_user_status ON test_indexes (user_id, status)`)
+	mustExec(t, db, `CREATE INDEX idx_expr ON test_indexes (lower(email))`)
+	mustExec(t, db, `CREATE INDEX idx_partial ON test_indexes (status) WHERE user_id > 0`)
+	// TEXT 主键：主键以 origin='pk' 的 sqlite_autoindex_* 出现在 index_list 中，须跳过以免与合成行重复
+	mustExec(t, db, `CREATE TABLE test_indexes_textpk (id TEXT PRIMARY KEY, a TEXT)`)
+	// 联合主键：合成行的列序按 pk 值升序（ddl 中写作 PRIMARY KEY (b, a) → b 在前）
+	mustExec(t, db, `CREATE TABLE test_indexes_pk (a INT NOT NULL, b INT NOT NULL, c TEXT, PRIMARY KEY (b, a))`)
+	defer func() {
+		mustExec(t, db, `DROP TABLE IF EXISTS test_indexes`)
+		mustExec(t, db, `DROP TABLE IF EXISTS test_indexes_textpk`)
+		mustExec(t, db, `DROP TABLE IF EXISTS test_indexes_pk`)
+	}()
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	indexes, err := inspector.Indexes(context.Background(), "test_indexes")
+	if err != nil {
+		t.Fatalf("Indexes() error: %v", err)
+	}
+	byName := make(map[string]IndexInfo, len(indexes))
+	var primaryCount int
+	for _, idx := range indexes {
+		byName[idx.Name] = idx
+		if idx.Primary {
+			primaryCount++
+		}
+	}
+	if primaryCount != 1 {
+		t.Errorf("应恰有 1 个主键索引（合成行），实际 %d: %v", primaryCount, indexes)
+	}
+
+	checks := []struct {
+		name    string
+		columns []string
+		unique  bool
+		primary bool
+	}{
+		// rowid 表的 INTEGER PRIMARY KEY 无二级索引，此行由 table_info 合成
+		{"PRIMARY", []string{"id"}, true, true},
+		// UNIQUE 约束的自动索引：元数据中没有用户命名，原样呈现自动名
+		{"sqlite_autoindex_test_indexes_1", []string{"email"}, true, false},
+		{"idx_user_status", []string{"user_id", "status"}, false, false},
+		{"idx_expr", []string{"#expr"}, false, false},
+		// 部分索引：v1 忽略谓词（该索引只覆盖 user_id > 0 的行，此处呈现为普通索引）
+		{"idx_partial", []string{"status"}, false, false},
+	}
+	for _, c := range checks {
+		idx, ok := byName[c.name]
+		if !ok {
+			t.Errorf("缺少索引 %s（实际：%v）", c.name, indexes)
+			continue
+		}
+		if !reflect.DeepEqual(idx.Columns, c.columns) {
+			t.Errorf("索引 %s: Columns 期望 %v，实际 %v", c.name, c.columns, idx.Columns)
+		}
+		if idx.Unique != c.unique {
+			t.Errorf("索引 %s: Unique 期望 %v，实际 %v", c.name, c.unique, idx.Unique)
+		}
+		if idx.Primary != c.primary {
+			t.Errorf("索引 %s: Primary 期望 %v，实际 %v", c.name, c.primary, idx.Primary)
+		}
+	}
+
+	// TEXT 主键表：origin='pk' 的自动索引被跳过，只剩合成的 PRIMARY 行
+	textPK, err := inspector.Indexes(context.Background(), "test_indexes_textpk")
+	if err != nil {
+		t.Fatalf("Indexes() error: %v", err)
+	}
+	if len(textPK) != 1 || !textPK[0].Primary || !reflect.DeepEqual(textPK[0].Columns, []string{"id"}) {
+		t.Errorf("TEXT 主键表应只剩 1 个合成主键行 [id]，实际 %+v", textPK)
+	}
+
+	// 联合主键表：合成行的列序按 pk 值升序（即 ddl 中的定义顺序 b, a）
+	composite, err := inspector.Indexes(context.Background(), "test_indexes_pk")
+	if err != nil {
+		t.Fatalf("Indexes() error: %v", err)
+	}
+	if len(composite) != 1 || !composite[0].Primary || !reflect.DeepEqual(composite[0].Columns, []string{"b", "a"}) {
+		t.Errorf("联合主键表应只剩 1 个合成主键行 [b a]，实际 %+v", composite)
+	}
+}
+
+// TestSQLiteInteg_SchemaInspector_IndexesNonexistentTable 边界固化：不存在的表查 Indexes
+// 返回空切片与 nil 错误（PRAGMA 对未知表返回空结果集：主键合成为 nil、index_list 无行），
+// 与 Columns 的边界行为一致。
+func TestSQLiteInteg_SchemaInspector_IndexesNonexistentTable(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	indexes, err := inspector.Indexes(context.Background(), "no_such_table_zz")
+	if err != nil {
+		t.Fatalf("Indexes() 对不存在的表应返回空结果, got error: %v", err)
+	}
+	if len(indexes) != 0 {
+		t.Errorf("expected empty indexes, got %v", indexes)
 	}
 }

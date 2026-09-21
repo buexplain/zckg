@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/buexplain/zckg/zcconfig"
@@ -687,8 +688,17 @@ func schemaMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 		return err
 	}
 	for _, c := range columns {
-		fmt.Printf("%s %s nullable=%v default=%v comment=%s\n",
-			c.Name, c.Type, c.Nullable, c.Default, c.Comment)
+		fmt.Printf("%s %s nullable=%v default=%v comment=%s primary=%v extra=%s\n",
+			c.Name, c.Type, c.Nullable, c.Default, c.Comment, c.PrimaryKey, c.Extra)
+	}
+
+	// Indexes：查询表的索引信息
+	indexes, err := inspector.Indexes(ctx, "users")
+	if err != nil {
+		return err
+	}
+	for _, idx := range indexes {
+		fmt.Printf("%s unique=%v primary=%v columns=%v\n", idx.Name, idx.Unique, idx.Primary, idx.Columns)
 	}
 
 	// 完整示例
@@ -703,7 +713,24 @@ func schemaMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 			if c.Nullable {
 				null = "NULL"
 			}
-			fmt.Printf("  %s %s %s\n", c.Name, c.Type, null)
+			key := ""
+			if c.PrimaryKey {
+				key = " PRIMARY KEY"
+			}
+			fmt.Printf("  %s %s %s%s\n", c.Name, c.Type, null, key)
+		}
+		indexes, err := inspector.Indexes(ctx, t.Name)
+		if err != nil {
+			return err
+		}
+		for _, idx := range indexes {
+			kind := "KEY"
+			if idx.Primary {
+				kind = "PRIMARY KEY"
+			} else if idx.Unique {
+				kind = "UNIQUE KEY"
+			}
+			fmt.Printf("  %s %s (%s)\n", kind, idx.Name, strings.Join(idx.Columns, ", "))
 		}
 	}
 	return nil

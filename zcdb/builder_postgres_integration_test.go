@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1472,5 +1473,171 @@ func TestPgInteg_ExistsStateRestore(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].Name != "alice" || rows[1].Name != "bob" {
 		t.Errorf("状态未恢复：期望 [alice bob]，实际 %v", rows)
+	}
+}
+
+// ==================== SchemaInspector：PrimaryKey / Extra / Indexes ====================
+
+// TestPgInteg_SchemaInspector_ColumnsPrimaryKeyAndExtra 验证 PG 的主键标记与恒空的 Extra：
+// 联合主键的各列 PrimaryKey 均为 true，普通列 false；PG 无 EXTRA 元数据列，Extra 恒为空
+// （SERIAL 的自增语义经 Default 的 nextval(...) 表达式呈现，不在 Extra 中）。
+func TestPgInteg_SchemaInspector_ColumnsPrimaryKeyAndExtra(t *testing.T) {
+	db := openPgTestDB(t)
+	mustExec(t, db, `CREATE TABLE "test_pk_extra" (
+		"a" INT NOT NULL,
+		"b" INT NOT NULL,
+		"c" VARCHAR(16) NOT NULL,
+		PRIMARY KEY ("a", "b")
+	)`)
+	mustExec(t, db, `CREATE TABLE "test_serial" (
+		"id" SERIAL PRIMARY KEY,
+		"name" TEXT NOT NULL
+	)`)
+	defer func() {
+		mustExec(t, db, `DROP TABLE IF EXISTS "test_pk_extra"`)
+		mustExec(t, db, `DROP TABLE IF EXISTS "test_serial"`)
+	}()
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	columns, err := inspector.Columns(context.Background(), "test_pk_extra")
+	if err != nil {
+		t.Fatalf("Columns() error: %v", err)
+	}
+	byName := make(map[string]ColumnInfo, len(columns))
+	for _, c := range columns {
+		byName[c.Name] = c
+	}
+	for _, name := range []string{"a", "b"} {
+		got, ok := byName[name]
+		if !ok {
+			t.Errorf("缺少列 %s", name)
+			continue
+		}
+		if !got.PrimaryKey {
+			t.Errorf("联合主键列 %s 应标记 PrimaryKey", name)
+		}
+		if got.Extra != "" {
+			t.Errorf("PG 的 Extra 应恒为空，列 %s 实际 %q", name, got.Extra)
+		}
+	}
+	if got := byName["c"]; got.PrimaryKey {
+		t.Errorf("非主键列 c 不应标记 PrimaryKey: %+v", got)
+	}
+
+	serialCols, err := inspector.Columns(context.Background(), "test_serial")
+	if err != nil {
+		t.Fatalf("Columns() error: %v", err)
+	}
+	for _, c := range serialCols {
+		if c.Name != "id" {
+			continue
+		}
+		if !c.PrimaryKey {
+			t.Errorf("SERIAL 主键列 id 应标记 PrimaryKey")
+		}
+		if c.Extra != "" {
+			t.Errorf("SERIAL 列的 Extra 应为空（自增经 Default 呈现），实际 %q", c.Extra)
+		}
+		if c.Default == nil || !strings.Contains(*c.Default, "nextval(") {
+			t.Errorf("SERIAL 列的 Default 应为 nextval(...) 表达式，实际 %v", c.Default)
+		}
+	}
+}
+
+// TestPgInteg_SchemaInspector_Indexes 验证 PG 的索引查询：主键索引（名称为 xxx_pkey，不叫 PRIMARY）、
+// 唯一索引、联合普通索引、表达式索引（attname 为 NULL → #expr）与 INCLUDE 列（不参与索引键，v1 不输出）。
+func TestPgInteg_SchemaInspector_Indexes(t *testing.T) {
+	db := openPgTestDB(t)
+	mustExec(t, db, `CREATE TABLE "test_indexes" (
+		"id" BIGINT NOT NULL,
+		"email" VARCHAR(64) NOT NULL,
+		"user_id" BIGINT NOT NULL,
+		"status" VARCHAR(16) NOT NULL,
+		PRIMARY KEY ("id")
+	)`)
+	mustExec(t, db, `CREATE UNIQUE INDEX "uk_email" ON "test_indexes" ("email")`)
+	mustExec(t, db, `CREATE INDEX "idx_user_status" ON "test_indexes" ("user_id", "status")`)
+	mustExec(t, db, `CREATE INDEX "idx_fn" ON "test_indexes" (lower("email"))`)
+	// INCLUDE 列的索引键只有 user_id，status 仅随行存储
+	mustExec(t, db, `CREATE INDEX "idx_incl" ON "test_indexes" ("user_id") INCLUDE ("status")`)
+	defer func() {
+		mustExec(t, db, `DROP TABLE IF EXISTS "test_indexes"`)
+	}()
+
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	indexes, err := inspector.Indexes(context.Background(), "test_indexes")
+	if err != nil {
+		t.Fatalf("Indexes() error: %v", err)
+	}
+
+	byName := make(map[string]IndexInfo, len(indexes))
+	var primaryCount int
+	var primaryColumns []string
+	for _, idx := range indexes {
+		byName[idx.Name] = idx
+		if idx.Primary {
+			primaryCount++
+			primaryColumns = idx.Columns
+		}
+	}
+	// 主键索引在 PG 中的名称是自动生成的（test_indexes_pkey），按标记而非名字定位
+	if primaryCount != 1 {
+		t.Errorf("应恰有 1 个主键索引，实际 %d: %v", primaryCount, indexes)
+	}
+	if !reflect.DeepEqual(primaryColumns, []string{"id"}) {
+		t.Errorf("主键索引列应为 [id]，实际 %v", primaryColumns)
+	}
+	// 主键索引同时是唯一索引，且名称确实不是 MySQL 风格的 PRIMARY
+	for _, idx := range indexes {
+		if idx.Primary && (!idx.Unique || idx.Name == mysqlPrimaryIndexName) {
+			t.Errorf("PG 主键索引应 Unique 且名称非 %q，实际 %+v", mysqlPrimaryIndexName, idx)
+		}
+	}
+
+	checks := []struct {
+		name    string
+		columns []string
+		unique  bool
+	}{
+		{"uk_email", []string{"email"}, true},
+		{"idx_user_status", []string{"user_id", "status"}, false},
+		{"idx_fn", []string{"#expr"}, false},
+		{"idx_incl", []string{"user_id"}, false},
+	}
+	for _, c := range checks {
+		idx, ok := byName[c.name]
+		if !ok {
+			t.Errorf("缺少索引 %s（实际：%v）", c.name, indexes)
+			continue
+		}
+		if !reflect.DeepEqual(idx.Columns, c.columns) {
+			t.Errorf("索引 %s: Columns 期望 %v，实际 %v", c.name, c.columns, idx.Columns)
+		}
+		if idx.Unique != c.unique {
+			t.Errorf("索引 %s: Unique 期望 %v，实际 %v", c.name, c.unique, idx.Unique)
+		}
+	}
+}
+
+// TestPgInteg_SchemaInspector_IndexesNonexistentTable 边界固化：不存在的表查 Indexes
+// 返回空切片与 nil 错误（pg_index 查询无命中行），与 Columns 的边界行为一致。
+func TestPgInteg_SchemaInspector_IndexesNonexistentTable(t *testing.T) {
+	db := openPgTestDB(t)
+	inspector, err := db.Schema()
+	if err != nil {
+		t.Fatalf("Schema() error: %v", err)
+	}
+	indexes, err := inspector.Indexes(context.Background(), "no_such_table_zz")
+	if err != nil {
+		t.Fatalf("Indexes() 对不存在的表应返回空结果, got error: %v", err)
+	}
+	if len(indexes) != 0 {
+		t.Errorf("expected empty indexes, got %v", indexes)
 	}
 }
