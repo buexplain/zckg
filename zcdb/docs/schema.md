@@ -176,6 +176,16 @@ PRAGMA index_info("idx_name") -- seqno, cid, name
 
 不存在的表与 `Columns` 行为一致：返回空切片与 nil 错误，不报错也不 panic，调用方以空切片自行判断。
 
+### 当前未呈现的信息（后续可增强）
+
+以下几类索引细节不在 v1 的 `IndexInfo` 中，需要时请回查建表语句：
+
+- **部分索引谓词**（PostgreSQL `indpred`、SQLite `partial` 标志；MySQL 无此能力）——SQLite 的部分索引目前按普通索引呈现；
+- **PostgreSQL 的 INCLUDE 列**（不参与索引键，`INCLUDE` 只影响覆盖查询）；
+- **降序索引标注**（PostgreSQL / SQLite 的 `desc`、MySQL 8 的 `ASC/DESC`）；
+- **表达式索引的完整表达式文本**：目前统一以 `#expr` 占位，取表达式需按方言读取 `EXPRESSION`（MySQL）等方言特有元数据；
+- **MySQL 生成列的生成表达式**（`GENERATION_EXPRESSION`）：`ColumnInfo.Extra` 只标注 `VIRTUAL/STORED GENERATED`，不含表达式本身。
+
 ## 完整示例
 
 ```go

@@ -1,10 +1,7 @@
-// 本文件为 Pool 生命周期与 SchemaInspector 的补充测试。
-// Pool 部分为 SQLite 集成测试（需真实连接验证 Close/AddSlave/PickReadDB 行为）；
-// SchemaInspector 部分覆盖三方言 Tables/Columns 的真实查询路径（SQLite 用内存库）。
+// 本文件为 Pool 生命周期的 SQLite 集成测试（需真实连接验证 Close/AddSlave/PickReadDB 行为）。
 package zcdb
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"testing"
@@ -62,52 +59,5 @@ func TestPoolInteg_PickReadDBNilStrategyFallback(t *testing.T) {
 	}
 	if db != pool.master {
 		t.Fatal("PickReadDB should return master when strategy returns nil")
-	}
-}
-
-// TestSQLiteInteg_SchemaInspector 验证 SQLite SchemaInspector 的 Tables/Columns 查询。
-func TestSQLiteInteg_SchemaInspector(t *testing.T) {
-	db := openSQLiteTestDB(t)
-	setupSQLiteUsersTable(t, db)
-
-	inspector, err := NewSchemaInspector(db)
-	if err != nil {
-		t.Fatalf("NewSchemaInspector: %v", err)
-	}
-	sqliteInsp, ok := inspector.(*SQLiteSchemaInspector)
-	if !ok {
-		t.Fatalf("expected *SQLiteSchemaInspector, got %T", inspector)
-	}
-
-	tables, err := sqliteInsp.Tables(context.Background())
-	if err != nil {
-		t.Fatalf("Tables: %v", err)
-	}
-	found := false
-	for _, tb := range tables {
-		if tb.Name == "users" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected users table in Tables result, got %+v", tables)
-	}
-
-	cols, err := sqliteInsp.Columns(context.Background(), "users")
-	if err != nil {
-		t.Fatalf("Columns: %v", err)
-	}
-	if len(cols) == 0 {
-		t.Fatal("expected columns for users table, got empty")
-	}
-	byName := map[string]ColumnInfo{}
-	for _, c := range cols {
-		byName[c.Name] = c
-	}
-	if _, ok := byName["id"]; !ok {
-		t.Fatalf("expected id column, got %+v", cols)
-	}
-	if _, ok := byName["name"]; !ok {
-		t.Fatalf("expected name column, got %+v", cols)
 	}
 }

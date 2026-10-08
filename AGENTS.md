@@ -54,6 +54,7 @@ gofmt -l .   # 输出应为空
 **各模块布局**：
 
 - **zcdb**：Builder 相关按「功能 × 方言 × 类型」镜像组织，命名 `builder_{功能}_{方言}_{类型}_test.go`（功能 = select / where / join / order / group / exec / query / cursor / compile；方言 = mysql / postgres / sqlite；类型 = unit / integration）。三方言缺失的 unit 空占位文件是刻意预留的骨架，保持不动。跨方言共享用例集中在 `cross_dialect_integration_test.go`（共享主体）+ `cross_dialect_{mysql,postgres,sqlite}_integration_test.go`（方言执行入口）；方言特有用例必须放回对应 `builder_{功能}_{方言}_integration_test.go`，不得留在入口文件。建连/建表等共享基础设施放 `testhelpers_{mysql,postgres,sqlite}_test.go`。
+- **zcdb（SchemaInspector 例外族）**：非 Builder 功能族的用例按被测源码归集——`schema_inspector_test.go` 放单元/接口契约用例，`schema_inspector_{mysql,postgres,sqlite}_integration_test.go` 放三方言集成用例（`schema_inspector.go` + `{mysql,postgres,sqlite}_schema.go`），**不混入** `builder_*_test.go`。
 - **zchttp / zcconfig / zcmodel / zcquit**：按被测源码文件一一对应命名（如 `binding_test.go`、`validate_test.go`、`openapi_test.go`、`httpEngine_test.go`、`cast_test.go`、`quit_test.go`），新用例就近加入对应文件。跨测试文件共享的请求执行/建连等 helper 放 `testhelpers_test.go`。
 
 - 集成测试**内置门控**：目标数据库不可达时 `t.Skip`，保证无数据库环境下 `go test ./...` 不误报。
