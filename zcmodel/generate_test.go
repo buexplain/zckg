@@ -745,8 +745,8 @@ func TestGenerate_KeepBuildTags(t *testing.T) {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
 	got := string(content)
-	// 说明头补写于最顶，其后为文件头（build tags + package 注释 + 原 package 行），逐字节保留
-	wantHeader := fileHeaderPrefix + "//go:build ignore\n// +build ignore\n\n// Package model 包文档注释。\npackage model\n"
+	// 文件头（build tags + package 注释 + 原 package 行）逐字节保留，且不追加任何生成声明
+	wantHeader := "//go:build ignore\n// +build ignore\n\n// Package model 包文档注释。\npackage model\n"
 	if !strings.HasPrefix(got, wantHeader) {
 		t.Errorf("文件头 build tags/package 注释未保留\nwant prefix:\n%s\ngot:\n%s", wantHeader, got)
 	}
@@ -839,7 +839,7 @@ func sampleIndexes() []IndexInfo {
 }
 
 // TestGenerate_SampleWithMetadataGolden 端到端 golden 锁定 §3.4 样板产物：
-// 说明头、索引块（排序后固定顺序 + gofmt 三空格清单形态）、字段 tag 顺序与 ddl 片段取值逐行核对，
+// 索引块（排序后固定顺序 + gofmt 三空格清单形态）、字段 tag 顺序与 ddl 片段取值逐行核对，
 // 索引块在 Entity 与 DO 各出现一次，产物与 gofmt 输出逐字节一致并可被 go/parser 解析。
 func TestGenerate_SampleWithMetadataGolden(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "model")
@@ -858,8 +858,7 @@ func TestGenerate_SampleWithMetadataGolden(t *testing.T) {
 	got := string(content)
 
 	assertContainsAll(t, got, []string{
-		fileHeaderComment,
-		"\n\npackage model\n",
+		"package model\n",
 		`import "time"`,
 		"// UserOrderEntity test_db.user_order 订单表，entity结构体，常用于数据库读取操作。",
 		"//",
@@ -917,7 +916,7 @@ func TestGenerate_SampleWithMetadataGolden(t *testing.T) {
 	}
 }
 
-// TestGenerate_LegacyInputDelta 验证老式 Input（不填任何新字段）的产物差异恰为 `ddl` tag 与文件说明头：
+// TestGenerate_LegacyInputDelta 验证老式 Input（不填任何新字段）的产物差异恰为 `ddl` tag：
 // Nullable 未设置时 ddl 片段只含类型（不误标 NOT NULL），不生成 primary_key tag，索引块因数据为空自然省略。
 func TestGenerate_LegacyInputDelta(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "model")
@@ -939,7 +938,6 @@ func TestGenerate_LegacyInputDelta(t *testing.T) {
 	}
 	got := string(content)
 
-	assertContains(t, got, fileHeaderComment, "老式 Input 也应补写文件说明头")
 	assertContains(t, got, "// UserInfoEntity test_db.user_info 用户信息表，entity结构体，常用于数据库读取操作。\ntype UserInfoEntity struct {", "无索引时不生成索引块")
 	for _, tc := range []struct{ field, tag string }{
 		{"ID", "`json:\"id\" db:\"id\" ddl:\"bigint(20)\" description:\"主键\"`"},
@@ -956,26 +954,12 @@ func TestGenerate_LegacyInputDelta(t *testing.T) {
 	assertNotContains(t, got, "索引:", "未提供索引时不应生成索引块")
 }
 
-// TestGenerate_FileHeaderTextAndOfficialMarker 锁定说明头字面文本，并验证它不匹配 Go 官方生成标记正则：
-// 官方标记（^// Code generated .* DO NOT EDIT\.$）会使 staticcheck/golangci-lint 等工具整体跳过该文件，
-// 而本文件含用户代码、不应被整体豁免静态检查（刻意不采用的决策见设计稿 §3.3）。
-func TestGenerate_FileHeaderTextAndOfficialMarker(t *testing.T) {
-	want := []string{
-		"// 本文件由 zcmodel 部分生成：Entity/DO 结构体及 ToDO/ToEntity 方法在再次调用",
-		"// Generate 时会被替换，其余用户代码会被完整保留。表结构变更请重新调用",
-		"// zcmodel.Generate，勿手改生成区。",
-	}
-	if got := strings.Split(fileHeaderComment, "\n"); !reflect.DeepEqual(got, want) {
-		t.Errorf("说明头文本变更\ngot:  %q\nwant: %q", got, want)
-	}
+// TestGenerate_NoGeneratedMarker 回归锁死「产物不是官方意义上的生成物」：产物不得匹配 Go 官方
+// 生成标记正则（^// Code generated .* DO NOT EDIT\.$）——匹配会使 staticcheck/golangci-lint 等
+// 工具整体跳过该文件，而本文件含用户代码、不应被整体豁免静态检查。
+// 自拟的分区声明说明头已按决策移除（2026-09-21），故同时锁死产物以 package 声明起始。
+func TestGenerate_NoGeneratedMarker(t *testing.T) {
 	official := regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
-	for _, line := range want {
-		if official.MatchString(line) {
-			t.Errorf("说明头不得匹配官方生成标记正则（会致文件被工具链整体跳过）: %q", line)
-		}
-	}
-
-	// 产物全文中同样不出现官方生成标记（防止后续改动误加）
 	dir := filepath.Join(t.TempDir(), "model")
 	if err := Generate(Input{
 		OutputDir: dir, Database: "test_db", Dialect: DialectMysql,
@@ -988,12 +972,12 @@ func TestGenerate_FileHeaderTextAndOfficialMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
+	if !strings.HasPrefix(string(content), "package model\n") {
+		t.Errorf("产物应以 package 声明起始（不生成任何文件头声明）:\n%s", content)
+	}
 	for i, line := range strings.Split(string(content), "\n") {
 		if official.MatchString(line) {
 			t.Errorf("产物第 %d 行匹配官方生成标记正则: %q", i+1, line)
 		}
-	}
-	if !strings.HasPrefix(string(content), fileHeaderPrefix) {
-		t.Errorf("产物应以说明头 + 空行起始:\n%s", content)
 	}
 }

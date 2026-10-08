@@ -660,10 +660,9 @@ func TestInteg_MySQL_SampleBridge(t *testing.T) {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
 	got := string(content)
-
-	// 说明头 + 索引块（Entity 与 DO 各一次，顺序固定）
+	// 索引块（Entity 与 DO 各一次，顺序固定）
 	assertContainsAll(t, got, []string{
-		fileHeaderComment,
+		"package model\n",
 		"// 索引:",
 		"//   - PRIMARY KEY (id)",
 		"//   - UNIQUE KEY uk_email (email)",

@@ -137,7 +137,7 @@ func docSchemaBridge() {
 }
 
 // TestDocExamples_ManualInput 执行文档「手工构造 Input 生成」示例的 Input，核对文档描述的产物：
-// 文件带说明头、Entity/DO 各含索引块（PRIMARY 行不显示物理索引名）、主键自增与可空列的 ddl 片段形态符合文档示例。
+// Entity/DO 各含索引块（PRIMARY 行不显示物理索引名）、主键自增与可空列的 ddl 片段形态符合文档示例。
 func TestDocExamples_ManualInput(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "model")
 	if err := zcmodel.Generate(docManualInput(dir)); err != nil {
@@ -149,7 +149,7 @@ func TestDocExamples_ManualInput(t *testing.T) {
 	}
 	got := string(content)
 	for _, want := range []string{
-		"// 本文件由 zcmodel 部分生成：Entity/DO 结构体及 ToDO/ToEntity 方法在再次调用",
+		"package model\n",
 		"//   - PRIMARY KEY (id)",
 		"//   - UNIQUE KEY uk_order_no (order_no)",
 		"`json:\"id\" db:\"id\" primary_key:\"true\" ddl:\"bigint unsigned NOT NULL AUTO_INCREMENT\" description:\"主键\"`",

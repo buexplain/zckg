@@ -267,33 +267,9 @@ func buildImportDecl(paths []string) string {
 	return buf.String()
 }
 
-// fileHeaderComment 是混合生成文件的说明头：文件性质（部分生成）、分区规则（生成区替换/用户区保留）、
-// 行为指引（表结构变更走再生成，勿手改生成区）。
-// 刻意不以 "// Code generated " 开头——官方生成标记的社区共识是「整个文件是生成物，手改会丢失」，
-// 与本模块「用户代码在再生成时被完整保留」的契约相反；且匹配官方正则会使 staticcheck/golangci-lint
-// 等工具整体跳过本文件，使用户自定义代码逃过静态检查。
-const fileHeaderComment = `// 本文件由 zcmodel 部分生成：Entity/DO 结构体及 ToDO/ToEntity 方法在再次调用
-// Generate 时会被替换，其余用户代码会被完整保留。表结构变更请重新调用
-// zcmodel.Generate，勿手改生成区。`
-
-// hasFileHeaderComment 判断存量文件的头部区域（package 声明之前的原文）是否已含说明块首行：
-// 按整行精确匹配，避免文件中段出现同文本时误判；用户改动说明块其余行时不重复补写，尊重用户版本。
-func hasFileHeaderComment(fileHeader string) bool {
-	firstLine := strings.SplitN(fileHeaderComment, "\n", 2)[0]
-	for _, line := range strings.Split(fileHeader, "\n") {
-		if strings.TrimRight(line, "\r") == firstLine {
-			return true
-		}
-	}
-	return false
-}
-
-// buildFileContent 组装新建文件的完整内容：说明头 + package + imports + Entity 生成代码 + DO 生成代码。
-// 说明头与 package 声明之间以空行分隔，避免被 godoc 识别为 package doc。
+// buildFileContent 组装新建文件的完整内容：package + imports + Entity 生成代码 + DO 生成代码。
 func buildFileContent(pkgName, entityCode, doCode string, neededImports []string) string {
 	var buf bytes.Buffer
-	buf.WriteString(fileHeaderComment)
-	buf.WriteString("\n\n")
 	buf.WriteString(fmt.Sprintf("package %s\n", pkgName))
 	if imp := buildImportDecl(neededImports); imp != "" {
 		buf.WriteString("\n")
@@ -355,7 +331,7 @@ func writeGeneratedFile(filePath string, content []byte) error {
 }
 
 // writeOrReplaceStruct 将 Entity 和 DO 结构体（含关联方法）写入文件。
-// 文件最终布局为：说明头 + 原文件头（build tags、文件级注释、原 package 行）+ imports + Entity 生成代码 +
+// 文件最终布局为：原文件头（build tags、文件级注释、原 package 行）+ imports + Entity 生成代码 +
 // Entity 自定义方法 + DO 生成代码 + DO 自定义方法 + 其他用户代码。
 // 若文件已存在，通过 AST 解析识别并移除旧的生成代码（Entity/DO 结构体、ToDO/ToEntity 方法，
 // 含值接收者版本），保留用户自定义代码（含 Entity/DO 上的自定义方法，指针/值接收者均识别）并按上述布局重新组织；
@@ -647,14 +623,9 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		}
 	}
 
-	// 补写说明头：存量文件头部区域没有说明块首行时，在最终产物最顶插入「说明头 + 空行」。
-	// 说明头位于原文件头（build tags、文件级注释）之前合法——Go 规定 build 约束之前仅允许
-	// 空行与其他行注释；已含说明块首行则不重复补写（判定范围限定头部，避免文件中段同文本误判）。
+	// 重建产物：原文件头 + 原 package 行 + imports + 生成代码 + 用户代码。
+	// 存量文件 package 声明之前的原文（build tags、文件级注释）按原文前置保留，不做任何补写。
 	var buf bytes.Buffer
-	if !hasFileHeaderComment(string(fileHeader)) {
-		buf.WriteString(fileHeaderComment)
-		buf.WriteString("\n\n")
-	}
 	buf.Write(fileHeader)
 	buf.Write(pkgClause)
 	buf.WriteString("\n")

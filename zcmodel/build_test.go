@@ -259,7 +259,7 @@ func TestWriteOrReplaceStruct_NewFile(t *testing.T) {
 	entityCode := "type UserEntity struct {\n\tID int\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
 	got := writeAndVerify(t, "", entityCode, doCode, nil)
-	want := fileHeaderPrefix + "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
+	want := "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
 	if got != want {
 		t.Errorf("新建文件内容错误\nwant:\n%s\ngot:\n%s", want, got)
 	}
@@ -270,7 +270,7 @@ func TestWriteOrReplaceStruct_EmptyFile(t *testing.T) {
 	entityCode := "type UserEntity struct {\n\tID int\n}"
 	doCode := "type UserDO struct {\n\tID any\n}"
 	got := writeAndVerify(t, "  \n", entityCode, doCode, nil)
-	want := fileHeaderPrefix + "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
+	want := "package model\n\n" + entityCode + "\n\n" + doCode + "\n"
 	if got != want {
 		t.Errorf("空文件重建内容错误\nwant:\n%s\ngot:\n%s", want, got)
 	}
@@ -409,7 +409,7 @@ func TestWriteOrReplaceStruct_NewFile_NeededImports(t *testing.T) {
 	got := writeAndVerify(t, "", entityCode, doCode, []string{"time"})
 	// import "time" 自动引入，且位于 package 与生成代码之间
 	assertContains(t, got, "import \"time\"", "需要 time 包时新建文件应自动引入 import")
-	if !strings.HasPrefix(got, fileHeaderPrefix+"package model\n\nimport \"time\"\n\ntype UserEntity struct {") {
+	if !strings.HasPrefix(got, "package model\n\nimport \"time\"\n\ntype UserEntity struct {") {
 		t.Errorf("import 位置错误:\n%s", got)
 	}
 }
@@ -518,7 +518,7 @@ func TestWriteOrReplaceStruct_MultipleNeededImports(t *testing.T) {
 
 	// 新建文件：多个 import 组装为排序后的 import (…) 块
 	got := writeAndVerify(t, "", entityCode, doCode, needed)
-	want := fileHeaderPrefix + "package model\n\nimport (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)\n\n"
+	want := "package model\n\nimport (\n\t\"github.com/foo/bar\"\n\t\"time\"\n)\n\n"
 	if !strings.HasPrefix(got, want) {
 		t.Errorf("多 import 块格式错误\nwant prefix:\n%s\ngot:\n%s", want, got)
 	}
@@ -571,8 +571,8 @@ var Extra = 1
 	doCode := "type UserDO struct {\n\tID  any\n\tAge any\n}\n\nfunc (d *UserDO) ToEntity() {}"
 	got := writeAndVerify(t, orig, entityCode, doCode, nil)
 
-	// 说明头补写于最顶，其后为文件头（build tags + package 注释 + 原 package 行），逐字节保留
-	wantHeader := fileHeaderPrefix + "//go:build ignore\n// +build ignore\n\n// Package custompkg 包文档注释。\npackage custompkg\n"
+	// 文件头（build tags + package 注释 + 原 package 行）逐字节保留，且不追加任何生成声明
+	wantHeader := "//go:build ignore\n// +build ignore\n\n// Package custompkg 包文档注释。\npackage custompkg\n"
 	if !strings.HasPrefix(got, wantHeader) {
 		t.Errorf("文件头 build tags/package 注释未逐字节保留\nwant prefix:\n%s\ngot:\n%s", wantHeader, got)
 	}
@@ -890,7 +890,7 @@ func TestWriteOrReplaceStruct_PkgNameFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
-	if !strings.HasPrefix(string(content), fileHeaderPrefix+"package main\n") {
+	if !strings.HasPrefix(string(content), "package main\n") {
 		t.Fatalf("无目录部分的相对路径应回退为 package main，实际:\n%s", content)
 	}
 }
@@ -1215,95 +1215,5 @@ func TestBuildStruct_TableCommentNewlineRegression(t *testing.T) {
 	}
 	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
 		t.Errorf("净化后的产物应可解析: %v\n%s", err, got)
-	}
-}
-
-// ==================== 说明头判定与补写（hasFileHeaderComment / writeOrReplaceStruct） ====================
-
-// TestHasFileHeaderComment 验证说明头判定按整行精确匹配：头部含首行即命中（兼容 CRLF 行尾），
-// 用户改写说明块其余行但首行仍在时不重复补写；首行被改动则不命中。
-func TestHasFileHeaderComment(t *testing.T) {
-	firstLine := strings.SplitN(fileHeaderComment, "\n", 2)[0]
-	cases := []struct {
-		name   string
-		header string
-		want   bool
-	}{
-		{"空头部", "", false},
-		{"仅有用户文件级注释", "// 用户注释\n\n", false},
-		{"说明头整块在头部", fileHeaderComment + "\n\n", true},
-		{"CRLF 行尾仍命中", firstLine + "\r\n\r\n", true},
-		{"用户改写说明块其余行但首行在", firstLine + "\n// 用户改写的第二行\n", true},
-		{"首行被用户改动则不命中", "// 本文件由 zcmodel 生成：用户改写了首行\n", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := hasFileHeaderComment(tc.header); got != tc.want {
-				t.Errorf("hasFileHeaderComment(%q) = %v, want %v", tc.header, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestWriteOrReplaceStruct_HeaderIdempotentOnRegenerate 验证说明头补写的幂等性：
-// 连续多次再生成后说明头首行只出现一次（不叠加），且用户自定义方法完整保留。
-func TestWriteOrReplaceStruct_HeaderIdempotentOnRegenerate(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("创建目录失败: %v", err)
-	}
-	filePath := filepath.Join(dir, "user.go")
-	entityCode := "type UserEntity struct {\n\tID int64\n}"
-	doCode := "type UserDO struct {\n\tID any\n}"
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("首次生成失败: %v", err)
-	}
-	first, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	assertContains(t, string(first), fileHeaderComment, "新建文件应带说明头")
-
-	// 追加用户代码后再次生成（走存量路径的说明头判定）
-	withUser := append(first, []byte("\n// 用户自定义方法\nfunc (e *UserEntity) Hello() string { return \"hi\" }\n")...)
-	if err := os.WriteFile(filePath, withUser, 0644); err != nil {
-		t.Fatalf("写入用户代码失败: %v", err)
-	}
-	if err := writeOrReplaceStruct(filePath, "UserEntity", entityCode, "UserDO", doCode, nil); err != nil {
-		t.Fatalf("再生成失败: %v", err)
-	}
-	second, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("读取文件失败: %v", err)
-	}
-	firstLine := strings.SplitN(fileHeaderComment, "\n", 2)[0]
-	if n := strings.Count(string(second), firstLine); n != 1 {
-		t.Errorf("再生成后说明头首行应只出现一次，实际 %d 次:\n%s", n, second)
-	}
-	if !strings.HasPrefix(string(second), fileHeaderPrefix) {
-		t.Errorf("存量文件产物应以说明头起始:\n%s", second)
-	}
-	assertContains(t, string(second), "func (e *UserEntity) Hello() string", "用户自定义方法应保留")
-}
-
-// TestWriteOrReplaceStruct_HeaderScopeLimitedToFileHead 验证说明头判定范围限定于 package 声明之前的头部：
-// 说明块文本仅出现在文件中段（用户代码里）时，仍应在文件最顶补写说明头（不误判为已存在）。
-func TestWriteOrReplaceStruct_HeaderScopeLimitedToFileHead(t *testing.T) {
-	orig := "package model\n\nvar userText = 1\n\n// 本文件由 zcmodel 部分生成：Entity/DO 结构体及 ToDO/ToEntity 方法在再次调用\nvar headFirstLineInBody = 2\n"
-	got := writeAndVerify(t, orig, "type UserEntity struct {\n\tID int\n}", "type UserDO struct {\n\tID any\n}", nil)
-	if !strings.HasPrefix(got, fileHeaderPrefix+"package model\n") {
-		t.Errorf("文件中段出现说明块文本时仍应在最顶补写说明头:\n%s", got)
-	}
-	assertContains(t, got, "var headFirstLineInBody = 2", "中段的用户代码应原样保留")
-}
-
-// TestWriteOrReplaceStruct_HeaderSeparatedFromPackageDoc 验证说明头与 package 文档注释之间以空行分隔
-// （否则说明头会被 godoc 当作 package doc 的一部分），package 文档注释仍紧邻 package 行。
-func TestWriteOrReplaceStruct_HeaderSeparatedFromPackageDoc(t *testing.T) {
-	orig := "// Package model 包文档注释。\npackage model\n\ntype UserEntity struct {\n\tID int\n}\n"
-	got := writeAndVerify(t, orig, "type UserEntity struct {\n\tID int64\n}", "type UserDO struct {\n\tID any\n}", nil)
-	wantPrefix := fileHeaderPrefix + "// Package model 包文档注释。\npackage model\n"
-	if !strings.HasPrefix(got, wantPrefix) {
-		t.Errorf("说明头应与 package 文档注释以空行分隔且 package doc 紧邻 package 行\nwant prefix:\n%s\ngot:\n%s", wantPrefix, got)
 	}
 }

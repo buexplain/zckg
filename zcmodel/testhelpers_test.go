@@ -8,12 +8,6 @@ import (
 	"testing"
 )
 
-// fileHeaderPrefix 是新建文件或存量文件补写说明头后，文件应有的起始内容（说明头 + 空行）。
-// 复用被测的 fileHeaderComment 常量而非复制文本：说明头的字面内容由专门的用例锁死，
-// 各布局用例（新建/空文件/import 位置/build tags 保留等）只需断言「说明头在前」这一结构事实，
-// 避免说明头文案调整时波及十余处断言。
-const fileHeaderPrefix = fileHeaderComment + "\n\n"
-
 // boolPtr / strPtr 构造指针字面量：Column.Nullable 与 Column.Default 用指针区分
 // 「未知 / 无默认值」与零值，测试需显式区分这两种状态。
 func boolPtr(v bool) *bool { return &v }
