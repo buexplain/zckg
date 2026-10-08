@@ -871,29 +871,18 @@ func TestGenerate_SampleWithMetadataGolden(t *testing.T) {
 		"type UserOrderDO struct {",
 	}, "§3.4 样板产物")
 
-	// tag 顺序 json → db → primary_key → ddl → description；ddl 片段取值逐列核对
-	// （字面量经 QuoteMeta：ddl 含括号与单引号，不转义会被当作正则元字符）
-	entityFields := map[string]string{
-		"ID":        "`json:\"id\" db:\"id\" primary_key:\"true\" ddl:\"bigint unsigned NOT NULL AUTO_INCREMENT\" description:\"主键\"`",
-		"OrderNo":   "`json:\"orderNo\" db:\"order_no\" ddl:\"varchar(32) NOT NULL\" description:\"订单号\"`",
-		"UserID":    "`json:\"userId\" db:\"user_id\" ddl:\"bigint NOT NULL\" description:\"用户ID\"`",
-		"Email":     "`json:\"email\" db:\"email\" ddl:\"varchar(64) NOT NULL\" description:\"用户邮箱\"`",
-		"Amount":    "`json:\"amount\" db:\"amount\" ddl:\"decimal(10,2) NOT NULL DEFAULT 0.00\" description:\"订单金额（保留两位小数）\"`",
-		"Status":    "`json:\"status\" db:\"status\" ddl:\"enum('pending','paid','refunded') NOT NULL DEFAULT pending\" description:\"订单状态\"`",
-		"Remark":    "`json:\"remark\" db:\"remark\" ddl:\"varchar(255) NULL\" description:\"备注（可为空）\"`",
-		"CreatedAt": "`json:\"createdAt\" db:\"created_at\" ddl:\"datetime NOT NULL DEFAULT CURRENT_TIMESTAMP\" description:\"创建时间\"`",
-	}
-	for field, tag := range entityFields {
-		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+\S+\s+` + regexp.QuoteMeta(tag))
-		if !re.MatchString(got) {
-			t.Errorf("Entity 字段 %s 未匹配期望 tag: %s", field, tag)
+	// tag 顺序 json → db → primary_key → ddl → description；字段类型与 ddl 片段取值逐列核对
+	// （期望事实源与真库端到端用例共用 sampleFieldExpectations；
+	//  tag 字面量经 QuoteMeta：ddl 含括号与单引号，不转义会被当作正则元字符）
+	for _, tc := range sampleFieldExpectations() {
+		entityRe := regexp.MustCompile(regexp.QuoteMeta(tc.Field) + `\s+` + regexp.QuoteMeta(tc.Type) + `\s+` + regexp.QuoteMeta(tc.Tag))
+		if !entityRe.MatchString(got) {
+			t.Errorf("Entity 字段 %s（%s）未匹配期望 tag: %s", tc.Field, tc.Type, tc.Tag)
 		}
-	}
-	// DO 侧字段类型为 any，tag 与 Entity 完全一致
-	for field, tag := range entityFields {
-		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+any\s+` + regexp.QuoteMeta(tag))
-		if !re.MatchString(got) {
-			t.Errorf("DO 字段 %s 未匹配期望 tag: %s", field, tag)
+		// DO 侧字段类型为 any，tag 与 Entity 完全一致
+		doRe := regexp.MustCompile(regexp.QuoteMeta(tc.Field) + `\s+any\s+` + regexp.QuoteMeta(tc.Tag))
+		if !doRe.MatchString(got) {
+			t.Errorf("DO 字段 %s 未匹配期望 tag: %s", tc.Field, tc.Tag)
 		}
 	}
 	// 索引块在 Entity 与 DO 的 doc 注释中各出现一次

@@ -575,8 +575,10 @@ func fieldNameOf(colName string) string {
 
 // ==================== §3.4 样板：真实元数据一键生成 ====================
 
-// sampleUserOrderDDL 是设计稿 §3.4 的样板表（MySQL 方言）：覆盖自增主键、双唯一索引、
+// sampleUserOrderDDL 是端到端验收用的样板表（MySQL 方言）：覆盖自增主键、双唯一索引、
 // 联合索引、decimal 精度、enum 值域、默认值（含表达式默认值）与可空列。
+// 与该表对应的期望产物见 TestGenerate_SampleWithMetadataGolden（期望字段由
+// sampleFieldExpectations 统一提供，两处用例共用）。
 const sampleUserOrderDDL = "CREATE TABLE `user_order` (\n" +
 	"  `id`         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT       COMMENT '主键',\n" +
 	"  `order_no`   VARCHAR(32)     NOT NULL                      COMMENT '订单号',\n" +
@@ -674,28 +676,17 @@ func TestInteg_MySQL_SampleBridge(t *testing.T) {
 	}
 
 	// 逐列核对完整字段行：tag 顺序 json → db → primary_key → ddl → description，
-	// ddl 片段取值必须与真实元数据逐字一致（字面量经 QuoteMeta：含括号与单引号）
-	entityFields := map[string]string{
-		"ID":        "`json:\"id\" db:\"id\" primary_key:\"true\" ddl:\"bigint unsigned NOT NULL AUTO_INCREMENT\" description:\"主键\"`",
-		"OrderNo":   "`json:\"orderNo\" db:\"order_no\" ddl:\"varchar(32) NOT NULL\" description:\"订单号\"`",
-		"UserID":    "`json:\"userId\" db:\"user_id\" ddl:\"bigint NOT NULL\" description:\"用户ID\"`",
-		"Email":     "`json:\"email\" db:\"email\" ddl:\"varchar(64) NOT NULL\" description:\"用户邮箱\"`",
-		"Amount":    "`json:\"amount\" db:\"amount\" ddl:\"decimal(10,2) NOT NULL DEFAULT 0.00\" description:\"订单金额（保留两位小数）\"`",
-		"Status":    "`json:\"status\" db:\"status\" ddl:\"enum('pending','paid','refunded') NOT NULL DEFAULT pending\" description:\"订单状态\"`",
-		"Remark":    "`json:\"remark\" db:\"remark\" ddl:\"varchar(255) NULL\" description:\"备注（可为空）\"`",
-		"CreatedAt": "`json:\"createdAt\" db:\"created_at\" ddl:\"datetime NOT NULL DEFAULT CURRENT_TIMESTAMP\" description:\"创建时间\"`",
-	}
-	for field, tag := range entityFields {
-		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+\S+\s+` + regexp.QuoteMeta(tag))
-		if !re.MatchString(got) {
-			t.Errorf("Entity 字段 %s 未匹配 §3.4 期望 tag: %s", field, tag)
+	// 类型与 ddl 片段取值必须与真实元数据逐字一致（期望事实源与单元 golden 用例共用
+	// sampleFieldExpectations；字面量经 QuoteMeta：含括号与单引号）
+	for _, tc := range sampleFieldExpectations() {
+		entityRe := regexp.MustCompile(regexp.QuoteMeta(tc.Field) + `\s+` + regexp.QuoteMeta(tc.Type) + `\s+` + regexp.QuoteMeta(tc.Tag))
+		if !entityRe.MatchString(got) {
+			t.Errorf("Entity 字段 %s（%s）未匹配 §3.4 期望 tag: %s", tc.Field, tc.Type, tc.Tag)
 		}
-	}
-	// DO 侧类型为 any，tag 与 Entity 一致
-	for field, tag := range entityFields {
-		re := regexp.MustCompile(regexp.QuoteMeta(field) + `\s+any\s+` + regexp.QuoteMeta(tag))
-		if !re.MatchString(got) {
-			t.Errorf("DO 字段 %s 未匹配 §3.4 期望 tag: %s", field, tag)
+		// DO 侧类型为 any，tag 与 Entity 一致
+		doRe := regexp.MustCompile(regexp.QuoteMeta(tc.Field) + `\s+any\s+` + regexp.QuoteMeta(tc.Tag))
+		if !doRe.MatchString(got) {
+			t.Errorf("DO 字段 %s 未匹配 §3.4 期望 tag: %s", tc.Field, tc.Tag)
 		}
 	}
 
@@ -706,5 +697,156 @@ func TestInteg_MySQL_SampleBridge(t *testing.T) {
 	}
 	if string(formatted) != got {
 		t.Errorf("生成产物与 gofmt 输出不一致\ngot:\n%s\nwant:\n%s", got, formatted)
+	}
+}
+
+// TestInteg_SQLite_IndexChangeRegeneration 验证索引变化后再次生成时索引块的正确性
+// （「增量再生成 × 索引块」这一核心组合）：索引块位于 Entity/DO 的 doc 注释内，
+// 随结构体整体重建，因此必须「有则更新、无则消失」，不得残留旧索引行。
+//
+// 逐步覆盖：无索引 → 新增主键与唯一索引 → 唯一索引改为联合普通索引 → 撤销二级索引 →
+// 撤销主键 → 更换主键列（主键行与 primary_key tag 同步迁移）。
+//
+// 方言适配说明：SQLite 的 ALTER TABLE 不支持增删主键与唯一约束，故主键相关步骤改为
+// 重建表后再生成——被测行为是「依据最新元数据重建索引块」，与索引经由何种 DDL 变更无关；
+// SQLite 用内嵌内存库，无需外部环境，本用例在无数据库环境下同样实跑（非 Skip）。
+//
+// 组织形式说明：各步**依赖前一步的库状态**（如第 3 步 DROP 第 2 步创建的索引），
+// 子用例无法单独运行，故按 AGENTS.md「长流程回归测试保留独立函数」的要求写成线性流程，
+// 而非 t.Run 大表驱动；每处断言的说明中带步骤名以便定位失败阶段。
+func TestInteg_SQLite_IndexChangeRegeneration(t *testing.T) {
+	dao := openSQLiteDAO(t)
+	ctx := context.Background()
+	inspector, err := dao.Schema()
+	if err != nil {
+		t.Fatalf("Schema() 失败: %v", err)
+	}
+	const table = "index_change_probe"
+	dir := filepath.Join(t.TempDir(), "model")
+	t.Cleanup(func() { mustExec(t, dao, "DROP TABLE IF EXISTS "+table) })
+
+	steps := []struct {
+		name    string
+		setup   []string // 本步的 DDL（在生成之前执行）
+		want    []string // 产物中必须出现的片段
+		notWant []string // 产物中必须不出现的片段（旧索引残留）
+	}{
+		{
+			name: "无索引表不生成索引块",
+			setup: []string{
+				"DROP TABLE IF EXISTS " + table,
+				"CREATE TABLE " + table + " (id INTEGER NOT NULL, name TEXT NOT NULL)",
+			},
+			notWant: []string{"索引:", "primary_key:", "PRIMARY KEY ("},
+		},
+		{
+			name: "新增主键与唯一索引后索引块出现",
+			setup: []string{
+				"DROP TABLE IF EXISTS " + table,
+				"CREATE TABLE " + table + " (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)",
+				"CREATE UNIQUE INDEX uk_name ON " + table + " (name)",
+			},
+			want: []string{
+				"// 索引:",
+				"//   - PRIMARY KEY (id)",
+				"//   - UNIQUE KEY uk_name (name)",
+				`json:"id" db:"id" primary_key:"true"`,
+			},
+		},
+		{
+			name: "唯一索引改为联合普通索引后旧块被替换",
+			setup: []string{
+				"DROP INDEX uk_name",
+				"CREATE INDEX idx_name_id ON " + table + " (name, id)",
+			},
+			want: []string{
+				"//   - PRIMARY KEY (id)",
+				"//   - KEY idx_name_id (name, id)",
+			},
+			notWant: []string{"uk_name", "//   - UNIQUE KEY "},
+		},
+		{
+			name:  "撤销二级索引后只剩主键行",
+			setup: []string{"DROP INDEX idx_name_id"},
+			want: []string{
+				"// 索引:",
+				"//   - PRIMARY KEY (id)",
+			},
+			notWant: []string{"idx_name_id", "//   - KEY ", "//   - UNIQUE KEY "},
+		},
+		{
+			name: "撤销主键后索引块整体消失",
+			setup: []string{
+				"DROP TABLE IF EXISTS " + table,
+				"CREATE TABLE " + table + " (id INTEGER NOT NULL, name TEXT NOT NULL)",
+			},
+			notWant: []string{"索引:", "PRIMARY KEY (", "primary_key:"},
+		},
+		{
+			name: "更换主键列后主键行与 primary_key tag 同步迁移",
+			setup: []string{
+				"DROP TABLE IF EXISTS " + table,
+				"CREATE TABLE " + table + " (id INTEGER NOT NULL, name TEXT NOT NULL PRIMARY KEY)",
+			},
+			want: []string{
+				"//   - PRIMARY KEY (name)",
+				`json:"name" db:"name" primary_key:"true"`,
+			},
+			notWant: []string{"PRIMARY KEY (id)", `json:"id" db:"id" primary_key`},
+		},
+	}
+	for _, step := range steps {
+		// 每步：改库 → 重新读取元数据 → 生成到同一文件 → 断言产物
+		for _, sql := range step.setup {
+			mustExec(t, dao, sql)
+		}
+		cols, err := inspector.Columns(ctx, table)
+		if err != nil {
+			t.Fatalf("步骤 %q: Columns() 失败: %v", step.name, err)
+		}
+		indexes, err := inspector.Indexes(ctx, table)
+		if err != nil {
+			t.Fatalf("步骤 %q: Indexes() 失败: %v", step.name, err)
+		}
+		if err := Generate(Input{
+			OutputDir:        dir,
+			Database:         "sqlite",
+			Dialect:          DialectSqlite,
+			TableName:        table,
+			TableComment:     "索引变更探针表",
+			ColumnTagName:    "db",
+			JsonTagValueCase: NameCaseLowerCamel,
+			Columns:          bridgeColumns(cols),
+			Indexes:          bridgeIndexes(indexes),
+		}); err != nil {
+			t.Fatalf("步骤 %q: Generate() 失败: %v", step.name, err)
+		}
+		content, err := os.ReadFile(filepath.Join(dir, table+".go"))
+		if err != nil {
+			t.Fatalf("步骤 %q: 读取生成文件失败: %v", step.name, err)
+		}
+		got := string(content)
+
+		for _, want := range step.want {
+			assertContains(t, got, want, "步骤 "+step.name+"：应包含")
+		}
+		for _, notWant := range step.notWant {
+			assertNotContains(t, got, notWant, "步骤 "+step.name+"：不应残留")
+		}
+		// 索引块只应出现在 Entity 与 DO 两处；无索引时完全不出现
+		if n := strings.Count(got, "// 索引:"); n != 0 && n != 2 {
+			t.Errorf("步骤 %q: 索引块应出现 0 或 2 次（Entity/DO），实际 %d 次:\n%s", step.name, n, got)
+		}
+		// 产物必须可解析且与 gofmt 输出逐字节一致（索引块清单形态遵循 gofmt 规范）
+		if _, err := parser.ParseFile(token.NewFileSet(), table+".go", got, parser.AllErrors); err != nil {
+			t.Errorf("步骤 %q: 产物存在语法错误: %v", step.name, err)
+		}
+		formatted, err := format.Source(content)
+		if err != nil {
+			t.Fatalf("步骤 %q: 产物无法通过 gofmt: %v", step.name, err)
+		}
+		if string(formatted) != got {
+			t.Errorf("步骤 %q: 产物与 gofmt 输出不一致\ngot:\n%s\nwant:\n%s", step.name, got, formatted)
+		}
 	}
 }

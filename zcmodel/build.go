@@ -112,6 +112,9 @@ func assembleDDLFragment(col Column) string {
 // formatDDLDefault 渲染 DEFAULT 段的值：空串补一对单引号还原为字符串字面量（MySQL 元数据对
 // DEFAULT 空串给出裸空串，直接拼接会产出悬空的 DEFAULT 关键字，而空串唯一无歧义地只能是
 // 字符串字面量），其余值方言原样。
+// 注：本注释刻意用「一对单引号」文字描述而非直接写出——gofmt 对声明级 doc 注释做智能引号
+// 规范化，连续两个单引号会被改写成右双引号、连续两个反引号会被改写成左双引号，直接写出
+// 会导致 gofmt 校验不通过（返回值本身不受影响，仍是普通字符串字面量）。
 func formatDDLDefault(v string) string {
 	if v == "" {
 		return "''"

@@ -14,6 +14,30 @@ func boolPtr(v bool) *bool { return &v }
 
 func strPtr(v string) *string { return &v }
 
+// sampleFieldExpectation 是 §3.4 样板表某字段的期望产物：字段名、Entity 侧的 Go 类型与完整 tag。
+// DO 侧字段类型恒为 any，tag 与 Entity 完全一致（由用例复用同一份期望）。
+type sampleFieldExpectation struct {
+	Field string // 结构体字段名
+	Type  string // Entity 侧 Go 类型（DO 侧为 any，不在此列）
+	Tag   string // 完整 tag（反引号内含 json → 列 tag → primary_key → ddl → description）
+}
+
+// sampleFieldExpectations 返回样板表的字段期望，供单元 golden 用例与真库端到端用例**共用同一份
+// 事实源**，避免两处各写一份 tag 期望而分叉（样板表的 MySQL DDL 见 integration_test.go 的
+// sampleUserOrderDDL，两处期望必须同时改）。
+func sampleFieldExpectations() []sampleFieldExpectation {
+	return []sampleFieldExpectation{
+		{"ID", "int64", "`json:\"id\" db:\"id\" primary_key:\"true\" ddl:\"bigint unsigned NOT NULL AUTO_INCREMENT\" description:\"主键\"`"},
+		{"OrderNo", "string", "`json:\"orderNo\" db:\"order_no\" ddl:\"varchar(32) NOT NULL\" description:\"订单号\"`"},
+		{"UserID", "int64", "`json:\"userId\" db:\"user_id\" ddl:\"bigint NOT NULL\" description:\"用户ID\"`"},
+		{"Email", "string", "`json:\"email\" db:\"email\" ddl:\"varchar(64) NOT NULL\" description:\"用户邮箱\"`"},
+		{"Amount", "float64", "`json:\"amount\" db:\"amount\" ddl:\"decimal(10,2) NOT NULL DEFAULT 0.00\" description:\"订单金额（保留两位小数）\"`"},
+		{"Status", "string", "`json:\"status\" db:\"status\" ddl:\"enum('pending','paid','refunded') NOT NULL DEFAULT pending\" description:\"订单状态\"`"},
+		{"Remark", "string", "`json:\"remark\" db:\"remark\" ddl:\"varchar(255) NULL\" description:\"备注（可为空）\"`"},
+		{"CreatedAt", "time.Time", "`json:\"createdAt\" db:\"created_at\" ddl:\"datetime NOT NULL DEFAULT CURRENT_TIMESTAMP\" description:\"创建时间\"`"},
+	}
+}
+
 // writeAndVerify 执行 writeOrReplaceStruct 的标准流程并返回产物内容：
 // 在独立临时目录下建立包目录 model（目录名即新建文件的包名推导来源），
 // initialContent 非空时先落盘为存量文件（模拟再生成场景），空串表示新建文件场景；

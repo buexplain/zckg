@@ -1126,18 +1126,23 @@ func TestBuildIndexCommentBlock_Ordering(t *testing.T) {
 	}
 }
 
-// TestBuildIndexCommentBlock_Format 验证渲染格式：主键行不显示方言内部物理索引名（PG 的 xxx_pkey、
-// SQLite 的 sqlite_autoindex_* 即使出现在传入的 Name 中也不被渲染）、多列按定义顺序以逗号加空格连接、
-// 非主键索引名原样呈现、表达式列占位符 #expr 透传；索引名与列文本中的换行净化为空格，防止注释行断裂。
+// TestBuildIndexCommentBlock_Format 验证渲染格式：主键行不显示方言内部物理索引名
+// （渲染端只依据 Primary 标记判定，不依赖索引名的命名形态——PG 的 xxx_pkey 与 SQLite 风格的
+// sqlite_autoindex_* 均被隐藏；后者实践中由 zcdb 合成为 PRIMARY，此处按单元输入锁定该规则）、
+// 多列按定义顺序以逗号加空格连接、非主键索引名原样呈现、表达式列占位符 #expr 透传；
+// 索引名与列文本中的换行净化为空格，防止注释行断裂。
 // 排序键为净化前的原始索引名（真实索引名不含换行，此处 "idx\nnewline" 因 '\n' 的字节序小于 '_' 而排在前面）。
 func TestBuildIndexCommentBlock_Format(t *testing.T) {
 	got := buildIndexCommentBlock([]IndexInfo{
 		{Name: "user_order_pkey", Columns: []string{"id"}, Unique: true, Primary: true},
+		{Name: "sqlite_autoindex_probe_1", Columns: []string{"tenant_id"}, Unique: true, Primary: true},
 		{Name: "uk_multi", Columns: []string{"user_id", "status"}, Unique: true},
 		{Name: "idx_expr", Columns: []string{"#expr"}},
 		{Name: "idx\nnewline", Columns: []string{"a\nb"}},
 	})
 	want := []string{
+		// 两个主键行（单元输入刻意同时给两种方言命名形态）之间仍按索引名字典序稳定排列
+		"//   - PRIMARY KEY (tenant_id)",
 		"//   - PRIMARY KEY (id)",
 		"//   - UNIQUE KEY uk_multi (user_id, status)",
 		"//   - KEY idx newline (a b)",
@@ -1146,7 +1151,9 @@ func TestBuildIndexCommentBlock_Format(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("索引块渲染错误\ngot:  %q\nwant: %q", got, want)
 	}
-	assertNotContains(t, strings.Join(got, "\n"), "user_order_pkey", "主键行不应显示方言内部物理索引名")
+	joined := strings.Join(got, "\n")
+	assertNotContains(t, joined, "user_order_pkey", "主键行不应显示 PG 的物理索引名")
+	assertNotContains(t, joined, "sqlite_autoindex_probe_1", "主键行不应显示 SQLite 风格的自动索引名")
 }
 
 // TestBuildIndexCommentBlock_Empty 验证无索引时整块省略：nil 与空切片均返回空结果，

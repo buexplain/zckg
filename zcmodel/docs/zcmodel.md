@@ -260,10 +260,14 @@ type UserOrderDO struct {
 
 - 元数据是**生成时刻的快照**，表结构变更后未重新生成即过期；`ddl` 只呈现单个列定义片段，不含索引与约束（索引见索引块，约束请回查建表语句）；
 - 各段的值形态因方言而异（裸值 / 带引号字面量 / 带 cast 表达式），这是「方言原样」决策的自然结果，不抹平方言与版本差异；
+- **MySQL 裸值默认值的数字形态有歧义**：`varchar(10) DEFAULT '0'` 在元数据里是裸值 `0`，片段渲染为 `DEFAULT 0`（读起来像数值默认值）；列类型紧邻其前可消除歧义，如需精确语义请回查建表语句；
+- **显式 `DEFAULT NULL` 的呈现因方言而异**：MySQL 元数据与「无默认值」不可区分，片段不含 DEFAULT 段；PostgreSQL 给出表达式 `NULL::character varying`、SQLite 给出字面量 `NULL`，二者都会如实渲染出 DEFAULT 段（判定只看指针，不做特殊抹平）；
 - MySQL 版本间差异（如 8.0.13+ 才支持表达式默认值）未逐一验证（测试基准为 MySQL 8.4）；
 - SQLite 的 `INTEGER PRIMARY KEY` 在 `table_info` 中 `notnull=0`，会渲染为 `INTEGER NULL`——该列实为 rowid 别名、不可能为 NULL，属元数据固有局限，不做特判修正。
 
 #### 索引块
+
+索引是**表级信息、没有自然的结构体字段挂载点**，因此不放 tag，而渲染为 struct 的 doc 注释（与各字段 tag 契约无关）：
 
 `Input.Indexes` 非空时，Entity 与 DO 的 doc 注释中追加索引清单（upsert 是写操作，DO 侧对读者同样关键）：
 
