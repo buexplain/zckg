@@ -1,7 +1,8 @@
 // 本文件为 MySQL 集成测试：SchemaInspector 元数据查询（Tables / Columns / Indexes）。
 // 用例按被测源码归集（schema_inspector.go 与 mysql_schema.go），不混入 Builder 的 builder_*_test.go；
 // 建连统一走 testhelpers_mysql_test.go 的 openMySQLTestDB（容器不可达时 Skip）：
-//   docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+//
+//	docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
 package zcdb
 
 import (

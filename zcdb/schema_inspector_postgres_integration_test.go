@@ -2,7 +2,8 @@
 // 用例按被测源码归集（schema_inspector.go 与 postgres_schema.go），不混入 Builder 的 builder_*_test.go；
 // 建连统一走 testhelpers_postgres_test.go 的 openPgTestDB（容器不可达时 Skip）；
 // Indexes 查询要求 PG >= 11（indnkeyatts 自 PG 11 引入）：
-//   docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+//
+//	docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
 package zcdb
 
 import (
