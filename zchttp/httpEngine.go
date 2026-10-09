@@ -220,11 +220,28 @@ func DefaultNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func invokePanicHandler(handler PanicHandler, w http.ResponseWriter, r *http.Request, recovered any) {
+	defer func() {
+		if handlerPanic := recover(); handlerPanic != nil {
+			slog.Error("panic handler panicked",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"error", handlerPanic,
+				"stack", string(debug.Stack()),
+			)
+			if !IsResponseWritten(w) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}
+	}()
+	handler(w, r, recovered)
+}
+
 // ServeHTTP 实现 http.Handler，是请求处理的总入口：
 //  1. MaxBodyBytes > 0 时以 http.MaxBytesReader 包裹请求体（超限绑定失败映射为 400）；
-//  2. 路由查找：基数树匹配，静态段优先、静态分支失败回溯参数段（末尾斜杠归一化）；
-//  3. 构造 Req 并绑定 query/body/路径参数与请求阶段默认值（绑定失败不提前返回，
-//     错误随中间件链穿透到 core 层）；
+//  2. 路由查找：基数树匹配，静态段 > 参数段 > 通配尾段，前者分支失败依次回溯（末尾斜杠归一化）；
+//  3. 构造 Req 并绑定 query/body/路径参数与请求阶段默认值（Req 嵌入 KeepRawBody 时不绑定 body；
+//     绑定失败不提前返回，错误随中间件链穿透到 core 层）；
 //  4. 执行洋葱模型中间件链；*BindingError/*ValidationError 路由到 OnValidationError
 //     （默认 400），其余错误路由到 OnError（默认 500）；panic 由 recover 捕获后交 OnPanic。
 func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -236,22 +253,31 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 从池中取出 ResponseWriter 包装器以跟踪响应是否已被写入（提前获取，以便 panic 恢复时也能使用）
 	rw := acquireResponseWriter(w)
+	defer releaseResponseWriter(rw)
 
-	// 包装器归还 defer 独立注册（先注册、LIFO 后执行，即 OnPanic 执行完毕后归还）：
-	// 若 OnPanic 回调自身 panic，归还 defer 仍会随栈展开执行，包装器不会从池中丢失
-	defer func() {
-		releaseResponseWriter(rw)
-	}()
+	// 所有请求（包括 404）都在结束时限量排空并关闭入口请求体。
+	if r.Body != nil {
+		body := r.Body
+		defer func() {
+			_, _ = io.Copy(io.Discard, io.LimitReader(body, maxBodyDrainBytes))
+			_ = body.Close()
+		}()
+	}
 
-	// panic 捕获：防止单个请求的 panic 导致整个进程崩溃；
-	// 捕获后交由 OnPanic 处理（默认记录日志并返回 500）
+	var st *requestState
+	// panic 捕获使用中间件链最后一次 next(w, r) 提交的当前对象；自定义 OnPanic
+	// 若再次 panic，则记录日志并在尚未写响应时兜底返回 500，不再向 net/http 传播。
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			e.OnPanic(rw, r, recovered)
+			currentW, currentR := http.ResponseWriter(rw), r
+			if st != nil {
+				currentW, currentR = st.w, st.req
+			}
+			invokePanicHandler(e.OnPanic, currentW, currentR, recovered)
 		}
 	}()
 
-	// 1. 查找路由：在基数树上匹配（静态段优先于参数段，静态分支失败回溯参数分支；
+	// 1. 查找路由：在基数树上匹配（静态段 > 参数段 > 通配尾段，前者分支失败依次回溯；
 	//    末尾斜杠归一化，使 /hello 与 /hello/ 等价）
 	normalizedPath := normalizePath(r.URL.Path)
 	entry, paramValues := e.Router.match(r.Method, normalizedPath)
@@ -264,17 +290,8 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 将请求作用域的全部状态（*HttpEngine、*http.Request、包装后的 ResponseWriter）
 	// 合并为单个 requestState 一次性注入 ctx（仅一次 context.WithValue），
 	// 供 handler 通过 EngineFromContext / RequestFromContext / ResponseWriterFromContext 获取
-	st := &requestState{engine: e, req: r, w: rw}
+	st = &requestState{engine: e, req: r, w: rw}
 	ctx = context.WithValue(ctx, stateKey, st)
-
-	if r.Body != nil {
-		defer func() {
-			// 限量排空剩余请求体以复用 keep-alive 连接；超出上限不再排空，
-			// 连接由 net/http 关闭，避免超大未读请求体占用服务端 IO
-			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxBodyDrainBytes))
-			_ = r.Body.Close()
-		}()
-	}
 
 	// 2. 命中路由后立即构造 Req 并绑定请求数据（不做参数校验），
 	//    使中间件可通过 BoundReqFromContext 提前检查请求数据
@@ -289,7 +306,7 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(entry.reqMeta.fields) > 0 {
-		if err := bindRequestData(r, reqPtr, entry.reqMeta, e.MultipartFormMaxMemory); err != nil {
+		if err := bindRequestData(r, reqPtr, entry.reqMeta, e.MultipartFormMaxMemory, entry.keepRawBody); err != nil {
 			// 绑定失败不提前返回，将错误存入状态，随中间件链穿透到 core 层再处理
 			st.bindingErr = NewBindingError(err)
 		} else if len(entry.pathParams) > 0 {
@@ -374,9 +391,9 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var ve *ValidationError
 		var be *BindingError
 		if errors.As(err, &ve) || errors.As(err, &be) {
-			e.OnValidationError(rw, r, err)
+			e.OnValidationError(st.w, st.req, err)
 		} else {
-			e.OnError(rw, r, err)
+			e.OnError(st.w, st.req, err)
 		}
 	}
 }

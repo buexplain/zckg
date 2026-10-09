@@ -1401,6 +1401,83 @@ func TestGenerateOpenAPI_PtrNestedValueTypeDefault(t *testing.T) {
 	}
 }
 
+// TestGenerateOpenAPI_RequiredUsesSupportedDefault 验证 Req 与 Res 的 required 均依据有效 hasDefault：
+// 不支持 default 的 time.Time 仍为 required，支持 default 的 int 不进入 required。
+func TestGenerateOpenAPI_RequiredUsesSupportedDefault(t *testing.T) {
+	type requiredContractReq struct {
+		When time.Time `json:"when" nonzero:"true" default:"invalid"`
+		Page int       `json:"page" nonzero:"true" default:"1"`
+	}
+	type requiredContractRes struct {
+		When time.Time `json:"when" nonzero:"true" default:"invalid"`
+		Page int       `json:"page" nonzero:"true" default:"1"`
+	}
+
+	router := NewRouter()
+	router.POST("/required-contract", func(context.Context, requiredContractReq) (requiredContractRes, error) {
+		return requiredContractRes{}, nil
+	})
+	doc := GenerateOpenAPI(router, OpenAPIInfo{Title: "required", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	for _, name := range []string{"requiredContractReq", "requiredContractRes"} {
+		schema := schemas[name].(map[string]any)
+		required := schema["required"].([]any)
+		if len(required) != 1 || required[0] != "when" {
+			t.Fatalf("%s.required = %v, want [when]", name, required)
+		}
+	}
+}
+
+// TestGenerateOpenAPI_RequestBodyRequired 验证 requestBody.required 按省略 body 后的内建 nonzero 结果推导：
+// 全可选与有效 default 为 false，缺少必填字段为 true，path 必填字段和 KeepRawBody 不强制 body。
+func TestGenerateOpenAPI_RequestBodyRequired(t *testing.T) {
+	type optionalReq struct {
+		Name string `json:"name"`
+	}
+	type requiredReq struct {
+		Name string `json:"name" nonzero:"true"`
+	}
+	type defaultedReq struct {
+		Page int `json:"page" nonzero:"true" default:"1"`
+	}
+	type pathReq struct {
+		ID   string `json:"id" nonzero:"true"`
+		Note string `json:"note"`
+	}
+	type rawReq struct {
+		KeepRawBody
+		Sig string `json:"sig" nonzero:"true"`
+	}
+	type bodyRes struct{}
+
+	router := NewRouter()
+	router.POST("/optional", func(context.Context, optionalReq) (bodyRes, error) { return bodyRes{}, nil })
+	router.POST("/required", func(context.Context, requiredReq) (bodyRes, error) { return bodyRes{}, nil })
+	router.POST("/defaulted", func(context.Context, defaultedReq) (bodyRes, error) { return bodyRes{}, nil })
+	router.POST("/path/{id}", func(context.Context, pathReq) (bodyRes, error) { return bodyRes{}, nil })
+	router.POST("/raw", func(context.Context, rawReq) (bodyRes, error) { return bodyRes{}, nil })
+
+	doc := GenerateOpenAPI(router, OpenAPIInfo{Title: "body", Version: "1"})
+	paths := doc["paths"].(map[string]any)
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{path: "/optional", want: false},
+		{path: "/required", want: true},
+		{path: "/defaulted", want: false},
+		{path: "/path/{id}", want: false},
+		{path: "/raw", want: false},
+	}
+	for _, tc := range cases {
+		body := paths[tc.path].(map[string]any)["post"].(map[string]any)["requestBody"].(map[string]any)
+		got, _ := body["required"].(bool)
+		if got != tc.want {
+			t.Errorf("%s requestBody.required = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 // ======== P0 补充测试 ========
 
 // ---- 自定义 ResponseWrapper ----
@@ -2301,7 +2378,7 @@ func TestOpenAPIBuilderNonStructBranches(t *testing.T) {
 	if got := g.buildQueryParams(reflect.TypeOf(0), structMeta{}, nil); got != nil {
 		t.Fatalf("buildQueryParams(non-struct) = %v, want nil", got)
 	}
-	if got := g.buildRequestBody(reflect.TypeOf(0), structMeta{}); got != nil {
+	if got := g.buildRequestBody(reflect.TypeOf(0), structMeta{}, false); got != nil {
 		t.Fatalf("buildRequestBody(non-struct) = %v, want nil", got)
 	}
 	if got := g.registerStructSchema(reflect.TypeOf(0), structMeta{}); got["type"] != "object" {
@@ -2309,19 +2386,36 @@ func TestOpenAPIBuilderNonStructBranches(t *testing.T) {
 	}
 }
 
-// TestBuildWrapperPropertiesNonStructWrapper 覆盖 responseWrapper 为非结构体时回退默认包装的分支
-func TestBuildWrapperPropertiesNonStructWrapper(t *testing.T) {
-	g := newTestGenerator()
-	g.responseWrapper = 42
-	wrapper := g.buildWrapperProperties(map[string]any{"type": "object"})
-	props, ok := wrapper["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("wrapper properties missing: %v", wrapper)
+// TestGenerateOpenAPI_InvalidResponseWrapperPanic 验证非结构体、占位字段数量错误或
+// 参与输出的导出字段缺少显式 json 名时立即 panic，不再静默回退或生成歧义 schema。
+func TestGenerateOpenAPI_InvalidResponseWrapperPanic(t *testing.T) {
+	type noPlaceholder struct {
+		Code int `json:"code"`
 	}
-	for _, key := range []string{"data", "code", "message"} {
-		if _, exists := props[key]; !exists {
-			t.Fatalf("default wrapper should contain %q, got: %v", key, props)
-		}
+	type multiplePlaceholders struct {
+		Data  any `json:"data"`
+		Extra any `json:"extra"`
+	}
+	type missingJSONName struct {
+		Data any `json:"data"`
+		Code int
+	}
+	cases := []struct {
+		name    string
+		wrapper any
+		want    string
+	}{
+		{name: "non struct", wrapper: 42, want: "must be a struct"},
+		{name: "no placeholder", wrapper: noPlaceholder{}, want: "exactly one"},
+		{name: "multiple placeholders", wrapper: multiplePlaceholders{}, want: "exactly one"},
+		{name: "missing json name", wrapper: missingJSONName{}, want: "must declare a non-empty json name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectPanicContains(t, []string{"ResponseWrapper", tc.want}, func() {
+				GenerateOpenAPI(NewRouter(), OpenAPIInfo{ResponseWrapper: tc.wrapper})
+			})
+		})
 	}
 }
 
@@ -3718,4 +3812,128 @@ func TestOpenAPIDeprecated_RuntimeUnchanged(t *testing.T) {
 			})
 		}
 	}
+}
+
+// ========== 通配尾段 {name...} 与 KeepRawBody ==========
+
+type oaCatchAllReq struct {
+	X    string `json:"x"`
+	Rest string `json:"rest"`
+}
+
+// TestOpenAPICatchAllPathParam 验证通配段的 OpenAPI 呈现：路径模板 {name...} 转为 {name}（paths 中不残留 "..."），
+// 通配参数以 in=path、required=false 声明（与可选参数同属既有规范兼容限制），
+// 前置必选参数仍为 required=true；根路径通配 /{rest...} 转为 /{rest}。
+func TestOpenAPICatchAllPathParam(t *testing.T) {
+	cases := []struct {
+		route    string
+		template string
+		required map[string]bool
+	}{
+		{"/proxy/{rest...}", "/proxy/{rest}", map[string]bool{"rest": false}},
+		{"/a/{x}/{rest...}", "/a/{x}/{rest}", map[string]bool{"x": true, "rest": false}},
+		{"/{rest...}", "/{rest}", map[string]bool{"rest": false}},
+	}
+	for _, c := range cases {
+		t.Run(c.route, func(t *testing.T) {
+			r := NewRouter()
+			r.GET(c.route, func(_ context.Context, req oaCatchAllReq) (oaCatchAllReq, error) { return req, nil })
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+			paths := doc["paths"].(map[string]any)
+			for k := range paths {
+				if strings.Contains(k, "...") {
+					t.Fatalf("path template should not contain '...', got %q", k)
+				}
+			}
+			item, ok := paths[c.template].(map[string]any)
+			if !ok {
+				t.Fatalf("%s missing from paths, got: %v", c.template, paths)
+			}
+			params, _ := item["get"].(map[string]any)["parameters"].([]any)
+			for name, wantRequired := range c.required {
+				pm := findParam(t, params, name)
+				if pm["in"] != "path" {
+					t.Errorf("%s.in = %v, want path", name, pm["in"])
+				}
+				if got, _ := pm["required"].(bool); got != wantRequired {
+					t.Errorf("%s.required = %v, want %v", name, got, wantRequired)
+				}
+			}
+		})
+	}
+}
+
+type oaRawReq struct {
+	KeepRawBody
+	Rest string `json:"rest"`
+	Sig  string `json:"sig" nonzero:"true"`
+}
+
+type oaPlainReq struct {
+	Rest string `json:"rest"`
+	Sig  string `json:"sig" nonzero:"true"`
+}
+
+type oaRawRes struct {
+	OK bool `json:"ok"`
+}
+
+// TestOpenAPIKeepRawBody 验证 KeepRawBody 路由的 OpenAPI 输出：POST/PUT/PATCH 下非路径字段输出为 query 参数
+// （nonzero → required），requestBody 恰为 {"content":{"*/*":{"schema":{}}}}，不从 Req 推导 schema，
+// components.schemas 不出现 KeepRawBody 与 Req 类型；GET 下嵌入与否的 parameters 完全一致且均无 requestBody。
+func TestOpenAPIKeepRawBody(t *testing.T) {
+	wantBody := map[string]any{"content": map[string]any{"*/*": map[string]any{"schema": map[string]any{}}}}
+	cases := []struct {
+		method   string
+		register func(*Router, string, any)
+	}{
+		{http.MethodPost, (*Router).POST},
+		{http.MethodPut, (*Router).PUT},
+		{http.MethodPatch, (*Router).PATCH},
+	}
+	for _, c := range cases {
+		t.Run(c.method, func(t *testing.T) {
+			r := NewRouter()
+			c.register(r, "/hook/{rest...}", func(_ context.Context, _ oaRawReq) (oaRawRes, error) { return oaRawRes{}, nil })
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+			op := doc["paths"].(map[string]any)["/hook/{rest}"].(map[string]any)[strings.ToLower(c.method)].(map[string]any)
+			params, _ := op["parameters"].([]any)
+			if len(params) != 2 {
+				t.Fatalf("expected 2 parameters (rest path + sig query), got %v", params)
+			}
+			if rest := findParam(t, params, "rest"); rest["in"] != "path" {
+				t.Errorf("rest.in = %v, want path", rest["in"])
+			}
+			sig := findParam(t, params, "sig")
+			if sig["in"] != "query" || sig["required"] != true {
+				t.Errorf("sig should be required query param, got %v", sig)
+			}
+			if !reflect.DeepEqual(op["requestBody"], wantBody) {
+				t.Fatalf("requestBody = %v, want %v", op["requestBody"], wantBody)
+			}
+			schemas, _ := doc["components"].(map[string]any)["schemas"].(map[string]any)
+			for name := range schemas {
+				if strings.Contains(name, "KeepRawBody") || name == "oaRawReq" {
+					t.Errorf("components.schemas should not contain %q", name)
+				}
+			}
+		})
+	}
+
+	t.Run("GET嵌入与未嵌入一致", func(t *testing.T) {
+		gen := func(handler any) map[string]any {
+			r := NewRouter()
+			r.GET("/hook/{rest...}", handler)
+			doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+			return doc["paths"].(map[string]any)["/hook/{rest}"].(map[string]any)["get"].(map[string]any)
+		}
+		raw := gen(func(_ context.Context, _ oaRawReq) (oaRawRes, error) { return oaRawRes{}, nil })
+		plain := gen(func(_ context.Context, _ oaPlainReq) (oaRawRes, error) { return oaRawRes{}, nil })
+		if !reflect.DeepEqual(raw["parameters"], plain["parameters"]) {
+			t.Fatalf("GET parameters differ:\nraw:   %v\nplain: %v", raw["parameters"], plain["parameters"])
+		}
+		if _, ok := raw["requestBody"]; ok {
+			t.Fatalf("GET with KeepRawBody should have no requestBody, got %v", raw["requestBody"])
+		}
+	})
 }

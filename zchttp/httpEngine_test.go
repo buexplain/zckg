@@ -7,11 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 )
 
 // TestDefaultResponseJSON 验证默认响应回调输出 JSON
@@ -775,6 +779,23 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+type trackingReadCloser struct {
+	r      io.Reader
+	n      int64
+	closed bool
+}
+
+func (r *trackingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
 // TestBodyDrainLimited 验证 handler 未消费的超大请求体不会被全量排空，
 // 读取量不超过 maxBodyDrainBytes（防止慢客户端借排空占用服务端 IO）
 func TestBodyDrainLimited(t *testing.T) {
@@ -798,6 +819,29 @@ func TestBodyDrainLimited(t *testing.T) {
 	}
 	if cr.n > maxBodyDrainBytes {
 		t.Fatalf("drained %d bytes, want <= %d", cr.n, maxBodyDrainBytes)
+	}
+}
+
+// TestNotFoundDrainsAndClosesBody 验证路由未命中的 404 请求也执行统一生命周期收尾：
+// 限量排空入口请求体并调用 Close，而不是在路由查找后提前返回时遗漏清理。
+func TestNotFoundDrainsAndClosesBody(t *testing.T) {
+	body := &trackingReadCloser{r: strings.NewReader("unread body")}
+	req := httptest.NewRequest(http.MethodPost, "/missing", nil)
+	req.Body = body
+	req.ContentLength = int64(len("unread body"))
+
+	engine := NewEngine()
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if !body.closed {
+		t.Fatal("404 request body was not closed")
+	}
+	if body.n != int64(len("unread body")) {
+		t.Fatalf("drained bytes = %d, want %d", body.n, len("unread body"))
 	}
 }
 
@@ -1116,10 +1160,8 @@ func TestTypedNilMapErrorNonNilStillPropagates(t *testing.T) {
 
 // ======== Minor-4: OnPanic 自身 panic 时包装器仍归还池 ========
 
-// TestOnPanicPanicStillReleasesWriter 验证 OnPanic 回调自身 panic 时：
-// ① OnPanic 的 panic 向外传播（由上层 net/http 兜底）；
-// ② 传播路径上归还 defer 必然执行——捕获的包装器已被重置（底层 writer 置 nil）；
-// ③ 后续请求不受影响（同一全局池可正常复用，无污染）。
+// TestOnPanicPanicStillReleasesWriter 验证 OnPanic 回调自身 panic 时不会再次向外传播，
+// 未写响应时由引擎兜底返回 500，包装器仍被重置归还且后续请求不受影响。
 func TestOnPanicPanicStillReleasesWriter(t *testing.T) {
 	var captured *responseWriter
 	router := NewRouter()
@@ -1137,19 +1179,14 @@ func TestOnPanicPanicStillReleasesWriter(t *testing.T) {
 		panic("OnPanic boom")
 	}
 
-	func() {
-		defer func() {
-			if r := recover(); r != "OnPanic boom" {
-				t.Fatalf("expected OnPanic panic to propagate, got %v", r)
-			}
-		}()
-		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/boom", nil))
-	}()
-
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/boom", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("secondary panic fallback status = %d, want 500", rec.Code)
+	}
 	if captured == nil {
 		t.Fatal("OnPanic was not called")
 	}
-	// 归还 defer 在 OnPanic 的 panic 展开路径上执行：底层 writer 已置 nil，包装器已回池
 	if captured.ResponseWriter != nil || captured.written {
 		t.Fatal("responseWriter was not released after OnPanic panic (pool leak)")
 	}
@@ -1161,9 +1198,378 @@ func TestOnPanicPanicStillReleasesWriter(t *testing.T) {
 	})
 	okEngine := NewEngine()
 	okEngine.Router = okRouter
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	okEngine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ok", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("pool not reusable: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
 	}
+}
+
+// ======== 通配尾段 {name...} 与 KeepRawBody 端到端 ========
+
+type catchAllE2EReq struct {
+	Rest string `json:"rest" default:"none"`
+}
+
+type catchAllE2ERes struct {
+	Rest string `json:"rest"`
+}
+
+func catchAllE2EHandler(_ context.Context, req catchAllE2EReq) (catchAllE2ERes, error) {
+	return catchAllE2ERes{Rest: req.Rest}, nil
+}
+
+// TestCatchAllParamBindingE2E 经 ServeHTTP 验证通配捕获值绑定到 Req：多段与单段捕获原样写入；
+// /dify 与 /dify/ 归一化后零段命中，字段保留 default；分组前缀下注册同样生效；
+// 同名 query 被路径参数覆盖（path > query）。
+func TestCatchAllParamBindingE2E(t *testing.T) {
+	router := NewRouter()
+	router.GET("/dify/{rest...}", catchAllE2EHandler)
+	router.Group("/api").GET("/files/{rest...}", catchAllE2EHandler)
+	engine := NewEngine()
+	engine.Router = router
+
+	cases := []struct {
+		target string
+		want   string
+	}{
+		{"/dify/v1/chat-messages", "v1/chat-messages"},
+		{"/dify/health", "health"},
+		{"/dify", "none"},
+		{"/dify/", "none"},
+		{"/dify/a/b?rest=query", "a/b"},
+		{"/api/files/a/b.txt", "a/b.txt"},
+		{"/api/files", "none"},
+	}
+	for _, c := range cases {
+		t.Run(c.target, func(t *testing.T) {
+			rec := serveJSONOn(t, engine, http.MethodGet, c.target, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+			}
+			var res catchAllE2ERes
+			decodeData(t, rec, &res)
+			if res.Rest != c.want {
+				t.Fatalf("rest = %q, want %q", res.Rest, c.want)
+			}
+		})
+	}
+}
+
+// TestCatchAllDecodedPathE2E 锁死捕获值来源为已百分号解码的 r.URL.Path 且不做路径清理：
+// %2F 还原为 /、%3F 还原为 ?（不被当作 query 分隔）、%2e%2e 还原为 .. 原样捕获、./ 原样保留。
+// 若改为按 RawPath 匹配或在路由层 path.Clean，此用例失败。
+func TestCatchAllDecodedPathE2E(t *testing.T) {
+	router := NewRouter()
+	router.GET("/dify/{rest...}", catchAllE2EHandler)
+	engine := NewEngine()
+	engine.Router = router
+
+	cases := []struct {
+		target string
+		want   string
+	}{
+		{"/dify/a%2Fb", "a/b"},
+		{"/dify/q%3Fx", "q?x"},
+		{"/dify/%2e%2e/etc/passwd", "../etc/passwd"},
+		{"/dify/./x", "./x"},
+	}
+	for _, c := range cases {
+		t.Run(c.target, func(t *testing.T) {
+			rec := serveJSONOn(t, engine, http.MethodGet, c.target, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+			}
+			var res catchAllE2ERes
+			decodeData(t, rec, &res)
+			if res.Rest != c.want {
+				t.Fatalf("rest = %q, want %q", res.Rest, c.want)
+			}
+		})
+	}
+}
+
+// TestCatchAllZeroSegmentNonzeroE2E 验证通配字段带 nonzero 时，零段命中（字段保持零值）校验失败返回 400，
+// 有捕获值时正常 200。
+func TestCatchAllZeroSegmentNonzeroE2E(t *testing.T) {
+	type nonzeroCatchAllReq struct {
+		Rest string `json:"rest" nonzero:"true"`
+	}
+	router := NewRouter()
+	router.GET("/dify/{rest...}", func(_ context.Context, req nonzeroCatchAllReq) (catchAllE2ERes, error) {
+		return catchAllE2ERes{Rest: req.Rest}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	for _, target := range []string{"/dify", "/dify/"} {
+		if rec := serveJSONOn(t, engine, http.MethodGet, target, ""); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400 for zero-segment nonzero field, got %d, body: %s", target, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := serveJSONOn(t, engine, http.MethodGet, "/dify/x", ""); rec.Code != http.StatusOK {
+		t.Fatalf("/dify/x: expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+type rawBodyE2EReq struct {
+	KeepRawBody
+	Rest string `json:"rest"`
+	Sig  string `json:"sig" nonzero:"true"`
+}
+
+type rawBodyE2ERes struct {
+	Rest    string `json:"rest"`
+	Sig     string `json:"sig"`
+	Body    string `json:"body"`
+	ReadErr string `json:"read_err"`
+}
+
+func rawBodyE2EHandler(ctx context.Context, req rawBodyE2EReq) (rawBodyE2ERes, error) {
+	res := rawBodyE2ERes{Rest: req.Rest, Sig: req.Sig}
+	r, ok := RequestFromContext(ctx)
+	if !ok {
+		return res, errors.New("request not in context")
+	}
+	b, err := io.ReadAll(r.Body)
+	res.Body = string(b)
+	if err != nil {
+		res.ReadErr = err.Error()
+	}
+	return res, nil
+}
+
+// TestKeepRawBodyE2E 经 ServeHTTP 验证 KeepRawBody：handler 经 RequestFromContext 读到逐字节完整的原始请求体
+// （body 中的同名字段不参与绑定）；路径参数与 query 照常绑定、nonzero 照常校验（body 携带 sig 也不能满足）；
+// MaxBodyBytes 仍包裹请求体，超限时 handler 读取得到 "request body too large"；GET 路由嵌入无副作用。
+func TestKeepRawBodyE2E(t *testing.T) {
+	router := NewRouter()
+	router.POST("/hook/{rest...}", rawBodyE2EHandler)
+	router.GET("/hook/{rest...}", rawBodyE2EHandler)
+	engine := NewEngine()
+	engine.Router = router
+
+	t.Run("原始请求体完整可读", func(t *testing.T) {
+		body := `{"sig":"body","rest":"body"}`
+		rec := serveJSONOn(t, engine, http.MethodPost, "/hook/a/b?sig=query", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+		}
+		var res rawBodyE2ERes
+		decodeData(t, rec, &res)
+		if res.Rest != "a/b" || res.Sig != "query" {
+			t.Fatalf("path/query binding mismatch: %+v", res)
+		}
+		if res.Body != body || res.ReadErr != "" {
+			t.Fatalf("raw body = %q (err %q), want %q", res.Body, res.ReadErr, body)
+		}
+	})
+
+	t.Run("nonzero仅看query", func(t *testing.T) {
+		rec := serveJSONOn(t, engine, http.MethodPost, "/hook/a", `{"sig":"body"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 (sig only in body is not bound), got %d, body: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("超MaxBodyBytes读取报错", func(t *testing.T) {
+		small := NewEngine()
+		small.Router = router
+		small.MaxBodyBytes = 8
+		rec := serveJSONOn(t, small, http.MethodPost, "/hook/a?sig=q", `{"payload":"0123456789"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+		}
+		var res rawBodyE2ERes
+		decodeData(t, rec, &res)
+		if !strings.Contains(res.ReadErr, "request body too large") {
+			t.Fatalf("read error should mention 'request body too large', got %q", res.ReadErr)
+		}
+	})
+
+	t.Run("GET嵌入无副作用", func(t *testing.T) {
+		rec := serveJSONOn(t, engine, http.MethodGet, "/hook/x?sig=q", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
+		}
+		var res rawBodyE2ERes
+		decodeData(t, rec, &res)
+		if res.Rest != "x" || res.Sig != "q" || res.Body != "" {
+			t.Fatalf("unexpected GET result: %+v", res)
+		}
+	})
+}
+
+// upstreamCapture 记录反向代理上游收到的请求
+type upstreamCapture struct {
+	method      string
+	escapedPath string
+	rawQuery    string
+	body        []byte
+	readErr     error
+}
+
+// TestKeepRawBodyReverseProxyE2E 以真实监听的引擎 + httputil.ReverseProxy 转发到 httptest 上游，锁死代理链路：
+// POST 请求体逐字节到达上游；请求路径中的 %2F 经 EscapedPath 原样转发（不被解码成 /）；
+// query 透传；上游的状态码、响应头、响应体原样回到客户端，handler 写入后引擎不追加任何输出。
+func TestKeepRawBodyReverseProxyE2E(t *testing.T) {
+	captured := make(chan upstreamCapture, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		captured <- upstreamCapture{method: r.Method, escapedPath: r.URL.EscapedPath(), rawQuery: r.URL.RawQuery, body: b, readErr: err}
+		w.Header().Set("X-Upstream", "1")
+		w.WriteHeader(http.StatusCreated)
+		if _, err := io.WriteString(w, "upstream-ok"); err != nil {
+			t.Errorf("upstream write: %v", err)
+		}
+	}))
+	defer upstream.Close()
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.URL.RawPath = strings.TrimPrefix(pr.In.URL.EscapedPath(), "/dify")
+			pr.Out.URL.Path = strings.TrimPrefix(pr.In.URL.Path, "/dify")
+		},
+	}
+	type proxyReq struct {
+		KeepRawBody
+		Rest string `json:"rest"`
+	}
+	gotRest := make(chan string, 1)
+	router := NewRouter()
+	router.POST("/dify/{rest...}", func(ctx context.Context, req proxyReq) (struct{}, error) {
+		gotRest <- req.Rest
+		r, _ := RequestFromContext(ctx)
+		w, _ := ResponseWriterFromContext(ctx)
+		proxy.ServeHTTP(w, r)
+		return struct{}{}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+	srv := httptest.NewServer(engine)
+	defer srv.Close()
+
+	body := `{"query":"hi","stream":false}`
+	resp, err := http.Post(srv.URL+"/dify/v1/a%2Fb?x=1", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusCreated || resp.Header.Get("X-Upstream") != "1" {
+		t.Fatalf("upstream status/header not relayed: %d %v", resp.StatusCode, resp.Header)
+	}
+	if string(respBody) != "upstream-ok" {
+		t.Fatalf("response body = %q, want exactly %q (engine must not append output)", respBody, "upstream-ok")
+	}
+	if rest := <-gotRest; rest != "v1/a/b" {
+		t.Fatalf("handler rest = %q, want decoded %q", rest, "v1/a/b")
+	}
+	up := <-captured
+	if up.readErr != nil {
+		t.Fatalf("upstream read body: %v", up.readErr)
+	}
+	if up.method != http.MethodPost || up.escapedPath != "/v1/a%2Fb" || up.rawQuery != "x=1" {
+		t.Fatalf("upstream request mismatch: method=%s path=%s query=%s", up.method, up.escapedPath, up.rawQuery)
+	}
+	if string(up.body) != body {
+		t.Fatalf("upstream body = %q, want %q", up.body, body)
+	}
+}
+
+// TestCatchAllStaticFileServeE2E 以 fstest.MapFS + fs.Sub 限定根目录、http.ServeFileFS 提供文件，锁死静态文件场景：
+// 多级路径 200 且内容一致；零段回退 index.html；Range 返回 206；HEAD 有 Content-Length 无响应体；
+// 不存在的文件 404；%2e%2e 穿越请求（捕获值还原为 ..）被拒绝（非 200）且不泄漏根外 secret.txt 内容。
+func TestCatchAllStaticFileServeE2E(t *testing.T) {
+	const secret = "TOPSECRET"
+	assets, err := fs.Sub(fstest.MapFS{
+		"secret.txt":         {Data: []byte(secret)},
+		"public/index.html":  {Data: []byte("<h1>home</h1>")},
+		"public/css/app.css": {Data: []byte("body{color:red}")},
+	}, "public")
+	if err != nil {
+		t.Fatalf("fs.Sub: %v", err)
+	}
+	type staticReq struct {
+		File string `json:"file"`
+	}
+	serveStatic := func(ctx context.Context, req staticReq) (struct{}, error) {
+		r, _ := RequestFromContext(ctx)
+		w, _ := ResponseWriterFromContext(ctx)
+		name := req.File
+		if name == "" {
+			name = "index.html"
+		}
+		http.ServeFileFS(w, r, assets, name)
+		return struct{}{}, nil
+	}
+	router := NewRouter()
+	static := router.Group("/static")
+	static.GET("/{file...}", serveStatic)
+	static.HEAD("/{file...}", serveStatic)
+	engine := NewEngine()
+	engine.Router = router
+
+	do := func(method, target string, header http.Header) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, nil)
+		for k, v := range header {
+			req.Header[k] = v
+		}
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		return rec
+	}
+
+	t.Run("多级路径", func(t *testing.T) {
+		rec := do(http.MethodGet, "/static/css/app.css", nil)
+		if rec.Code != http.StatusOK || rec.Body.String() != "body{color:red}" {
+			t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("零段回退index", func(t *testing.T) {
+		rec := do(http.MethodGet, "/static", nil)
+		if rec.Code != http.StatusOK || rec.Body.String() != "<h1>home</h1>" {
+			t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("Range", func(t *testing.T) {
+		rec := do(http.MethodGet, "/static/css/app.css", http.Header{"Range": {"bytes=0-3"}})
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "body" {
+			t.Fatalf("got %d %q, want 206 %q", rec.Code, rec.Body.String(), "body")
+		}
+	})
+	t.Run("HEAD", func(t *testing.T) {
+		rec := do(http.MethodHead, "/static/css/app.css", nil)
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Fatalf("got %d with %d body bytes, want 200 and empty body", rec.Code, rec.Body.Len())
+		}
+		if got := rec.Header().Get("Content-Length"); got != "15" {
+			t.Fatalf("Content-Length = %q, want 15", got)
+		}
+	})
+	t.Run("不存在", func(t *testing.T) {
+		if rec := do(http.MethodGet, "/static/missing.txt", nil); rec.Code != http.StatusNotFound {
+			t.Fatalf("got %d, want 404", rec.Code)
+		}
+	})
+	t.Run("穿越被拒", func(t *testing.T) {
+		rec := do(http.MethodGet, "/static/%2e%2e/secret.txt", nil)
+		if rec.Code == http.StatusOK {
+			t.Fatalf("traversal request must not succeed, got 200: %q", rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), secret) {
+			t.Fatalf("traversal leaked content outside root: %q", rec.Body.String())
+		}
+	})
 }

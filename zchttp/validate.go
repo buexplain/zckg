@@ -196,9 +196,9 @@ func validateNonzeroWalk(v reflect.Value, meta structMeta, visited map[visitKey]
 			}
 		}
 
-		// 若为非零值的嵌套结构体/指针字段，递归进入子字段校验
-		// （nonzero 字段已校验通过；非 nonzero 字段只要非零值就递归）
-		if fv.IsZero() {
+		// 数组始终拥有固定数量的元素，即使整体为零值也必须递归校验元素；
+		// 其他可选嵌套字段为零值时仍跳过。
+		if fv.IsZero() && fv.Kind() != reflect.Array {
 			continue
 		}
 		subV := fv

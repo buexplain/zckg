@@ -69,20 +69,21 @@ Middleware A ── 前置逻辑
 func gzipMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     gz := gzip.NewWriter(w)
     wrapped := &gzipResponseWriter{Writer: gz, ResponseWriter: w}
-    err := next(wrapped, r)   // 下游拿到的是 wrapped
+    err := next(wrapped, r)   // 下游及 Context 访问器观察到 wrapped
     gz.Close()
     return err
 }
 ```
 
-多层中间件可各自替换，每层收到的是上一层传入的版本：
+每次成功调用 `next(w, r)` 时，引擎都会先把这组对象记录为当前请求状态，再进入下一层。因此以下位置观察到的是同一组、最近一次传给 `next` 的对象：
 
-```go
-// 外层替换 w 为 w2，内层收到 w2 并进一步替换为 w3
-// handler 和 finalHandler 最终收到 w3
-```
+- 下游中间件与最内层 core；
+- 业务 handler 通过 `ResponseWriterFromContext(ctx)`、`RequestFromContext(ctx)` 取得的对象；
+- `OnResponse`、`OnError`、`OnValidationError` 与 `OnPanic` 回调收到的对象。
 
-若无需替换，原样透传即可：
+多层中间件可逐层替换。外层把 `w2/r2` 传给 `next`、内层再把 `w3/r3` 传给 `next` 时，core、Context 访问器和链后回调最终都使用 `w3/r3`。该状态在调用返回时不会回退为外层对象。
+
+替换 `*http.Request` 不会重新执行参数绑定：`BoundReqFromContext` 仍返回进入中间件链之前已经绑定的 Req。若无需替换 w/r，原样透传即可：
 
 ```go
 func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
@@ -92,6 +93,8 @@ func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next Ne
     return err
 }
 ```
+
+> 自定义 ResponseWriter 若要让默认回调正确判断是否已经写响应，应保留底层写入能力并正确转发所需接口；引擎自身的响应包装器会跟踪写操作。详细规则见 `http-engine-callback.md`。
 
 ## 四、短路控制
 
@@ -163,7 +166,7 @@ func recoverError(ctx context.Context, w http.ResponseWriter, r *http.Request, n
 
 ## 六、panic 恢复
 
-`HttpEngine.ServeHTTP` 内置 `defer recover`，捕获 handler 或中间件中的 panic，交由 `OnPanic` 回调处理（默认 `DefaultPanicHandler`）。中间件无需自行处理 panic，引擎层已覆盖：
+`HttpEngine.ServeHTTP` 内置 `defer recover`，捕获 handler 或中间件中的 panic，交由 `OnPanic` 回调处理（默认 `DefaultPanicHandler`）。中间件无需自行处理 panic，引擎层已覆盖；回调收到最近一次成功传给 `next` 的 w/r：
 
 ```go
 // 默认 panic 处理：输出 slog.Error + 堆栈，返回 500 错误；
@@ -180,6 +183,8 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 }
 ```
 
+`OnPanic` 自身若再次 panic，引擎会进行第二层 recover、记录错误，并在响应尚未写入时兜底写入 HTTP 500；该二次 panic 不会继续传播到 `net/http`。
+
 ## 七、注册方式
 
 中间件通过 `Use(...)` 注册，分为全局与分组两级：
@@ -194,9 +199,9 @@ api.GET("/users", listUsers)
 
 关键规则：
 
-- **只对此后注册的路由生效**：注册路由时会将当前中间件链快照存入路由条目。
-- 最终链顺序为 `[全局中间件..., 分组中间件...]`。
-- 嵌套分组中，父分组中间件位于子分组中间件之前。
+- **只对此后注册的路由生效**：注册路由时会将全局中间件与当前分组祖先链的当前状态快照到路由条目；已注册路由不受后续 `Use(...)` 影响。
+- 子分组保留父分组引用。先创建子分组、后向父分组追加中间件时，之后注册的子路由仍会继承新增中间件。
+- 最终链顺序为 `[全局中间件..., 最外层分组中间件..., 当前分组中间件...]`。
 
 > 注册与快照的细节详见 `routing.md`。
 

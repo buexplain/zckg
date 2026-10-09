@@ -134,6 +134,27 @@ func TestBuildStructMeta_SkipOpenAPIMeta(t *testing.T) {
 	}
 }
 
+// TestBuildStructMeta_SkipKeepRawBody 验证嵌入的 KeepRawBody 空结构体不产生任何字段元数据，
+// 且不影响兄弟字段的名称与反射索引（Name 位于结构体第 2 个字段，索引应为 [1]）。
+func TestBuildStructMeta_SkipKeepRawBody(t *testing.T) {
+	type reqRaw struct {
+		KeepRawBody
+		Name string `json:"name"`
+	}
+
+	meta := buildStructMeta(reflect.TypeOf(reqRaw{}))
+
+	if len(meta.fields) != 1 {
+		t.Fatalf("expected 1 field (KeepRawBody expands to nothing), got %d", len(meta.fields))
+	}
+	if meta.fields[0].name != "name" {
+		t.Fatalf("expected field 'name', got %q", meta.fields[0].name)
+	}
+	if !reflect.DeepEqual(meta.fields[0].indices, []int{1}) {
+		t.Fatalf("expected index [1], got %v", meta.fields[0].indices)
+	}
+}
+
 func TestBuildStructMeta_JsonDash(t *testing.T) {
 	type reqDash struct {
 		Name   string `json:"name"`

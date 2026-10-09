@@ -2,6 +2,7 @@ package zchttp
 
 import (
 	"context"
+	"mime/multipart"
 	"net/http"
 	"reflect"
 	"strings"
@@ -475,6 +476,93 @@ func TestBuildEntry_EmbeddedStructReq(t *testing.T) {
 
 	if entry.reqType != reflect.TypeOf(createReq{}) {
 		t.Fatalf("reqType mismatch")
+	}
+}
+
+// rawDeepBase 自身嵌入 KeepRawBody，用于验证深层嵌入不被识别
+type rawDeepBase struct {
+	KeepRawBody
+	ID int `json:"id"`
+}
+
+// rawFileBase 携带上传文件字段，用于验证经嵌入展开的文件字段同样与 KeepRawBody 冲突
+type rawFileBase struct {
+	Avatar *multipart.FileHeader `json:"avatar"`
+}
+
+// TestBuildEntryKeepRawBody 验证 KeepRawBody 的识别范围与文件字段冲突检测：
+// 仅 Req 顶层值嵌入置 keepRawBody=true；指针嵌入、深层嵌入、具名字段均不识别；
+// 与 *multipart.FileHeader / []*multipart.FileHeader（含经嵌入展开的）共存时 buildEntry 返回错误，
+// 错误消息包含 KeepRawBody、Req 类型名与冲突字段名。
+func TestBuildEntryKeepRawBody(t *testing.T) {
+	type rawTopReq struct {
+		KeepRawBody
+		Name string `json:"name"`
+	}
+	type rawPtrReq struct {
+		*KeepRawBody
+		Name string `json:"name"`
+	}
+	type rawDeepReq struct {
+		rawDeepBase
+		Name string `json:"name"`
+	}
+	type rawNamedReq struct {
+		Raw  KeepRawBody `json:"raw"`
+		Name string      `json:"name"`
+	}
+	type rawFileReq struct {
+		KeepRawBody
+		File *multipart.FileHeader `json:"file"`
+	}
+	type rawFilesReq struct {
+		KeepRawBody
+		Files []*multipart.FileHeader `json:"files"`
+	}
+	type rawEmbedFileReq struct {
+		KeepRawBody
+		rawFileBase
+	}
+
+	cases := []struct {
+		name    string
+		handler any
+		want    bool
+		errPart []string
+	}{
+		{"顶层值嵌入", func(context.Context, rawTopReq) (testRes, error) { return testRes{}, nil }, true, nil},
+		{"未嵌入", func(context.Context, testReq) (testRes, error) { return testRes{}, nil }, false, nil},
+		{"指针嵌入不识别", func(context.Context, rawPtrReq) (testRes, error) { return testRes{}, nil }, false, nil},
+		{"深层嵌入不识别", func(context.Context, rawDeepReq) (testRes, error) { return testRes{}, nil }, false, nil},
+		{"具名字段不识别", func(context.Context, rawNamedReq) (testRes, error) { return testRes{}, nil }, false, nil},
+		{"单文件字段冲突", func(context.Context, rawFileReq) (testRes, error) { return testRes{}, nil }, false,
+			[]string{"KeepRawBody", "rawFileReq", `upload file field "File"`}},
+		{"多文件字段冲突", func(context.Context, rawFilesReq) (testRes, error) { return testRes{}, nil }, false,
+			[]string{"KeepRawBody", "rawFilesReq", `upload file field "Files"`}},
+		{"嵌入展开的文件字段冲突", func(context.Context, rawEmbedFileReq) (testRes, error) { return testRes{}, nil }, false,
+			[]string{"KeepRawBody", "rawEmbedFileReq", `upload file field "Avatar"`}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			entry, err := buildEntry(c.handler, nil, nil)
+			if c.errPart != nil {
+				if err == nil {
+					t.Fatalf("expected error containing %v, got nil", c.errPart)
+				}
+				for _, part := range c.errPart {
+					if !strings.Contains(err.Error(), part) {
+						t.Fatalf("error should contain %q, got: %v", part, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if entry.keepRawBody != c.want {
+				t.Fatalf("keepRawBody = %v, want %v", entry.keepRawBody, c.want)
+			}
+		})
 	}
 }
 

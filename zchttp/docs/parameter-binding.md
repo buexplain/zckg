@@ -3,7 +3,7 @@
 本框架会根据请求的方法（method）与内容类型（Content-Type），自动将请求参数绑定到 handler 的 `Req` 结构体。绑定相关实现位于 `binding.go`，校验相关实现位于 `validate.go`。
 
 绑定与校验分为两个独立函数：
-- `bindRequestData(r, reqPtr, meta, multipartMaxMemory)`：仅执行数据绑定（query/body），在路由命中后立即调用（`multipartMaxMemory` 为 multipart 解析的内存缓冲上限，取自引擎的 `MultipartFormMaxMemory`）。
+- `bindRequestData(r, reqPtr, meta, multipartMaxMemory, keepRawBody)`：仅执行数据绑定（query/body），在路由命中后立即调用（`multipartMaxMemory` 为 multipart 解析的内存缓冲上限，取自引擎的 `MultipartFormMaxMemory`；`keepRawBody` 为注册期预计算的 `KeepRawBody` 嵌入标记，为真时不读取请求体，见“2.2 保留原始请求体（KeepRawBody）”）。
 - `bindPathParams(reqPtr, params, values)`：仅执行路由路径参数绑定，在 `bindRequestData` 之后调用（仅参数路由触发，路径参数覆盖同名 query/body 值）。
 - `validateRequest(reqPtr, meta, needsNonzero)`：仅执行参数校验（nonzero + Validator），在洋葱模型 core 层调用；`needsNonzero` 为注册期预计算的传递性标记，全树无 nonzero 字段时跳过遍历（详见 `parameter-validate.md`）。
 
@@ -20,6 +20,8 @@ GET /search?keyword=go&page=3
 ```
 
 ### 2. POST / PUT / PATCH 等带请求体的方法
+
+> 例外：Req 嵌入 `zchttp.KeepRawBody` 时，无论 method 均按上一节 GET / DELETE / HEAD 规则只绑定 query，请求体原样保留，见“2.2 保留原始请求体（KeepRawBody）”。
 
 采用**合并绑定**：先绑定 URL query 参数，再按 `Content-Type` 绑定请求体，**body 中出现的字段覆盖 query 已绑定的同名字段**，body 中缺失的字段保留 query 绑定值（兼容 REST 常见的"query 放控制参数 + body 放资源数据"混合传参风格，如 `POST /orders/batch?dryRun=true` + JSON 资源体）。
 
@@ -45,7 +47,9 @@ GET /search?keyword=go&page=3
 
 表单（`x-www-form-urlencoded` / `multipart`）同理：body 中出现的字段覆盖同名 query 值，未出现则保留。
 
-> `Content-Type` 会先去除 `; charset=utf-8` 等参数部分，仅保留主类型再匹配。
+> `Content-Type` 通过 `mime.ParseMediaType` 解析：主类型按标准规则规范为小写后匹配，支持大小写变体、带引号参数和额外空白；语法非法时绑定失败并返回 400。
+>
+> JSON 请求体必须包含且仅包含一个完整 JSON 值；首个值后的空白合法，第二个 JSON 值或其他非空尾随内容会绑定失败并返回 400。空请求体保持现有 Req 模板值。
 >
 > `multipart/form-data` 的内存缓冲上限由引擎字段 `MultipartFormMaxMemory` 定义，`NewEngine` 默认 **32 MB**，超出部分由标准库写入临时文件；按需调整示例：`engine.MultipartFormMaxMemory = 64 << 20`。
 
@@ -67,15 +71,72 @@ engine.MaxBodyBytes = 64 << 20          // 请求体整体上限 64 MB
 engine.MultipartFormMaxMemory = 32 << 20 // multipart 内存缓冲上限，超出落盘
 ```
 
+### 2.2 保留原始请求体（KeepRawBody）
+
+反向代理、webhook 原始请求体验签、流式上传等场景需要 handler 拿到**未被读取的原始请求体**。只要 Req 有可绑定字段，引擎就会在中间件与 handler 之前按 Content-Type 读取请求体且不回填；在 Req 中嵌入 `zchttp.KeepRawBody` 即可声明“本 Req 不绑定请求体”：
+
+```go
+type WebhookReq struct {
+	// 声明：请求体原样保留，不解析
+	zchttp.KeepRawBody
+	// 仍从 query 绑定，nonzero 照常校验
+	Sig string `json:"sig" nonzero:"true"`
+}
+
+type WebhookRes struct {
+	OK bool `json:"ok"`
+}
+
+var webhookSecret = []byte("secret")
+
+func webhook(ctx context.Context, req WebhookReq) (WebhookRes, error) {
+	r, _ := zchttp.RequestFromContext(ctx)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		// 含超出 MaxBodyBytes 的 *http.MaxBytesError，包装为 BindingError 返回 400
+		return WebhookRes{}, zchttp.NewBindingError(err)
+	}
+	mac := hmac.New(sha256.New, webhookSecret)
+	mac.Write(body)
+	if !hmac.Equal([]byte(req.Sig), []byte(hex.EncodeToString(mac.Sum(nil)))) {
+		return WebhookRes{}, zchttp.NewBindingError(errors.New("invalid signature"))
+	}
+	return WebhookRes{OK: true}, nil
+}
+
+r.POST("/webhook", webhook)
+```
+
+**语义：嵌入 `KeepRawBody` 的 Req，无论 HTTP 方法，均按 GET / DELETE / HEAD 规则绑定**——只绑定 query 与路径参数，`r.Body` 不被读取，原样留给中间件与 handler（经 `RequestFromContext` 获取）。默认值、`nonzero` 校验、`Validator`、“路径参数 > query”覆盖顺序均不变。
+
+识别与校验规则：
+
+| 情形 | 行为 |
+| --- | --- |
+| Req **顶层值嵌入** `zchttp.KeepRawBody` | 生效（注册期预计算为 `routeEntry.keepRawBody`，请求期仅读 bool） |
+| `*KeepRawBody` 指针嵌入、嵌套在更深层结构体中、作为具名字段 | 不识别，按普通规则绑定 |
+| 嵌入在 GET / DELETE / HEAD 路由上 | 不报错，等价于无效果（代理通常将同一 handler 注册到全部方法） |
+| 同时含上传文件字段（`*multipart.FileHeader` 及其切片，含嵌入结构体中的） | 注册时 panic：文件只能来自 multipart 请求体，与声明自相矛盾 |
+| 含 map / 嵌套 struct 等仅能经 JSON 绑定的字段 | 不报错，静默不绑定（与 GET 路由上同类字段的行为一致） |
+
+`KeepRawBody` 为空结构体，嵌入后不产生任何绑定字段，不影响 `default` 填充、`nonzero` 校验与 OpenAPI schema（OpenAPI 输出规则见 `openapi.md`）。
+
+使用限制：
+
+- **`MaxBodyBytes` 仍生效**：请求体在路由匹配前即被 `http.MaxBytesReader` 包装，handler 读取超限时返回 `*http.MaxBytesError`；代理大文件需调大或设为 0。
+- **排空不受影响**：handler 返回后引擎限量排空剩余请求体以复用连接；handler 已读尽时为空操作。
+- **中间件读取请求体会使 handler 拿不到**：与普通 `http.Handler` 约定一致，由使用者负责。
+
 ### 3. 路由路径参数（所有 method）
 
-若路由注册时使用了 `{name}` / `{name?}` 路径参数（详见 `routing.md` 中“路由参数”章节），参数值在 query/body 绑定**之后**由 `bindPathParams` 写入 Req，规则如下：
+若路由注册时使用了 `{name}` / `{name?}` / `{name...}` 路径参数（详见 `routing.md` 中“路由参数”章节），参数值在 query/body 绑定**之后**由 `bindPathParams` 写入 Req，规则如下：
 
 - **参数名即字段绑定名**：按 form > json > 字段名优先级解析，注册阶段预计算绑定关系，参数名无对应字段时注册即 panic。
 - **覆盖语义**：三级覆盖链 **path > body > query**（路径参数是更精确的意图，优先级最高；带 body 方法内部为 body > query，见上节）。
 - **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（`time_format`/`time_location` 标签同样生效）。
 - **失败语义区别于尽力绑定**：单个参数转换失败立即返回错误（包装为 `BindingError` 返回 400），而非跳过。
 - **可选参数省略**：`{name?}` 未出现在请求路径中时不写入字段，保留模板 `default` 值或零值。
+- **通配尾段**：`{name...}` 捕获剩余全部路径（已百分号解码、可含 `/`、不做路径清理）；零段命中（如 `/dify/{rest...}` 收到 `/dify`）时同可选参数省略，不写入字段。
 
 ## 二、字段名解析规则
 
@@ -110,18 +171,18 @@ type Req struct {
 | `time.Time` | 见下文时间解析 |
 | `*multipart.FileHeader` | 单文件上传 |
 | `[]*multipart.FileHeader` | 多文件上传 |
-| 嵌套结构体 | 仅 JSON 路径支持（`json.Decoder` 递归反序列化），query/form 路径仅处理扁平字段 |
+| 嵌套结构体 | 仅 JSON 路径支持（`json.Decoder` 递归反序列化）；query/form 路径不递归具名嵌套结构体，但匿名嵌入展开后的字段视为扁平字段处理 |
 
-> **尽力绑定策略**：单个字段类型转换失败时会跳过该字段（保持零值），不会中断整个请求。
+> **尽力绑定策略**：query/form 单字段类型转换失败时跳过该字段且保持绑定前原值，不会中断整个请求。无默认值的 nil 指针仍为 nil，因此其 `nonzero:"true"` 校验会失败；已有默认值或已有指针值也不会被失败输入覆盖。路径参数转换失败不采用此策略，而是返回 400。
 
 ### map 类型绑定
 
 map 类型字段的绑定行为因来源而异：
 
-- **JSON 绑定**：`json.Decoder` 原生支持，可直接反序列化为 `map[string]any`、`map[string]string`、`map[string]int`、`map[string]*Struct` 等任意 key/value 组合。
-- **query / form 绑定**：`bindValues` 遍历 `structMeta.fields` 调用 `setFieldValue` → `setScalar`，map 类型不在 switch case 中，被静默跳过，保持默认值（nil）。
+- **JSON 绑定**：支持 `encoding/json` 能解码的 map 类型，例如 `map[string]any`、`map[string]string`、`map[string]int`、`map[string]*Struct`。JSON 对象键通常需为 string、整数类型或实现标准库支持的文本解码接口；不支持的键值类型会绑定失败并返回 400。
+- **query / form 绑定**：`bindValues` 遍历 `structMeta.fields` 调用 `setFieldValue` → `setScalar`，map 类型不在 switch case 中，被跳过并保持绑定前原值。
 
-因此，若 handler 的 Req 包含 map 字段，应确保使用 JSON 请求体（`Content-Type: application/json`）。
+因此，若 handler 的 Req 包含 map 字段，应使用 JSON 请求体，并遵守 `encoding/json` 的可解码类型约束。
 
 ### 切片绑定
 
@@ -148,7 +209,7 @@ GET /search?tags=a&tags=b&tags=c   →   Tags []string{"a","b","c"}
 
 ### 自动探测（未设置 time_format）
 
-- **纯数字**：视为时间戳，按位数推断精度——`10` 位=秒、`13`=毫秒、`16`=微秒、`19`=纳秒，其余按秒。
+- **带可选负号的十进制整数**：视为时间戳，负号不计入位数；按数字位数推断精度——`10` 位=秒、`13`=毫秒、`16`=微秒、`19`=纳秒，其余按秒。四种精度分别使用 `time.Unix`、`time.UnixMilli`、`time.UnixMicro` 和纳秒构造，避免统一乘纳秒造成溢出。
 - **非数字**：依次尝试常见布局 `defaultTimeLayouts`：
     - `RFC3339Nano`、`RFC3339`
     - `2006-01-02 15:04:05`、`2006-01-02T15:04:05`
@@ -291,7 +352,7 @@ type OrderReq struct {
 2. **`hasDefault=false` 的容器字段**（struct/map/切片）自身不支持 `default` 标签，但注册阶段会穷尽其内部所有零值字段；请求阶段在绑定创建子元素后，再对 nil 指针子字段补填。
 3. **值 struct 与指针 struct 的关键差异**：`Addr Address` 模板为零值 struct → 注册阶段递归预填子字段；`BillAddr *Address` 模板为 nil → 注册阶段跳过，其子字段默认值仅在请求阶段（JSON 传入后）生效。
 4. **OpenAPI 文档**展示 `default` 的规则与填充保证一致：**指针类型**字段在其所属 struct 可被 `applyDefaults` 到达时展示（`reachedByDefaults` 追踪）；**值类型**字段仅在其所在 struct 被值嵌套可达（顶层或值类型 struct 字段链）时展示（`reachedViaValue` 追踪）。多层容器（如 `map[K][]Struct`）中的 struct 不可达，其指针和值字段的 `default` 均不展示。详见 `openapi.md` 中 decorate 决策矩阵。
-5. **不支持 default 的类型**（`map`、`any`、`*struct`、`[]struct`、`time.Time` 等）设置 `default` 标签无效，`isDefaultSupported` 返回 false，`hasDefault` 恒为 false，标签值被静默忽略。
+5. **不支持 default 的类型**（`map`、`any`、`*struct`、`[]struct`、`time.Time` 等）设置 `default` 标签无效，`isDefaultSupported` 返回 false，`hasDefault` 恒为 false；字段不会被填充，注册期会输出 `slog.Warn`（Warn 被日志级别过滤时可能不可见）。
 
 ### 注册阶段：模板预填
 
@@ -305,7 +366,7 @@ JSON 绑定会**动态创建** slice/数组元素、map value、指针嵌套结�
 
 **关键约束**：请求阶段仅对 **nil 指针字段** 填充默认值，值类型（`int`/`string`/`bool` 等）一律跳过。原因是值类型的零值（`0`、`""`、`false`）无法区分"用户未传"与"用户显式传了零值"——直接填充会覆盖用户的合法零值输入。
 
-**容器嵌套深度限制**：`applyDefaults` 仅支持单层容器（`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`，固定长度数组与切片行为一致）及其指针包裹形式（`*[]Struct`、`*[]*Struct`、`*[N]Struct`、`*map[K]Struct`、`*map[K]*Struct`，指针解引用后穿透进入元素）。多层容器（如 `map[K][]Struct`、`map[K][N]Struct`、`[][]Struct`）的内部元素无法被穿透，其默认值填充、nonzero 校验均不生效。详见 `request.md` 中"容器嵌套深度限制"章节。
+**容器嵌套深度限制**：`applyDefaults` 可递归单层容器（`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`）及其非 nil 指针包裹。固定数组与切片并不完全相同：`[N]Struct` 的 N 个值元素在注册模板中始终存在，元素内值字段和指针字段的 default 均可注册期预填；nil 切片/map 以及 nil 的容器指针没有元素可预填，绑定动态创建元素后仅补填 nil 指针子字段。多层容器（如 `map[K][]Struct`、`map[K][N]Struct`、`[][]Struct`）的内部元素无法被穿透。详见 `request.md` 中“容器嵌套深度限制”章节。
 
 ```go
 // ✅ 嵌套容器中的默认值字段推荐使用指针类型
@@ -328,7 +389,7 @@ type Req struct {
 | 场景 | 结果 |
 | --- | --- |
 | 请求**未传递**该字段 | 保留默认值（注册阶段模板预填） |
-| 请求**传递了但解析失败**（如 `page=abc`） | 保留默认值 |
+| query/form 请求**传递了但解析失败**（如 `page=abc`） | 保持绑定前原值：有 default 时保留默认值，无 default 的 nil 指针仍为 nil |
 | 请求**传递且解析成功** | 使用请求值（覆盖默认值） |
 
 规则要点：

@@ -16,11 +16,23 @@ type Router struct {
 }
 
 // routeRecord 保存一条路由的 method/path 模板与 entry，供 GenerateOpenAPI 还原路径模板
-// （path 为归一化后的模板，参数路由含 {name}/{name?} 段）。
+// （path 为归一化后的模板，参数路由含 {name}/{name?}/{name...} 段）。
 type routeRecord struct {
 	method string
 	path   string
 	entry  *routeEntry
+}
+
+type routeRegistration struct {
+	method   string
+	path     string
+	segments []routeSegment
+	entry    *routeEntry
+}
+
+var allHTTPMethods = [...]string{
+	http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete,
+	http.MethodPatch, http.MethodHead, http.MethodOptions, http.MethodConnect, http.MethodTrace,
 }
 
 // NewRouter 创建空路由表，并预初始化 9 个标准 HTTP 方法的基数树根节点。
@@ -28,10 +40,7 @@ func NewRouter() *Router {
 	r := &Router{
 		trees: make(map[string]*routeNode),
 	}
-	for _, method := range []string{
-		http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete,
-		http.MethodPatch, http.MethodHead, http.MethodOptions, http.MethodConnect, http.MethodTrace,
-	} {
+	for _, method := range allHTTPMethods {
 		r.trees[method] = &routeNode{static: make(map[string]*routeNode)}
 	}
 	return r
@@ -52,32 +61,49 @@ func (r *Router) Group(prefix string, middlewares ...MiddlewareHandler) *RouterG
 	}
 }
 
-// register 是所有 HTTP 方法共用的注册逻辑：先构建 entry（含签名校验与反射预计算），
-// 再解析路径段、预计算 Req 字段绑定，最后插入基数树（静态段与参数段同树，冲突在树内检测）。
-// groupMiddlewares 为分组的中间件；最终中间件链顺序为 [全局 ... , 分组 ...]
+// register 是所有 HTTP 方法共用的注册逻辑：先完整准备，再写入路由树与顺序索引。
 func (r *Router) register(method, path string, handler any, groupMiddlewares []MiddlewareHandler) {
-	path = normalizePath(path)
+	registration := r.prepareRegistration(method, path, handler, groupMiddlewares)
+	r.commitRegistration(registration)
+}
 
+func (r *Router) prepareRegistration(method, path string, handler any, groupMiddlewares []MiddlewareHandler) routeRegistration {
+	path = normalizePath(path)
 	entry, err := buildEntry(handler, r.middlewares, groupMiddlewares)
 	if err != nil {
 		panic(err.Error())
 	}
-
-	// 注册阶段扫描 Req 类型树，检测 default 标签误用（包含路由信息以便定位）
 	checkUnsupportedDefaults(entry.reqElemType, true, true, method, path, entry.handlerName, entry.handlerFile, entry.handlerLine, map[reflect.Type]bool{})
-
-	segments, perr := parseRoutePath(path)
-	if perr != nil {
-		panic(fmt.Sprintf("invalid route path: %s", perr))
+	segments, err := parseRoutePath(path)
+	if err != nil {
+		panic(fmt.Sprintf("invalid route path: %s", err))
 	}
 	attachPathParamBindings(entry, segments, method, path)
-	insertRoute(r.trees[method], segments, entry, method, path)
-	r.routes = append(r.routes, routeRecord{method: method, path: path, entry: entry})
+	return routeRegistration{method: method, path: path, segments: segments, entry: entry}
+}
+
+func (r *Router) commitRegistration(registration routeRegistration) {
+	insertRoute(r.trees[registration.method], registration.segments, registration.entry, registration.method, registration.path)
+	r.routes = append(r.routes, routeRecord{method: registration.method, path: registration.path, entry: registration.entry})
+}
+
+func (r *Router) registerAny(path string, handler any, groupMiddlewares []MiddlewareHandler) {
+	registrations := make([]routeRegistration, 0, len(allHTTPMethods))
+	for _, method := range allHTTPMethods {
+		registrations = append(registrations, r.prepareRegistration(method, path, handler, groupMiddlewares))
+	}
+	for _, registration := range registrations {
+		rootCopy := cloneRouteNode(r.trees[registration.method])
+		insertRoute(rootCopy, registration.segments, registration.entry, registration.method, registration.path)
+	}
+	for _, registration := range registrations {
+		r.commitRegistration(registration)
+	}
 }
 
 // match 在指定 method 的基数树上匹配请求路径，
-// 命中时返回 entry 与按注册顺序捕获的参数值（被省略的尾部可选参数不在切片中）；未命中返回 nil。
-// 静态段优先于参数段，静态分支失败时回溯尝试参数分支；
+// 命中时返回 entry 与按注册顺序捕获的参数值（被省略的尾部可选参数、零段命中的通配尾段不在切片中）；
+// 未命中返回 nil。同节点优先级为静态段 > 参数段 > 通配尾段，前者分支失败时依次回溯；
 // 匹配采用逐段子串扫描，不预切分整个路径，捕获切片延迟到真正捕获参数时才分配
 func (r *Router) match(method, path string) (*routeEntry, []string) {
 	root := r.trees[method]
@@ -90,12 +116,13 @@ func (r *Router) match(method, path string) (*routeEntry, []string) {
 	return root.matchPath(path, nil)
 }
 
-// routeSegment 表示参数路由路径中的一段：静态字面量或 {name}/{name?} 参数
+// routeSegment 表示参数路由路径中的一段：静态字面量或 {name}/{name?}/{name...} 参数
 type routeSegment struct {
 	literal  string // 静态段内容（isParam=false 时有效）
 	name     string // 参数名（isParam=true 时有效）
-	isParam  bool   // 是否为参数段
+	isParam  bool   // 是否为参数段（含 {name...} 通配尾段）
 	optional bool   // 是否为可选参数 {name?}
+	catchAll bool   // 是否为通配尾段 {name...}
 }
 
 // paramNamePattern 限定参数名格式：字母/下划线开头，仅含字母、数字、下划线
@@ -112,14 +139,17 @@ func splitPathSegments(path string) []string {
 }
 
 // parseRoutePath 解析参数路由路径为段列表，并执行语法校验：
-//   - 参数必须独占整个段，形如 {name} 或 {name?}
+//   - 参数必须独占整个段，形如 {name}、{name?} 或 {name...}
 //   - 参数名仅允许 [A-Za-z_][A-Za-z0-9_]*，同一路径内不允许重复
 //   - 可选参数之后不允许再出现任何段（省略匹配会产生歧义，可选参数必须位于路径末尾）
+//   - 通配尾段 {name...} 捕获剩余全部路径，其后同样不允许再出现任何段
+//   - 后缀先判 "..." 再判 "?"：{a?...}、{a...?} 剥离后缀后的残余名不合法，由参数名校验拒绝
 func parseRoutePath(path string) ([]routeSegment, error) {
 	parts := splitPathSegments(path)
 	segments := make([]routeSegment, 0, len(parts))
 	names := make(map[string]bool, len(parts))
 	seenOptional := false
+	seenCatchAll := false
 	for _, part := range parts {
 		if part == "" {
 			return nil, fmt.Errorf("empty path segment in %q", path)
@@ -127,16 +157,23 @@ func parseRoutePath(path string) ([]routeSegment, error) {
 		if seenOptional {
 			return nil, fmt.Errorf("segment %q is not allowed after optional parameter in %q", part, path)
 		}
+		if seenCatchAll {
+			return nil, fmt.Errorf("segment %q is not allowed after catch-all parameter in %q", part, path)
+		}
 		if !strings.ContainsAny(part, "{}") {
 			segments = append(segments, routeSegment{literal: part})
 			continue
 		}
 		if len(part) < 2 || part[0] != '{' || part[len(part)-1] != '}' {
-			return nil, fmt.Errorf("invalid parameter segment %q in %q: parameter must occupy a whole segment as {name} or {name?}", part, path)
+			return nil, fmt.Errorf("invalid parameter segment %q in %q: parameter must occupy a whole segment as {name}, {name?} or {name...}", part, path)
 		}
 		inner := part[1 : len(part)-1]
-		optional := strings.HasSuffix(inner, "?")
-		if optional {
+		optional, catchAll := false, false
+		if strings.HasSuffix(inner, "...") {
+			catchAll = true
+			inner = inner[:len(inner)-3]
+		} else if strings.HasSuffix(inner, "?") {
+			optional = true
 			inner = inner[:len(inner)-1]
 		}
 		if !paramNamePattern.MatchString(inner) {
@@ -146,10 +183,9 @@ func parseRoutePath(path string) ([]routeSegment, error) {
 			return nil, fmt.Errorf("duplicate parameter name %q in %q", inner, path)
 		}
 		names[inner] = true
-		if optional {
-			seenOptional = true
-		}
-		segments = append(segments, routeSegment{name: inner, isParam: true, optional: optional})
+		seenOptional = optional
+		seenCatchAll = catchAll
+		segments = append(segments, routeSegment{name: inner, isParam: true, optional: optional, catchAll: catchAll})
 	}
 	return segments, nil
 }
@@ -199,11 +235,17 @@ func (r *Router) TRACE(path string, handler any) {
 	r.register(http.MethodTrace, path, handler, nil)
 }
 
+// Any 为全部 9 个受支持的 HTTP 方法原子注册同一路由；预检全部通过后才统一提交。
+func (r *Router) Any(path string, handler any) {
+	r.registerAny(path, handler, nil)
+}
+
 // =============== RouterGroup ===============
 
-// RouterGroup 路由分组：携带 path 前缀与一组中间件，可嵌套生成子分组
+// RouterGroup 路由分组：保存父组引用与当前组自己的中间件，注册路由时再展开完整祖先链。
 type RouterGroup struct {
 	router      *Router
+	parent      *RouterGroup
 	prefix      string
 	middlewares []MiddlewareHandler
 }
@@ -214,70 +256,97 @@ func (g *RouterGroup) Use(middlewares ...MiddlewareHandler) *RouterGroup {
 	return g
 }
 
-// Group 创建嵌套子分组：前缀拼接，父分组的中间件被继承且位于子分组中间件之前
+// Group 创建嵌套子分组：安全拼接前缀，并保留父组引用以在注册时展开完整中间件链。
 func (g *RouterGroup) Group(prefix string, middlewares ...MiddlewareHandler) *RouterGroup {
-	sub := &RouterGroup{
-		router: g.router,
-		prefix: g.prefix + normalizePrefix(prefix),
+	return &RouterGroup{
+		router:      g.router,
+		parent:      g,
+		prefix:      normalizePrefix(joinGroupPath(g.prefix, prefix)),
+		middlewares: append([]MiddlewareHandler{}, middlewares...),
 	}
-	sub.middlewares = make([]MiddlewareHandler, 0, len(g.middlewares)+len(middlewares))
-	sub.middlewares = append(sub.middlewares, g.middlewares...)
-	sub.middlewares = append(sub.middlewares, middlewares...)
-	return sub
 }
 
-// GET 在分组内注册 GET 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+func (g *RouterGroup) middlewareChain() []MiddlewareHandler {
+	groups := make([]*RouterGroup, 0, 4)
+	total := 0
+	for current := g; current != nil; current = current.parent {
+		groups = append(groups, current)
+		total += len(current.middlewares)
+	}
+	middlewares := make([]MiddlewareHandler, 0, total)
+	for i := len(groups) - 1; i >= 0; i-- {
+		middlewares = append(middlewares, groups[i].middlewares...)
+	}
+	return middlewares
+}
+
+func (g *RouterGroup) fullPath(path string) string {
+	return joinGroupPath(g.prefix, path)
+}
+
+// GET 在分组内注册 GET 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) GET(path string, handler any) {
-	g.router.register(http.MethodGet, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodGet, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// POST 在分组内注册 POST 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// POST 在分组内注册 POST 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) POST(path string, handler any) {
-	g.router.register(http.MethodPost, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodPost, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// PUT 在分组内注册 PUT 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// PUT 在分组内注册 PUT 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) PUT(path string, handler any) {
-	g.router.register(http.MethodPut, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodPut, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// DELETE 在分组内注册 DELETE 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// DELETE 在分组内注册 DELETE 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) DELETE(path string, handler any) {
-	g.router.register(http.MethodDelete, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodDelete, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// PATCH 在分组内注册 PATCH 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// PATCH 在分组内注册 PATCH 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) PATCH(path string, handler any) {
-	g.router.register(http.MethodPatch, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodPatch, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// HEAD 在分组内注册 HEAD 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// HEAD 在分组内注册 HEAD 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) HEAD(path string, handler any) {
-	g.router.register(http.MethodHead, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodHead, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// OPTIONS 在分组内注册 OPTIONS 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// OPTIONS 在分组内注册 OPTIONS 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) OPTIONS(path string, handler any) {
-	g.router.register(http.MethodOptions, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodOptions, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// CONNECT 在分组内注册 CONNECT 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// CONNECT 在分组内注册 CONNECT 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) CONNECT(path string, handler any) {
-	g.router.register(http.MethodConnect, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodConnect, g.fullPath(path), handler, g.middlewareChain())
 }
 
-// TRACE 在分组内注册 TRACE 方法路由：完整路径为分组前缀 + path，中间件链为
-// [全局..., 分组...] 快照；handler 签名非法或路由冲突时 panic。
+// TRACE 在分组内注册 TRACE 方法路由；注册时快照全局及祖先分组的当前中间件链。
 func (g *RouterGroup) TRACE(path string, handler any) {
-	g.router.register(http.MethodTrace, g.prefix+path, handler, g.middlewares)
+	g.router.register(http.MethodTrace, g.fullPath(path), handler, g.middlewareChain())
+}
+
+// Any 在分组内为全部 9 个受支持的方法原子注册同一路由。
+func (g *RouterGroup) Any(path string, handler any) {
+	g.router.registerAny(g.fullPath(path), handler, g.middlewareChain())
+}
+
+func joinGroupPath(prefix, path string) string {
+	prefix = normalizePrefix(prefix)
+	path = normalizePath(path)
+	if path == "/" {
+		if prefix == "" {
+			return "/"
+		}
+		return prefix
+	}
+	if prefix == "" {
+		return path
+	}
+	return prefix + path
 }
 
 // normalizePrefix 规范化分组前缀：保证以 "/" 开头、去除末尾 "/"，空串与 "/" 返回 ""

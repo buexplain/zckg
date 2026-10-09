@@ -1448,6 +1448,55 @@ func TestValidateNonzeroNonStruct(t *testing.T) {
 	}
 }
 
+// TestValidateNonzero_KeepRawBodyEmbedded 验证首字段嵌入 KeepRawBody（零大小、与父结构体同址）
+// 自身不产生校验错误，且不干扰兄弟字段与嵌套结构体内 nonzero 字段的校验：
+// 全部填写时通过；顶层 name 缺失报 "name"；profile 非零但 city 缺失报 "profile.city"。
+func TestValidateNonzero_KeepRawBodyEmbedded(t *testing.T) {
+	type rawProfile struct {
+		City string `json:"city" nonzero:"true"`
+		Zip  string `json:"zip"`
+	}
+	type rawNonzeroReq struct {
+		KeepRawBody
+		Name    string     `json:"name" nonzero:"true"`
+		Profile rawProfile `json:"profile"`
+	}
+	typ := reflect.TypeOf(rawNonzeroReq{})
+	if !hasNonzeroInTree(typ, nil) {
+		t.Fatal("hasNonzeroInTree should be true for sibling nonzero fields")
+	}
+	meta := buildStructMeta(typ)
+
+	cases := []struct {
+		name      string
+		req       rawNonzeroReq
+		wantField string
+	}{
+		{"全部填写", rawNonzeroReq{Name: "a", Profile: rawProfile{City: "b"}}, ""},
+		{"顶层缺失", rawNonzeroReq{Profile: rawProfile{City: "b"}}, "name"},
+		{"嵌套缺失", rawNonzeroReq{Name: "a", Profile: rawProfile{Zip: "z"}}, "profile.city"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := c.req
+			err := validateNonzero(reflect.ValueOf(&req), meta)
+			if c.wantField == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *ValidationError, got %v", err)
+			}
+			if ve.Field != c.wantField {
+				t.Fatalf("error field = %q, want %q", ve.Field, c.wantField)
+			}
+		})
+	}
+}
+
 // TestReleaseVisitMap_Oversized 覆盖超出池大小上限的 visited map 不归还池的分支，
 // 且归还大 map 后池仍能正常提供空 map
 func TestReleaseVisitMap_Oversized(t *testing.T) {
@@ -1493,5 +1542,41 @@ func TestValidateNonzeroWalk_NonStructAndNilVisited(t *testing.T) {
 	x := noNonzero{}
 	if err := validateNonzeroWalk(reflect.ValueOf(&x).Elem(), cachedStructMeta(reflect.TypeOf(x)), nil, "", false); err != nil {
 		t.Fatalf("无 nonzero 字段应返回 nil: %v", err)
+	}
+}
+
+// TestValidateNonzero_ZeroArrayStillValidatesElements 验证可选固定数组即使整体为零值，
+// 也会校验其始终存在的元素；错误路径维持不带数组索引的既有格式。
+func TestValidateNonzero_ZeroArrayStillValidatesElements(t *testing.T) {
+	type item struct {
+		Name string `json:"name" nonzero:"true"`
+	}
+	type req struct {
+		Items [1]item `json:"items"`
+	}
+	value := req{}
+	err := validateNonzero(reflect.ValueOf(&value), buildStructMeta(reflect.TypeOf(value)))
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("expected *ValidationError, got %v", err)
+	}
+	if validationErr.Field != "items.name" {
+		t.Fatalf("Field = %q, want items.name", validationErr.Field)
+	}
+}
+
+// TestInvalidPointerBindingDoesNotBypassNonzero 验证非法 query 值不会分配零值指针绕过必填校验。
+func TestInvalidPointerBindingDoesNotBypassNonzero(t *testing.T) {
+	type req struct {
+		Page *int `json:"page" nonzero:"true"`
+	}
+	type res struct {
+		OK bool `json:"ok"`
+	}
+	router := NewRouter()
+	router.GET("/", func(_ context.Context, _ req) (res, error) { return res{OK: true}, nil })
+	recorder := serveRequest(t, router, http.MethodGet, "/?page=bad", "")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid required pointer should return 400, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }

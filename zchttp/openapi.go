@@ -1,6 +1,7 @@
 package zchttp
 
 import (
+	"fmt"
 	"net/http"
 	"reflect"
 	"sort"
@@ -23,7 +24,7 @@ type OpenAPIInfo struct {
 	Description     string
 	Version         string
 	Servers         []OpenAPIServer
-	ResponseWrapper any // 自定义响应包装结构体样例（如 MyResponse{}），为 nil 时使用默认 Response{data,code,message}
+	ResponseWrapper any // 自定义响应包装结构体样例；必须恰有一个带 json 名的 interface data 占位字段，非法配置 panic
 }
 
 // openAPIGenerator 承载一次生成过程中的可复用状态
@@ -37,8 +38,11 @@ type openAPIGenerator struct {
 	responseWrapper   any                     // 自定义响应包装结构体样例
 }
 
-// GenerateOpenAPI 遍历路由表，通过反射生成 OpenAPI 3.0 文档（map 形式，可序列化为 JSON）
+// GenerateOpenAPI 遍历路由表，通过反射生成 OpenAPI 3.0 文档（map 形式，可序列化为 JSON）。
+// ResponseWrapper 非 nil 时必须是结构体或结构体指针，所有参与输出的导出字段必须有显式 json 名，
+// 且必须恰有一个 interface 字段作为业务响应 data 占位符；配置非法时 panic。
 func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
+	validateResponseWrapper(info.ResponseWrapper)
 	g := &openAPIGenerator{
 		schemas:           map[string]any{},
 		typeNames:         map[reflect.Type]string{},
@@ -69,9 +73,10 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 		return sortedRoutes[i].path < sortedRoutes[j].path
 	})
 	for _, rec := range sortedRoutes {
-		// 参数路由的 {name}/{name?} 段声明为 path 参数并从 query 排除；
+		// 参数路由的 {name}/{name?}/{name...} 段声明为 path 参数并从 query 排除；
 		// 静态路由无参数段，paramNames/optionalParams 为空集。
-		// OpenAPI 无 {name?} 语法，可选参数转换为 {name} 形式并以 required:false 声明
+		// OpenAPI 无 {name?}/{name...} 语法，二者转换为 {name} 形式并以 required:false 声明
+		// （通配尾段可零段命中，与可选参数同属"可省略"）
 		segments, perr := parseRoutePath(rec.path)
 		if perr != nil {
 			continue // 注册阶段已校验，防御性跳过
@@ -81,7 +86,7 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 		for _, seg := range segments {
 			if seg.isParam {
 				paramNames[seg.name] = true
-				if seg.optional {
+				if seg.optional || seg.catchAll {
 					optionalParams[seg.name] = true
 				}
 			}
@@ -90,8 +95,9 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 		if op == nil {
 			continue
 		}
-		// 路径模板转换为 OpenAPI 规范形式：{name?} → {name}
+		// 路径模板转换为 OpenAPI 规范形式：{name?} → {name}、{name...} → {name}（参数名不含 "."，替换无误伤）
 		openapiPath := strings.ReplaceAll(rec.path, "?}", "}")
+		openapiPath = strings.ReplaceAll(openapiPath, "...}", "}")
 		item, ok := paths[openapiPath].(map[string]any)
 		if !ok {
 			item = map[string]any{}
@@ -297,9 +303,11 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 }
 
 // buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary/deprecated）。
-// paramNames 为路径模板中的 {name}/{name?} 参数名集合（无参数段的路由为空集）：所有方法均声明
+// paramNames 为路径模板中的 {name}/{name?}/{name...} 参数名集合（无参数段的路由为空集）：所有方法均声明
 // path 参数（含被 ignore 的字段——path 声明受规范强制，见 buildPathParams），
-// GET/DELETE/HEAD 不再重复展示为 query；optionalParams 标记其中可选参数。
+// GET/DELETE/HEAD 不再重复展示为 query；optionalParams 标记其中可选参数与通配尾段。
+// Req 嵌入 KeepRawBody 时与 GET 同样只绑定 query：其余方法的非路径字段输出为 query 参数，
+// requestBody 输出通用声明 {"content": {"*/*": {"schema": {}}}}（接受任意请求体、原样处理，不从字段推导）。
 func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, paramNames, optionalParams map[string]bool) map[string]any {
 	// 使用注册阶段预计算的类型信息，避免重复反射
 	if entry.reqType == nil || entry.resType == nil {
@@ -338,7 +346,12 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, para
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
 		params = append(params, g.buildQueryParams(reqType, entry.reqMeta, paramNames)...)
 	default:
-		if body := g.buildRequestBody(reqType, entry.reqMeta); body != nil {
+		if entry.keepRawBody {
+			params = append(params, g.buildQueryParams(reqType, entry.reqMeta, paramNames)...)
+			op["requestBody"] = map[string]any{
+				"content": map[string]any{"*/*": map[string]any{"schema": map[string]any{}}},
+			}
+		} else if body := g.buildRequestBody(reqType, entry.reqMeta, requestBodyRequired(entry, paramNames)); body != nil {
 			op["requestBody"] = body
 		}
 	}
@@ -401,13 +414,13 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 	return params
 }
 
-// buildPathParams 为所有方法的参数路由 {name}/{name?} 段声明 path 参数。
+// buildPathParams 为所有方法的参数路由 {name}/{name?}/{name...} 段声明 path 参数。
 // path 声明受 OpenAPI 规范强制（每个模板表达式都必须有对应参数），因此**不受 ignore 影响**：
 // 被 ignore 的路径字段仍声明为 path 参数，只是不再出现在 body schema 与 query 中，
 // 从而避免生成"占位符无对应声明"的非法文档。
 // meta 为注册阶段预计算的 structMeta；paramNames 为路径模板中的参数名集合；
-// optionalParams 标记可选参数（{name?}），其 required 为 false，
-// 可选参数被省略时保留字段 default 值或零值。
+// optionalParams 标记可选参数（{name?}）与通配尾段（{name...}），其 required 为 false，
+// 可选参数被省略或通配零段命中时保留字段 default 值或零值。
 // 带 deprecated:"true" 的字段在 Parameter Object 顶层输出 deprecated: true。
 func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta, paramNames, optionalParams map[string]bool) []any {
 	if reqType.Kind() != reflect.Struct {
@@ -437,9 +450,30 @@ func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta
 	return params
 }
 
+// requestBodyRequired 判断省略 body 且没有 query 值时，默认 Req 模板能否通过内建 nonzero 校验。
+// 路径参数由路由匹配单独提供，不构成 body 必填依据；自定义 Validator 属任意业务代码，不静态推导。
+func requestBodyRequired(entry *routeEntry, paramNames map[string]bool) bool {
+	if !entry.needsNonzeroValidation {
+		return false
+	}
+	meta := entry.reqMeta
+	if len(paramNames) > 0 {
+		fields := make([]fieldMeta, 0, len(meta.fields))
+		for _, fm := range meta.fields {
+			if !paramNames[fm.name] {
+				fields = append(fields, fm)
+			}
+		}
+		meta.fields = fields
+	}
+	reqPtr := reflect.New(entry.reqElemType)
+	reqPtr.Elem().Set(entry.defaultReq)
+	return validateNonzero(reqPtr, meta) != nil
+}
+
 // buildRequestBody 为携带请求体的方法生成 requestBody；含文件字段时使用 multipart/form-data。
-// meta 为注册阶段预计算的 structMeta，透传给 registerStructSchema 以复用 nonzero+default 判定。
-func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMeta) map[string]any {
+// required 表示省略 body 时默认 Req 模板无法通过内建 nonzero 校验。
+func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMeta, required bool) map[string]any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
 	}
@@ -448,7 +482,7 @@ func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMet
 		contentType = "multipart/form-data"
 	}
 	return map[string]any{
-		"required": true,
+		"required": required,
 		"content": map[string]any{
 			contentType: map[string]any{
 				"schema": g.registerStructSchema(reqType, meta),
@@ -489,9 +523,39 @@ func (g *openAPIGenerator) wrapResponseSchema(resType reflect.Type, meta structM
 	return refSchema(wrapName)
 }
 
+func validateResponseWrapper(wrapper any) reflect.Type {
+	if wrapper == nil {
+		return nil
+	}
+	wt := derefType(reflect.TypeOf(wrapper))
+	if wt.Kind() != reflect.Struct {
+		panic(fmt.Sprintf("zchttp: OpenAPI ResponseWrapper must be a struct or pointer to struct, got %T", wrapper))
+	}
+	placeholders := 0
+	for i := 0; i < wt.NumField(); i++ {
+		f := wt.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		jsonName := parseJSONName(f.Tag.Get("json"))
+		if jsonName == "-" {
+			continue
+		}
+		if jsonName == "" {
+			panic(fmt.Sprintf("zchttp: OpenAPI ResponseWrapper field %s.%s must declare a non-empty json name or json:\"-\"", wt.Name(), f.Name))
+		}
+		if f.Type.Kind() == reflect.Interface {
+			placeholders++
+		}
+	}
+	if placeholders != 1 {
+		panic(fmt.Sprintf("zchttp: OpenAPI ResponseWrapper %s must contain exactly one exported interface data placeholder with a valid json name, got %d", wt.String(), placeholders))
+	}
+	return wt
+}
+
 // buildWrapperProperties 根据 responseWrapper 构建响应包装的 schema properties。
-// 若 responseWrapper 为 nil，返回默认 {data, code, message}；
-// 否则通过反射读取自定义结构体的 json 标签，将 any/interface{} 类型字段视为 data 占位符。
+// nil 使用默认 {data, code, message}；自定义结构体已通过 validateResponseWrapper 校验。
 func (g *openAPIGenerator) buildWrapperProperties(dataSchema map[string]any) map[string]any {
 	if g.responseWrapper == nil {
 		return map[string]any{
@@ -504,19 +568,7 @@ func (g *openAPIGenerator) buildWrapperProperties(dataSchema map[string]any) map
 		}
 	}
 
-	wt := reflect.TypeOf(g.responseWrapper)
-	wt = derefType(wt)
-	if wt.Kind() != reflect.Struct {
-		return map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"data":    dataSchema,
-				"code":    map[string]any{"type": "integer"},
-				"message": map[string]any{"type": "string"},
-			},
-		}
-	}
-
+	wt := validateResponseWrapper(g.responseWrapper)
 	props := map[string]any{}
 	for i := 0; i < wt.NumField(); i++ {
 		f := wt.Field(i)
@@ -524,10 +576,9 @@ func (g *openAPIGenerator) buildWrapperProperties(dataSchema map[string]any) map
 			continue
 		}
 		jsonName := parseJSONName(f.Tag.Get("json"))
-		if jsonName == "" || jsonName == "-" {
+		if jsonName == "-" {
 			continue
 		}
-		// any/interface{} 类型字段视为 data 占位符，替换为实际 Res schema
 		if f.Type.Kind() == reflect.Interface {
 			props[jsonName] = dataSchema
 		} else {

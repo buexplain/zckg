@@ -26,6 +26,23 @@ type OpenAPIMeta struct{}
 // metaType 用于识别嵌入的 OpenAPIMeta 字段
 var metaType = reflect.TypeOf(OpenAPIMeta{})
 
+// KeepRawBody 嵌入到 handler 的 Req 结构体顶层（值嵌入），声明本 Req 不绑定请求体：
+// 无论 HTTP 方法，均按 GET/DELETE/HEAD 规则只绑定 query 与路径参数，r.Body 不被读取，
+// 原样留给中间件与 handler（经 RequestFromContext 获取），适用于反向代理、webhook 验签等场景。
+// 默认值、nonzero 校验、Validator 与"路径参数 > query"覆盖顺序不变。
+// *KeepRawBody 或嵌套在更深层结构体中的嵌入不识别；与上传文件字段同时出现时注册 panic。
+//
+// 示例：
+//
+//	type ProxyReq struct {
+//	    zchttp.KeepRawBody
+//	    Rest string `json:"rest"`
+//	}
+type KeepRawBody struct{}
+
+// keepRawBodyType 用于识别 Req 顶层嵌入的 KeepRawBody 字段
+var keepRawBodyType = reflect.TypeOf(KeepRawBody{})
+
 // validatorType 是 Validator 接口的 reflect.Type，用于快速判断结构体是否实现了校验接口
 var validatorType = reflect.TypeOf((*Validator)(nil)).Elem()
 

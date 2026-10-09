@@ -18,6 +18,10 @@ type engineRes struct {
 	Message string `json:"message"`
 }
 
+type currentObjectWriter struct {
+	http.ResponseWriter
+}
+
 // ========== context 存取测试 ==========
 
 // TestRequestResponseFromContext 验证 handler 可从 ctx 获取 *http.Request 与 ResponseWriter
@@ -53,6 +57,109 @@ func TestRequestResponseFromContext(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
 		t.Fatalf("content-type should stay text/plain, got %q", ct)
+	}
+}
+
+// TestMiddlewareReplacementUpdatesContextAndCallbacks 验证中间件通过 next(w, r) 替换对象后，
+// 下游 Context 访问器以及成功、普通错误、校验错误和 panic 回调均收到同一组当前对象。
+func TestMiddlewareReplacementUpdatesContextAndCallbacks(t *testing.T) {
+	cases := []struct {
+		name       string
+		wantStatus int
+	}{
+		{name: "response", wantStatus: http.StatusOK},
+		{name: "error", wantStatus: http.StatusInternalServerError},
+		{name: "validation", wantStatus: http.StatusBadRequest},
+		{name: "panic", wantStatus: http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var replacementReq *http.Request
+			var replacementW *currentObjectWriter
+			contextChecked := false
+			callbackChecked := false
+
+			router := NewRouter()
+			router.Use(
+				func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+					replacementReq = r.Clone(r.Context())
+					replacementReq.URL.Path = "/replacement"
+					replacementW = &currentObjectWriter{ResponseWriter: w}
+					return next(replacementW, replacementReq)
+				},
+				func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+					ctxReq, reqOK := RequestFromContext(ctx)
+					ctxW, wOK := ResponseWriterFromContext(ctx)
+					if !reqOK || !wOK || ctxReq != r || ctxW != w {
+						t.Fatalf("context objects do not match current chain objects")
+					}
+					contextChecked = true
+					return next(w, r)
+				},
+			)
+
+			switch tc.name {
+			case "response":
+				router.GET("/test", func(context.Context, engineReq) (engineRes, error) {
+					return engineRes{Message: "ok"}, nil
+				})
+			case "error":
+				router.GET("/test", func(context.Context, engineReq) (engineRes, error) {
+					return engineRes{}, errors.New("boom")
+				})
+			case "validation":
+				type requiredReq struct {
+					Name string `json:"name" nonzero:"true"`
+				}
+				router.GET("/test", func(context.Context, requiredReq) (engineRes, error) {
+					return engineRes{}, nil
+				})
+			case "panic":
+				router.GET("/test", func(context.Context, engineReq) (engineRes, error) {
+					panic("boom")
+				})
+			}
+
+			assertCallbackObjects := func(w http.ResponseWriter, r *http.Request) {
+				if w != replacementW || r != replacementReq {
+					t.Fatalf("callback objects do not match current chain objects")
+				}
+				callbackChecked = true
+			}
+			engine := NewEngine()
+			engine.Router = router
+			switch tc.name {
+			case "response":
+				engine.OnResponse = func(w http.ResponseWriter, r *http.Request, res any) {
+					assertCallbackObjects(w, r)
+					DefaultResponseHandler(w, r, res)
+				}
+			case "error":
+				engine.OnError = func(w http.ResponseWriter, r *http.Request, err error) {
+					assertCallbackObjects(w, r)
+					DefaultErrorHandler(w, r, err)
+				}
+			case "validation":
+				engine.OnValidationError = func(w http.ResponseWriter, r *http.Request, err error) {
+					assertCallbackObjects(w, r)
+					DefaultValidationErrorHandler(w, r, err)
+				}
+			case "panic":
+				engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
+					assertCallbackObjects(w, r)
+					DefaultPanicHandler(w, r, recovered)
+				}
+			}
+
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/test", nil))
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if !contextChecked || !callbackChecked {
+				t.Fatalf("contextChecked=%v callbackChecked=%v", contextChecked, callbackChecked)
+			}
+		})
 	}
 }
 

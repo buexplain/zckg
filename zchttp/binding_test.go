@@ -2094,6 +2094,86 @@ func TestBindPathParamsOptionalOmitted(t *testing.T) {
 	}
 }
 
+// TestBindPathParamsCatchAllZeroSegment 验证通配参数零段命中（match 不追加捕获值，values 为空）时
+// 绑定被跳过，字段保留预置的 default 值，且不报错。绑定按生产口径构造 optional=false
+// （通配段不是可选参数），锁死"跳过"只依赖捕获值缺失、不依赖 optional 标记。
+func TestBindPathParamsCatchAllZeroSegment(t *testing.T) {
+	params := []pathParamBinding{unitParamBinding("s", false)}
+	reqPtr := reflect.New(reflect.TypeOf(pathParamUnitReq{}))
+	reqPtr.Elem().Field(0).SetString("preset")
+	if err := bindPathParams(reqPtr, params, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := reqPtr.Elem().Interface().(pathParamUnitReq).S; got != "preset" {
+		t.Fatalf("zero-segment catch-all should keep preset value, got %q", got)
+	}
+}
+
+// TestBindRequestDataKeepRawBody 验证 keepRawBody=true 时 bindRequestData 对 POST/PUT/PATCH ×
+// JSON/form/multipart/未知 Content-Type 均只绑定 query：body 中的同名字段不覆盖 query 值，
+// 且绑定后 r.Body 仍可逐字节完整读出；对照组 keepRawBody=false 时 JSON body 照常覆盖 query。
+func TestBindRequestDataKeepRawBody(t *testing.T) {
+	type rawBindReq struct {
+		KeepRawBody
+		Name string `json:"name"`
+	}
+	meta := buildStructMeta(reflect.TypeOf(rawBindReq{}))
+
+	var mpBody bytes.Buffer
+	mw := multipart.NewWriter(&mpBody)
+	if err := mw.WriteField("name", "body"); err != nil {
+		t.Fatalf("write multipart field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	bodies := []struct {
+		name        string
+		contentType string
+		body        []byte
+	}{
+		{"json", "application/json", []byte(`{"name":"body"}`)},
+		{"form", "application/x-www-form-urlencoded", []byte("name=body")},
+		{"multipart", mw.FormDataContentType(), mpBody.Bytes()},
+		{"unknown", "application/octet-stream", []byte{0x00, 0xff, 'n', 'a', 'm', 'e'}},
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
+		for _, b := range bodies {
+			t.Run(method+"/"+b.name, func(t *testing.T) {
+				r := httptest.NewRequest(method, "/raw?name=query", bytes.NewReader(b.body))
+				r.Header.Set("Content-Type", b.contentType)
+				reqPtr := reflect.New(reflect.TypeOf(rawBindReq{}))
+				if err := bindRequestData(r, reqPtr, meta, 32<<20, true); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got := reqPtr.Elem().Interface().(rawBindReq).Name; got != "query" {
+					t.Fatalf("Name = %q, want query (body must not be bound)", got)
+				}
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("read body: %v", err)
+				}
+				if !bytes.Equal(raw, b.body) {
+					t.Fatalf("body should remain intact, got %q, want %q", raw, b.body)
+				}
+			})
+		}
+	}
+
+	t.Run("对照组keepRawBody=false", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/raw?name=query", strings.NewReader(`{"name":"body"}`))
+		r.Header.Set("Content-Type", "application/json")
+		reqPtr := reflect.New(reflect.TypeOf(rawBindReq{}))
+		if err := bindRequestData(r, reqPtr, meta, 32<<20, false); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := reqPtr.Elem().Interface().(rawBindReq).Name; got != "body" {
+			t.Fatalf("Name = %q, want body (body overrides query)", got)
+		}
+	})
+}
+
 // ======== setUnix/setUnixAuto/setTime 分支补测 ========
 
 // TestSetUnixAutoBranches 覆盖 16 位（微秒）、19 位（纳秒）与其他位数（秒）分支
@@ -2112,7 +2192,18 @@ func TestSetUnixAutoBranches(t *testing.T) {
 			t.Fatalf("setUnixAuto(%q): %v", c.value, err)
 		}
 		n, _ := strconv.ParseInt(c.value, 10, 64)
-		want := time.Unix(0, n*int64(c.unit)).In(time.UTC)
+		var want time.Time
+		switch c.unit {
+		case time.Second:
+			want = time.Unix(n, 0)
+		case time.Millisecond:
+			want = time.UnixMilli(n)
+		case time.Microsecond:
+			want = time.UnixMicro(n)
+		case time.Nanosecond:
+			want = time.Unix(0, n)
+		}
+		want = want.In(time.UTC)
 		if got := fv.Interface().(time.Time); !got.Equal(want) {
 			t.Errorf("setUnixAuto(%q) = %v, want %v", c.value, got, want)
 		}
@@ -2458,5 +2549,121 @@ func TestBindPathParams_UnsettableFieldSkipped(t *testing.T) {
 	got := reqPtr.Interface().(*hiddenFieldReq)
 	if got.Public != "v0" {
 		t.Fatalf("可设置路径参数应正常绑定，实际: %q", got.Public)
+	}
+}
+
+// TestBindValues_InvalidPointerPreservesOriginal 验证 query/form 转换失败不会分配 nil 指针，
+// 也不会覆盖字段原有值。
+func TestBindValues_InvalidPointerPreservesOriginal(t *testing.T) {
+	type req struct {
+		Page    *int       `json:"page"`
+		Enabled *bool      `json:"enabled"`
+		When    *time.Time `json:"when" time_format:"2006-01-02"`
+		Preset  *int       `json:"preset"`
+	}
+	preset := 7
+	got := req{Preset: &preset}
+	meta := buildStructMeta(reflect.TypeOf(got))
+	values := map[string][]string{
+		"page":    {"bad"},
+		"enabled": {"bad"},
+		"when":    {"bad"},
+		"preset":  {"bad"},
+	}
+	if err := bindValues(reflect.ValueOf(&got), values, nil, meta); err != nil {
+		t.Fatalf("尽力绑定不应返回字段转换错误: %v", err)
+	}
+	if got.Page != nil || got.Enabled != nil || got.When != nil {
+		t.Fatalf("失败绑定不得分配 nil 指针: %+v", got)
+	}
+	if got.Preset == nil || *got.Preset != 7 {
+		t.Fatalf("失败绑定应保留原值 7，实际: %v", got.Preset)
+	}
+}
+
+// TestBindBody_JSONRequiresSingleValue 验证 JSON 仅允许一个完整值，尾随空白合法，
+// 第二个值或尾随垃圾均返回错误。
+func TestBindBody_JSONRequiresSingleValue(t *testing.T) {
+	type req struct {
+		Page int `json:"page"`
+	}
+	meta := buildStructMeta(reflect.TypeOf(req{}))
+	cases := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{name: "single with whitespace", body: "{\"page\":1} \n\t"},
+		{name: "second value", body: "{\"page\":1}{\"page\":2}", wantErr: true},
+		{name: "trailing garbage", body: "{\"page\":1}x", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", "application/json")
+			err := bindBody(r, reflect.New(reflect.TypeOf(req{})), meta, 0)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("bindBody() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestBindBody_ContentTypeParsing 验证媒体类型大小写不敏感、参数可解析，非法值明确报错。
+func TestBindBody_ContentTypeParsing(t *testing.T) {
+	type req struct {
+		Name string `form:"name"`
+	}
+	meta := buildStructMeta(reflect.TypeOf(req{}))
+
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("name=ok"))
+	r.Header.Set("Content-Type", "Application/X-Www-Form-Urlencoded; Charset=UTF-8")
+	dst := reflect.New(reflect.TypeOf(req{}))
+	if err := bindBody(r, dst, meta, 0); err != nil {
+		t.Fatalf("合法混合大小写 Content-Type 不应失败: %v", err)
+	}
+	if got := dst.Elem().FieldByName("Name").String(); got != "ok" {
+		t.Fatalf("Name = %q, want ok", got)
+	}
+
+	invalid := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{}"))
+	invalid.Header.Set("Content-Type", `application/json; charset="unterminated`)
+	if err := bindBody(invalid, reflect.New(reflect.TypeOf(req{})), meta, 0); err == nil {
+		t.Fatal("非法 Content-Type 应返回错误")
+	}
+}
+
+// TestSetUnixAuto_NegativePrecision 验证负号不参与自动时间戳位数判断，且换算不溢出。
+func TestSetUnixAuto_NegativePrecision(t *testing.T) {
+	cases := []struct {
+		value string
+		want  time.Time
+	}{
+		{value: "-1000000000", want: time.Unix(-1000000000, 0)},
+		{value: "-1000000000000", want: time.UnixMilli(-1000000000000)},
+		{value: "-1000000000000000", want: time.UnixMicro(-1000000000000000)},
+		{value: "-1000000000000000000", want: time.Unix(0, -1000000000000000000)},
+	}
+	for _, tc := range cases {
+		fv := reflect.New(timeType).Elem()
+		if err := setUnixAuto(fv, tc.value, time.UTC); err != nil {
+			t.Fatalf("setUnixAuto(%q): %v", tc.value, err)
+		}
+		if got := fv.Interface().(time.Time); !got.Equal(tc.want) {
+			t.Fatalf("setUnixAuto(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+// TestBindBody_UnsupportedMapType 验证 JSON map 能力严格遵循 encoding/json，
+// 不支持的 key 类型通过绑定错误返回。
+func TestBindBody_UnsupportedMapType(t *testing.T) {
+	type req struct {
+		Values map[float64]string `json:"values"`
+	}
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"values":{"1.5":"x"}}`))
+	r.Header.Set("Content-Type", "application/json")
+	if err := bindBody(r, reflect.New(reflect.TypeOf(req{})), buildStructMeta(reflect.TypeOf(req{})), 0); err == nil {
+		t.Fatal("encoding/json 不支持的 map key 类型应返回绑定错误")
 	}
 }

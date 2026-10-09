@@ -59,11 +59,11 @@ ID int64 `json:"id" nonzero:"true"`
 | `description`   | ✅   | ✅   | 字段描述                                                                     |
 | `example`       | ✅   | ✅   | 字段示例值（按字段类型自动转换为对应 JSON 类型：整数→`int64`、浮点→`float64`、布尔→`bool`，无法转换时保留字符串） |
 | `ignore:"true"` | ✅   | ✅   | 从文档中**排除**该字段（不影响绑定与校验；path 参数声明除外，见 [参数位置与响应](#参数位置与响应)）                                                  |
-| `default`       | ✅   | 仅文档 | Req 上设置默认值，受类型限制、分两阶段填充，且文档展示有额外约束——详见 [default 文档展示规则](#default-文档展示规则仅-req)；Res 上无运行时效果，仅在文档中展示。    |
-| `nonzero`       | ✅   | 仅文档 | Req 上标记非零值必填，影响运行时校验和 required 推断——详见 [required 推断规则](#required-推断规则仅-req)；Res 上无运行时校验，仅参与 required 推断。       |
+| `default`       | ✅   | 仅文档 | Req 上设置默认值，受类型限制、分两阶段填充，且文档展示有额外约束——详见 [default 文档展示规则](#default-文档展示规则req-与-res)；Res 上无运行时效果，仅在文档中展示。    |
+| `nonzero`       | ✅   | 仅文档 | Req 上标记非零值必填，影响运行时校验和 required 推断——详见 [required 推断规则](#required-推断规则req-与-res)；Res 上无运行时校验，仅参与 required 推断。       |
 | `deprecated`    | ✅   | ✅   | `deprecated:"true"` 标记字段为已废弃，schema 与 query/path 参数对象均输出 `"deprecated": true`；废弃原因写在 `description` 中——详见 [deprecated 标记](#deprecated-标记) |
 
-> Res 结构体上的 `default` 和 `nonzero` 标签**没有运行时语义**：Res 不参与参数绑定与校验，`applyDefaults` 和 `validateNonzero` 均仅作用于 Req。但它们**参与文档生成**：Res 的 `default` 按与 Req 相同的展示规则在 schema 中展示，Res 的 `nonzero:"true"` 且无 `default` 同样推断为 `required`（用于描述响应结构约束）。
+> Res 结构体上的 `default` 和 `nonzero` 标签**没有运行时语义**：Res 不参与参数绑定与校验，`applyDefaults` 和 `validateNonzero` 均仅作用于 Req。但它们**参与文档生成**：Res 的 `default` 按与 Req 相同的展示规则在 schema 中展示；Res 的 `nonzero:"true"` 仅在不存在受支持并被元数据识别的 `default` 时推断为 `required`（用于描述响应结构约束）。
 
 字段名沿用绑定规则：优先 `form` 标签，其次 `json` 标签，最后使用字段名。
 
@@ -116,43 +116,43 @@ Go 原始字符串不能用反斜杠转义反引号；这里的 `\x60` 由 `refl
 
 `deprecated` 是纯文档标签，对参数绑定、校验、默认值填充均无副作用。
 
-## default 文档展示规则（仅 Req）
+## default 文档展示规则（Req 与 Res）
 
-`default` 标签仅对 Req 结构体有效。生成的 schema 按**嵌套上下文**决定是否输出 `default` 属性。
+`default` 在 Req 上同时具有运行时与文档语义，在 Res 上仅具有文档语义。Req 与 Res 的 schema 使用相同的**嵌套上下文**规则决定是否输出 `default` 属性；以下运行时填充说明只适用于 Req。
 
 ### struct 嵌套上下文
 
-| 字段类型                     | 值嵌套 struct（含顶层 Req） | 指针嵌套 struct（`*Company`） |
-|--------------------------|-------------------------|-------------------------|
-| 指针类型（`*int`/`*string` 等） | 展示 default              | 展示 default              |
-| 值类型（`int`/`string` 等）    | 展示 default              | **不展示** default         |
+| 字段类型                     | 值嵌套 struct（含顶层 Req/Res） | 指针嵌套 struct（`*Company`） |
+|--------------------------|-----------------------------|-------------------------|
+| 指针类型（`*int`/`*string` 等） | 展示 default                  | 展示 default              |
+| 值类型（`int`/`string` 等）    | 展示 default                  | **不展示** default         |
 
 > 规则依据：
-> - **指针类型**：请求阶段（post-bind）对 nil 指针字段无条件填充，故在任何 struct 嵌套上下文中均可靠（前提是该 struct 可被 `applyDefaults` 到达）。
-> - **值类型**：仅在注册阶段填充（请求阶段跳过以避免覆盖显式传入的零值），而注册阶段只能到达"值嵌套"路径上的 struct（顶层
-    Req + 值类型 struct 字段）。指针嵌套（如 `*Company`）在注册阶段为 nil，其内部字段无法被到达，值类型的 default
-    实际不生效，故不展示。
-> - 若同一 struct 被多处使用——路径 A 值嵌套、路径 B 指针嵌套——则取并集（展示），因为至少在一个场景下 default 有效。
+> - **指针类型**：Req 在请求阶段（post-bind）对 nil 指针字段无条件填充，故在任何 struct 嵌套上下文中均可靠（前提是该 struct 可被 `applyDefaults` 到达）。
+> - **值类型**：Req 仅在注册阶段填充（请求阶段跳过以避免覆盖显式传入的零值），而注册阶段只能到达“值嵌套”路径上的 struct（顶层 Req + 值类型 struct 字段）。指针嵌套（如 `*Company`）在注册阶段为 nil，其内部字段无法被到达，值类型的 default 实际不生效，故不展示。
+> - Res 不执行默认值填充；生成器仅复用上述可达性规则描述其 schema。
+> - 若同一 struct 被多处使用——路径 A 值嵌套、路径 B 指针嵌套——则取并集（展示），因为至少存在一条允许展示的路径。
 
 ### 容器嵌套深度
 
 单层容器及其外包一层指针（如 `[]Struct`、`*[N]Struct`、`*[]Struct`、`*map[K]Struct`）中的 struct 可被 `applyDefaults` 到达，指针字段的 `default` 可以展示。对于**多层容器**（如 `map[K][]Struct`、`[][]Struct`、`[]map[K]Struct`），框架无法穿透内部元素；类型仅经这些路径到达时，即使是指针字段的 `default` 也**不展示**（`reachedByDefaults=false`）。
 
-可达性按 struct **类型取并集**：若同一类型还用于单层容器，其指针字段的 `default` 会展示；若另有纯值嵌套路径，其值字段的 `default` 也会展示。这不改变多层容器路径在运行时不填充的限制。详见 `request.md` 中"容器嵌套深度限制"章节。
+可达性按 struct **类型取并集**：若同一类型还用于单层容器，其指针字段的 `default` 会展示；若另有纯值嵌套路径，其值字段的 `default` 也会展示。这不改变多层容器路径在 Req 运行时不填充的限制。详见 `request.md` 中“容器嵌套深度限制”章节。
 
-切片类型字段的 `default` 按逗号切分后，逐元素依据 items schema 递归转换展示（如 `default:"a,b"` 展示为 `["a","b"]`，`[]int` 的 `default:"1,2"` 展示为 `[1,2]`）；Trim 后为空（`default:""`、`default:",,,"`）视为空切片 `[]`，与运行时填充语义一致。
+切片类型字段的 `default` 按逗号切分后，逐元素依据 items schema 递归转换展示（如 `default:"a,b"` 展示为 `["a","b"]`，`[]int` 的 `default:"1,2"` 展示为 `[1,2]`）；Trim 后为空（`default:""`、`default:",,,"`）视为空切片 `[]`，与 Req 运行时填充语义一致。
 
-`GenerateOpenAPI` 采用**三遍遍历**架构：第一遍（`collectTypeUsages`）收集每个 struct 类型的"值嵌套可达性"（`reachedViaValue` map）；第二遍（`collectDefaultsReachability`）收集每个 struct 类型是否可被 `applyDefaults` 递归到达（`reachedByDefaults` map）；第三遍构造 schema 时 `decorate` 依据这两个可达性标记决定是否输出 `default`——指针字段依赖 `reachedByDefaults`，值字段依赖 `reachedViaValue`。
+`GenerateOpenAPI` 采用**三遍遍历**架构：第一遍（`collectTypeUsages`）收集每个 struct 类型的“值嵌套可达性”（`reachedViaValue` map）；第二遍（`collectDefaultsReachability`）收集每个 struct 类型是否可被 `applyDefaults` 递归到达（`reachedByDefaults` map）；第三遍构造 schema 时 `decorate` 依据这两个可达性标记决定是否输出 `default`——指针字段依赖 `reachedByDefaults`，值字段依赖 `reachedViaValue`。
 
-## required 推断规则（仅 Req）
+## required 推断规则（Req 与 Res）
 
-Req 字段在 OpenAPI 文档中是否标记为 `required`，按以下规则判定：
+Req 与 Res 字段在 OpenAPI schema 中是否标记为 `required`，按以下规则判定：
 
-1. 字段带 `nonzero:"true"` 且**没有** `default` 标签 → **必填**（Req 与 Res 的 schema 生成均适用）。
-2. 其它情况（有 `default`、或 `nonzero:"false"`、或未标注 `nonzero`）→ **可选**。
+1. 字段带 `nonzero:"true"`，且不存在**受支持并被元数据识别的** `default` → **必填**。
+2. 其它情况（存在受支持的 `default`、`nonzero:"false"`、未标注 `nonzero` 或 `nonzero` 值无法解析为 true）→ **可选**。
 
-> `nonzero` 标签与 `default` 标签独立解析：带 `default` 的 `nonzero:"true"` 字段在运行时**仍然会校验零值**
-> （所见即所得），但在文档中标记为可选，避免「有默认值却又必填」的矛盾。
+“存在 `default` 标签”不等于“存在受支持的 default”。例如 `time.Time` 不支持默认值，因此 `time.Time` 字段同时标注 `nonzero:"true" default:"x"` 时仍会标记为 `required`；支持范围见 `request.md` 的“default — 默认值”章节。
+
+> `nonzero` 与 `default` 独立解析：Req 中带有受支持 `default` 的 `nonzero:"true"` 字段在运行时**仍然会校验零值**（所见即所得），但在文档中标记为可选，避免“有默认值却又必填”的矛盾。Res 不参与运行时校验，这两个标签仅用于描述响应 schema。
 
 ## 类型映射
 
@@ -206,10 +206,9 @@ map 的 value 类型通过 `t.Elem()` 递归推断：
 ## 参数位置与响应
 
 - **GET / DELETE / HEAD**：请求字段生成为 `query` 参数（`in: query`）。**仅扁平字段**（标量、切片、指针标量、`time.Time`）参与生成：命名 struct（`time.Time` 除外）、`map` 与文件字段被跳过——query 绑定仅处理扁平字段，展示无法绑定的参数会误导 API 使用者。
-- **其余方法**：请求字段生成为 `requestBody`；含文件字段（`*multipart.FileHeader` 或 `[]*multipart.FileHeader`，含**嵌入结构体**中的文件字段）时使用
-  `multipart/form-data`，否则 `application/json`。
-- **参数路由**（如 `/users/{id}`）：所有 HTTP 方法均将 `{name}` 对应的字段声明为 path 参数（`in: path`，`required: true`）——**不受 `ignore` 影响**：OpenAPI 要求每个模板占位符都有对应声明，缺失即产生非法文档；GET / DELETE / HEAD 不再重复声明为 query，其余方法仍保留既有 body 字段（其中 `ignore:"true"` 的字段仍从 body schema 排除）。可选参数 `{name?}` 转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` 语法）并沿用 `required: false` 的既有输出，路径模板中不再出现 `?`；OpenAPI 3.0 要求 path 参数必填，此可选参数表示也是既有的规范兼容性限制。
-- **响应**：统一包装为 `Response{data, code, message}` 结构，schema 名称为 `Response_<Type>`；成功时统一返回 `200`（与
-  `HttpEngine` 默认响应行为一致）。可通过 `OpenAPIInfo.ResponseWrapper` 指定自定义响应包装结构体样例（如 `MyResponse{}`），为 nil 时使用默认结构；自定义结构体中 `interface{}` 类型字段被视为 data 占位符，替换为实际 Res schema。
+- **其余方法**：请求字段生成为 `requestBody`；含文件字段（`*multipart.FileHeader` 或 `[]*multipart.FileHeader`，含**嵌入结构体**中的文件字段）时使用 `multipart/form-data`，否则 `application/json`。`requestBody.required` 通过默认 Req 模板推导：生成器以注册期默认值作为初始状态，排除 path 字段后执行内建 `nonzero` 校验；校验失败时为 `true`，否则为 `false`。因此全可选 Req、仅含有效默认值的 Req，以及只由 path 参数满足必填要求的 Req 均不强制 body；含无默认值 `nonzero:"true"` body 字段的 Req 强制 body。任意自定义 `Validate()` 无法静态推导，不参与此判定。该推导以 OpenAPI 展示的 body 作为非路径字段的规范输入位置，不考虑运行时“先绑定 query、再绑定 body”的兼容能力；因此扁平 nonzero 字段即使可仅由 query 满足，文档仍可能要求 requestBody，生成契约有意比运行时可接受输入更严格。
+- **嵌入 `zchttp.KeepRawBody` 的 Req（POST / PUT / PATCH 等）**：与请求阶段“只绑定 query 与路径参数”的语义一致，非路径字段按 GET 规则生成为 `query` 参数，`requestBody` 输出通用声明 `{"content": {"*/*": {"schema": {}}}}`（表达“接受任意请求体，原样处理”，不从 Req 字段推导 schema，`components.schemas` 中也不出现 Req 与 `KeepRawBody`），且不标记为 required；GET / DELETE / HEAD 上嵌入时输出与未嵌入一致。
+- **参数路由**（如 `/users/{id}`）：所有 HTTP 方法均将 `{name}` 对应的字段声明为 path 参数（`in: path`，`required: true`）——**不受 `ignore` 影响**：OpenAPI 要求每个模板占位符都有对应声明，缺失即产生非法文档；GET / DELETE / HEAD 不再重复声明为 query，其余方法仍保留既有 body 字段（其中 `ignore:"true"` 的字段仍从 body schema 排除）。可选参数 `{name?}` 与通配尾段 `{name...}` 分别转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` / `...` 语法），路径模板中不再出现 `?` 与 `...`，二者均输出 `in: path`、`required: false`（通配尾段可零段命中，如 `/dify/{rest...}` 收到 `/dify`）；OpenAPI 3.0 要求 path 参数必填，此表示违反规范，属既有的兼容性限制。客户端生成器填充通配参数时通常把 `/` 编码为 `%2F`，引擎按解码后的 `r.URL.Path` 匹配，仍命中同一路由。
+- **响应**：统一包装为 `Response{data, code, message}` 结构，schema 名称为 `Response_<Type>`；成功时统一返回 `200`（与 `HttpEngine` 默认响应行为一致）。`OpenAPIInfo.ResponseWrapper` 为 nil 时使用默认包装；非 nil 时必须是 struct 或 struct 指针，所有参与输出的导出字段必须声明非空 `json` 名（或用 `json:"-"` 排除），并且必须恰有一个导出的 interface kind 字段（包括 `interface{}`/`any` 或命名接口）作为 data 占位符。该占位符会替换为实际 Res schema，其余字段按自身类型生成；未导出字段被忽略。配置为非 struct、缺少或含多个占位符、或者导出字段缺少有效 `json` 名时，`GenerateOpenAPI` 会 panic 并给出配置错误，而不会静默回退默认包装。
 
 > 输出确定性：生成前对 method 与 path 排序，多次生成的输出字节级一致（schema 序号归属稳定），快照测试/增量 diff 友好。

@@ -110,6 +110,15 @@ func (c *chainRunner) exec(level int) error {
 	return err
 }
 
+// updateChainState 记录最近一次 next(w, r) 传入的对象，使 Context 访问器和链后回调
+// 与下游中间件及 handler 始终观察同一组当前对象。
+func updateChainState(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if st := requestStateFromContext(ctx); st != nil {
+		st.w = w
+		st.req = r
+	}
+}
+
 // advance 是所有层共享的 next 实现：按调用者层号做防重标记，更新 w/r 后执行下一层
 func (c *chainRunner) advance(w http.ResponseWriter, r *http.Request) error {
 	bit := uint64(1) << c.current
@@ -119,6 +128,7 @@ func (c *chainRunner) advance(w http.ResponseWriter, r *http.Request) error {
 	c.calledBits |= bit
 	c.w = w
 	c.r = r
+	updateChainState(c.ctx, w, r)
 	return c.exec(c.current + 1)
 }
 
@@ -134,6 +144,7 @@ func runChainRecursive(middlewares []MiddlewareHandler, ctx context.Context, w h
 			return ErrNextCalledMultipleTimes
 		}
 		called = true
+		updateChainState(ctx, w, r)
 		return runChainRecursive(middlewares[1:], ctx, w, r, finalHandler)
 	})
 }

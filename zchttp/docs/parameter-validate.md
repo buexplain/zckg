@@ -4,22 +4,22 @@
 
 ## 一、非零值校验（nonzero）
 
-`nonzero` 标签的解析在注册阶段由 `buildStructMeta` 一次性完成并存入 `fieldMeta.nonzero`，运行时 `validateNonzero` 和 OpenAPI 文档生成均直接读取该预计算结果，两者天然一致。注意：`buildStructMeta` 仅计算当前结构体的顶层字段（`indices` 为单层），嵌套结构体的 meta 在递归校验首次使用时经 `cachedStructMeta` 构建，并进入进程级缓存（`sync.Map`）供后续请求复用。
+`nonzero` 标签的解析在注册阶段由 `buildStructMeta` 完成并存入 `fieldMeta.nonzero`，运行时 `validateNonzero` 和 OpenAPI 文档生成均读取该预计算结果。具名嵌套结构体的 meta 在递归校验首次使用时经 `cachedStructMeta` 构建并进入进程级缓存（`sync.Map`）；匿名嵌入结构体会在构建当前 meta 时递归展开为扁平字段，因此 `fieldMeta.indices` 可能是多级索引路径。
 
 `nonzero` 标签与 `default` 标签**独立解析、互不影响**：
 
 - **校验阶段**：只要字段标记了 `nonzero:"true"`，就始终校验零值（所见即所得），不受 `default` 标签影响。
-- **文档生成阶段**：`nonzero:"true"` 且**没有** `default` 标签 → 文档中标记为**必填**；其它情况（有 `default`、或 `nonzero:"false"`、或未标注 `nonzero`）一律视为**可选**。详见 `openapi.md`。
+- **文档生成阶段**：`nonzero:"true"` 且不存在**受支持并被元数据识别的** `default` → 文档中标记为**必填**；其它情况（存在受支持的 `default`、`nonzero:"false"`、未标注 `nonzero` 或其值无法解析为 true）视为**可选**。仅存在不受支持类型的 `default` 标签不会取消 required，详见 `openapi.md`。
 
 ### 递归校验
 
-`validateNonzero` 会递归进入嵌套结构体、结构体指针字段、单层容器（`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`，固定长度数组与切片行为一致）及其指针包裹形式（`*[]Struct`、`*[]*Struct`、`*[N]Struct`、`*map[K]Struct`、`*map[K]*Struct`，指针解引用后穿透进入元素）的元素，校验所有 `nonzero:"true"` 字段。多层容器（如 `map[K][]Struct`、`map[K][N]Struct`）的内部元素无法穿透，详见 `request.md` 中"容器嵌套深度限制"章节。规则如下：
+`validateNonzero` 会递归进入嵌套结构体、结构体指针字段、单层容器（`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`）及其非 nil 指针包裹，校验所有 `nonzero:"true"` 字段。固定数组始终具有 N 个元素，即使数组整体为零值也逐元素校验；nil/空切片和 nil map 没有元素可校验。多层容器（如 `map[K][]Struct`、`map[K][N]Struct`）的内部元素无法穿透，详见 `request.md` 中“容器嵌套深度限制”章节。规则如下：
 
 | 本级字段 | 零值 | 行为 |
 |---------|------|------|
 | `nonzero:"true"` | 是 | 报错 `"is required"`（嵌套字段带绑定名路径，如 `"company.name"`），不递归 |
 | `nonzero:"true"` | 否 | 校验通过，若为嵌套结构体/指针/单层容器元素（切片/数组/map）则递归进入子字段 |
-| 未标注 `nonzero` | 是 | 跳过，不报错，不递归 |
+| 未标注 `nonzero` | 是 | 通常跳过；固定数组例外，仍递归其全部现存元素 |
 | 未标注 `nonzero` | 否 | 不报本级，但若为嵌套结构体/指针/单层容器元素（切片/数组/map）则递归进入子字段 |
 
 典型场景——收货地址必填，发票选填但填了就必须校验抬头和金额：
@@ -49,7 +49,7 @@ type Invoice struct {
 
 递归过程通过 `visited map[visitKey]bool`（`visitKey` 同时记录指针地址与类型，避免值类型首字段与父结构体共享地址时被误判为循环引用）记录已访问的节点，防止循环引用导致无限递归。
 
-嵌套字段的校验错误路径使用**字段绑定名**（json/form tag，与 API 命名一致），例如 `company.name`、`addr.city`，便于客户端直接定位请求字段。
+嵌套字段的校验错误路径使用**字段绑定名**（json/form tag，与 API 命名一致），例如 `company.name`、`addr.city`。当前切片/数组递归不附加元素索引，因此第 3 个 `items` 元素失败仍为 `items.name`；map 会附加 `fmt.Sprint(key)`，例如 `children.zzz_bad.name`。map key 中的点号不做转义，调用方不应把该路径当作可无歧义反解析的机器协议。
 
 ### 零值判定与快速跳过
 
@@ -62,8 +62,8 @@ type Invoice struct {
 要点：
 
 - 校验仅针对显式 `nonzero:"true"` 的字段，普通字段传零值不会报错。
-- `nonzero` 与 `default` 独立：带 `default` 的 `nonzero:"true"` 字段在请求阶段**仍然会校验零值**（所见即所得），但在 OpenAPI 文档中标记为可选。
-- 嵌套结构体的 `nonzero` 字段仅在**父字段非零**时才会被递归校验；父字段为零值时子字段的 nonzero 被跳过。**匿名嵌入字段除外**——嵌入字段没有「父字段判零」环节，其内部 `nonzero` 字段等价于顶层必填字段、无条件校验（详见 `request.md`「匿名嵌入结构体展开」）。
+- `nonzero` 与 `default` 独立：带有受支持 `default` 的 `nonzero:"true"` 字段在请求阶段**仍然会校验零值**（所见即所得），但在 OpenAPI 文档中标记为可选；不受支持类型上的 `default` 不改变 required 推断。
+- 嵌套结构体的 `nonzero` 字段通常仅在**父字段非零**时递归校验；父字段为零值时子字段被跳过。两个例外是：匿名嵌入字段没有“父字段判零”环节，其内部 `nonzero` 等价于顶层必填；固定数组即使整体为零值也始终逐元素递归。
 - 仅顶层 Req 的 `Validate()` 方法会被自动调用；嵌套结构体若需自定义校验逻辑，请在顶层 `Validate()` 中手动调用。
 
 ## 二、自定义业务校验（Validate）

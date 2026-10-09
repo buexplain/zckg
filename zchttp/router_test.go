@@ -3,6 +3,7 @@ package zchttp
 import (
 	"context"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -300,6 +301,18 @@ func TestNestedSubGroup(t *testing.T) {
 	}
 }
 
+// TestGroupPathWithoutLeadingSlash 验证分组、子分组和路由路径均可省略前导斜杠，
+// 拼接结果仍为具有段边界的 /api/v1/items，而不是直接连接成错误路径。
+func TestGroupPathWithoutLeadingSlash(t *testing.T) {
+	router := NewRouter()
+	router.Group("api").Group("v1").GET("items", hello)
+
+	rec := serveRequest(t, router, http.MethodGet, "/api/v1/items?name=test", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/items expected 200, got %d", rec.Code)
+	}
+}
+
 // TestGroupMiddlewareWithGlobalMiddleware 验证全局中间件 + 分组中间件的叠加顺序
 func TestGroupMiddlewareWithGlobalMiddleware(t *testing.T) {
 	var order []string
@@ -427,7 +440,90 @@ func TestAllHTTPMethods(t *testing.T) {
 	}
 }
 
-// ======== P1 补充测试 ========
+// TestAny 验证 Router.Any 与 RouterGroup.Any 均为全部 9 个受支持的方法注册路由，
+// 分组版本同时拼接前缀；不受支持的自定义方法不被注册。
+func TestAny(t *testing.T) {
+	cases := []struct {
+		name     string
+		target   string
+		register func(*Router)
+	}{
+		{"Router", "/any", func(r *Router) { r.Any("/any", hello) }},
+		{"RouterGroup", "/api/any", func(r *Router) { r.Group("/api").Any("/any", hello) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := NewRouter()
+			tc.register(router)
+			engine := NewEngine()
+			engine.Router = router
+
+			for _, method := range allHTTPMethods {
+				t.Run(method, func(t *testing.T) {
+					target := tc.target
+					var body io.Reader
+					if method == http.MethodGet || method == http.MethodHead || method == http.MethodDelete {
+						target += "?name=test"
+					} else {
+						body = strings.NewReader(`{"name":"test"}`)
+					}
+					rec := httptest.NewRecorder()
+					engine.ServeHTTP(rec, httptest.NewRequest(method, target, body))
+					if rec.Code != http.StatusOK {
+						t.Fatalf("%s %s expected 200, got %d", method, target, rec.Code)
+					}
+				})
+			}
+
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, httptest.NewRequest("PROPFIND", tc.target, nil))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("PROPFIND %s expected 404, got %d", tc.target, rec.Code)
+			}
+		})
+	}
+}
+
+// TestAnyRegistrationIsAtomic 验证 Router.Any 与 RouterGroup.Any 遇到任一方法冲突时，
+// 不会把冲突前已预检通过的方法残留到真实路由树或顺序索引中。
+func TestAnyRegistrationIsAtomic(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		register func(*Router)
+	}{
+		{name: "Router", path: "/atomic", register: func(r *Router) { r.Any("/atomic", hello) }},
+		{name: "RouterGroup", path: "/api/atomic", register: func(r *Router) { r.Group("/api").Any("atomic", hello) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := NewRouter()
+			router.POST(tc.path, hello)
+
+			expectPanicContains(t, []string{"route conflict", http.MethodPost, tc.path}, func() {
+				tc.register(router)
+			})
+
+			if len(router.routes) != 1 {
+				t.Fatalf("route record count = %d, want 1 after failed Any", len(router.routes))
+			}
+			for _, method := range allHTTPMethods {
+				entry, _ := router.match(method, tc.path)
+				if method == http.MethodPost {
+					if entry == nil {
+						t.Fatal("pre-existing POST route was lost")
+					}
+					continue
+				}
+				if entry != nil {
+					t.Fatalf("failed Any left a residual %s route", method)
+				}
+			}
+		})
+	}
+}
+
+// ======== P1 补充测试 ======
 
 // TestNormalizePrefix 验证 normalizePrefix 规范化逻辑
 func TestNormalizePrefix(t *testing.T) {
@@ -606,6 +702,49 @@ func TestGroupUseOnlyAffectsSubsequentRoutes(t *testing.T) {
 	}
 }
 
+// TestParentGroupLateMiddlewareAffectsLaterChildRoutes 验证子组创建后父组追加的中间件
+// 会进入之后注册的子路由，但不会追溯修改此前已注册路由的中间件快照。
+func TestParentGroupLateMiddlewareAffectsLaterChildRoutes(t *testing.T) {
+	var order []string
+	parentMW := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		order = append(order, "parent")
+		return next(w, r)
+	}
+	childMW := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		order = append(order, "child")
+		return next(w, r)
+	}
+	handler := func(_ context.Context, _ helloReq) (helloRes, error) {
+		order = append(order, "handler")
+		return helloRes{}, nil
+	}
+
+	router := NewRouter()
+	parent := router.Group("/api")
+	child := parent.Group("/v1", childMW)
+	child.GET("/before", handler)
+	parent.Use(parentMW)
+	child.GET("/after", handler)
+
+	order = nil
+	before := serveRequest(t, router, http.MethodGet, "/api/v1/before", "")
+	if before.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/before expected 200, got %d", before.Code)
+	}
+	if got, want := strings.Join(order, ","), "child,handler"; got != want {
+		t.Fatalf("before route order = %q, want %q", got, want)
+	}
+
+	order = nil
+	after := serveRequest(t, router, http.MethodGet, "/api/v1/after", "")
+	if after.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/after expected 200, got %d", after.Code)
+	}
+	if got, want := strings.Join(order, ","), "parent,child,handler"; got != want {
+		t.Fatalf("after route order = %q, want %q", got, want)
+	}
+}
+
 // TestRouterGroupAllHTTPMethods 验证 RouterGroup 的所有 HTTP 方法快捷注册
 func TestRouterGroupAllHTTPMethods(t *testing.T) {
 	router := NewRouter()
@@ -711,6 +850,37 @@ func TestParamRouteNoFieldPanic(t *testing.T) {
 	expectPanicContains(t, []string{"{nope}", "no corresponding field", "helloReq"}, func() {
 		router := NewRouter()
 		router.GET("/p/{nope}", hello)
+	})
+}
+
+// TestCatchAllRouteNoFieldPanic 验证通配尾段与普通路径参数同样受字段强约束：
+// {nope...} 在 Req 中无对应字段时注册 panic，消息含参数名、路由模板与 Req 类型名
+func TestCatchAllRouteNoFieldPanic(t *testing.T) {
+	expectPanicContains(t, []string{"{nope}", "/p/{nope...}", "no corresponding field", "helloReq"}, func() {
+		router := NewRouter()
+		router.GET("/p/{nope...}", hello)
+	})
+}
+
+// TestKeepRawBodyFileFieldPanic 验证 Req 嵌入 KeepRawBody 同时声明上传文件字段
+// （*multipart.FileHeader 及其切片）时注册 panic：文件只能来自 multipart 请求体，与不读取请求体的声明矛盾
+func TestKeepRawBodyFileFieldPanic(t *testing.T) {
+	type rawFileReq struct {
+		KeepRawBody
+		File *multipart.FileHeader `json:"file"`
+	}
+	type rawFilesReq struct {
+		KeepRawBody
+		Files []*multipart.FileHeader `json:"files"`
+	}
+	type rawRes struct{}
+	expectPanicContains(t, []string{"KeepRawBody", "rawFileReq", `upload file field "File"`}, func() {
+		router := NewRouter()
+		router.POST("/raw", func(_ context.Context, _ rawFileReq) (rawRes, error) { return rawRes{}, nil })
+	})
+	expectPanicContains(t, []string{"KeepRawBody", "rawFilesReq", `upload file field "Files"`}, func() {
+		router := NewRouter()
+		router.POST("/raw", func(_ context.Context, _ rawFilesReq) (rawRes, error) { return rawRes{}, nil })
 	})
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"reflect"
@@ -39,13 +40,18 @@ var defaultTimeLayouts = []string{
 // 采用合并绑定——先绑定 query 参数，再绑定请求体，body 中出现的字段覆盖
 // query 已绑定的同名字段，body 中缺失的字段保留 query 绑定值
 // （兼容 REST 常见的"query 放控制参数 + body 放资源数据"混合传参风格）。
+// keepRawBody 为真（Req 顶层嵌入 KeepRawBody）时无论 method 均仅绑定 query，
+// r.Body 不被读取，原样留给中间件与 handler。
 // 路径参数在 ServeHTTP 中于本函数之后绑定，覆盖同名 query/body 值（path > body > query）。
 // body 覆盖粒度由解码器语义决定：JSON 中显式出现的字段（含显式零值如 "page": 0）
 // 覆盖 query 值；JSON null 对非指针字段为 no-op（保留 query 值）、对指针字段置 nil。
 // 详见 docs/parameter-binding.md。
 // meta 为注册阶段预计算的 structMeta，避免请求阶段重复反射解析。
 // multipartMaxMemory 为 multipart/form-data 解析的内存缓冲上限（字节）。
-func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartMaxMemory int64) error {
+func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartMaxMemory int64, keepRawBody bool) error {
+	if keepRawBody {
+		return bindValues(reqPtr, r.URL.Query(), nil, meta)
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
 		return bindValues(reqPtr, r.URL.Query(), nil, meta)
@@ -64,24 +70,17 @@ func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta, mul
 // multipartMaxMemory 为 multipart/form-data 解析的内存缓冲上限（字节）。
 func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartMaxMemory int64) error {
 	contentType := r.Header.Get("Content-Type")
-	// 去掉 charset 等参数，只保留主类型，如 "application/json; charset=utf-8"
-	if idx := strings.IndexByte(contentType, ';'); idx != -1 {
-		contentType = contentType[:idx]
+	if contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err != nil {
+			return fmt.Errorf("invalid Content-Type %q: %w", contentType, err)
+		}
+		contentType = mediaType
 	}
-	contentType = strings.TrimSpace(contentType)
 
 	switch contentType {
 	case "application/json":
-		if r.Body == nil {
-			return nil
-		}
-		if err := json.NewDecoder(r.Body).Decode(reqPtr.Interface()); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil // 空 body 不报错，交给校验阶段通过 nonzero 拦截缺失字段
-			}
-			return err
-		}
-		return nil
+		return decodeJSONBody(r.Body, reqPtr.Interface())
 	case "application/x-www-form-urlencoded":
 		if err := r.ParseForm(); err != nil {
 			return err
@@ -98,16 +97,30 @@ func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartM
 		return bindValues(reqPtr, r.MultipartForm.Value, r.MultipartForm.File, meta)
 	default:
 		// 未知 Content-Type：若有请求体则尝试按 JSON 解析，否则不绑定
-		if r.Body != nil {
-			if err := json.NewDecoder(r.Body).Decode(reqPtr.Interface()); err != nil {
-				if errors.Is(err, io.EOF) {
-					return nil // 空 body 不报错，交给校验阶段通过 nonzero 拦截缺失字段
-				}
-				return err
-			}
-		}
+		return decodeJSONBody(r.Body, reqPtr.Interface())
+	}
+}
+
+// decodeJSONBody 只接受一个完整 JSON 值；空请求体合法，尾随空白之外的内容均报错。
+func decodeJSONBody(body io.Reader, dst any) error {
+	if body == nil {
 		return nil
 	}
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	return errors.New("request body must contain exactly one JSON value")
 }
 
 // bindValues 将 values（query 或表单字段）与 files（上传文件）按字段标签映射到结构体。
@@ -146,7 +159,7 @@ func bindValues(reqPtr reflect.Value, values map[string][]string, files map[stri
 // bindPathParams 将捕获的路由路径参数值按注册顺序写入 Req 字段。
 // 路径参数覆盖同名 query/body 值，必须在 bindRequestData 之后调用。
 // 单个参数转换失败立即返回错误（区别于 bindValues 的尽力绑定策略）；
-// 被省略的尾部可选参数无捕获值，跳过绑定以保留模板默认值或零值。
+// 尾部可选参数省略或通配零段命中时无捕获值，跳过绑定以保留模板默认值或零值。
 func bindPathParams(reqPtr reflect.Value, params []pathParamBinding, values []string) error {
 	elem := reqPtr.Elem()
 	if elem.Kind() != reflect.Struct {
@@ -154,7 +167,7 @@ func bindPathParams(reqPtr reflect.Value, params []pathParamBinding, values []st
 	}
 	for i := range params {
 		if i >= len(values) {
-			// 尾部可选参数被省略，剩余绑定均跳过
+			// 尾部可选参数省略或通配零段命中，剩余绑定均跳过
 			break
 		}
 		fieldValue := fieldByIndex(elem, params[i].indices)
@@ -226,21 +239,38 @@ func setFieldValue(fieldValue reflect.Value, values []string, timeFormat string,
 }
 
 // setScalar 将单个字符串转换并写入标量字段，支持指针、字符串、布尔、有符号/无符号整型、
-// 浮点型、time.Time；不支持的类型静默跳过（尽力绑定语义，不返回错误）
+// 浮点型、time.Time。转换先在临时值中完成，成功后才提交；失败时目标字段保持原值。
+// 不支持的类型静默跳过（尽力绑定语义，不返回错误）。
 func setScalar(fieldValue reflect.Value, value string, timeFormat string, loc *time.Location) error {
-	// 逐层解指针（带深度上限，防自引用指针类型无限分配）
-	for depth := 0; fieldValue.Kind() == reflect.Ptr; depth++ {
-		if depth >= maxPtrDerefDepth {
-			return fmt.Errorf("pointer nesting too deep for type %s", fieldValue.Type())
-		}
-		if fieldValue.IsNil() {
-			fieldValue.Set(reflect.New(fieldValue.Type().Elem()))
-		}
-		fieldValue = fieldValue.Elem()
+	parsed := reflect.New(fieldValue.Type()).Elem()
+	supported, err := parseScalar(parsed, value, timeFormat, loc, 0)
+	if err != nil {
+		return err
 	}
-	// time.Time 需特殊解析（时间戳或多种时间格式）
+	if supported {
+		fieldValue.Set(parsed)
+	}
+	return nil
+}
+
+func parseScalar(fieldValue reflect.Value, value string, timeFormat string, loc *time.Location, depth int) (bool, error) {
+	if fieldValue.Kind() == reflect.Ptr {
+		if depth >= maxPtrDerefDepth {
+			return false, fmt.Errorf("pointer nesting too deep for type %s", fieldValue.Type())
+		}
+		parsed := reflect.New(fieldValue.Type().Elem())
+		supported, err := parseScalar(parsed.Elem(), value, timeFormat, loc, depth+1)
+		if err != nil || !supported {
+			return supported, err
+		}
+		fieldValue.Set(parsed)
+		return true, nil
+	}
 	if fieldValue.Type() == timeType {
-		return setTime(fieldValue, value, timeFormat, loc)
+		if value == "" {
+			return false, nil
+		}
+		return true, setTime(fieldValue, value, timeFormat, loc)
 	}
 	switch fieldValue.Kind() {
 	case reflect.String:
@@ -248,33 +278,31 @@ func setScalar(fieldValue reflect.Value, value string, timeFormat string, loc *t
 	case reflect.Bool:
 		b, err := strconv.ParseBool(value)
 		if err != nil {
-			return err
+			return false, err
 		}
 		fieldValue.SetBool(b)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		// 按目标类型的位宽解析，溢出时 ParseInt 直接报错，避免 SetInt 静默截断
 		n, err := strconv.ParseInt(value, 10, fieldValue.Type().Bits())
 		if err != nil {
-			return err
+			return false, err
 		}
 		fieldValue.SetInt(n)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		// 按目标类型的位宽解析，溢出时 ParseUint 直接报错，避免 SetUint 静默截断
 		n, err := strconv.ParseUint(value, 10, fieldValue.Type().Bits())
 		if err != nil {
-			return err
+			return false, err
 		}
 		fieldValue.SetUint(n)
 	case reflect.Float32, reflect.Float64:
-		f, err := strconv.ParseFloat(value, 64)
+		f, err := strconv.ParseFloat(value, fieldValue.Type().Bits())
 		if err != nil {
-			return err
+			return false, err
 		}
 		fieldValue.SetFloat(f)
 	default:
-		// 其他类型暂不支持，跳过
+		return false, nil
 	}
-	return nil
+	return true, nil
 }
 
 // setTime 将字符串解析为 time.Time：
@@ -320,21 +348,34 @@ func setTime(fieldValue reflect.Value, value, timeFormat string, loc *time.Locat
 	}
 }
 
-// setUnix 按给定精度将时间戳字符串解析为 time.Time
+// setUnix 按给定精度将时间戳字符串解析为 time.Time，避免先统一换算为纳秒导致溢出。
 func setUnix(fieldValue reflect.Value, value string, unit time.Duration, loc *time.Location) error {
 	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return err
 	}
-	tv := time.Unix(0, n*int64(unit)).In(loc)
-	fieldValue.Set(reflect.ValueOf(tv))
+	var tv time.Time
+	switch unit {
+	case time.Second:
+		tv = time.Unix(n, 0)
+	case time.Millisecond:
+		tv = time.UnixMilli(n)
+	case time.Microsecond:
+		tv = time.UnixMicro(n)
+	case time.Nanosecond:
+		tv = time.Unix(0, n)
+	default:
+		return fmt.Errorf("unsupported unix timestamp unit %s", unit)
+	}
+	fieldValue.Set(reflect.ValueOf(tv.In(loc)))
 	return nil
 }
 
-// setUnixAuto 依据数字位数推断时间戳精度（13=毫秒,16=微秒,19=纳秒），其余按秒处理
+// setUnixAuto 依据数字位数推断时间戳精度；可选负号不计入位数。
 func setUnixAuto(fieldValue reflect.Value, value string, loc *time.Location) error {
+	digits := strings.TrimPrefix(value, "-")
 	var unit time.Duration
-	switch len(value) {
+	switch len(digits) {
 	case 13:
 		unit = time.Millisecond
 	case 16:

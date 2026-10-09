@@ -953,7 +953,7 @@ func TestApplyDefaults_RequestPhase(t *testing.T) {
 			check: func(t *testing.T, v reflect.Value) {
 				whenVal := v.Elem().FieldByName("When").Interface().(time.Time)
 				if !whenVal.IsZero() {
-					t.Fatal("unsupported type default should be silently ignored")
+					t.Fatal("unsupported type default should remain unapplied after registration warning")
 				}
 			},
 		},
@@ -1731,8 +1731,9 @@ func billOrderHandler(_ context.Context, req billOrderReq) (billOrderRes, error)
 	return r, nil
 }
 
-// TestUnsupportedDefaultTypeSilentlyIgnored 验证不支持 default 的类型（time.Time/map/any）设置 default 被静默忽略
-func TestUnsupportedDefaultTypeSilentlyIgnored(t *testing.T) {
+// TestUnsupportedDefaultTypeWarnedAndIgnored 验证不支持 default 的类型（time.Time/map/any）
+// 会在注册期告警且不填充值，请求处理仍可正常完成。
+func TestUnsupportedDefaultTypeWarnedAndIgnored(t *testing.T) {
 	type unsupportedDefReq struct {
 		Name string    `json:"name"`
 		When time.Time `json:"when" default:"2023-01-01"` // 不支持
@@ -1757,9 +1758,9 @@ func TestUnsupportedDefaultTypeSilentlyIgnored(t *testing.T) {
 	}
 	var r unsupportedDefRes
 	decodeData(t, rec, &r)
-	// time.Time 不支持 default，应被忽略，保持零值
+	// time.Time 不支持 default，注册期告警后不填充，字段保持零值
 	if !r.IsZero {
-		t.Fatal("time.Time default should be silently ignored, field should remain zero")
+		t.Fatal("time.Time default should remain unapplied after registration warning")
 	}
 }
 
@@ -2219,4 +2220,37 @@ func TestApplyDefaultsWithVisiting_NonStructAndNilVisiting(t *testing.T) {
 	type plain struct{ A string }
 	applyDefaultsWithVisiting(reflect.ValueOf(&plain{}), cachedStructMeta(reflect.TypeOf(plain{})), false, nil)
 	// 不 panic 即通过：visiting 惰性创建后正常遍历
+}
+
+// TestApplyDefaults_KeepRawBodyEmbedded 验证嵌入 KeepRawBody 不影响兄弟字段的默认值填充：
+// 注册阶段值类型与指针类型 default 均生效；请求阶段仅补填 nil 指针，值类型零值保持不变。
+func TestApplyDefaults_KeepRawBodyEmbedded(t *testing.T) {
+	type rawDefaultReq struct {
+		KeepRawBody
+		Page   int     `json:"page" default:"5"`
+		Status *string `json:"status" default:"ok"`
+	}
+	meta := buildStructMeta(reflect.TypeOf(rawDefaultReq{}))
+
+	t.Run("注册阶段", func(t *testing.T) {
+		req := &rawDefaultReq{}
+		applyDefaults(reflect.ValueOf(req), meta)
+		if req.Page != 5 {
+			t.Fatalf("page = %d, want default 5", req.Page)
+		}
+		if req.Status == nil || *req.Status != "ok" {
+			t.Fatalf("status should be filled with 'ok', got %v", req.Status)
+		}
+	})
+
+	t.Run("请求阶段", func(t *testing.T) {
+		req := &rawDefaultReq{}
+		applyDefaults(reflect.ValueOf(req), meta, true)
+		if req.Page != 0 {
+			t.Fatalf("value-type default should not be applied in request phase, got %d", req.Page)
+		}
+		if req.Status == nil || *req.Status != "ok" {
+			t.Fatalf("nil pointer should be filled with 'ok' in request phase, got %v", req.Status)
+		}
+	})
 }

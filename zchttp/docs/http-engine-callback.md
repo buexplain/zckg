@@ -82,13 +82,15 @@ func WantHtml(r *http.Request) bool
 - 若命中 `*ValidationError`（参数校验失败，来自 `nonzero` 非零值校验或 `Validate()` 业务校验）→ 交由 `OnValidationError`（默认 400）。
 - 其余错误 → 交由 `OnError`（默认 500，客户端仅收到通用 `"internal server error"` 消息，err 详情写入服务端日志）。
 
+中间件每次调用 `next(w, r)` 时都会更新当前请求对象。`OnResponse`、`OnError`、`OnValidationError` 与 `OnPanic` 均使用最近一次成功传给 `next` 的 w/r，与下游中间件以及 `ResponseWriterFromContext`、`RequestFromContext` 的观察结果一致；多层替换后不会回退为外层对象。未命中路由时尚未进入中间件链，`OnNotFound` 收到引擎最初包装的 writer 与入口 request。
+
 > `OnValidationError` 有意回显校验细节（字段名、类型名、路径参数原始值）以便调用方修正请求，且信息仅来自请求侧、敏感度低；如需脱敏请自定义该回调。
 
 > `*BindingError` 的定义及参数绑定细节详见 `parameter-binding.md`；`*ValidationError` 的定义及参数校验规则详见 `parameter-validate.md`。
 
 ## 四、panic 恢复
 
-`ServeHTTP` 入口处通过 `defer recover` 捕获整个请求生命周期（含中间件链与 handler）中的 panic，交由 `OnPanic` 回调处理。默认 `DefaultPanicHandler` 在 `slog.Error` 中输出请求方法与路径、panic 值及调用栈，随后向客户端返回 500。
+`ServeHTTP` 入口处通过 `defer recover` 捕获整个请求生命周期（含路由回调、中间件链与 handler）中的 panic，交由 `OnPanic` 处理。进入中间件链后，`OnPanic` 收到最近一次成功传给 `next` 的 w/r；此前发生 panic 时使用引擎最初包装的 writer 与入口 request。默认 `DefaultPanicHandler` 在 `slog.Error` 中输出请求方法与路径、panic 值及调用栈，随后在响应尚未写入时向客户端返回 500。
 
 ```go
 func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) {
@@ -104,6 +106,8 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
 }
 ```
 
+`OnPanic` 的调用外还有一层最终 recover。若自定义 `OnPanic` 自身再次 panic，引擎会记录该 panic 及堆栈，并在当前响应尚未写入时直接兜底调用 `WriteHeader(500)`；不会递归调用 `OnPanic`，二次 panic 也不会继续传播到 `net/http`。
+
 ## 五、"是否已写入"的判定
 
 引擎用 `responseWriter` 包装原始 `http.ResponseWriter`，记录 `WriteHeader` / `Write` / `ReadFrom` / `Flush` / `Hijack` 是否被调用过（`Written()`；`ReadFrom` 为 `io.Copy(w, file)` 等零拷贝写入路径）。`Push` 推送的是独立流（HTTP/2 server push），**不影响本响应的 written 状态**——即使中间件调用过 `Push`，后续仍可按正常流程写入响应。`IsResponseWritten` 通过接口断言判定：
@@ -115,10 +119,11 @@ func IsResponseWritten(w http.ResponseWriter) bool {
 }
 ```
 
-- 判定依据是是否真正写入过响应体或状态码，而非仅仅设置了 Header。
-- 这样，仅设置 Header 的中间件（如 CORS）不会导致 JSON 响应被误跳过；只有真正写了响应（如文件流）才跳过。
-- `WriteHeader` 是幂等的：按 `net/http` 语义仅首次调用生效，重复调用被包装层挡下（不再透传底层），避免出现 `superfluous response.WriteHeader call` 警告。
-- 1xx 信息性响应（如 `103 Early Hints`）是例外：它不代表最终响应已写出，因此**不标记 written**，也不参与上述幂等判定——`WriteHeader(103)` 之后仍可正常写出最终状态码与响应体。
+- `written` 表示发生过最终 `WriteHeader`、`Write`、`ReadFrom`、`Flush` 或 `Hijack` 调用，不表示底层已成功写入字节。即使 `Write([]byte{})` 写入零字节，或底层 `Write` / `ReadFrom` / `Hijack` 返回错误，也会保持为 true，避免错误后默认回调再次尝试写响应。
+- 仅调用 `Header().Set(...)` 不标记 written，因此 CORS 等只设置响应头的中间件不会导致默认 JSON 响应被跳过。
+- `WriteHeader` 是幂等的：按 `net/http` 语义仅首次最终状态码调用生效，重复调用被包装层挡下（不再透传底层），避免出现 `superfluous response.WriteHeader call` 警告。
+- 1xx 信息性响应（如 `103 Early Hints`）不代表最终响应已写出，因此**不标记 written**，也不参与上述幂等判定；`WriteHeader(103)` 之后仍可正常写出最终状态码与响应体。
+- `Push` 写入的是独立的 HTTP/2 server push 流，同样不标记当前响应的 written。
 
 ## 六、自定义响应示例
 
@@ -196,18 +201,18 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 
 ## 七、执行流程（全链路）
 
-1. **请求体限制**：`MaxBodyBytes > 0` 时以 `http.MaxBytesReader` 包裹 `r.Body`（`NewEngine` 默认 **32 MB**，置 0 不限制），超限在绑定阶段失败并映射为 400（详见 `parameter-binding.md`）。
-2. **路由匹配**：`ServeHTTP` 按 method → normalizePath 查找路由条目，未命中 → `OnNotFound`。
-3. **panic 保护**：`defer recover` 包裹全流程，捕获 panic → `OnPanic`（`slog.Error` + 堆栈）。
+1. **请求入口准备**：`MaxBodyBytes > 0` 时以 `http.MaxBytesReader` 包裹入口 `r.Body`（`NewEngine` 默认 **32 MB**，置 0 不限制），并取得带 written 跟踪能力的初始 ResponseWriter；同时为入口请求体注册限量排空与关闭逻辑，404 也不例外。
+2. **panic 保护**：安装请求级 recover；后续 panic 交由 `OnPanic`，回调自身 panic 则由第二层 recover 记录并兜底 500。
+3. **路由匹配**：按 method → normalizePath 查找路由条目，未命中 → `OnNotFound` 并返回，随后仍执行请求体收尾。
 4. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body（POST 等带 body 方法为先 query 后 body 的合并绑定）；参数路由再由 `bindPathParams` 绑定路径参数（覆盖同名 query/body 值）；若注册期预计算 `needsRequestPhaseDefaults` 为 true，执行 `applyDefaults(requestPhase=true)` 为绑定后动态创建的子元素（切片/数组/map/nested ptr）补填 nil 指针的默认值；绑定错误（`*BindingError`，由 `NewBindingError` 包装底层错误构造）随 Req 注入 ctx。
-5. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；各中间件可通过 `BoundReqFromContext[T]` 获取已绑定的 Req。
+5. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；每次 `next(w, r)` 都更新当前 w/r，各中间件可通过 `BoundReqFromContext[T]` 获取此前已绑定的 Req。
 6. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateNonzero` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
-7. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler，成功 → `OnResponse(w, r, res)`，Res 同时注入 ctx 供后置中间件通过 `BoundResFromContext[T]` 获取。
-8. **错误分发**：任一环节返回 error，按类型分发：
+7. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler；成功时 Res 注入 ctx，随后以当前 w/r 调用 `OnResponse`，供后置中间件通过 `BoundResFromContext[T]` 获取 Res。
+8. **错误分发**：任一环节返回 error，均使用当前 w/r 按类型分发：
     - `*BindingError` / `*ValidationError` → `OnValidationError`（默认 400）
     - 其余 → `OnError`（默认 500）
-9. 各回调收到的 `w` 均为带 `Written()` 追踪能力的包装对象，已写入则跳过默认响应。
-10. **请求收尾**：请求处理结束后限量排空剩余未读请求体（上限 `maxBodyDrainBytes` = 2 KB）以复用 keep-alive 连接；超出上限不再排空，连接由 net/http 关闭。
+9. **响应状态跟踪**：未被中间件替换时，回调收到引擎的 written 跟踪包装器；若中间件替换 ResponseWriter，回调收到最近一次传给 `next` 的替换对象。自定义包装器应透传 `Written()`，否则默认回调无法识别其底层是否发生过写操作。
+10. **请求收尾**：所有请求（包括 404）结束后，引擎尝试排空入口请求体中至多 `maxBodyDrainBytes`（2 KB）的剩余数据并调用 `Close`；超过上限的部分不再由框架主动读取，后续连接处理由 `net/http` 决定。
 
 ## 八、在 handler 与中间件中获取上下文资源
 
@@ -223,10 +228,10 @@ func BoundResFromContext[T any](ctx context.Context) (T, error)
 
 | 方法 | 用途 |
 | --- | --- |
-| `RequestFromContext` | 获取 `*http.Request` |
-| `ResponseWriterFromContext` | 获取包装后的 `http.ResponseWriter`（带 `Written()` 追踪） |
+| `RequestFromContext` | 获取当前 `*http.Request`；中间件替换后为最近一次传给 `next` 的 request |
+| `ResponseWriterFromContext` | 获取当前 `http.ResponseWriter`；中间件替换后为最近一次传给 `next` 的 writer |
 | `EngineFromContext` | 获取 `*HttpEngine` |
-| `BoundReqFromContext[T]` | 获取已绑定的 Req（绑定阶段出错则 err 为非 nil 的 `*BindingError`；ctx 中不存在 Req 时返回 `ErrBoundReqNotFound`） |
+| `BoundReqFromContext[T]` | 获取进入中间件链前已绑定的 Req（替换 request 不会重新绑定；绑定阶段出错则 err 为非 nil 的 `*BindingError`；ctx 中不存在 Req 时返回 `ErrBoundReqNotFound`） |
 | `BoundResFromContext[T]` | 获取 handler 的 Res（仅在 `next()` 返回后可用；ctx 中不存在或类型不符时返回 `ErrBoundResNotFound`） |
 
-> 注入的 `ResponseWriter` 是带 `Written()` 追踪能力的包装对象。因此 handler 内若直接通过它写响应（如文件流），默认响应回调会自动跳过 JSON 编码。
+> 未被中间件替换时，注入的 ResponseWriter 是带 `Written()` 追踪能力的引擎包装对象，handler 直接通过它写响应（如文件流）后，默认响应回调会跳过 JSON 编码。中间件替换 writer 时，应让自定义包装器透传 `Written()` 以保留同一判定能力。

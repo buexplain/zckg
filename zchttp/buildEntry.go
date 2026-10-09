@@ -44,6 +44,8 @@ type routeEntry struct {
 	needsNonzeroValidation bool
 	// 路由路径参数与 Req 字段的绑定关系，按注册顺序与捕获值对位；静态路由为 nil
 	pathParams []pathParamBinding
+	// Req 顶层值嵌入了 KeepRawBody：请求阶段不绑定请求体，OpenAPI 输出通用 */* requestBody
+	keepRawBody bool
 }
 
 // pathParamBinding 描述单个路由路径参数绑定到 Req 哪个字段，
@@ -52,7 +54,7 @@ type pathParamBinding struct {
 	indices      []int          // 从 Req 根结构体出发的字段索引路径（复用 fieldMeta.indices 机制）
 	timeFormat   string         // 复用字段的 time_format 标签
 	timeLocation *time.Location // 复用字段的 time_location 标签
-	optional     bool           // 对应的路由参数是否为可选参数 {name?}
+	optional     bool           // 对应的路由参数是否为可选参数 {name?}（通配尾段 {name...} 为 false，零段命中由捕获值缺失表达）
 }
 
 // buildEntry 校验 handler 签名、构建中间件链、预计算反射信息，返回完整的 routeEntry。
@@ -102,6 +104,16 @@ func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHan
 
 	// 预计算 Req 结构体的字段元信息（binding/validation/defaults 及 OpenAPI 生成使用）
 	reqMeta := buildStructMeta(reqElemType)
+
+	// KeepRawBody 声明不读取请求体，而上传文件只能来自 multipart 请求体，二者自相矛盾
+	keepRawBody := hasKeepRawBody(reqElemType)
+	if keepRawBody {
+		for _, fm := range reqMeta.fields {
+			if fm.isFile || fm.isFileSlice {
+				return nil, fmt.Errorf("zchttp.KeepRawBody embedded in Req struct %s conflicts with upload file field %q: files can only be bound from a multipart request body", reqElemType.Name(), fm.field.Name)
+			}
+		}
+	}
 
 	// 预计算 Res 结构体的字段元信息（OpenAPI 生成使用，避免重复反射遍历结构体字段）
 	var resElemType reflect.Type
@@ -161,6 +173,7 @@ func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHan
 		needsDeepCopy:             needsDeepCopy,
 		needsRequestPhaseDefaults: needsRequestPhaseDefaults,
 		needsNonzeroValidation:    needsNonzeroValidation,
+		keepRawBody:               keepRawBody,
 		handlerName:               handlerName,
 		handlerFile:               handlerFile,
 		handlerLine:               handlerLine,
@@ -193,6 +206,21 @@ func buildOperationMeta(reqType reflect.Type) operationMeta {
 		return m
 	}
 	return m
+}
+
+// hasKeepRawBody 判断 Req 结构体是否在顶层值嵌入了 KeepRawBody；
+// *KeepRawBody 与更深层结构体中的嵌入均不识别。
+func hasKeepRawBody(reqType reflect.Type) bool {
+	if reqType.Kind() != reflect.Struct {
+		return false
+	}
+	for i := 0; i < reqType.NumField(); i++ {
+		f := reqType.Field(i)
+		if f.Anonymous && f.Type == keepRawBodyType {
+			return true
+		}
+	}
+	return false
 }
 
 // attachPathParamBindings 按参数名在 Req 的预计算元信息中查找对应字段，
