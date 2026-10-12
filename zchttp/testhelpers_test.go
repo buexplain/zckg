@@ -2,6 +2,7 @@
 package zchttp
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -32,4 +33,22 @@ func serveRequest(t *testing.T, router *Router, method, target, body string) *ht
 	engine := NewEngine()
 	engine.Router = router
 	return serveJSONOn(t, engine, method, target, body)
+}
+
+// expectPanicContains 断言 fn 触发 panic，且 panic 消息包含所有 want 子串
+func expectPanicContains(t *testing.T, want []string, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected panic containing %v, got none", want)
+		}
+		msg := fmt.Sprintf("%v", r)
+		for _, w := range want {
+			if !strings.Contains(msg, w) {
+				t.Fatalf("panic message should contain %q, got: %s", w, msg)
+			}
+		}
+	}()
+	fn()
 }

@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -967,5 +968,111 @@ func TestParamRouteEmptySegmentNotFound(t *testing.T) {
 	rec := serveRequest(t, router, http.MethodGet, "/c7/v/b", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"x":"v"`) {
 		t.Fatalf("GET /c7/v/b status = %d, body = %s, want 200 with x=v", rec.Code, rec.Body.String())
+	}
+}
+
+// ======== splitPathSegments / parseRoutePath 单元测试 ========
+
+func TestSplitPathSegments(t *testing.T) {
+	cases := []struct {
+		input string
+		want  []string
+	}{
+		{"/", nil},
+		{"/a", []string{"a"}},
+		{"/a/b", []string{"a", "b"}},
+		{"/posts/{post_id}", []string{"posts", "{post_id}"}},
+	}
+	for _, c := range cases {
+		got := splitPathSegments(c.input)
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("splitPathSegments(%q) = %v, want %v", c.input, got, c.want)
+		}
+	}
+}
+
+func TestParseRoutePathValid(t *testing.T) {
+	segments, err := parseRoutePath("/posts/{post_id}/comments/{comment_id?}")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []routeSegment{
+		{literal: "posts"},
+		{name: "post_id", isParam: true},
+		{literal: "comments"},
+		{name: "comment_id", isParam: true, optional: true},
+	}
+	if !reflect.DeepEqual(segments, want) {
+		t.Fatalf("segments = %+v, want %+v", segments, want)
+	}
+}
+
+func TestParseRoutePathInvalid(t *testing.T) {
+	cases := []struct {
+		name    string
+		path    string
+		errPart string
+	}{
+		{"invalid name starts with digit", "/p/{1id}", "invalid parameter name"},
+		{"empty name", "/p/{}", "invalid parameter name"},
+		{"invalid char in name", "/p/{a-b}", "invalid parameter name"},
+		{"param not whole segment prefix", "/p/abc{id}", "invalid parameter segment"},
+		{"param not whole segment suffix", "/p/{id}x", "invalid parameter segment"},
+		{"unbalanced braces", "/p/{id", "invalid parameter segment"},
+		{"required after optional param", "/p/{a?}/{b}", "not allowed after optional"},
+		{"static after optional param", "/p/{a?}/x", "not allowed after optional"},
+		{"duplicate param name", "/p/{a}/{a}", "duplicate parameter name"},
+		{"empty segment", "/p//{a}", "empty path segment"},
+		{"param after catch-all", "/p/{rest...}/{b}", "not allowed after catch-all"},
+		{"static after catch-all", "/p/{rest...}/x", "not allowed after catch-all"},
+		{"optional then catch-all suffix", "/p/{a?...}", `invalid parameter name "a?"`},
+		{"catch-all then optional suffix", "/p/{a...?}", `invalid parameter name "a..."`},
+		{"catch-all without name", "/p/{...}", `invalid parameter name ""`},
+		{"catch-all not whole segment", "/p/x{a...}", "{name...}"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseRoutePath(c.path)
+			if err == nil {
+				t.Fatalf("expected error containing %q for path %q, got nil", c.errPart, c.path)
+			}
+			if !strings.Contains(err.Error(), c.errPart) {
+				t.Fatalf("error should contain %q, got: %v", c.errPart, err)
+			}
+		})
+	}
+}
+
+// TestParseRoutePathCatchAllValid 验证通配尾段 {name...} 解析为 isParam=true、catchAll=true，
+// 且不标记 optional；覆盖单独使用、跟在必选参数后、根路径三种合法位置
+func TestParseRoutePathCatchAllValid(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want []routeSegment
+	}{
+		{"alone after static", "/dify/{rest...}", []routeSegment{
+			{literal: "dify"},
+			{name: "rest", isParam: true, catchAll: true},
+		}},
+		{"after required param", "/a/{x}/{rest...}", []routeSegment{
+			{literal: "a"},
+			{name: "x", isParam: true},
+			{name: "rest", isParam: true, catchAll: true},
+		}},
+		{"root", "/{rest...}", []routeSegment{
+			{name: "rest", isParam: true, catchAll: true},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			segments, err := parseRoutePath(c.path)
+			if err != nil {
+				t.Fatalf("parseRoutePath(%q) unexpected error: %v", c.path, err)
+			}
+			if !reflect.DeepEqual(segments, c.want) {
+				t.Fatalf("segments = %+v, want %+v", segments, c.want)
+			}
+		})
 	}
 }
