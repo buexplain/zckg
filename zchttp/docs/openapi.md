@@ -65,7 +65,11 @@ ID int64 `json:"id" nonzero:"true"`
 
 > Res 结构体上的 `default` 和 `nonzero` 标签**没有运行时语义**：Res 不参与参数绑定与校验，`applyDefaults` 和 `validateNonzero` 均仅作用于 Req。但它们**参与文档生成**：Res 的 `default` 按与 Req 相同的展示规则在 schema 中展示；Res 的 `nonzero:"true"` 仅在不存在受支持并被元数据识别的 `default` 时推断为 `required`（用于描述响应结构约束）。
 
-字段名沿用绑定规则：优先 `form` 标签，其次 `json` 标签，最后使用字段名。
+字段名按所在位置区分，与运行时实际接受的键保持一致：
+
+- **query / path 参数与 multipart/form-data 顶层请求体**：沿用绑定规则，优先 `form` 标签，其次 `json` 标签，最后使用字段名。
+- **application/json 请求体、响应以及所有嵌套结构体**：按 `encoding/json` 的字段规则——`json` 标签名优先（空名或非法名回退字段名），`json:"-"` 排除、`json:"-,"` 名为 `-`，`form` 标签不参与；无 json 名的匿名嵌入展开到父级，带 json 名的匿名嵌入作为嵌套对象；同名字段取嵌入深度最浅者，同深度时带标签者胜出，仍并列则全部不输出。与 `encoding/json` 的差异：未导出的匿名指针嵌入不展开（框架同样跳过，见 `request.md`）；`,string` 选项不改变 schema 类型。`required` 列出受 `nonzero` 校验的字段的 JSON 名。
+- 同一类型既作 multipart 顶层请求体又作 JSON 结构（如响应）时，分别注册为两个 schema，后注册者名称追加序号。
 
 ## deprecated 标记
 

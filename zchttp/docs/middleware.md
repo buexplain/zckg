@@ -13,7 +13,7 @@ type MiddlewareHandler func(ctx context.Context, w http.ResponseWriter, r *http.
 - `next` 调用**之前**的逻辑为「前置」处理。
 - `next(w, r)` 返回**之后**的逻辑为「后置」处理。
 - 返回值 `error` 会向上层中间件传播。
-- `next` 接收的 `w` 和 `r` 将传递给下游；若无需替换，原样传入当前收到的 `w` 和 `r` 即可。
+- `next` 接收的 `w` 和 `r` 将传递给下游；若无需替换，原样传入当前收到的 `w` 和 `r` 即可。传入新的 `r` 时，其 `r.Context()` 同时成为下游中间件与 handler 的 `ctx`（见第三节）。
 
 标准写法：
 
@@ -83,6 +83,21 @@ func gzipMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request,
 
 多层中间件可逐层替换。外层把 `w2/r2` 传给 `next`、内层再把 `w3/r3` 传给 `next` 时，core、Context 访问器和链后回调最终都使用 `w3/r3`。该状态在调用返回时不会回退为外层对象。
 
+### 通过 `r.WithContext` 向下游注入值
+
+传给 `next` 的 `r` 与当前层收到的不是同一对象时，`r.Context()` 会成为下游中间件的 `ctx` 参数以及业务 handler 的 `ctx` 参数，与标准库 `r.WithContext` 的习惯一致：
+
+```go
+func traceMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+    ctx = context.WithValue(ctx, traceKey{}, newTraceID())
+    return next(w, r.WithContext(ctx)) // 下游中间件与 handler 的 ctx.Value(traceKey{}) 均可读到
+}
+```
+
+- 新 Context 若由中间件收到的 `ctx` 派生（已含框架请求状态），下游直接使用它。
+- 新 Context 若由原始 `r.Context()` 或其他上下文派生（不含框架请求状态），引擎会在其上补挂同一份请求状态，因此下游 `ctx` 上的 `RequestFromContext`、`ResponseWriterFromContext`、`EngineFromContext`、`BoundReqFromContext`、`BoundResFromContext` 仍可用。
+- 原样传入 `r` 时下游 `ctx` 与当前层相同；外层中间件自身的 `ctx` 参数不会被下游的替换改变，外层后置阶段读取 `BoundResFromContext(ctx)` 等访问器不受影响（同一份请求状态）。
+
 替换 `*http.Request` 不会重新执行参数绑定：`BoundReqFromContext` 仍返回进入中间件链之前已经绑定的 Req。若无需替换 w/r，原样透传即可：
 
 ```go
@@ -130,6 +145,8 @@ func authMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request,
 ```
 
 > 此时 Req 已完成数据绑定但尚未做参数校验（nonzero / Validate），校验在 core 层执行。若绑定阶段出错，`BoundReqFromContext` 会返回 `*BindingError`。
+>
+> 以值类型 `BoundReqFromContext[LoginReq]` 取得的是浅拷贝副本，修改其非引用字段不影响 handler；以指针类型 `BoundReqFromContext[*LoginReq]` 取得的是 handler 即将使用的同一实例，在 `next()` 之前修改其字段会改变 handler 收到的入参（且该修改发生在 nonzero / Validate 校验之前）。只读观察时请用值类型。类型参数与路由 Req 类型不符时同样返回 `ErrBoundReqNotFound`，与「ctx 中没有 Req」无法区分。
 
 ### 在中间件中获取 handler 的响应 Res
 

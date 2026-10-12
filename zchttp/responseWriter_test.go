@@ -2,12 +2,15 @@ package zchttp
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ========== IsResponseWritten 测试 ==========
@@ -105,6 +108,80 @@ func TestResponseWriter_WriteHeaderInformationalNotFinal(t *testing.T) {
 	}
 	if len(sw.codes) != 2 || sw.codes[0] != http.StatusEarlyHints || sw.codes[1] != http.StatusOK {
 		t.Fatalf("1xx 与最终状态码都应透传底层，底层收到: %v", sw.codes)
+	}
+}
+
+// TestResponseWriter_WriteHeader101IsFinal 锁死 101 Switching Protocols 与 net/http 一致视为最终响应：
+// 写出后标记 written，随后的 WriteHeader(500) 不再透传底层；经引擎执行时 handler 写 101 后返回 error，
+// 默认错误回调因 IsResponseWritten 跳过，底层只收到 101、不追加任何错误正文
+func TestResponseWriter_WriteHeader101IsFinal(t *testing.T) {
+	sw := &statusRecordingWriter{}
+	rw := acquireResponseWriter(sw)
+	rw.WriteHeader(http.StatusSwitchingProtocols)
+	if !IsResponseWritten(rw) {
+		t.Fatal("101 应标记 written")
+	}
+	rw.WriteHeader(http.StatusInternalServerError)
+	if len(sw.codes) != 1 || sw.codes[0] != http.StatusSwitchingProtocols {
+		t.Fatalf("101 之后的状态码不应透传，底层收到: %v", sw.codes)
+	}
+	releaseResponseWriter(rw)
+
+	router := NewRouter()
+	router.GET("/upgrade", func(ctx context.Context, _ struct{}) (struct{}, error) {
+		w, _ := ResponseWriterFromContext(ctx)
+		w.WriteHeader(http.StatusSwitchingProtocols)
+		return struct{}{}, errors.New("after upgrade")
+	})
+	engine := NewEngine()
+	engine.Router = router
+	esw := &statusRecordingWriter{}
+	engine.ServeHTTP(esw, httptest.NewRequest(http.MethodGet, "/upgrade", nil))
+	if len(esw.codes) != 1 || esw.codes[0] != http.StatusSwitchingProtocols || len(esw.body) != 0 {
+		t.Fatalf("engine after 101: codes=%v body=%q, want only 101 and empty body", esw.codes, esw.body)
+	}
+}
+
+// TestResponseWriter_UnwrapForResponseController 验证包装器实现 Unwrap：
+// 真实 net/http 连接上 http.ResponseController 的 SetWriteDeadline/EnableFullDuplex 可穿透到底层并成功，
+// Unwrap 返回的正是底层 writer；经包装器 Flush 仍标记 written
+func TestResponseWriter_UnwrapForResponseController(t *testing.T) {
+	type result struct {
+		deadlineErr, duplexErr, flushErr error
+		unwrapOK, written                bool
+	}
+	ch := make(chan result, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rw := acquireResponseWriter(w)
+		defer releaseResponseWriter(rw)
+		var res result
+		u, ok := rw.(interface{ Unwrap() http.ResponseWriter })
+		res.unwrapOK = ok && u.Unwrap() == w
+		rc := http.NewResponseController(rw)
+		res.deadlineErr = rc.SetWriteDeadline(time.Now().Add(time.Minute))
+		res.duplexErr = rc.EnableFullDuplex()
+		res.flushErr = rc.Flush()
+		res.written = IsResponseWritten(rw)
+		ch <- res
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+	res := <-ch
+	if !res.unwrapOK {
+		t.Fatal("wrapper must implement Unwrap returning the underlying writer")
+	}
+	if res.deadlineErr != nil || res.duplexErr != nil || res.flushErr != nil {
+		t.Fatalf("ResponseController errors: deadline=%v duplex=%v flush=%v, want all nil",
+			res.deadlineErr, res.duplexErr, res.flushErr)
+	}
+	if !res.written {
+		t.Fatal("Flush via ResponseController must hit the wrapper and mark written")
 	}
 }
 

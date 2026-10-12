@@ -2667,3 +2667,114 @@ func TestBindBody_UnsupportedMapType(t *testing.T) {
 		t.Fatal("encoding/json 不支持的 map key 类型应返回绑定错误")
 	}
 }
+
+type docUnexportedPtrInner struct {
+	X string `json:"x"`
+}
+
+type docUnexportedPtrEmbedReq struct {
+	*docUnexportedPtrInner
+	Y string `json:"y"`
+}
+
+type docUnexportedPtrEmbedRes struct {
+	Y string `json:"y"`
+}
+
+// TestBindJSON_UnexportedPointerEmbed 锁死非导出类型指针嵌入在 JSON 请求体下的行为：请求体不含嵌入字段
+// 时正常绑定（200）；含嵌入字段 x 时 encoding/json 无法为非导出指针分配内存，绑定失败返回 400，
+// 错误消息含 "cannot set embedded pointer to unexported struct"。
+func TestBindJSON_UnexportedPointerEmbed(t *testing.T) {
+	router := NewRouter()
+	router.POST("/unexported-ptr", func(_ context.Context, req docUnexportedPtrEmbedReq) (docUnexportedPtrEmbedRes, error) {
+		return docUnexportedPtrEmbedRes{Y: req.Y}, nil
+	})
+	ok := serveRequest(t, router, http.MethodPost, "/unexported-ptr", `{"y":"1"}`)
+	if ok.Code != http.StatusOK || !strings.Contains(ok.Body.String(), `"y":"1"`) {
+		t.Fatalf("不含嵌入字段: status = %d, body = %s, want 200 with y=1", ok.Code, ok.Body.String())
+	}
+	bad := serveRequest(t, router, http.MethodPost, "/unexported-ptr", `{"x":"1","y":"1"}`)
+	if bad.Code != http.StatusBadRequest || !strings.Contains(bad.Body.String(), "cannot set embedded pointer to unexported struct") {
+		t.Fatalf("含嵌入字段: status = %d, body = %s, want 400 with encoding/json embedded pointer error", bad.Code, bad.Body.String())
+	}
+}
+
+type docMaxBodyZeroReq struct {
+	Body string `form:"body" json:"body"`
+}
+
+type docMaxBodyZeroRes struct {
+	Len int `json:"len"`
+}
+
+// TestBindBody_MaxBodyBytesZeroParserLimits 锁死 MaxBodyBytes=0 时“框架不额外限制、解析器自身限制仍生效”：
+// 11 MB 的 urlencoded 请求体被标准库 ParseForm 的 10 MB 固有上限拒绝（400，消息 http: POST too large）；
+// 同样 11 MB 的 JSON 请求体正常绑定（200，长度完整）。
+func TestBindBody_MaxBodyBytesZeroParserLimits(t *testing.T) {
+	router := NewRouter()
+	router.POST("/zero-limit", func(_ context.Context, req docMaxBodyZeroReq) (docMaxBodyZeroRes, error) {
+		return docMaxBodyZeroRes{Len: len(req.Body)}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+	engine.MaxBodyBytes = 0
+	payload := strings.Repeat("a", 11<<20)
+
+	formReq := httptest.NewRequest(http.MethodPost, "/zero-limit", strings.NewReader("body="+payload))
+	formReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	formRec := httptest.NewRecorder()
+	engine.ServeHTTP(formRec, formReq)
+	if formRec.Code != http.StatusBadRequest || !strings.Contains(formRec.Body.String(), "http: POST too large") {
+		t.Fatalf("urlencoded 11MB: status = %d, body = %.200s, want 400 with http: POST too large", formRec.Code, formRec.Body.String())
+	}
+
+	jsonRec := serveJSONOn(t, engine, http.MethodPost, "/zero-limit", `{"body":"`+payload+`"}`)
+	if jsonRec.Code != http.StatusOK {
+		t.Fatalf("JSON 11MB: status = %d, body = %.200s, want 200", jsonRec.Code, jsonRec.Body.String())
+	}
+	var res docMaxBodyZeroRes
+	decodeData(t, jsonRec, &res)
+	if res.Len != len(payload) {
+		t.Fatalf("JSON 11MB 绑定长度 = %d, want %d", res.Len, len(payload))
+	}
+}
+
+// TestIsScalarType 锁死路径参数可绑定类型的判定：标量各宽度、time.Time 及其指针（含多级）为 true；
+// slice、map、struct、chan、interface 以及指针层数超过 maxPtrDerefDepth 的标量为 false。
+func TestIsScalarType(t *testing.T) {
+	deep := reflect.TypeOf(0)
+	for i := 0; i <= maxPtrDerefDepth; i++ {
+		deep = reflect.PointerTo(deep)
+	}
+	limit := reflect.TypeOf(0)
+	for i := 0; i < maxPtrDerefDepth; i++ {
+		limit = reflect.PointerTo(limit)
+	}
+	cases := []struct {
+		name string
+		typ  reflect.Type
+		want bool
+	}{
+		{"string", reflect.TypeOf(""), true},
+		{"bool", reflect.TypeOf(false), true},
+		{"int8", reflect.TypeOf(int8(0)), true},
+		{"uint64", reflect.TypeOf(uint64(0)), true},
+		{"float32", reflect.TypeOf(float32(0)), true},
+		{"time", reflect.TypeOf(time.Time{}), true},
+		{"ptr time", reflect.TypeOf(&time.Time{}), true},
+		{"ptr at depth limit", limit, true},
+		{"ptr beyond depth limit", deep, false},
+		{"slice", reflect.TypeOf([]string{}), false},
+		{"map", reflect.TypeOf(map[string]int{}), false},
+		{"struct", reflect.TypeOf(struct{}{}), false},
+		{"chan", reflect.TypeOf(make(chan int)), false},
+		{"interface", reflect.TypeOf((*any)(nil)).Elem(), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isScalarType(c.typ); got != c.want {
+				t.Fatalf("isScalarType(%v) = %v, want %v", c.typ, got, c.want)
+			}
+		})
+	}
+}

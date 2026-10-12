@@ -61,7 +61,7 @@ GET /search?keyword=go&page=3
 | --- | --- |
 | `NewEngine()` 默认 **32 MB** | 超限请求在绑定阶段失败，映射为 `BindingError` 返回 **400** |
 | 显式调大（如 `engine.MaxBodyBytes = 64 << 20`） | 适用于合法的大请求体场景 |
-| 显式置 `0` | 不限制（需自行评估超大请求体导致的内存/磁盘 DoS 风险） |
+| 显式置 `0` | 框架不额外限制（需自行评估超大请求体导致的内存/磁盘 DoS 风险）；但解析器自身的限制仍生效：`application/x-www-form-urlencoded` 由标准库 `ParseForm` 解析，超过 10 MB 时绑定失败返回 400（`http: POST too large`），JSON 与 multipart 无此隐式上限 |
 
 两个字段的关系：`MaxBodyBytes` 是请求体的**整体入口上限**（先于任何解析生效）；`MultipartFormMaxMemory` 仅控制 multipart 解析时的**内存缓冲上限**（超出部分写入临时文件，仍受 `MaxBodyBytes` 总量约束）。需要大文件上传时两者需同步调大。
 
@@ -133,7 +133,7 @@ r.POST("/webhook", webhook)
 
 - **参数名即字段绑定名**：按 form > json > 字段名优先级解析，注册阶段预计算绑定关系，参数名无对应字段时注册即 panic。
 - **覆盖语义**：三级覆盖链 **path > body > query**（路径参数是更精确的意图，优先级最高；带 body 方法内部为 body > query，见上节）。
-- **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（`time_format`/`time_location` 标签同样生效）。
+- **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（`time_format`/`time_location` 标签同样生效）；目标字段为 slice、map、结构体等其他类型时注册即 panic。
 - **失败语义区别于尽力绑定**：单个参数转换失败立即返回错误（包装为 `BindingError` 返回 400），而非跳过。
 - **可选参数省略**：`{name?}` 未出现在请求路径中时不写入字段，保留模板 `default` 值或零值。
 - **通配尾段**：`{name...}` 捕获剩余全部路径（已百分号解码、可含 `/`、不做路径清理）；零段命中（如 `/dify/{rest...}` 收到 `/dify`）时同可选参数省略，不写入字段。
@@ -147,6 +147,10 @@ r.POST("/webhook", webhook)
 3. 结构体字段名
 
 字段名为空或为 `-` 时跳过该字段；未导出字段（小写开头）跳过。
+
+上述绑定名作用于 query / 表单 / multipart / 路径参数。JSON 请求体由 `encoding/json` 直接解码，只认 `json` 标签（无 json 名时用字段名，键名大小写不敏感，`json:"-"` 永不绑定），`form` 标签对其无效；例如 `form:"q" json:"keyword"` 的字段在 JSON 中只接受 `keyword`（`KEYWORD` 也可），不接受 `q`。OpenAPI 的 JSON schema 按同一规则命名，见 `openapi.md`。
+
+未导出的匿名**指针**嵌入（`type Req struct { *base }`）是例外：框架元数据跳过它（query / 表单不绑定其字段），但 JSON 请求体仍交给 `encoding/json`，只要 JSON 中出现该嵌入的导出字段，解码就会报 `json: cannot set embedded pointer to unexported struct`，整个请求返回 400；不含这些字段的请求不受影响。详见 `request.md`。
 
 ```go
 type Req struct {

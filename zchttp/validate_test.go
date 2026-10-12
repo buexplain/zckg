@@ -357,6 +357,35 @@ func TestValidateCustomPass(t *testing.T) {
 	}
 }
 
+// typedNilValidatorReq 的 Validate 返回 typed-nil *ValidationError（接口非 nil、指针为 nil）
+type typedNilValidatorReq struct {
+	Name string `form:"name"`
+}
+
+func (typedNilValidatorReq) Validate() error {
+	var ve *ValidationError
+	return ve
+}
+
+// TestValidateCustomTypedNilPasses 锁死 Validator 返回 typed-nil 与 handler 返回 typed-nil 同一语义：
+// 视为校验通过，handler 正常执行并返回 200；修复前 typed-nil 被当作 *ValidationError 透传，
+// 默认校验回调写出 400 后调用 err.Error() 解引用 nil 指针 panic
+func TestValidateCustomTypedNilPasses(t *testing.T) {
+	handlerCalled := false
+	router := NewRouter()
+	router.GET("/tn", func(_ context.Context, req typedNilValidatorReq) (validateRes, error) {
+		handlerCalled = true
+		return validateRes{OK: req.Name == "a"}, nil
+	})
+	rec := serveRequest(t, router, http.MethodGet, "/tn?name=a", "")
+	if rec.Code != http.StatusOK || !handlerCalled {
+		t.Fatalf("status=%d handlerCalled=%v body=%s, want 200 and handler executed", rec.Code, handlerCalled, rec.Body.String())
+	}
+	if err := validateCustom(reflect.ValueOf(&typedNilValidatorReq{}), buildStructMeta(reflect.TypeOf(typedNilValidatorReq{}))); err != nil {
+		t.Fatalf("validateCustom(typed-nil) = %#v, want nil", err)
+	}
+}
+
 // TestValidateCustomStructuredError 验证 Validate 返回 *ValidationError 时进入 400 回调
 func TestValidateCustomStructuredError(t *testing.T) {
 	router := NewRouter()

@@ -536,3 +536,30 @@ func BenchmarkMatchCatchAllAfterParamMiss(b *testing.B) {
 		router.match(http.MethodGet, "/a/1/2")
 	}
 }
+
+// TestTrieParamRejectsEmptySegment 锁死参数段不匹配空段：/a/{x}/b 对 /a//b 不命中（而非以 x="" 命中），
+// "必选参数 + 通配尾段"同样不以空段命中（可选参数只能位于末尾，末尾空段已被归一化去除，无需单列）；同节点存在通配尾段时空段改由通配捕获（含前导 "/"）；
+// 非空段照常命中参数分支。
+func TestTrieParamRejectsEmptySegment(t *testing.T) {
+	required := NewRouter()
+	required.GET("/a/{x}/b", caParam)
+	assertTrieMatches(t, required, []trieMatchCase{
+		{"empty segment misses", "/a//b", "", nil},
+		{"non-empty segment hits", "/a/1/b", "caParam", []string{"1"}},
+	})
+
+	paramThenRest := NewRouter()
+	paramThenRest.GET("/o/{x}/{rest...}", caRest)
+	assertTrieMatches(t, paramThenRest, []trieMatchCase{
+		{"param before catch-all empty segment misses", "/o//y/z", "", nil},
+		{"param before catch-all hits", "/o/1/y/z", "caRest", []string{"1", "y/z"}},
+	})
+
+	withCatchAll := NewRouter()
+	withCatchAll.GET("/c/{x}/b", caParam)
+	withCatchAll.GET("/c/{rest...}", caRest)
+	assertTrieMatches(t, withCatchAll, []trieMatchCase{
+		{"empty segment falls to catch-all", "/c//b", "caRest", []string{"/b"}},
+		{"non-empty segment prefers param", "/c/1/b", "caParam", []string{"1"}},
+	})
+}

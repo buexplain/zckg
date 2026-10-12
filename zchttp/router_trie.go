@@ -121,7 +121,7 @@ func routeConflictPanic(method, path string, existing, incoming *routeEntry, rea
 }
 
 // matchPath 在基数树上逐段扫描匹配请求路径，同节点按 静态段 > 参数段 > 通配尾段 依次尝试，
-// 前者分支失败时回溯。路径耗尽时按 终点 entry > 可选参数省略分支（param 子节点 optional 且
+// 前者分支失败时回溯；参数段不匹配空段（如 "/a//b" 中的空段），通配尾段不受此限。路径耗尽时按 终点 entry > 可选参数省略分支（param 子节点 optional 且
 // entries[1] 非空）> 通配零段命中 的顺序兜底；通配零段命中不追加捕获值。
 // 静态与参数分支均失败时，通配槽捕获本层进入时的剩余路径（去掉前导 "/"，可含多段），
 // 不能用切出首段后的剩余部分，否则丢失通配起点后的第一段。
@@ -156,7 +156,7 @@ func (n *routeNode) matchPath(path string, captured []string) (*routeEntry, []st
 			return e, c
 		}
 	}
-	if n.param != nil {
+	if n.param != nil && seg != "" {
 		if e, c := n.param.matchPath(rest, append(captured, seg)); e != nil {
 			return e, c
 		}

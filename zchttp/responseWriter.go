@@ -120,10 +120,11 @@ func releaseResponseWriter(rw http.ResponseWriter) {
 // WriteHeader 实现 http.ResponseWriter：首次调用标记响应已写入并透传底层 WriteHeader；
 // 重复调用按 net/http 语义为无效操作（直接返回，不再透传），避免底层
 // ResponseWriter 打印 "superfluous response.WriteHeader call"。
-// 1xx 是信息性响应（如 103 Early Hints），不代表最终响应已写出：既不标记 written
+// 除 101 外的 1xx 是信息性响应（如 103 Early Hints），不代表最终响应已写出：既不标记 written
 // 也不参与幂等判定，使 net/http 允许的「1xx 之后再写最终状态码」仍然生效。
+// 101 Switching Protocols 与 net/http 一致视为最终响应（协议已切换，之后不应再写状态码）。
 func (w *responseWriter) WriteHeader(statusCode int) {
-	if statusCode >= 100 && statusCode < 200 {
+	if statusCode >= 100 && statusCode < 200 && statusCode != http.StatusSwitchingProtocols {
 		w.ResponseWriter.WriteHeader(statusCode)
 		return
 	}
@@ -132,6 +133,13 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 	}
 	w.written = true
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Unwrap 返回底层 ResponseWriter，供 http.ResponseController 发现底层能力
+// （SetReadDeadline/SetWriteDeadline/EnableFullDuplex 等）。经 Unwrap 取得的 writer
+// 直接写入不经本包装器，不会标记 written；需要框架感知写入状态时应写本包装器。
+func (w *responseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // Write 实现 http.ResponseWriter：标记响应已写入（0 字节写入同样标记），再透传底层 Write。

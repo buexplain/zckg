@@ -14,7 +14,9 @@ var ErrNextCalledMultipleTimes = errors.New("middleware next() called multiple t
 
 // NextFunc 调用后继续执行下一层中间件，若当前已是最后一层则执行路由 handler
 // 传入的 w 和 r 将替代当前层的值传递给下游，中间件可借此替换 ResponseWriter（如 gzip 包装）
-// 或修改 Request（如注入 Header）；若无需替换，原样传入当前收到的 w 和 r 即可
+// 或修改 Request（如注入 Header）；若无需替换，原样传入当前收到的 w 和 r 即可。
+// 传入新的 r 时，r.Context() 成为下游中间件与 handler 的 ctx（若其中不含框架请求状态，
+// 框架会在其上补挂，Context 访问器始终可用），与标准库 r.WithContext 习惯一致
 // 返回值 error 为下游（后续中间件或 handler）产生的错误
 // 若不调用，则后续中间件与 handler 均不会执行（短路）
 //
@@ -45,14 +47,14 @@ const maxBitmaskMiddlewares = 64
 // chainRunner 承载中间件链执行状态：所有层共享同一个 next 函数值（创建池对象时
 // 一次性绑定），用位图记录各层 next() 是否已被调用，避免递归实现中每层
 // 都分配一个捕获 called 标记的闭包（热路径优化）。
-// w 和 r 为可变状态：每层中间件可通过 next(w, r) 传入替换值，advance 将其
-// 写入 c.w / c.r，使下一层中间件与 finalHandler 拿到替换后的版本。
+// ctx、w 和 r 为可变状态：每层中间件可通过 next(w, r) 传入替换值，advance 将其
+// 写入 c.w / c.r（r 被替换时 c.ctx 同步为其 Context），使下一层中间件与 finalHandler 拿到替换后的版本。
 type chainRunner struct {
 	middlewares []MiddlewareHandler
 	ctx         context.Context
 	w           http.ResponseWriter
 	r           *http.Request
-	final       func(w http.ResponseWriter, r *http.Request) error
+	final       finalHandlerFunc
 	nextFunc    NextFunc // 池对象创建时绑定 c.advance，此后不再重新分配
 	calledBits  uint64   // 第 i 层 next() 已调用标记（位 i）
 	current     int      // 当前正在执行的中间件层号
@@ -71,9 +73,9 @@ var chainRunnerPool = sync.Pool{
 // 这构成了洋葱模型：middlewares[0] 在最外层，finalHandler 在最内层。
 // 每层的 next 仅允许调用一次，重复调用返回 ErrNextCalledMultipleTimes，
 // 防止下游中间件与 handler 被重复执行。
-func runChain(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler func(w http.ResponseWriter, r *http.Request) error) error {
+func runChain(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler finalHandlerFunc) error {
 	if len(middlewares) == 0 {
-		return finalHandler(w, r)
+		return finalHandler(ctx, w, r)
 	}
 	if len(middlewares) > maxBitmaskMiddlewares {
 		return runChainRecursive(middlewares, ctx, w, r, finalHandler)
@@ -97,11 +99,14 @@ func runChain(middlewares []MiddlewareHandler, ctx context.Context, w http.Respo
 	return err
 }
 
+// finalHandlerFunc 是链最内层（core）的签名；ctx 为最近一次 next 传入的 request 所对应的上下文
+type finalHandlerFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) error
+
 // exec 执行第 level 层中间件；层号越界时执行最内层 finalHandler。
 // 进入前记录并切换 current，退出时恢复，保证 next() 总能定位到调用者所在层
 func (c *chainRunner) exec(level int) error {
 	if level == len(c.middlewares) {
-		return c.final(c.w, c.r)
+		return c.final(c.ctx, c.w, c.r)
 	}
 	prev := c.current
 	c.current = level
@@ -119,13 +124,31 @@ func updateChainState(ctx context.Context, w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// advance 是所有层共享的 next 实现：按调用者层号做防重标记，更新 w/r 后执行下一层
+// nextContext 计算 request 被替换为 r 后下游使用的 ctx：采用 r.Context()，
+// 若其中不含当前请求状态（如基于原始 r.Context() 派生），则补挂同一个 requestState，
+// 保证下游的 Context 访问器与 BoundReqFromContext 仍可用。r 为 nil 时沿用 cur。
+func nextContext(cur context.Context, r *http.Request) context.Context {
+	if r == nil {
+		return cur
+	}
+	rc := r.Context()
+	st := requestStateFromContext(cur)
+	if st == nil || requestStateFromContext(rc) == st {
+		return rc
+	}
+	return context.WithValue(rc, stateKey, st)
+}
+
+// advance 是所有层共享的 next 实现：按调用者层号做防重标记，更新 w/r（r 变化时同步 ctx）后执行下一层
 func (c *chainRunner) advance(w http.ResponseWriter, r *http.Request) error {
 	bit := uint64(1) << c.current
 	if c.calledBits&bit != 0 {
 		return ErrNextCalledMultipleTimes
 	}
 	c.calledBits |= bit
+	if r != c.r {
+		c.ctx = nextContext(c.ctx, r)
+	}
 	c.w = w
 	c.r = r
 	updateChainState(c.ctx, w, r)
@@ -134,17 +157,21 @@ func (c *chainRunner) advance(w http.ResponseWriter, r *http.Request) error {
 
 // runChainRecursive 是递归实现，作为中间件层数超过位图上限时的回退路径；
 // 每层分配一个捕获 called 标记的 next 闭包，闭包接收 w/r 以支持下游替换
-func runChainRecursive(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler func(w http.ResponseWriter, r *http.Request) error) error {
+func runChainRecursive(middlewares []MiddlewareHandler, ctx context.Context, w http.ResponseWriter, r *http.Request, finalHandler finalHandlerFunc) error {
 	if len(middlewares) == 0 {
-		return finalHandler(w, r)
+		return finalHandler(ctx, w, r)
 	}
 	called := false
-	return middlewares[0](ctx, w, r, func(w http.ResponseWriter, r *http.Request) error {
+	return middlewares[0](ctx, w, r, func(nw http.ResponseWriter, nr *http.Request) error {
 		if called {
 			return ErrNextCalledMultipleTimes
 		}
 		called = true
-		updateChainState(ctx, w, r)
-		return runChainRecursive(middlewares[1:], ctx, w, r, finalHandler)
+		nctx := ctx
+		if nr != r {
+			nctx = nextContext(ctx, nr)
+		}
+		updateChainState(nctx, nw, nr)
+		return runChainRecursive(middlewares[1:], nctx, nw, nr, finalHandler)
 	})
 }

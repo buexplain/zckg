@@ -62,13 +62,14 @@ func EngineFromContext(ctx context.Context) (*HttpEngine, bool) {
 
 // BoundReqFromContext 从 ctx 中获取路由命中时已解析绑定的 Req。
 // T 为 Req 的具体类型（指针或值均可），若绑定阶段出错则 err 为非 nil 的 *BindingError；
-// 若 Req 未注入 ctx 则返回 ErrBoundReqNotFound。
+// 若 Req 未注入 ctx，或 T 与注册的 Req 类型不符，均返回 ErrBoundReqNotFound。
 //
-// 注意：context 中存储的是 *Req（指针），推荐使用指针类型调用：
+// 注意：context 中存储的是 *Req（指针）。指针类型调用得到与 handler 共享的同一实例，
+// 在 next 之前修改会改变 handler 的入参，且发生在 core 层校验之前：
 //
 //	req, err := BoundReqFromContext[*MyReq](ctx)
 //
-// 也支持值类型调用（内部自动解引用）：
+// 值类型调用（内部自动解引用）得到浅拷贝，修改其非引用字段不影响 handler：
 //
 //	req, err := BoundReqFromContext[MyReq](ctx)
 func BoundReqFromContext[T any](ctx context.Context) (T, error) {

@@ -645,13 +645,55 @@ func (w *failingWriter) Header() http.Header {
 func (w *failingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 func (w *failingWriter) WriteHeader(code int)      { w.code = code }
 
-// TestDefaultResponseHandler_EncodeFail 验证 JSON 编码失败时回退 500 纯文本响应
-func TestDefaultResponseHandler_EncodeFail(t *testing.T) {
+// TestDefaultResponseHandler_WriteFailOnlyLogs 验证编码成功但写入失败（如客户端断开）时只记录日志：
+// 不在已提交的正文之后再调用 WriteHeader(500) 或追加纯文本
+func TestDefaultResponseHandler_WriteFailOnlyLogs(t *testing.T) {
 	w := &failingWriter{}
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
 	DefaultResponseHandler(w, req, helloRes{Message: "hi"})
-	if w.code != http.StatusInternalServerError {
-		t.Fatalf("code = %d, want 500", w.code)
+	if w.code != 0 {
+		t.Fatalf("WriteHeader called with %d after write failure, want no call", w.code)
+	}
+	if got := w.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+}
+
+// TestDefaultResponseHandler_EncodeFail 验证 res 无法编码为 JSON（含 func 字段）时：
+// 不输出任何 JSON 片段，状态 500，Content-Type 改为 text/plain; charset=utf-8，正文为通用消息
+func TestDefaultResponseHandler_EncodeFail(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	DefaultResponseHandler(rec, req, struct{ F func() }{F: func() {}})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want text/plain; charset=utf-8", got)
+	}
+	if got := rec.Body.String(); got != "internal server error" {
+		t.Fatalf("body = %q, want %q", got, "internal server error")
+	}
+}
+
+// TestEncodeJSON_EncodeErrorWritesNothing 验证 encodeJSON 编码失败时返回可被 errors.Is(errJSONEncode)
+// 识别的错误且不向 w 写入任何字节；写入失败则不带该标记
+func TestEncodeJSON_EncodeErrorWritesNothing(t *testing.T) {
+	var out bytes.Buffer
+	err := encodeJSON(&out, map[string]any{"f": func() {}})
+	if !errors.Is(err, errJSONEncode) {
+		t.Fatalf("err = %v, want errJSONEncode", err)
+	}
+	var ute *json.UnsupportedTypeError
+	if !errors.As(err, &ute) {
+		t.Fatalf("err = %v, want wrapped *json.UnsupportedTypeError", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("wrote %q on encode failure, want nothing", out.String())
+	}
+	werr := encodeJSON(&failingWriter{}, map[string]string{"a": "b"})
+	if werr == nil || errors.Is(werr, errJSONEncode) {
+		t.Fatalf("write failure err = %v, want non-nil without errJSONEncode", werr)
 	}
 }
 

@@ -31,7 +31,7 @@ func TestRunChainCrossGoroutineNextWeakAssertion(t *testing.T) {
 		}()
 		return <-errCh
 	}
-	if err := runChain([]MiddlewareHandler{mw}, context.Background(), nil, nil, func(w http.ResponseWriter, r *http.Request) error {
+	if err := runChain([]MiddlewareHandler{mw}, context.Background(), nil, nil, func(_ context.Context, w http.ResponseWriter, r *http.Request) error {
 		finalCalled = true
 		return nil
 	}); err != nil {

@@ -94,7 +94,7 @@ func (r CreateEventReq) Validate() error {
 
 `Validate()` 返回值处理：
 
-- 返回 `nil` → 校验通过；
+- 返回 `nil` 或装在 `error` 接口里的 typed-nil（如 `(*ValidationError)(nil)`）→ 校验通过，与 handler 返回值的 nil 判定同一语义；
 - 返回 `*ValidationError` → 直接透传（可携带 `Field` 等结构化信息，可用 `NewValidationError(Field, Message, Err)` 构造或直接结构体字面量）；
 - 返回其他普通 `error` → 自动兜底包装为 `*ValidationError`（保留原始错误链，`errors.Is/As` 可穿透）。
 
@@ -124,13 +124,13 @@ validateNonzero → validateCustom(Validate)
 
 ```go
 type ValidationError struct {
-    Field   string // 校验失败的字段名（绑定名路径，如 "company.name"，业务校验可留空）
+    Field   string // 校验失败的字段名（绑定名路径，如 "company.name"，业务校验可留空；留空时 Error() 只返回 Message）
     Message string // 失败原因
     Err     error  // 可选：包装底层错误，支持 errors.Is/As 穿透
 }
 ```
 
-`*BindingError`（绑定失败，由引擎经 `NewBindingError(err)` 包装底层错误构造，`Error()` 直接返回底层错误文案）与 `*ValidationError`（校验失败，`Err` 为 nil 时 `Error()` 返回 `field "<Field>" <Message>` 形式）在 `ServeHTTP` 中通过 `errors.As` 被识别，统一路由到 `OnValidationError` 回调（默认 `DefaultValidationErrorHandler`，返回 **400**）；其余非校验错误走 `OnError`（默认 **500**）。回调的自定义方式见 `http-engine-callback.md`。
+`*BindingError`（绑定失败，由引擎经 `NewBindingError(err)` 包装底层错误构造，`Error()` 直接返回底层错误文案）与 `*ValidationError`（校验失败，`Err` 为 nil 时 `Error()` 返回 `field "<Field>" <Message>` 形式；`Field` 为空时只返回 `<Message>`，不输出 `field ""` 前缀）在 `ServeHTTP` 中通过 `errors.As` 被识别，统一路由到 `OnValidationError` 回调（默认 `DefaultValidationErrorHandler`，返回 **400**）；其余非校验错误走 `OnError`（默认 **500**）。回调的自定义方式见 `http-engine-callback.md`。
 
 ## 四、相关文档
 

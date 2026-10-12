@@ -30,7 +30,7 @@ type Validator interface {
 
 // validateCustom 调用 Req 的 Validate 方法（若实现 Validator），并将其错误归一化为
 // *ValidationError，以便 HttpEngine 统一路由到 OnValidationError 回调（默认 400）。
-// 仅校验顶层 Req，不递归进入嵌套结构体。
+// 仅校验顶层 Req，不递归进入嵌套结构体。返回 nil 或 typed-nil（见 isNilError）均视为校验通过。
 // meta 为注册阶段预计算的 structMeta，直接使用其 implementsValidator 判断。
 func validateCustom(reqPtr reflect.Value, meta structMeta) error {
 	if !meta.implementsValidator {
@@ -41,7 +41,7 @@ func validateCustom(reqPtr reflect.Value, meta structMeta) error {
 		return nil
 	}
 	err := v.Validate()
-	if err == nil {
+	if isNilError(err) {
 		return nil
 	}
 	// 用户已返回结构化校验错误则透传，否则包装以保留原始错误链

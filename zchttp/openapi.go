@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // emptyField 供无字段上下文（如切片元素）复用，Tag 为空不会附加任何装饰信息
@@ -30,12 +31,19 @@ type OpenAPIInfo struct {
 // openAPIGenerator 承载一次生成过程中的可复用状态
 type openAPIGenerator struct {
 	schemas           map[string]any          // components/schemas
-	typeNames         map[reflect.Type]string // 已注册类型 → schema 名，避免重复与循环递归
-	nameToType        map[string]reflect.Type // schema 名 → 类型，用于命名去重
+	typeNames         map[reflect.Type]string // 已按 JSON 命名注册的类型 → schema 名，避免重复与循环递归
+	formTypeNames     map[reflect.Type]string // 已按 form 绑定名注册的类型（multipart 顶层请求体）→ schema 名
+	nameToType        map[string]schemaKey    // schema 名 → 注册键，用于命名去重
 	reachedViaValue   map[reflect.Type]bool   // struct 类型是否被"值嵌套"路径到达（含顶层）
 	reachedByDefaults map[reflect.Type]bool   // struct 类型是否可被 applyDefaults 递归到达
 	currentType       reflect.Type            // 当前正在生成 schema 的 struct 类型（decorate 据此判断上下文）
 	responseWrapper   any                     // 自定义响应包装结构体样例
+}
+
+// schemaKey 区分同一类型的两种 schema：JSON 命名（encoding/json 规则）与 form 绑定名
+type schemaKey struct {
+	t    reflect.Type
+	form bool
 }
 
 // GenerateOpenAPI 遍历路由表，通过反射生成 OpenAPI 3.0 文档（map 形式，可序列化为 JSON）。
@@ -46,7 +54,8 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 	g := &openAPIGenerator{
 		schemas:           map[string]any{},
 		typeNames:         map[reflect.Type]string{},
-		nameToType:        map[string]reflect.Type{},
+		formTypeNames:     map[reflect.Type]string{},
+		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
 		responseWrapper:   info.ResponseWrapper,
@@ -170,6 +179,9 @@ func (g *openAPIGenerator) walkTypeUsage(t reflect.Type, viaValue bool, visiting
 	visiting[t] = true
 	defer delete(visiting, t)
 
+	for _, et := range taggedEmbeddedStructs(t) {
+		g.walkTypeUsage(et, viaValue, visiting)
+	}
 	meta := buildStructMeta(t)
 	for _, fm := range meta.fields {
 		f := fm.field
@@ -254,6 +266,9 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 	visiting[t] = true
 	defer delete(visiting, t)
 
+	for _, et := range taggedEmbeddedStructs(t) {
+		g.walkDefaultsReachability(et, viaDefaults, visiting)
+	}
 	meta := buildStructMeta(t)
 	for _, fm := range meta.fields {
 		f := fm.field
@@ -472,20 +487,23 @@ func requestBodyRequired(entry *routeEntry, paramNames map[string]bool) bool {
 }
 
 // buildRequestBody 为携带请求体的方法生成 requestBody；含文件字段时使用 multipart/form-data。
+// application/json 的 schema 按 encoding/json 字段规则命名（与运行时 JSON 解码一致）；
+// multipart/form-data 的顶层 schema 按 form 优先绑定名命名（与表单绑定一致）。
 // required 表示省略 body 时默认 Req 模板无法通过内建 nonzero 校验。
 func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMeta, required bool) map[string]any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
 	}
 	contentType := "application/json"
-	if hasFileField(meta) {
+	form := hasFileField(meta)
+	if form {
 		contentType = "multipart/form-data"
 	}
 	return map[string]any{
 		"required": required,
 		"content": map[string]any{
 			contentType: map[string]any{
-				"schema": g.registerStructSchema(reqType, meta),
+				"schema": g.registerStructSchema(reqType, meta, form),
 			},
 		},
 	}
@@ -511,7 +529,7 @@ func (g *openAPIGenerator) buildResponses(resType reflect.Type, meta structMeta)
 // meta 为注册阶段预计算的 Res 结构体的 structMeta。
 func (g *openAPIGenerator) wrapResponseSchema(resType reflect.Type, meta structMeta) map[string]any {
 	rt := derefType(resType)
-	dataSchema := g.registerStructSchema(rt, meta)
+	dataSchema := g.registerStructSchema(rt, meta, false)
 	resName := g.typeNames[rt]
 	if resName == "" {
 		resName = "AnonymousStruct"
@@ -603,17 +621,23 @@ func parseJSONName(tag string) string {
 }
 
 // registerStructSchema 将结构体注册到 components/schemas 并返回 $ref 引用。
+// form=false 时属性集合与名称按 encoding/json 规则（jsonFields）生成，用于 application/json 请求体、
+// 响应与嵌套结构体；form=true 时按 meta 的 form 优先绑定名生成，仅用于 multipart/form-data 顶层请求体。
 // meta 为 structMeta（来自 routeEntry 或 buildStructMeta 现算），提供字段名和 nonzero+default 判定。
-func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta) map[string]any {
+func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta, form bool) map[string]any {
 	t = derefType(t)
 	if t.Kind() != reflect.Struct {
 		return map[string]any{"type": "object"}
 	}
-	if name, ok := g.typeNames[t]; ok {
+	names := g.typeNames
+	if form {
+		names = g.formTypeNames
+	}
+	if name, ok := names[t]; ok {
 		return refSchema(name)
 	}
-	name := g.uniqueName(t)
-	g.typeNames[t] = name
+	name := g.uniqueName(schemaKey{t: t, form: form})
+	names[t] = name
 
 	obj := map[string]any{"type": "object"}
 	g.schemas[name] = obj // 先占位，防止循环递归
@@ -625,17 +649,36 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta)
 
 	props := map[string]any{}
 	var required []any
-	for _, fm := range meta.fields {
-		if fm.name == "" || fm.name == "-" {
-			continue
+	if form {
+		for _, fm := range meta.fields {
+			if fm.name == "" || fm.name == "-" {
+				continue
+			}
+			f := fm.field
+			if isIgnored(f) {
+				continue
+			}
+			props[fm.name] = g.typeToSchema(f.Type, f, 0)
+			if fm.nonzero && !fm.hasDefault {
+				required = append(required, fm.name)
+			}
 		}
-		f := fm.field
-		if isIgnored(f) {
-			continue
+	} else {
+		// required 以 nonzero 校验实际覆盖的字段（按索引路径对齐）为准
+		requiredAt := map[string]bool{}
+		for _, fm := range meta.fields {
+			if fm.name != "" && fm.name != "-" && fm.nonzero && !fm.hasDefault {
+				requiredAt[fmt.Sprint(fm.indices)] = true
+			}
 		}
-		props[fm.name] = g.typeToSchema(f.Type, f, 0)
-		if fm.nonzero && !fm.hasDefault {
-			required = append(required, fm.name)
+		for _, jf := range jsonFields(t) {
+			if isIgnored(jf.field) {
+				continue
+			}
+			props[jf.name] = g.typeToSchema(jf.field.Type, jf.field, 0)
+			if requiredAt[fmt.Sprint(jf.index)] {
+				required = append(required, jf.name)
+			}
 		}
 	}
 	obj["properties"] = props
@@ -643,6 +686,166 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta)
 		obj["required"] = required
 	}
 	return refSchema(name)
+}
+
+// jsonField 是 encoding/json 对结构体可见的一个字段
+type jsonField struct {
+	name   string
+	tagged bool
+	index  []int
+	field  reflect.StructField
+}
+
+// jsonFields 按 encoding/json 的字段选择规则列出 t 的 JSON 字段：json 标签名优先（非法标签名回退字段名），
+// json:"-" 排除、json:"-," 名为 "-"；无 json 名的匿名 struct 嵌入展开，带 json 名的嵌入作为普通字段；
+// 同名字段取嵌入深度最浅者，同深度时带标签者胜出，仍并列则全部丢弃。
+// 与 encoding/json 的差异：未导出的匿名指针嵌入不展开（其 nil 指针在解码时报错，框架元数据同样跳过），
+// 框架的 OpenAPIMeta 嵌入不输出。
+func jsonFields(t reflect.Type) []jsonField {
+	type pending struct {
+		typ   reflect.Type
+		index []int
+	}
+	var fields []jsonField
+	next := []pending{{typ: t}}
+	var count, nextCount map[reflect.Type]int
+	visited := map[reflect.Type]bool{}
+	for len(next) > 0 {
+		current := next
+		next = nil
+		count, nextCount = nextCount, map[reflect.Type]int{}
+		for _, p := range current {
+			if visited[p.typ] {
+				continue
+			}
+			visited[p.typ] = true
+			for i := 0; i < p.typ.NumField(); i++ {
+				sf := p.typ.Field(i)
+				if sf.Anonymous {
+					if sf.Type == metaType {
+						continue
+					}
+					et := sf.Type
+					if et.Kind() == reflect.Ptr {
+						if !sf.IsExported() {
+							continue
+						}
+						et = et.Elem()
+					}
+					if !sf.IsExported() && et.Kind() != reflect.Struct {
+						continue
+					}
+				} else if !sf.IsExported() {
+					continue
+				}
+				tag := sf.Tag.Get("json")
+				if tag == "-" {
+					continue
+				}
+				name := tagName(tag)
+				if !isValidJSONTag(name) {
+					name = ""
+				}
+				index := make([]int, len(p.index)+1)
+				copy(index, p.index)
+				index[len(p.index)] = i
+				ft := sf.Type
+				if ft.Name() == "" && ft.Kind() == reflect.Ptr {
+					ft = ft.Elem()
+				}
+				if name != "" || !sf.Anonymous || ft.Kind() != reflect.Struct {
+					jf := jsonField{name: name, tagged: name != "", index: index, field: sf}
+					if jf.name == "" {
+						jf.name = sf.Name
+					}
+					fields = append(fields, jf)
+					if count[p.typ] > 1 {
+						// 同一嵌入类型在本层出现多次：追加副本，使下方的同名消解将其判为冲突
+						fields = append(fields, jf)
+					}
+					continue
+				}
+				nextCount[ft]++
+				if nextCount[ft] == 1 {
+					next = append(next, pending{typ: ft, index: index})
+				}
+			}
+		}
+	}
+
+	sort.Slice(fields, func(i, j int) bool {
+		x := fields
+		if x[i].name != x[j].name {
+			return x[i].name < x[j].name
+		}
+		if len(x[i].index) != len(x[j].index) {
+			return len(x[i].index) < len(x[j].index)
+		}
+		if x[i].tagged != x[j].tagged {
+			return x[i].tagged
+		}
+		return indexLess(x[i].index, x[j].index)
+	})
+	out := fields[:0]
+	for advance, i := 0, 0; i < len(fields); i += advance {
+		for advance = 1; i+advance < len(fields); advance++ {
+			if fields[i+advance].name != fields[i].name {
+				break
+			}
+		}
+		group := fields[i : i+advance]
+		if len(group) > 1 && len(group[0].index) == len(group[1].index) && group[0].tagged == group[1].tagged {
+			continue
+		}
+		out = append(out, group[0])
+	}
+	sort.Slice(out, func(i, j int) bool { return indexLess(out[i].index, out[j].index) })
+	return out
+}
+
+// taggedEmbeddedStructs 返回 t 中带合法 json 名的匿名 struct 嵌入类型。encoding/json 把它们作为具名嵌套对象
+// （schema 中为独立 $ref），框架元数据却把其字段扁平展开到父级并随父级填充默认值，故可达性与父级一致。
+func taggedEmbeddedStructs(t reflect.Type) []reflect.Type {
+	var out []reflect.Type
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.Anonymous || sf.Type == metaType || (!sf.IsExported() && sf.Type.Kind() == reflect.Ptr) {
+			continue
+		}
+		tag := sf.Tag.Get("json")
+		if tag == "-" || !isValidJSONTag(tagName(tag)) {
+			continue
+		}
+		if et := derefType(sf.Type); et.Kind() == reflect.Struct {
+			out = append(out, et)
+		}
+	}
+	return out
+}
+
+// indexLess 按字段索引路径的字典序比较，得到与结构体声明一致的顺序
+func indexLess(a, b []int) bool {
+	for k := 0; k < len(a) && k < len(b); k++ {
+		if a[k] != b[k] {
+			return a[k] < b[k]
+		}
+	}
+	return len(a) < len(b)
+}
+
+// isValidJSONTag 与 encoding/json 的标签名合法性判定一致，非法名回退为字段名
+func isValidJSONTag(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return false
+		}
+	}
+	return true
 }
 
 // typeToSchema 将 Go 类型映射为 JSON Schema；field 提供 default/example/description/deprecated/time_format 等信息。
@@ -698,7 +901,7 @@ func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructFiel
 			"items": g.typeToSchema(t.Elem(), emptyField, depth+1),
 		}, field)
 	case reflect.Struct:
-		return g.decorate(g.registerStructSchema(t, buildStructMeta(t)), field)
+		return g.decorate(g.registerStructSchema(t, buildStructMeta(t), false), field)
 	case reflect.Map:
 		valueSchema := g.typeToSchema(t.Elem(), emptyField, depth+1)
 		schema := map[string]any{
@@ -838,9 +1041,9 @@ func hasFileField(meta structMeta) bool {
 	return false
 }
 
-// uniqueName 为类型分配唯一的 schema 名，重名时追加序号
-func (g *openAPIGenerator) uniqueName(t reflect.Type) string {
-	base := t.Name()
+// uniqueName 为注册键分配唯一的 schema 名，重名时追加序号
+func (g *openAPIGenerator) uniqueName(key schemaKey) string {
+	base := key.t.Name()
 	if base == "" {
 		base = "AnonymousStruct"
 	}
@@ -848,10 +1051,10 @@ func (g *openAPIGenerator) uniqueName(t reflect.Type) string {
 	for i := 2; ; i++ {
 		owner, used := g.nameToType[name]
 		if !used {
-			g.nameToType[name] = t
+			g.nameToType[name] = key
 			return name
 		}
-		if owner == t {
+		if owner == key {
 			return name
 		}
 		name = base + strconv.Itoa(i)

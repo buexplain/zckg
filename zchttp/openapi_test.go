@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -2344,20 +2345,24 @@ func TestHasFileFieldVariants(t *testing.T) {
 	}
 }
 
-// TestUniqueNameCollision 覆盖匿名结构体命名、重名追加序号与同类型复用已有名的分支
+// TestUniqueNameCollision 覆盖匿名结构体命名、重名追加序号、同注册键复用已有名，
+// 以及同一类型的 JSON 与 form 两种 schema 分配不同名的分支
 func TestUniqueNameCollision(t *testing.T) {
-	g := &openAPIGenerator{nameToType: map[string]reflect.Type{}}
+	g := &openAPIGenerator{nameToType: map[string]schemaKey{}}
 	t1 := reflect.TypeOf(struct{ A int }{})
 	t2 := reflect.TypeOf(struct{ B string }{})
 
-	if n := g.uniqueName(t1); n != "AnonymousStruct" {
+	if n := g.uniqueName(schemaKey{t: t1}); n != "AnonymousStruct" {
 		t.Fatalf("first anonymous name = %q, want AnonymousStruct", n)
 	}
-	if n := g.uniqueName(t2); n != "AnonymousStruct2" {
+	if n := g.uniqueName(schemaKey{t: t2}); n != "AnonymousStruct2" {
 		t.Fatalf("colliding anonymous name = %q, want AnonymousStruct2", n)
 	}
-	if n := g.uniqueName(t1); n != "AnonymousStruct" {
+	if n := g.uniqueName(schemaKey{t: t1}); n != "AnonymousStruct" {
 		t.Fatalf("same type should reuse existing name, got %q", n)
+	}
+	if n := g.uniqueName(schemaKey{t: t1, form: true}); n != "AnonymousStruct3" {
+		t.Fatalf("form schema of same type should get a distinct name, got %q", n)
 	}
 }
 
@@ -2366,7 +2371,8 @@ func newTestGenerator() *openAPIGenerator {
 	return &openAPIGenerator{
 		schemas:           map[string]any{},
 		typeNames:         map[reflect.Type]string{},
-		nameToType:        map[string]reflect.Type{},
+		formTypeNames:     map[reflect.Type]string{},
+		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
 	}
@@ -2381,7 +2387,7 @@ func TestOpenAPIBuilderNonStructBranches(t *testing.T) {
 	if got := g.buildRequestBody(reflect.TypeOf(0), structMeta{}, false); got != nil {
 		t.Fatalf("buildRequestBody(non-struct) = %v, want nil", got)
 	}
-	if got := g.registerStructSchema(reflect.TypeOf(0), structMeta{}); got["type"] != "object" {
+	if got := g.registerStructSchema(reflect.TypeOf(0), structMeta{}, false); got["type"] != "object" {
 		t.Fatalf("registerStructSchema(non-struct) = %v, want generic object", got)
 	}
 }
@@ -2722,7 +2728,7 @@ func TestBuildPathParams_NonStruct(t *testing.T) {
 	g := &openAPIGenerator{
 		schemas:           map[string]any{},
 		typeNames:         map[reflect.Type]string{},
-		nameToType:        map[string]reflect.Type{},
+		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
 	}
@@ -3936,4 +3942,288 @@ func TestOpenAPIKeepRawBody(t *testing.T) {
 			t.Fatalf("GET with KeepRawBody should have no requestBody, got %v", raw["requestBody"])
 		}
 	})
+}
+
+// ---- JSON 字段名与 encoding/json 一致（DOC-03） ----
+
+type oaJSONNameNested struct {
+	V string `form:"v" json:"value"`
+}
+
+type oaJSONNameBase struct {
+	Inner string `json:"inner" default:"x"`
+}
+
+type oaJSONNameDupA struct {
+	Dup string
+}
+
+type oaJSONNameDupB struct {
+	Dup string
+}
+
+type oaJSONNameShadow struct {
+	Q    string `json:"keyword"`
+	Deep string `json:"deep"`
+}
+
+// oaJSONNameReq 汇集 form 名与 json 名分歧的各种写法：双标签、json:"-"、json:"-,"、仅 form 标签、
+// 空 json 名、非法 json 名、form:"-"、带 json 名的嵌入、同深度同名冲突与深层同名遮蔽
+type oaJSONNameReq struct {
+	Q              string `form:"q" json:"keyword" nonzero:"true"`
+	H              string `form:"h" json:"-"`
+	Dash           string `json:"-,"`
+	Plain          string `form:"p"`
+	Opt            string `json:",omitempty"`
+	Bad            string `json:"a'b"`
+	Hidden         string `form:"-" json:"hidden"`
+	oaJSONNameBase `json:"base"`
+	oaJSONNameDupA
+	oaJSONNameDupB
+	oaJSONNameShadow
+	Nested oaJSONNameNested `json:"nested"`
+}
+
+type oaJSONNameRes struct {
+	Q, H, Dash, Plain, Hidden, Inner, Nested string
+}
+
+type oaJSONNameUploadReq struct {
+	Q    string                `form:"q" json:"keyword"`
+	File *multipart.FileHeader `form:"file"`
+	Skip string                `form:"-"`
+	Ign  string                `form:"ign" ignore:"true"`
+}
+
+func oaJSONNamePost(_ context.Context, req oaJSONNameReq) (oaJSONNameRes, error) {
+	return oaJSONNameRes{Q: req.Q, H: req.H, Dash: req.Dash, Plain: req.Plain, Hidden: req.Hidden,
+		Inner: req.Inner, Nested: req.Nested.V}, nil
+}
+
+func oaJSONNameGet(_ context.Context, _ oaJSONNameReq) (oaJSONNameRes, error) {
+	return oaJSONNameRes{}, nil
+}
+
+func oaJSONNameUpload(_ context.Context, _ oaJSONNameUploadReq) (oaJSONNameRes, error) {
+	return oaJSONNameRes{}, nil
+}
+
+func oaJSONNameUploadEcho(_ context.Context, _ struct{}) (oaJSONNameUploadReq, error) {
+	return oaJSONNameUploadReq{}, nil
+}
+
+// oaSortedKeys 返回 map 的有序键列表，便于整体比较属性集合
+func oaSortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestGenerateOpenAPI_JSONBodyUsesEncodingJSONNames 锁死 application/json 请求体 schema 的属性集合
+// 与 encoding/json 实际键集合一致（以 json.Marshal 为判据，并同时比对显式期望）：json 名优先于 form 名，
+// json:"-" 排除、json:"-," 名为 "-"、无 json 名回退字段名、非法 json 名回退字段名、form:"-" 不影响 JSON，
+// 带 json 名的嵌入为嵌套对象、同深度同名冲突双双丢弃、深层同名被浅层遮蔽；嵌套结构体同样按 json 名，
+// required 按 json 名输出；带 json 名的值嵌入其值类型 default 仍展示。query 参数保持 form 优先绑定名。
+func TestGenerateOpenAPI_JSONBodyUsesEncodingJSONNames(t *testing.T) {
+	r := NewRouter()
+	r.POST("/oa-json/names", oaJSONNamePost)
+	r.GET("/oa-json/names", oaJSONNameGet)
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "T", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	post := doc["paths"].(map[string]any)["/oa-json/names"].(map[string]any)["post"].(map[string]any)
+	ref := post["requestBody"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+	obj := oaDepResolveRef(t, schemas, ref, "oaJSONNameReq")
+	props := obj["properties"].(map[string]any)
+
+	sample := oaJSONNameReq{Q: "1", H: "1", Dash: "1", Plain: "1", Opt: "1", Bad: "1", Hidden: "1"}
+	sample.Inner, sample.oaJSONNameDupA.Dup, sample.oaJSONNameDupB.Dup = "1", "1", "1"
+	sample.oaJSONNameShadow.Q, sample.Deep, sample.Nested.V = "1", "1", "1"
+	raw, err := json.Marshal(sample)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var marshaled map[string]any
+	if err := json.Unmarshal(raw, &marshaled); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	want := []string{"-", "Bad", "Opt", "Plain", "base", "deep", "hidden", "keyword", "nested"}
+	if got := oaSortedKeys(marshaled); !reflect.DeepEqual(got, want) {
+		t.Fatalf("encoding/json 键集合 = %v, want %v", got, want)
+	}
+	if got := oaSortedKeys(props); !reflect.DeepEqual(got, want) {
+		t.Fatalf("requestBody 属性 = %v, want %v（应与 encoding/json 一致）", got, want)
+	}
+	if !reflect.DeepEqual(obj["required"], []any{"keyword"}) {
+		t.Fatalf("required = %v, want [keyword]", obj["required"])
+	}
+	nested := oaDepResolveRef(t, schemas, props["nested"].(map[string]any), "oaJSONNameNested")["properties"].(map[string]any)
+	if got := oaSortedKeys(nested); !reflect.DeepEqual(got, []string{"value"}) {
+		t.Fatalf("嵌套结构体属性 = %v, want [value]", got)
+	}
+	baseRef := map[string]any{"$ref": props["base"].(map[string]any)["$ref"]}
+	base := oaDepResolveRef(t, schemas, baseRef, "oaJSONNameBase")["properties"].(map[string]any)
+	if inner := base["inner"].(map[string]any); inner["default"] != "x" {
+		t.Fatalf("带 json 名的值嵌入字段 default = %v, want x", inner["default"])
+	}
+
+	get := doc["paths"].(map[string]any)["/oa-json/names"].(map[string]any)["get"].(map[string]any)
+	queryNames := map[string]bool{}
+	for _, p := range get["parameters"].([]any) {
+		queryNames[p.(map[string]any)["name"].(string)] = true
+	}
+	for _, name := range []string{"q", "h", "p"} {
+		if !queryNames[name] {
+			t.Errorf("query 参数缺少 form 绑定名 %q，实际: %v", name, queryNames)
+		}
+	}
+	for _, name := range []string{"hidden", "-", "Plain"} {
+		if queryNames[name] {
+			t.Errorf("query 参数不应出现 %q，实际: %v", name, queryNames)
+		}
+	}
+}
+
+// TestGenerateOpenAPI_JSONNamesMatchRuntimeBinding 以同一 Req 实际发起 JSON 请求，确认 schema 公布的
+// 名称正是运行时接受的键：keyword 绑定而 form 名 q 不绑定，json:"-" 字段 h 永不绑定，form:"-" 的 hidden
+// 与 json:"-," 的 "-" 正常绑定，省略 base 时值嵌入的 default 生效。
+func TestGenerateOpenAPI_JSONNamesMatchRuntimeBinding(t *testing.T) {
+	r := NewRouter()
+	r.POST("/oa-json/names", oaJSONNamePost)
+	rec := serveRequest(t, r, http.MethodPost, "/oa-json/names",
+		`{"keyword":"k","q":"form-name","h":"hh","hidden":"hd","-":"dash","Plain":"pl","nested":{"value":"nv","v":"form-v"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data oaJSONNameRes `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	want := oaJSONNameRes{Q: "k", Dash: "dash", Plain: "pl", Hidden: "hd", Inner: "x", Nested: "nv"}
+	if resp.Data != want {
+		t.Fatalf("绑定结果 = %+v, want %+v", resp.Data, want)
+	}
+}
+
+// TestGenerateOpenAPI_MultipartKeepsFormNames 锁死 multipart/form-data 顶层请求体仍按 form 绑定名生成
+// （form:"-" 与 ignore:"true" 字段不输出），且同一类型作为 JSON 响应时另行注册为按 json 名的独立 schema
+// （form:"-" 不影响 JSON，字段名 Skip 照常输出），二者互不覆盖。
+func TestGenerateOpenAPI_MultipartKeepsFormNames(t *testing.T) {
+	r := NewRouter()
+	r.GET("/oa-json/upload", oaJSONNameUploadEcho)
+	r.POST("/oa-json/upload", oaJSONNameUpload)
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "T", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	paths := doc["paths"].(map[string]any)["/oa-json/upload"].(map[string]any)
+
+	post := paths["post"].(map[string]any)
+	ref := post["requestBody"].(map[string]any)["content"].(map[string]any)["multipart/form-data"].(map[string]any)["schema"].(map[string]any)
+	formProps := oaDepResolveRef(t, schemas, ref, "oaJSONNameUploadReq2")["properties"].(map[string]any)
+	if got := oaSortedKeys(formProps); !reflect.DeepEqual(got, []string{"file", "q"}) {
+		t.Fatalf("multipart 属性 = %v, want [file q]", got)
+	}
+
+	jsonProps := schemas["oaJSONNameUploadReq"].(map[string]any)["properties"].(map[string]any)
+	if got := oaSortedKeys(jsonProps); !reflect.DeepEqual(got, []string{"File", "Skip", "keyword"}) {
+		t.Fatalf("JSON 响应属性 = %v, want [File Skip keyword]", got)
+	}
+	get := paths["get"].(map[string]any)
+	respRef := get["responses"].(map[string]any)["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+	wrapper := oaDepResolveRef(t, schemas, respRef, "Response_oaJSONNameUploadReq")
+	data := wrapper["properties"].(map[string]any)["data"].(map[string]any)
+	if data["$ref"] != "#/components/schemas/oaJSONNameUploadReq" {
+		t.Fatalf("响应 data 应引用 JSON 命名 schema，实际: %v", data)
+	}
+}
+
+type oaJFInt int
+
+type OAJFExported struct {
+	E    string
+	Name string
+	X    string `json:"T"`
+}
+
+type oaJFPtrHidden struct {
+	H string `json:"h"`
+}
+
+type OAJFLeaf struct {
+	L      string
+	Deeper string
+}
+
+type oaJFMid1 struct{ OAJFLeaf }
+
+type oaJFMid2 struct{ OAJFLeaf }
+
+type OAJFSelfRec struct {
+	*OAJFSelfRec
+	R string
+	T string
+}
+
+// oaJFComplex 覆盖 encoding/json 字段选择的其余分支：导出指针嵌入展开、未导出非 struct 嵌入与未导出字段
+// 跳过、未导出值类型 struct 嵌入展开、同一类型经两条同深度路径嵌入时双双丢弃、自引用嵌入不重复展开、
+// 浅层字段遮蔽深层同名字段、同深度同名时带标签者胜出；未导出指针嵌入不展开（框架约定的差异，
+// 其指针为 nil 时 encoding/json 同样不输出其字段，故仍可与 json.Marshal 比对）
+type oaJFComplex struct {
+	*OAJFExported
+	*oaJFPtrHidden
+	oaJFInt
+	hidden string
+	oaJFMid1
+	oaJFMid2
+	OAJFSelfRec
+	Name string
+}
+
+// TestJSONFields_MatchesEncodingJSON 锁死 jsonFields 与 encoding/json 实际输出键一致（以 json.Marshal 为判据），
+// 且结果按声明顺序（索引路径字典序）排列：E、T（带标签的 X 胜过同深度无标签的 T）、R、Name；
+// OAJFLeaf 的 L/Deeper 因同深度重复嵌入被丢弃，未导出指针嵌入的 h 不出现。
+func TestJSONFields_MatchesEncodingJSON(t *testing.T) {
+	var got []string
+	for _, jf := range jsonFields(reflect.TypeOf(oaJFComplex{})) {
+		got = append(got, jf.name)
+	}
+	if want := []string{"E", "T", "R", "Name"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("jsonFields = %v, want %v", got, want)
+	}
+	v := oaJFComplex{OAJFExported: &OAJFExported{}, hidden: "h"}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	sorted := append([]string(nil), got...)
+	sort.Strings(sorted)
+	if keys := oaSortedKeys(m); !reflect.DeepEqual(keys, sorted) {
+		t.Fatalf("encoding/json 键 = %v, jsonFields = %v", keys, sorted)
+	}
+}
+
+// TestIndexLess 锁死索引路径按字典序比较，前缀较短者在前，相等时为 false
+func TestIndexLess(t *testing.T) {
+	cases := []struct {
+		a, b []int
+		want bool
+	}{
+		{[]int{0}, []int{1}, true},
+		{[]int{1}, []int{0, 5}, false},
+		{[]int{0}, []int{0, 1}, true},
+		{[]int{0, 1}, []int{0}, false},
+		{[]int{2, 3}, []int{2, 3}, false},
+	}
+	for _, c := range cases {
+		if got := indexLess(c.a, c.b); got != c.want {
+			t.Errorf("indexLess(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
 }

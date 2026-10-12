@@ -25,7 +25,7 @@ type HttpEngine struct {
     OnError           ErrorHandler                                 // 错误响应回调，默认 DefaultErrorHandler
     OnValidationError ErrorHandler                                 // 参数校验/绑定失败回调，默认 DefaultValidationErrorHandler
     OnPanic           PanicHandler                                 // panic 恢复回调，默认 DefaultPanicHandler
-    MaxBodyBytes           int64 // 请求体整体大小上限（字节），0 表示不限制；NewEngine 默认 32 MB
+    MaxBodyBytes           int64 // 请求体整体大小上限（字节），0 表示框架不额外限制（urlencoded 仍受 ParseForm 10 MB 上限）；NewEngine 默认 32 MB
     MultipartFormMaxMemory int64 // multipart/form-data 解析的内存缓冲上限（字节），超出部分写入临时文件；NewEngine 默认 32 MB
 }
 ```
@@ -54,7 +54,7 @@ type Response struct {
 
 | 回调 | 行为 |
 | --- | --- |
-| `DefaultResponseHandler` | 若响应尚未被写入，以 `{data: res, code: 0, message: "success"}` 的统一 JSON 结构返回；若 handler 已写入响应（如文件下载），则跳过 |
+| `DefaultResponseHandler` | 若响应尚未被写入，以 `{data: res, code: 0, message: "success"}` 的统一 JSON 结构返回；若 handler 已写入响应（如文件下载），则跳过。`res` 无法被 JSON 编码（如含 func/chan 字段）时不输出任何 JSON 片段，改为返回 500、`Content-Type: text/plain; charset=utf-8`、响应体 `internal server error`，错误详情写入服务端日志；编码成功但写出失败（如客户端断开）时仅记录日志 |
 | `DefaultErrorHandler` | 若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 500, message: "internal server error"}`），状态码统一为 500；err 详情仅写入服务端日志（`slog.Error`），不向客户端暴露内部信息；若已写入则跳过 |
 | `DefaultValidationErrorHandler` | 参数校验失败或绑定失败时调用。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 400, message: err}`），状态码统一为 400；若已写入则跳过 |
 | `DefaultNotFoundHandler` | 未命中路由时调用。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 404, message: "not found"}`），状态码统一为 404；若已写入则跳过 |
@@ -122,8 +122,10 @@ func IsResponseWritten(w http.ResponseWriter) bool {
 - `written` 表示发生过最终 `WriteHeader`、`Write`、`ReadFrom`、`Flush` 或 `Hijack` 调用，不表示底层已成功写入字节。即使 `Write([]byte{})` 写入零字节，或底层 `Write` / `ReadFrom` / `Hijack` 返回错误，也会保持为 true，避免错误后默认回调再次尝试写响应。
 - 仅调用 `Header().Set(...)` 不标记 written，因此 CORS 等只设置响应头的中间件不会导致默认 JSON 响应被跳过。
 - `WriteHeader` 是幂等的：按 `net/http` 语义仅首次最终状态码调用生效，重复调用被包装层挡下（不再透传底层），避免出现 `superfluous response.WriteHeader call` 警告。
-- 1xx 信息性响应（如 `103 Early Hints`）不代表最终响应已写出，因此**不标记 written**，也不参与上述幂等判定；`WriteHeader(103)` 之后仍可正常写出最终状态码与响应体。
+- 除 `101 Switching Protocols` 外的 1xx 信息性响应（如 `103 Early Hints`）不代表最终响应已写出，因此**不标记 written**，也不参与上述幂等判定；`WriteHeader(103)` 之后仍可正常写出最终状态码与响应体。
+- `101 Switching Protocols` 按 `net/http` 语义是最终响应：写出后标记 written，后续状态码与默认回调都会被挡下。
 - `Push` 写入的是独立的 HTTP/2 server push 流，同样不标记当前响应的 written。
+- 包装层实现 `Unwrap() http.ResponseWriter`，因此 `http.NewResponseController(w)` 的 `SetReadDeadline`、`SetWriteDeadline`、`EnableFullDuplex` 可穿透到底层 writer；`Flush` / `Hijack` 仍优先经包装层并标记 written。直接对 `Unwrap()` 返回的底层 writer 写入会绕过 written 跟踪，应避免。
 
 ## 六、自定义响应示例
 
@@ -201,11 +203,11 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 
 ## 七、执行流程（全链路）
 
-1. **请求入口准备**：`MaxBodyBytes > 0` 时以 `http.MaxBytesReader` 包裹入口 `r.Body`（`NewEngine` 默认 **32 MB**，置 0 不限制），并取得带 written 跟踪能力的初始 ResponseWriter；同时为入口请求体注册限量排空与关闭逻辑，404 也不例外。
+1. **请求入口准备**：`MaxBodyBytes > 0` 时以 `http.MaxBytesReader` 包裹入口 `r.Body`（`NewEngine` 默认 **32 MB**；置 0 表示框架不额外限制，但 `application/x-www-form-urlencoded` 请求体仍受标准库 `ParseForm` 固有的 10 MB 上限约束），并取得带 written 跟踪能力的初始 ResponseWriter；同时为入口请求体注册限量排空与关闭逻辑，404 也不例外。
 2. **panic 保护**：安装请求级 recover；后续 panic 交由 `OnPanic`，回调自身 panic 则由第二层 recover 记录并兜底 500。
 3. **路由匹配**：按 method → normalizePath 查找路由条目，未命中 → `OnNotFound` 并返回，随后仍执行请求体收尾。
 4. **绑定请求数据**：`reflect.New` 浅拷贝预计算模板（含默认值），若 `needsDeepCopy` 则深拷贝引用字段，随后 `bindRequestData` 绑定 query/body（POST 等带 body 方法为先 query 后 body 的合并绑定）；参数路由再由 `bindPathParams` 绑定路径参数（覆盖同名 query/body 值）；若注册期预计算 `needsRequestPhaseDefaults` 为 true，执行 `applyDefaults(requestPhase=true)` 为绑定后动态创建的子元素（切片/数组/map/nested ptr）补填 nil 指针的默认值；绑定错误（`*BindingError`，由 `NewBindingError` 包装底层错误构造）随 Req 注入 ctx。
-5. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；每次 `next(w, r)` 都更新当前 w/r，各中间件可通过 `BoundReqFromContext[T]` 获取此前已绑定的 Req。
+5. **中间件链执行**：洋葱模型从外到内执行中间件（`runChain`：池化执行对象 + 位图按层防重，超过 64 层回退递归实现）；每次 `next(w, r)` 都更新当前 w/r；传入新的 r 时，下游中间件与 handler 收到的 ctx 改为 `r.Context()`（并保留引擎请求状态），因此 `r.WithContext` 注入的值对 handler 可见；各中间件可通过 `BoundReqFromContext[T]` 获取此前已绑定的 Req。
 6. **core 层校验**（最内层）：`validateRequest` 依次执行 `validateNonzero` + `validateCustom(Validate)` → 校验失败产生 `*ValidationError`。
 7. **反射调用 handler**：校验通过后 `entry.handlerVal.Call` 调用 handler；成功时 Res 注入 ctx，随后以当前 w/r 调用 `OnResponse`，供后置中间件通过 `BoundResFromContext[T]` 获取 Res。
 8. **错误分发**：任一环节返回 error，均使用当前 w/r 按类型分发：
@@ -231,7 +233,7 @@ func BoundResFromContext[T any](ctx context.Context) (T, error)
 | `RequestFromContext` | 获取当前 `*http.Request`；中间件替换后为最近一次传给 `next` 的 request |
 | `ResponseWriterFromContext` | 获取当前 `http.ResponseWriter`；中间件替换后为最近一次传给 `next` 的 writer |
 | `EngineFromContext` | 获取 `*HttpEngine` |
-| `BoundReqFromContext[T]` | 获取进入中间件链前已绑定的 Req（替换 request 不会重新绑定；绑定阶段出错则 err 为非 nil 的 `*BindingError`；ctx 中不存在 Req 时返回 `ErrBoundReqNotFound`） |
+| `BoundReqFromContext[T]` | 获取进入中间件链前已绑定的 Req（替换 request 不会重新绑定；绑定阶段出错则 err 为非 nil 的 `*BindingError`；ctx 中不存在 Req 或 `T` 与注册的 Req 类型不符时均返回 `ErrBoundReqNotFound`）。`T` 为值类型时得到浅拷贝；`T` 为 `*Req` 时得到与 handler 共享的同一实例，在 `next` 前修改会改变 handler 的入参且发生在校验之前 |
 | `BoundResFromContext[T]` | 获取 handler 的 Res（仅在 `next()` 返回后可用；ctx 中不存在或类型不符时返回 `ErrBoundResNotFound`） |
 
 > 未被中间件替换时，注入的 ResponseWriter 是带 `Written()` 追踪能力的引擎包装对象，handler 直接通过它写响应（如文件流）后，默认响应回调会跳过 JSON 编码。中间件替换 writer 时，应让自定义包装器透传 `Written()` 以保留同一判定能力。

@@ -1,6 +1,25 @@
 package zchttp
 
-import "fmt"
+import (
+	"fmt"
+	"reflect"
+)
+
+// isNilError 判定 err 是否为 nil 或 typed-nil（动态类型为 nilable kind 且值为 nil，如 (*MyErr)(nil)）。
+// handler 返回值与 Validator.Validate() 返回值共用该归一化语义：typed-nil 视为无错误。
+// err == nil 的快速路径零反射开销；仅当接口非 nil 时才反射检测（错误路径本就低频）。
+func isNilError(err error) bool {
+	if err == nil {
+		return true
+	}
+	rv := reflect.ValueOf(err)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
 
 // ValidationError 表示请求参数校验失败，由 validateNonzero、Validate() 等校验逻辑产生。
 // HttpEngine 在 ServeHTTP 中通过 errors.As 识别该类型，并路由到 OnValidationError
@@ -17,10 +36,14 @@ func NewValidationError(Field string, Message string, Err error) *ValidationErro
 }
 
 // Error 实现 error 接口：包装了底层错误（Err 非 nil）时直接返回底层错误文案
-// （不叠加 Field/Message 前缀）；否则返回 "field \"<Field>\" <Message>" 形式。
+// （不叠加 Field/Message 前缀）；Field 为空（如跨字段业务校验）时仅返回 Message；
+// 否则返回 "field \"<Field>\" <Message>" 形式。
 func (e *ValidationError) Error() string {
 	if e.Err != nil {
 		return e.Err.Error()
+	}
+	if e.Field == "" {
+		return e.Message
 	}
 	return fmt.Sprintf("field %q %s", e.Field, e.Message)
 }

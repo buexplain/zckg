@@ -305,6 +305,28 @@ func parseScalar(fieldValue reflect.Value, value string, timeFormat string, loc 
 	return true, nil
 }
 
+// isScalarType 判断类型能否被 parseScalar 写入：string/bool/int/uint/float 各宽度、time.Time，
+// 以及它们的指针（指针层数上限与 parseScalar 一致）
+func isScalarType(t reflect.Type) bool {
+	for depth := 0; t.Kind() == reflect.Ptr; depth++ {
+		if depth >= maxPtrDerefDepth {
+			return false
+		}
+		t = t.Elem()
+	}
+	if t == timeType {
+		return true
+	}
+	switch t.Kind() {
+	case reflect.String, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
 // setTime 将字符串解析为 time.Time：
 //   - time_format 为 unix/unixmilli/unixmicro/unixnano 时按对应精度的时间戳解析
 //   - time_format 为其他非空值时作为 Go 时间布局（layout）解析，可支持任意非标准排列

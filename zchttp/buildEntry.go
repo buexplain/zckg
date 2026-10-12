@@ -225,8 +225,9 @@ func hasKeepRawBody(reqType reflect.Type) bool {
 
 // attachPathParamBindings 按参数名在 Req 的预计算元信息中查找对应字段，
 // 生成 pathParams 绑定列表（顺序与 segments 中的参数段一致，即注册顺序）。
-// 参数名在 Req 中无对应绑定名、或目标字段为上传文件字段时立即 panic（快速失败，
-// 消息含 method/path 与 handler 位置以便定位）。
+// 参数名在 Req 中无对应绑定名、目标字段为上传文件字段、或目标字段类型不是路径参数支持的
+// 标量（string/bool/int/uint/float、time.Time 及其指针）时立即 panic（快速失败，
+// 消息含 method/path、字段与类型以及 handler 位置以便定位）。
 func attachPathParamBindings(entry *routeEntry, segments []routeSegment, method, path string) {
 	for _, seg := range segments {
 		if !seg.isParam {
@@ -254,6 +255,14 @@ func attachPathParamBindings(entry *routeEntry, segments []routeSegment, method,
 				seg.name, method, path,
 				entry.handlerName, entry.handlerFile, entry.handlerLine,
 				found.field.Name, entry.reqElemType.Name(),
+			))
+		}
+		if !isScalarType(found.field.Type) {
+			panic(fmt.Sprintf(
+				"route param {%s} of %s %s (handler %s at %s:%d) cannot bind to field %q of unsupported type %s in Req struct %s; path params support string/bool/int/uint/float, time.Time and pointers to them",
+				seg.name, method, path,
+				entry.handlerName, entry.handlerFile, entry.handlerLine,
+				found.field.Name, found.field.Type, entry.reqElemType.Name(),
 			))
 		}
 		entry.pathParams = append(entry.pathParams, pathParamBinding{

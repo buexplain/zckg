@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html"
 	"io"
 	"log/slog"
@@ -51,7 +52,12 @@ var jsonEncoderPool = sync.Pool{
 	},
 }
 
+// errJSONEncode 标记 encodeJSON 在编码阶段失败（此时尚未向 w 写入任何字节），
+// 与编码成功后的写入失败区分
+var errJSONEncode = errors.New("json encode failed")
+
 // encodeJSON 从池中取出编码器将 v 编码为 JSON 写入 w，用完归还。
+// 先完整编码到缓冲区、成功后才写入 w：编码失败返回包装 errJSONEncode 的错误且不写入任何字节。
 // 归还前检查缓冲容量：单次超大响应抬升的缓冲超过 maxPooledJSONBufCap 时不入池
 // （交 GC 回收），避免大缓冲长期驻留池内固化内存峰值
 func encodeJSON(w io.Writer, v any) error {
@@ -59,6 +65,8 @@ func encodeJSON(w io.Writer, v any) error {
 	err := jb.enc.Encode(v)
 	if err == nil {
 		_, err = w.Write(jb.buf.Bytes())
+	} else {
+		err = fmt.Errorf("%w: %w", errJSONEncode, err)
 	}
 	jb.buf.Reset()
 	if jb.buf.Cap() > maxPooledJSONBufCap {
@@ -85,7 +93,8 @@ type HttpEngine struct {
 	OnValidationError ErrorHandler                                 // 参数校验失败回调，默认 DefaultValidationErrorHandler
 	OnPanic           PanicHandler                                 // panic 恢复回调，默认 DefaultPanicHandler
 	// MaxBodyBytes 请求体整体大小上限（字节），绑定前用 http.MaxBytesReader 包装 r.Body，
-	// 超限时绑定失败并映射为 400；0 表示不限制。对 JSON/表单/multipart 等所有请求体统一生效，
+	// 超限时绑定失败并映射为 400；0 表示框架不额外限制（urlencoded 表单仍受 ParseForm 固有的 10 MB 上限）。
+	// 对 JSON/表单/multipart 等所有请求体统一生效，
 	// 防止超大请求体造成的内存/磁盘 DoS。NewEngine 默认 32 MB（defaultMaxBodyBytes），
 	// 需要更大请求体的场景（如文件服务）由调用方显式调大或置 0
 	MaxBodyBytes int64
@@ -119,14 +128,21 @@ func WantHtml(r *http.Request) bool {
 }
 
 // DefaultResponseHandler 默认成功响应：若 handler 已写入响应（如文件下载、自定义 Content-Type 等）
-// 则跳过；否则以统一 JSON 结构返回 res
+// 则跳过；否则以统一 JSON 结构返回 res。
+// res 无法编码为 JSON（如含 func/chan 字段）时不写出任何 JSON 片段，改为 500 +
+// text/plain 正文 "internal server error"；编码成功后写入失败（如客户端断开）仅记录日志。
 func DefaultResponseHandler(w http.ResponseWriter, r *http.Request, res any) {
 	if IsResponseWritten(w) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := encodeJSON(w, Response{Data: res, Code: 0, Message: "success"}); err != nil {
-		slog.Error("json encode failed in DefaultResponseHandler", "error", err, "path", r.URL.Path)
+	err := encodeJSON(w, Response{Data: res, Code: 0, Message: "success"})
+	if err == nil {
+		return
+	}
+	slog.Error("json encode failed in DefaultResponseHandler", "error", err, "path", r.URL.Path)
+	if errors.Is(err, errJSONEncode) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("internal server error"))
 	}
@@ -330,7 +346,8 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 4. 洋葱模型核心层：参数校验 + 反射调用 handler
 	//    直接使用闭包捕获的 reqPtr（绑定阶段产物），避免再从 ctx 取值并重复反射
-	core := func(w http.ResponseWriter, r *http.Request) error {
+	//    ctx 为链上最近一次 next 传入的 request 对应的上下文（中间件 r.WithContext 注入的值对 handler 可见）
+	core := func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
 		// 绑定阶段失败时不提前返回，错误随中间件链穿透到 core 层再统一处理
 		if st.bindingErr != nil {
 			return st.bindingErr
@@ -357,23 +374,9 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 		// 处理返回值：成功交由响应回调，失败则返回 error 交由上层处理
-		// typed-nil 归一化：handler 返回 (*MyErr)(nil) 等 typed-nil 错误时接口非 nil，误判会走 500。
-		// errVal == nil 的快速路径零反射开销；仅当接口非 nil 时用反射检测 typed-nil
-		// （错误路径本就低频，反射开销可接受）。nilable kind 统一判定（Ptr/Map/Slice/Func/Chan），
-		// 覆盖以 map/slice 等类型实现 error 的罕见自定义错误类型
-		errVal := results[1].Interface()
-		if errVal != nil {
-			rv := reflect.ValueOf(errVal)
-			switch rv.Kind() {
-			case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
-				if rv.IsNil() {
-					errVal = nil // typed-nil 归一化为 nil，走成功路径
-				}
-			default:
-			}
-			if errVal != nil {
-				return errVal.(error)
-			}
+		// typed-nil 归一化（见 isNilError）：handler 返回 (*MyErr)(nil) 等 typed-nil 错误时视为成功
+		if errVal, _ := results[1].Interface().(error); !isNilError(errVal) {
+			return errVal
 		}
 
 		// 成功：将 Res 写入共享状态，再交由响应回调处理（默认 JSON，可自定义为文件等）

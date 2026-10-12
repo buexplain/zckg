@@ -886,7 +886,7 @@ func TestKeepRawBodyFileFieldPanic(t *testing.T) {
 
 // TestMultiSlashRoutePanic 验证显式注册多斜杠路径时注册 panic：
 // 基数树按 "/" 逐段切分，空段无法表达（//a、/a//b 均含空段）。
-// 请求侧多斜杠（注册 /a/b、请求 /a//b）不受影响，仍 404。
+// 请求侧多斜杠（注册 /a/b、请求 /a//b）不受影响，仍 404；参数段对空段的处理见 TestParamRouteEmptySegmentNotFound。
 func TestMultiSlashRoutePanic(t *testing.T) {
 	cases := []string{"//a", "/a//b"}
 	for _, p := range cases {
@@ -946,4 +946,26 @@ func TestParamRouteFileFieldPanic(t *testing.T) {
 		router := NewRouter()
 		router.GET("/p/{file}", handler)
 	})
+}
+
+// TestParamRouteEmptySegmentNotFound 端到端锁死参数段不匹配空段：注册 /c7/{x}/b（x 标注 nonzero）后，
+// 请求 /c7//b 返回 404 而非命中路由后以 x="" 进入校验返回 400；非空段 /c7/v/b 正常命中并绑定。
+func TestParamRouteEmptySegmentNotFound(t *testing.T) {
+	type emptySegReq struct {
+		X string `json:"x" nonzero:"true"`
+	}
+	type emptySegRes struct {
+		X string `json:"x"`
+	}
+	router := NewRouter()
+	router.GET("/c7/{x}/b", func(_ context.Context, req emptySegReq) (emptySegRes, error) {
+		return emptySegRes{X: req.X}, nil
+	})
+	if rec := serveRequest(t, router, http.MethodGet, "/c7//b", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /c7//b status = %d, want 404, body = %s", rec.Code, rec.Body.String())
+	}
+	rec := serveRequest(t, router, http.MethodGet, "/c7/v/b", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"x":"v"`) {
+		t.Fatalf("GET /c7/v/b status = %d, body = %s, want 200 with x=v", rec.Code, rec.Body.String())
+	}
 }

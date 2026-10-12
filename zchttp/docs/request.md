@@ -44,14 +44,14 @@ type Req struct {
 
 - **默认值填充**：嵌入指针在注册期模板中被 `fieldByIndex` 自动物化，其内部带 `default` 的字段与顶层字段一样在注册阶段填充。
 - **必填校验**：嵌入字段**没有**「父字段判零」环节——即使客户端完全不传嵌入对象，其内部 `nonzero:"true"` 字段仍会被强制校验（等价于顶层必填字段）。这与普通 `*Struct` 嵌套字段「父字段非零才递归校验」的规则不同（见 `parameter-validate.md`）。
-- **未导出指针嵌入不受支持**：`type Req struct { *base }`（类型名小写）注册时被跳过展开并输出 `slog.Warn` 引导改用导出类型名或值嵌入，其内部字段不进入可绑定集合（与 `encoding/json` 对「nil 未导出嵌入指针无法 unmarshal」的行为一致）。未导出**值**嵌入（`type Req struct { base }`）不受影响，内部导出字段仍可正常绑定、填充默认值与 nonzero 校验。
+- **未导出指针嵌入不受支持**：`type Req struct { *base }`（类型名小写）注册时被跳过展开并输出 `slog.Warn` 引导改用导出类型名或值嵌入，其内部字段不进入可绑定集合（query / 表单不绑定、不填默认值、不做 nonzero 校验，OpenAPI 也不输出）。JSON 请求体不经过该元数据：`encoding/json` 对 nil 未导出嵌入指针无法赋值，因此 JSON 中**出现**该嵌入的导出字段时解码失败并返回 400（`json: cannot set embedded pointer to unexported struct`），不出现时请求正常处理——并非一律静默忽略。未导出**值**嵌入（`type Req struct { base }`）不受影响，内部导出字段仍可正常绑定、填充默认值与 nonzero 校验。
 
 ## 二、结构体标签总览
 
 | 标签 | 作用 | 说明 |
 | --- | --- | --- |
-| `json` | 绑定名 / 序列化名 | 绑定名解析优先级：`form` > `json` > 字段名（取逗号前部分） |
-| `form` | 绑定名 | 优先级高于 `json`，常用于 query / 表单 |
+| `json` | 绑定名 / 序列化名 | query / form / 路径参数的绑定名解析优先级：`form` > `json` > 字段名（取逗号前部分）；JSON 请求体与响应只按 `json` 标签（`encoding/json` 规则） |
+| `form` | 绑定名 | 仅作用于 query / 表单 / 路径参数，优先级高于 `json`；对 JSON 请求体无效 |
 | `default` | 默认值 | 仅对标量类型（及其切片/指针）生效；注册阶段预填充到模板，详见 `parameter-binding.md` |
 | `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，详见 `parameter-binding.md` |
 | `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`；解析失败降级并输出 `slog.Warn` |
@@ -65,7 +65,7 @@ type Req struct {
 
 ### `json` — 绑定名 / 序列化名
 
-绑定名解析优先级：`form` > `json` > 字段名（取逗号前部分）。
+绑定名解析优先级：`form` > `json` > 字段名（取逗号前部分）。该优先级用于 query / 表单 / 路径参数与校验错误路径；JSON 请求体与响应的键只由 `json` 标签决定（见下节 `form`）。
 
 ```go
 type Req struct {
@@ -76,11 +76,11 @@ type Req struct {
 
 ### `form` — 绑定名（优先级高于 `json`）
 
-常用于 query 参数或表单字段，当 `form` 与 `json` 同时存在时，`form` 优先。
+常用于 query 参数或表单字段，当 `form` 与 `json` 同时存在时，query / 表单 / 路径参数按 `form` 绑定；JSON 请求体由 `encoding/json` 解码，只认 `json` 标签（无 json 名时用字段名，键名大小写不敏感），`form` 标签对其无效，OpenAPI 的 JSON schema 同样按 json 名生成。
 
 ```go
 type Req struct {
-    Keyword string `json:"keyword" form:"q"` // 绑定名为 "q"（form 优先）
+    Keyword string `json:"keyword" form:"q"` // query/表单绑定名为 "q"（form 优先）；JSON 请求体的键为 "keyword"
     Page    int    `json:"page" form:"page"` // 绑定名为 "page"
 }
 ```

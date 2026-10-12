@@ -126,7 +126,7 @@ func newRecGenerator() *openAPIGenerator {
 	return &openAPIGenerator{
 		schemas:           map[string]any{},
 		typeNames:         map[reflect.Type]string{},
-		nameToType:        map[string]reflect.Type{},
+		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
 	}

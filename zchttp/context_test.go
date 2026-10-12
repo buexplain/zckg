@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -395,5 +396,62 @@ func TestContextAccessors_NoState(t *testing.T) {
 	}
 	if _, ok := ResponseWriterFromContext(ctx); ok {
 		t.Fatal("ResponseWriterFromContext should return false without state")
+	}
+}
+
+type ctxSharedReq struct {
+	Name string `form:"name" nonzero:"true"`
+}
+
+type ctxSharedRes struct {
+	Name string `json:"name"`
+}
+
+// TestBoundReqFromContext_TypeMismatchAndSharedPointer 锁死 BoundReqFromContext 在真实中间件链中的两条语义：
+// 以错误的 Req 类型（值或指针）读取时与“未注入”返回同一哨兵 ErrBoundReqNotFound；以 *Req 取得的是 handler
+// 即将使用的共享实例，前置中间件在 next 前修改字段会改变 handler 实参，且修改先于 nonzero 校验
+// （请求缺省 name 时由中间件补值即可通过校验）；以值类型取得的是副本，修改不影响 handler。
+func TestBoundReqFromContext_TypeMismatchAndSharedPointer(t *testing.T) {
+	var valErr, ptrErr error
+	router := NewRouter()
+	router.Use(func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		_, valErr = BoundReqFromContext[ctxMismatchReq](ctx)
+		_, ptrErr = BoundReqFromContext[*ctxMismatchReq](ctx)
+		copied, err := BoundReqFromContext[ctxSharedReq](ctx)
+		if err != nil {
+			return err
+		}
+		copied.Name = "copy-mutated"
+		shared, err := BoundReqFromContext[*ctxSharedReq](ctx)
+		if err != nil {
+			return err
+		}
+		if r.URL.Query().Get("mutate") == "1" {
+			shared.Name = "mutated"
+		}
+		return next(w, r)
+	})
+	router.GET("/shared", func(_ context.Context, req ctxSharedReq) (ctxSharedRes, error) {
+		return ctxSharedRes{Name: req.Name}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+
+	rec := serveJSONOn(t, engine, http.MethodGet, "/shared?name=orig", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"name":"orig"`) {
+		t.Fatalf("未修改指针: status = %d, body = %s, want 200 with name=orig（值类型副本修改不应生效）", rec.Code, rec.Body.String())
+	}
+	if !errors.Is(valErr, ErrBoundReqNotFound) || !errors.Is(ptrErr, ErrBoundReqNotFound) {
+		t.Fatalf("类型不符应返回 ErrBoundReqNotFound, got value=%v pointer=%v", valErr, ptrErr)
+	}
+
+	rec = serveJSONOn(t, engine, http.MethodGet, "/shared?name=orig&mutate=1", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"name":"mutated"`) {
+		t.Fatalf("修改指针: status = %d, body = %s, want 200 with name=mutated", rec.Code, rec.Body.String())
+	}
+
+	rec = serveJSONOn(t, engine, http.MethodGet, "/shared?mutate=1", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"name":"mutated"`) {
+		t.Fatalf("缺省 name 由中间件补值: status = %d, body = %s, want 200 with name=mutated（修改先于 nonzero 校验）", rec.Code, rec.Body.String())
 	}
 }
