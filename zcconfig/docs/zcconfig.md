@@ -18,10 +18,12 @@ zcconfig/
 ├── config.go                      # 业务配置注册与 Config 泛型读取
 ├── dbConfig.go                    # 数据库连接配置与 DSN 生成（DBConfig / DBSlaveConfig）
 ├── cast_test.go                   # cast 函数测试
+├── env_test.go                    # LoadEnv 解析与 Env 泛型读取测试
+├── config_test.go                 # 配置树注册与 Config 泛型读取测试
 ├── config_extra_test.go           # 配置树深度合并与 nil map 边界测试
 ├── dbConfig_test.go               # DSN 组装与真实驱动解析回读测试
-├── docs_examples_compile_test.go  # 原样提取文档完整示例并编译
-└── zcconfig_test.go               # env 与 config 集成测试
+├── testhelpers_test.go            # 测试共享 helper（临时 .env 写入、状态重置）
+└── docs_examples_compile_test.go  # 原样提取文档完整示例并编译
 ```
 
 ## 架构设计
