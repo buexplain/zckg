@@ -3,6 +3,7 @@
 package zcquit
 
 import (
+	"errors"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -18,54 +19,40 @@ func prepareChildProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-// deliverSignal 向子进程投递指定信号。
+// deliverSignal 只向本测试新建的子进程组投递指定信号。
 func deliverSignal(pid int, sig syscall.Signal) error {
-	return syscall.Kill(pid, sig)
+	return syscall.Kill(-pid, sig)
 }
 
-// TestListen_SIGHUPIgnored 锁死「SIGHUP 不触发退出流程」：
-// 先投递 SIGHUP，子进程应继续存活（listen 循环内 continue 忽略）；
-// 再投递 SIGTERM，子进程正常完成退出流程。
-// 覆盖 listen() 的 SIGHUP 忽略分支（该分支在 Windows 上不可投递，仅 Unix 可覆盖）。
+// assertDefaultSignalExit 精确验证 Unix 默认 SIGTERM 终止，而非普通非零退出或清理超时。
+func assertDefaultSignalExit(t *testing.T, err error) {
+	t.Helper()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("第二个信号应终止子进程，实际退出结果: %v", err)
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != helperTermSignal || exitErr.ExitCode() != -1 {
+		t.Fatalf("应由 %v 默认终止（ExitCode=-1），实际: %v，status=%v", helperTermSignal, exitErr, exitErr.Sys())
+	}
+}
+
+// TestListen_SIGHUPIgnored 验证 Unix 真实 SIGHUP 被忽略：保留 800ms 独立存活观察窗口，
+// 再投递 SIGTERM 后仅执行一次清理并正常返回；READY 后无需额外就绪延迟。
 func TestListen_SIGHUPIgnored(t *testing.T) {
-	cmd, buf := startSignalHelper(t)
-	time.Sleep(time.Second)
-
-	if err := deliverSignal(cmd.Process.Pid, syscall.SIGHUP); err != nil {
-		t.Skipf("当前环境无法投递 SIGHUP，跳过: %v", err)
+	child := startSignalHelper(t, "single")
+	if err := deliverSignal(child.cmd.Process.Pid, syscall.SIGHUP); err != nil {
+		t.Skipf("当前环境无法向独立子进程组投递 SIGHUP，跳过: %v", err)
 	}
-
-	// SIGHUP 应被忽略：子进程在 800ms 内不应退出
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		t.Fatalf("SIGHUP 不应触发退出流程，子进程却提前退出: %v，输出: %s", err, buf.String())
-	case <-time.After(800 * time.Millisecond):
-		// 期望：子进程仍在监听
+	child.assertAlive(t, 800*time.Millisecond)
+	child.send(t)
+	if err := child.waitExit(t); err != nil {
+		t.Fatalf("SIGTERM 应触发正常退出流程（退出码 0），实际: %v，输出: %s", err, child.output.String())
 	}
-
-	if err := deliverSignal(cmd.Process.Pid, syscall.SIGTERM); err != nil {
-		_ = cmd.Process.Kill()
-		t.Skipf("当前环境无法投递 SIGTERM，跳过: %v", err)
-	}
-
-	select {
-	case err := <-done:
-		// 正常退出流程要求退出码为 0：非零退出码（如 panic/异常终止）不应因输出含标记而被放过
-		if err != nil {
-			t.Fatalf("SIGTERM 应触发正常退出流程（退出码 0），实际: %v，输出: %s", err, buf.String())
-		}
-	case <-time.After(30 * time.Second):
-		_ = cmd.Process.Kill()
-		t.Fatalf("SIGHUP 忽略后 SIGTERM 应能使 Listen 返回，输出: %s", buf.String())
-	}
-
-	out := buf.String()
-	if !strings.Contains(out, "LISTEN_RETURNED") {
-		t.Fatalf("SIGTERM 后 Listen 应返回，输出: %s", out)
-	}
-	if strings.Count(out, "SIG=") != 1 {
-		t.Fatalf("SIGHUP 不应触发 handler，仅 SIGTERM 应触发一次，输出: %s", out)
+	child.requireLine(t, "SIG="+helperTermSignal.String())
+	child.requireLine(t, "HANDLER_CALLS=1")
+	child.requireLine(t, "LISTEN_RETURNED")
+	if strings.Count(child.output.String(), "SIG=") != 1 {
+		t.Fatalf("SIGHUP 不应触发 handler，仅 SIGTERM 应触发一次，输出: %s", child.output.String())
 	}
 }

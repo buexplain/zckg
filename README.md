@@ -165,13 +165,13 @@ CREATE TABLE users (
 ## 测试
 
 ```bash
-# 运行全部测试（集成测试在数据库不可达时自动跳过）
+# 运行全部测试（数据库与操作系统信号集成测试的环境条件见下文）
 go test ./...
 ```
 
 - `*_unit_test.go`：纯单元测试，无外部依赖。
-- `*_integration_test.go`：集成测试，连接 `127.0.0.1` 上的 MySQL（3306）/ PostgreSQL（5432）/ SQLite（纯 Go 驱动，无需环境）；数据库不可达时自动
-  `t.Skip`。
+- 数据库集成测试（`*_integration_test.go`）：MySQL / PostgreSQL 连接 `127.0.0.1:3306` / `127.0.0.1:5432`，不可达时 `t.Skip`；SQLite 使用纯 Go 驱动，无需外部数据库，执行失败不因“环境不可达”跳过。
+- zcquit 信号/子进程集成测试（`quit_signal*_test.go`）：向隔离子进程投递真实 OS 信号，不依赖数据库。Windows 控制事件与 Unix 信号用例按平台构建条件选择；环境无法投递信号时明确跳过。helper 的普通父进程入口 Skip 不代表真实信号用例跳过，应结合 `go test -v` 输出判断。
 
 ### 测试覆盖率
 

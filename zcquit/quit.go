@@ -4,7 +4,7 @@
 //   - 通过 [GetCtx] 获取全局可取消上下文（context.WithCancel 创建）。任意协程可监听其 Done() 来感知退出信号。
 //   - [AddSigHandler] 注册分级信号处理函数（handler），按 level 升序分批执行：同级别并发、级别间串行。
 //   - [Listen] 是阻塞调用，用于在主协程中等待操作系统信号并触发退出流程。
-//   - [Shutdown] 用于在代码中主动触发退出（如健康检查失败），效果等同于收到终止信号。
+//   - [Shutdown] 用于在代码中主动触发相同的分级清理流程（如健康检查失败），信号取消订阅时点与信号触发不同。
 //
 // 退出流程：
 //  1. 取消全局上下文，通知所有监听 [GetCtx] 返回上下文 Done() 的协程退出。
@@ -14,19 +14,18 @@
 // 典型用法：
 //
 //	func main() {
-//	    // 1. 注册自定义清理逻辑（在 Listen 之前任意时机注册均可）
-//	    zcquit.AddSigHandler(0, func(sig os.Signal) {
-//	        slog.Info("收到信号，开始清理资源...", "signal", sig)
-//	        // 关闭数据库连接、刷新缓冲区等
+//	    workerDone := make(chan struct{})
+//	    go func() {
+//	        defer close(workerDone)
+//	        <-zcquit.GetCtx().Done()
+//	        slog.Info("业务协程完成收尾")
+//	    }()
+//	    zcquit.AddSigHandler(0, func(sig os.Signal) { <-workerDone })
+//	    zcquit.AddSigHandler(1, func(sig os.Signal) {
+//	        slog.Info("业务收尾完成，开始关闭资源...", "signal", sig)
 //	    })
 //
-//	    // 2. 启动业务协程，协程内部监听 Ctx.Done()
-//	    go func() {
-//	        <-zcquit.GetCtx().Done()
-//	        slog.Info("上下文已取消，协程退出")
-//	    }()
-//
-//	    // 3. 阻塞主协程，等待信号（或在协程中主动调用 Shutdown 触发退出）
+//	    // 所有 handler 应在任何退出触发之前注册；Listen 不自动等待普通业务协程。
 //	    zcquit.Listen()
 //	    slog.Info("程序退出")
 //	}
@@ -47,8 +46,8 @@ import (
 // 外部通过 [GetCtx] 只读访问，避免被意外覆盖。
 var ctx context.Context
 
-// GetCtx 返回全局可取消上下文。任意协程如需同步退出，都应监听返回 ctx 的 Done() 通道。
-// 当操作系统终止信号到达或 [Shutdown] 被调用时，该上下文将被取消。
+// GetCtx 返回全局可取消上下文；仅通知退出，不等待业务协程收尾，也不启动信号监听。
+// 退出流程开始时上下文取消；需要等待的协程应由 handler 或 main 显式同步。
 func GetCtx() context.Context {
 	return ctx
 }
@@ -83,8 +82,8 @@ var shutdownStarted atomic.Bool
 // 读写受 [signalHandlerMux] 保护。
 var signalHandlerMap = map[int][]SigHandler{}
 
-// SigHandler 信号处理函数类型。参数 sig 为触发该处理函数的操作系统信号。
-// [Shutdown] 主动调用时传入 nil，handler 可通过 sig == nil 区分触发来源。
+// SigHandler 的 sig 由取得退出执行权的路径决定：信号路径为该信号，[Shutdown] 路径为 nil。
+// 并发触发不保证先到先得；nil 不代表没有操作系统信号同时到达。
 type SigHandler func(sig os.Signal)
 
 // init 在包加载时初始化全局的 ctx 与 cancel。
@@ -92,10 +91,11 @@ func init() {
 	ctx, cancel = context.WithCancel(context.Background())
 }
 
-// Listen 阻塞等待操作系统终止信号，触发优雅退出流程。
+// Listen 阻塞等待信号或主动 Shutdown 触发的全部清理 handler 完成；此前已完成则立即返回。
 //
 // 该函数通过内部的 sync.Once 保证信号监听只启动一次，多次调用安全。
-// 首次调用时启动后台监听 goroutine，随后阻塞在 waitChan 上，直到信号到达并完成处理。
+// 首次初始化时同步完成信号注册并启动后台监听，随后等待全部 handler 完成。
+// 不自动等待普通业务协程或监听 goroutine 退出；handler 内不能调用 Listen 等待自身完成。
 //
 // 监听的信号包括：
 //   - syscall.SIGTERM：终止信号（如 kill 命令默认发送）
@@ -115,22 +115,9 @@ func Listen() {
 // listen 是信号监听的核心实现，运行在独立的 goroutine 中。
 // 它阻塞等待操作系统信号，收到非 SIGHUP 信号后执行退出流程；
 // 若退出流程已由 [Shutdown] 完成（stopListenCh 被关闭），则直接退出，避免 goroutine 泄漏。
-func listen() {
-	signalCH := make(chan os.Signal, 1)
-	// 注意：Windows 平台下 SIGHUP 与 SIGQUIT 不会被操作系统实际投递，
-	// 仅 SIGINT（Ctrl+C）和 SIGTERM（如 taskkill）可用。
-	signal.Notify(signalCH, []os.Signal{
-		syscall.SIGHUP,  // 挂起信号（终端会话断开），由循环内忽略
-		syscall.SIGTERM, // 终止信号
-		syscall.SIGINT,  // 中断信号（Ctrl+C）
-		syscall.SIGQUIT, // 退出信号（Ctrl+\）
-	}...)
-
+func listen(signalCH chan os.Signal) {
 	var sig os.Signal
-	// 循环读取信号通道，直到收到非 SIGHUP 信号，或收到退出通知。
-	// 注意：Shutdown 与信号并发触发时退出流程仅执行一次（shutdownStarted CAS 收敛）；
-	// 本 select 的两个分支同时就绪时由运行时随机选择——若走停止通知分支，信号被丢弃，
-	// handler 观察到的 sig 可能为 nil（与 Shutdown 主动触发的语义等价，可用 sig == nil 区分触发来源）。
+	// 停止通知只在清理完成后就绪；handler 的 sig 已由 CAS 获胜路径决定。
 loop:
 	for {
 		select {
@@ -148,8 +135,7 @@ loop:
 		}
 	}
 
-	// 取消信号注册：避免后续信号投递到无人消费的 channel；
-	// 同时使后续相同信号恢复操作系统默认行为（如再次 Ctrl+C 立即终止进程）
+	// 只撤销本通道的订阅；其他 Notify 订阅仍会阻止该信号恢复默认退出行为。
 	signal.Stop(signalCH)
 
 	// 触发退出流程（shutdownStarted CAS 保证与 Shutdown 互斥，只执行一次）
@@ -227,26 +213,24 @@ func executeShutdown(sig os.Signal) {
 	close(waitChan)
 }
 
-// doListen 通过 sync.Once 确保 listen goroutine 只启动一次。
-// 被 [Listen] 和 [AddSigHandler] 共同调用：
-//   - [Listen] 被调用时触发首次启动。
-//   - [AddSigHandler] 被调用时也尝试触发，保证即使在 [Listen] 之前注册 handler 也能正常监听。
+// doListen 同步完成首次信号注册；sync.Once 保证并发调用返回前初始化已经完成。
 func doListen() {
 	listenOnce.Do(func() {
-		go listen()
+		signalCH := make(chan os.Signal, 1)
+		// Windows 的 Ctrl+C/Break 为 SIGINT，控制台关闭/注销/关机为 SIGTERM，后者仅提供有限清理机会。
+		signal.Notify(signalCH, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
+		go listen(signalCH)
 	})
 }
 
-// Shutdown 主动触发退出流程，效果等同于收到操作系统终止信号。
+// Shutdown 主动触发分级清理：取消上下文，同级 handler 并发、级别间串行，完成后使 [Listen] 返回。
 //
-// 调用后会：取消全局上下文、并发执行所有已注册的 handler、
-// 最后使阻塞在 [Listen] 上的调用返回。
+// 取得 CAS 执行权的调用同步等待全部 handler 完成；其余调用立即返回，不等待清理结束。
+// 如需等待退出流程完成，应在 handler 之外调用 [Listen]。
 //
-// 与操作系统信号触发互斥：若信号先到达，Shutdown 为 no-op；
-// Shutdown 先调用则后续信号不再触发重复的退出流程。
-// 注意：非首次调用会立即返回，不等待首次触发的退出流程执行完成。
-//
-// 适用场景：健康检查失败、管理接口触发关闭等需要在代码中主动退出的场景。
+// 信号路径在清理开始前取消自身订阅；主动路径在清理完成后通知监听协程取消订阅。
+// 主动清理期间到达的首个终止信号可被消费并取消订阅，不重复清理；其他 Notify 订阅仍可能阻止默认退出。
+// [Listen] 返回不保证监听协程已经完成取消订阅。
 func Shutdown() {
 	// 确保信号监听已启动（若此前未调用 AddSigHandler 或 Listen）
 	doListen()
@@ -260,8 +244,8 @@ func Shutdown() {
 // 同级别内的 handler 并发执行，不同级别之间串行等待（当前级别全部完成后才进入下一级别）。
 // level 可以为任意整数值（含负数），没有预设的级别常量。
 //
-// 首次调用时会隐式触发信号监听的启动（通过内部的 sync.Once 保证仅启动一次）。
-// 后续调用仅追加 handler，不会重复启动监听。
+// 先注册本批 handler，再同步完成首次信号注册；退出尚未触发时，返回即可接收信号。
+// 后续调用不重复启动监听；所有 handler 应在任何退出触发之前注册，退出后追加也不会重启监听。
 //
 // handler 在退出时并发执行（各自在独立 goroutine 中），执行期间不持有锁，
 // 因此 handler 中可以安全地调用 AddSigHandler 追加新的 handler（但本次退出已开始的执行不受影响，
@@ -277,8 +261,8 @@ func AddSigHandler(level int, handler ...SigHandler) {
 			panic("zcquit: 不允许注册 nil 的 SigHandler")
 		}
 	}
-	doListen()
 	signalHandlerMux.Lock()
-	defer signalHandlerMux.Unlock()
 	signalHandlerMap[level] = append(signalHandlerMap[level], handler...)
+	signalHandlerMux.Unlock()
+	doListen()
 }

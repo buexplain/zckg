@@ -3,6 +3,10 @@ package zcquit
 import (
 	"context"
 	"os"
+	"os/exec"
+	"os/signal"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -579,4 +583,255 @@ func TestListen_AfterShutdownReturnsImmediately(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Shutdown 完成后 Listen 应立即返回")
 	}
+}
+
+func isolatedQuitTest(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("ZCQUIT_ISOLATED_TEST") == t.Name() {
+		return true
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	args := []string{"-test.run=^" + regexp.QuoteMeta(t.Name()) + "$", "-test.v"}
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "-test.gocoverdir=") {
+			args = append(args, arg)
+		}
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.Env = append(os.Environ(), "ZCQUIT_ISOLATED_TEST="+t.Name())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("独立进程测试失败: %v, context=%v\n%s", err, ctx.Err(), out)
+	}
+	return false
+}
+
+func waitQuitTest(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待退出测试同步点超时")
+	}
+}
+
+func assertQuitBlocked(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatal("收尾完成前不应返回")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestAddSigHandler_ListenerReady 在新进程中验证注册返回时 Notify 已生效，而非等待后台调度。
+func TestAddSigHandler_ListenerReady(t *testing.T) {
+	if !isolatedQuitTest(t) {
+		return
+	}
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	signal.Ignore(syscall.SIGINT)
+	defer signal.Reset(syscall.SIGINT)
+	if !signal.Ignored(syscall.SIGINT) {
+		t.Fatal("前置条件失败：SIGINT 应处于忽略状态")
+	}
+	var called atomic.Int32
+	AddSigHandler(0, func(os.Signal) { called.Add(1) })
+	if signal.Ignored(syscall.SIGINT) {
+		t.Fatal("AddSigHandler 返回时 signal.Notify 尚未生效")
+	}
+	Shutdown()
+	Listen()
+	if called.Load() != 1 {
+		t.Fatalf("首批 handler 应恰好执行一次，实际 %d", called.Load())
+	}
+}
+
+// TestAddSigHandler_RegistersBeforeListening 验证首次监听初始化阻塞时 handler 已先入表且注册尚未返回。
+func TestAddSigHandler_RegistersBeforeListening(t *testing.T) {
+	if !isolatedQuitTest(t) {
+		return
+	}
+	initializing, release, initialized := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
+	go func() {
+		listenOnce.Do(func() {
+			close(initializing)
+			<-release
+		})
+		close(initialized)
+	}()
+	waitQuitTest(t, initializing)
+	var called atomic.Int32
+	registered := make(chan struct{})
+	go func() {
+		AddSigHandler(0, func(os.Signal) { called.Add(1) })
+		close(registered)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		signalHandlerMux.RLock()
+		count := len(signalHandlerMap[0])
+		signalHandlerMux.RUnlock()
+		if count == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("首次监听初始化尚未完成时，handler 应已先注册")
+		}
+		runtime.Gosched()
+	}
+	assertQuitBlocked(t, registered)
+	unblock()
+	waitQuitTest(t, initialized)
+	waitQuitTest(t, registered)
+	Shutdown()
+	if called.Load() != 1 {
+		t.Fatalf("首批 handler 应恰好执行一次，实际 %d", called.Load())
+	}
+}
+
+// TestAddSigHandler_ConcurrentFirstRegistrations 验证新进程并发首次注册后全部 handler 保留且监听已就绪。
+func TestAddSigHandler_ConcurrentFirstRegistrations(t *testing.T) {
+	if !isolatedQuitTest(t) {
+		return
+	}
+	signal.Ignore(syscall.SIGINT)
+	defer signal.Reset(syscall.SIGINT)
+	var registered sync.WaitGroup
+	var called atomic.Int32
+	var notReady atomic.Int32
+	start := make(chan struct{})
+	for i := 0; i < 16; i++ {
+		registered.Add(1)
+		go func() {
+			defer registered.Done()
+			<-start
+			AddSigHandler(0, func(os.Signal) { called.Add(1) })
+			if signal.Ignored(syscall.SIGINT) {
+				notReady.Add(1)
+			}
+		}()
+	}
+	close(start)
+	registered.Wait()
+	if notReady.Load() != 0 {
+		t.Fatalf("%d 次注册返回时监听尚未就绪", notReady.Load())
+	}
+	Shutdown()
+	Listen()
+	if called.Load() != 16 {
+		t.Fatalf("并发注册的 handler 应全部执行，实际 %d", called.Load())
+	}
+}
+
+// TestShutdown_FirstTriggerWins 验证 CAS 获胜者同步等待并决定信号值，后续触发立即返回且不提前发送停止通知。
+func TestShutdown_FirstTriggerWins(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sig  os.Signal
+	}{
+		{name: "主动退出", sig: nil},
+		{name: "信号入口", sig: syscall.SIGTERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !isolatedQuitTest(t) {
+				return
+			}
+			release := make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(unblock)
+			entered := make(chan os.Signal, 1)
+			var count atomic.Int32
+			AddSigHandler(0, func(sig os.Signal) {
+				count.Add(1)
+				entered <- sig
+				<-release
+			})
+			firstDone, listenDone := make(chan struct{}), make(chan struct{})
+			go func() {
+				if tc.sig == nil {
+					Shutdown()
+				} else {
+					doShutdown(tc.sig)
+				}
+				close(firstDone)
+			}()
+			go func() { Listen(); close(listenDone) }()
+			select {
+			case sig := <-entered:
+				if sig != tc.sig {
+					t.Fatalf("handler 信号应为 %v，实际 %v", tc.sig, sig)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("handler 未开始执行")
+			}
+			laterDone := make(chan struct{})
+			go func() {
+				Shutdown()
+				doShutdown(syscall.SIGINT)
+				close(laterDone)
+			}()
+			waitQuitTest(t, laterDone)
+			if GetCtx().Err() != context.Canceled {
+				t.Fatalf("handler 开始时上下文应已取消，实际 %v", GetCtx().Err())
+			}
+			assertQuitBlocked(t, firstDone)
+			assertQuitBlocked(t, listenDone)
+			select {
+			case <-stopListenCh:
+				t.Fatal("handler 完成前不应发送停止监听通知")
+			default:
+			}
+			unblock()
+			waitQuitTest(t, firstDone)
+			waitQuitTest(t, listenDone)
+			if count.Load() != 1 {
+				t.Fatalf("handler 应恰好执行一次，实际 %d", count.Load())
+			}
+			select {
+			case <-stopListenCh:
+			default:
+				t.Fatal("清理结束后应发送停止监听通知")
+			}
+		})
+	}
+}
+
+// TestListen_WaitsForJoinedWorker 验证通过低级别 handler 等待业务收尾，完成后才关闭依赖资源并返回 Listen。
+func TestListen_WaitsForJoinedWorker(t *testing.T) {
+	if !isolatedQuitTest(t) {
+		return
+	}
+	workerCancelled, workerDone, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
+	go func() {
+		<-GetCtx().Done()
+		close(workerCancelled)
+		<-release
+		close(workerDone)
+	}()
+	joining, resourcesClosed := make(chan struct{}), make(chan struct{})
+	AddSigHandler(0, func(os.Signal) { close(joining); <-workerDone })
+	AddSigHandler(1, func(os.Signal) { close(resourcesClosed) })
+	shutdownDone, listenDone := make(chan struct{}), make(chan struct{})
+	go func() { Shutdown(); close(shutdownDone) }()
+	go func() { Listen(); close(listenDone) }()
+	waitQuitTest(t, workerCancelled)
+	waitQuitTest(t, joining)
+	assertQuitBlocked(t, resourcesClosed)
+	assertQuitBlocked(t, listenDone)
+	unblock()
+	waitQuitTest(t, workerDone)
+	waitQuitTest(t, resourcesClosed)
+	waitQuitTest(t, shutdownDone)
+	waitQuitTest(t, listenDone)
 }
