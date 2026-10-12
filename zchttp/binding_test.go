@@ -2778,3 +2778,24 @@ func TestIsScalarType(t *testing.T) {
 		})
 	}
 }
+
+// TestSetTime_EmptyValueNoop 验证空字符串直接略过解析（不报错、不改动字段），
+// 覆盖 setTime 的空值早退分支。
+func TestSetTime_EmptyValueNoop(t *testing.T) {
+	var tv time.Time
+	if err := setTime(reflect.ValueOf(&tv).Elem(), "", "unix", nil); err != nil {
+		t.Fatalf("空值应直接返回 nil，实际 %v", err)
+	}
+	if !tv.IsZero() {
+		t.Errorf("空值不应修改字段，实际 %v", tv)
+	}
+}
+
+// TestSetTime_UnparseableAutoDetect 验证 time_format 为空且值既非纯数字也不能匹配任何
+// 常见布局时返回错误，覆盖自动探测的失败分支。
+func TestSetTime_UnparseableAutoDetect(t *testing.T) {
+	var tv time.Time
+	if err := setTime(reflect.ValueOf(&tv).Elem(), "not-a-time", "", nil); err == nil {
+		t.Fatal("无法解析的时间字符串应返回错误")
+	}
+}

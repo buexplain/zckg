@@ -1076,3 +1076,25 @@ func TestParseRoutePathCatchAllValid(t *testing.T) {
 		})
 	}
 }
+
+// TestJoinGroupPath 以判定表锁定分组路径拼接：空前缀（根分组）在 path 为 "/" 时返回 "/"、
+// 否则返回路径本身；非空前缀与路径拼接，且前缀自身先归一化（前导 "/"、去尾 "/"）。
+func TestJoinGroupPath(t *testing.T) {
+	cases := []struct {
+		prefix, path, want string
+	}{
+		{"", "/", "/"},
+		{"/", "/", "/"},
+		{"/api", "/", "/api"},
+		{"", "/users", "/users"},
+		{"/api", "/users", "/api/users"},
+		{"/api/", "users", "/api/users"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.prefix+"+"+tc.path, func(t *testing.T) {
+			if got := joinGroupPath(tc.prefix, tc.path); got != tc.want {
+				t.Errorf("joinGroupPath(%q,%q)=%q want %q", tc.prefix, tc.path, got, tc.want)
+			}
+		})
+	}
+}
