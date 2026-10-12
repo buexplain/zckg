@@ -48,9 +48,9 @@ func LoadEnv(path string) error {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		// 剥离首行的 UTF-8 BOM：Windows 记事本默认带 BOM 保存，
-		// 不剥离会导致首行 key 带上 \ufeff 前缀而静默查不到
+		// 剥离后再次清理空白，确保 BOM 后缩进不影响 export 和注释识别。
 		if firstLine {
-			line = strings.TrimPrefix(line, "\ufeff")
+			line = strings.TrimSpace(strings.TrimPrefix(line, "\ufeff"))
 			firstLine = false
 		}
 		// 跳过空行和注释行

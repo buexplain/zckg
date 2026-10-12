@@ -423,3 +423,147 @@ func TestCast_DirectAssertion(t *testing.T) {
 		t.Errorf("float64 -> float64 期望 3.14，实际 %f", v)
 	}
 }
+
+// TestCast_NumericToNamedBool 验证各整数与浮点类型按零值转换为具名 bool，不因类型断言而 panic。
+func TestCast_NumericToNamedBool(t *testing.T) {
+	type flag bool
+	type count int
+	type address uintptr
+	tests := []struct {
+		name    string
+		zero    any
+		nonzero any
+	}{
+		{"int", int(0), int(-1)},
+		{"int8", int8(0), int8(-1)},
+		{"int16", int16(0), int16(-1)},
+		{"int32", int32(0), int32(-1)},
+		{"int64", int64(0), int64(-1)},
+		{"uint", uint(0), uint(1)},
+		{"uint8", uint8(0), uint8(1)},
+		{"uint16", uint16(0), uint16(1)},
+		{"uint32", uint32(0), uint32(1)},
+		{"uint64", uint64(0), uint64(1)},
+		{"uintptr", uintptr(0), uintptr(1)},
+		{"float32", float32(0), float32(-0.5)},
+		{"float64", float64(0), float64(-0.5)},
+		{"named_int", count(0), count(-1)},
+		{"named_uintptr", address(0), address(1)},
+		{"string", "false", "true"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cast(tt.zero, flag(true)); got != flag(false) {
+				t.Errorf("cast(%T(%v), true) = %v, want false", tt.zero, tt.zero, got)
+			}
+			if got := cast(tt.nonzero, flag(false)); got != flag(true) {
+				t.Errorf("cast(%T(%v), false) = %v, want true", tt.nonzero, tt.nonzero, got)
+			}
+		})
+	}
+}
+
+// TestCast_NamedString 验证普通与具名 string 双向转换，保留空值且不扩大到 struct 或数值码点转换。
+func TestCast_NamedString(t *testing.T) {
+	type label string
+	type other string
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"plain_to_named", castCase("hello", label("fallback"), label("hello"))},
+		{"named_to_plain", castCase(label("hello"), "fallback", "hello")},
+		{"named_to_other", castCase(label("hello"), other("fallback"), other("hello"))},
+		{"same_named", castCase(label("hello"), label("fallback"), label("hello"))},
+		{"empty_to_named", castCase("", label("fallback"), label(""))},
+		{"named_empty_to_plain", castCase(label(""), "fallback", "")},
+		{"named_numeric_to_int", castCase(label("42"), 7, 42)},
+		{"int_to_named_rejected", castCase(65, label("fallback"), label("fallback"))},
+		{"string_to_struct_rejected", castCase("hello", struct{ N int }{7}, struct{ N int }{7})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
+	}
+}
+
+// TestCast_Uintptr 验证 uintptr 的字符串解析、布尔转换与码点防护，包括平台位宽溢出。
+func TestCast_Uintptr(t *testing.T) {
+	type address uintptr
+	type label string
+	maxValue := ^uintptr(0)
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"string", castCase("42", uintptr(7), uintptr(42))},
+		{"named_target", castCase("42", address(7), address(42))},
+		{"max", castCase(strconv.FormatUint(uint64(maxValue), 10), uintptr(7), maxValue)},
+		{"overflow", castCase("18446744073709551616", uintptr(7), uintptr(7))},
+		{"negative", castCase("-1", uintptr(7), uintptr(7))},
+		{"invalid", castCase("invalid", uintptr(7), uintptr(7))},
+		{"zero_to_bool", castCase(uintptr(0), true, false)},
+		{"nonzero_to_bool", castCase(uintptr(65), false, true)},
+		{"named_source_to_bool", castCase(address(65), false, true)},
+		{"string_rejected", castCase(uintptr(65), "fallback", "fallback")},
+		{"named_string_rejected", castCase(address(65), label("fallback"), label("fallback"))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
+	}
+}
+
+// TestCast_ComplexToBoolReturnsDefault 验证复数不参与数值转 bool 特判，零与非零均返回调用方默认值。
+func TestCast_ComplexToBoolReturnsDefault(t *testing.T) {
+	type flag bool
+	for _, value := range []any{complex64(0), complex64(1 + 2i), complex128(0), complex128(1 + 2i)} {
+		t.Run(fmt.Sprintf("%T_%v", value, value), func(t *testing.T) {
+			for _, def := range []bool{false, true} {
+				if got := cast(value, def); got != def {
+					t.Errorf("cast(%v, %v) = %v, want default", value, def, got)
+				}
+				if got := cast(value, flag(def)); got != flag(def) {
+					t.Errorf("cast(%v, flag(%v)) = %v, want default", value, def, got)
+				}
+			}
+		})
+	}
+}
+
+// TestCast_SliceToArrayValueSafety 验证短切片转换失败返回原默认值，足长切片正常转数组及数组指针。
+func TestCast_SliceToArrayValueSafety(t *testing.T) {
+	tests := []struct {
+		name  string
+		value []int
+		want  [2]int
+		valid bool
+	}{
+		{"nil", nil, [2]int{8, 9}, false},
+		{"empty", []int{}, [2]int{8, 9}, false},
+		{"short", []int{1}, [2]int{8, 9}, false},
+		{"exact", []int{1, 2}, [2]int{1, 2}, true},
+		{"long", []int{1, 2, 3}, [2]int{1, 2}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			def := [2]int{8, 9}
+			if got := cast(tt.value, def); got != tt.want {
+				t.Errorf("array conversion = %v, want %v", got, tt.want)
+			}
+			got := cast(tt.value, &def)
+			if got == nil || *got != tt.want {
+				t.Fatalf("array pointer conversion = %v, want %v", got, tt.want)
+			}
+			if !tt.valid && got != &def {
+				t.Error("failed conversion did not return original default pointer")
+			}
+		})
+	}
+}
+
+// TestCast_DurationUnitlessZero 验证仅零及符号零可省略单位，非零数字字符串仍返回非零默认值。
+func TestCast_DurationUnitlessZero(t *testing.T) {
+	for _, value := range []string{"0", "+0", "-0"} {
+		t.Run(value, castCase(value, 5*time.Second, time.Duration(0)))
+	}
+	t.Run("nonzero", castCase("10", 5*time.Second, 5*time.Second))
+}

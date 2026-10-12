@@ -21,6 +21,8 @@ var (
 //     zcconfig 不拷贝 fn 的返回值（直接存储引用），外部修改会污染全局配置。
 //   - 若 key 路径的中间层级已存在标量值（如 "app.name" 已注册为 string），
 //     后续在该路径下注册子节点（如 "app.name.sub"）会覆盖原标量值为 map。
+//   - nil 目标 map 视为待初始化节点，沿路径注册时分配，合并时由源 map 覆盖；
+//     nil 源 map 不清空已有的非 nil 目标 map，fn 返回 nil 时不做任何操作。
 //   - Register 仅允许在启动阶段调用，运行期配置只读。
 func Register(key string, fn func() map[string]any) {
 	data := fn()
@@ -41,13 +43,13 @@ func Register(key string, fn func() map[string]any) {
 	mergeMap(target, data)
 }
 
-// ensureMapAt 在 dst 中沿 parts 路径导航，缺少的中间层级自动创建为 map[string]any。
+// ensureMapAt 在 dst 中沿 parts 路径导航，缺失、非 map 或 nil map 节点视为待初始化节点，分配 map[string]any。
 // 返回路径终点的 map[string]any 引用，用于后续合并数据。
 func ensureMapAt(dst map[string]any, parts []string) map[string]any {
 	current := dst
 	for _, part := range parts {
 		next, ok := current[part].(map[string]any)
-		if !ok {
+		if !ok || next == nil {
 			next = make(map[string]any)
 			current[part] = next
 		}
@@ -56,12 +58,13 @@ func ensureMapAt(dst map[string]any, parts []string) map[string]any {
 	return current
 }
 
-// mergeMap 将 src 深度合并到 dst 中。
-// 当 src 和 dst 的同名 key 都为 map[string]any 时递归合并，否则 src 的值覆盖 dst。
+// mergeMap 将 src 深度合并到非 nil 的 dst 中。
+// 当同名 key 均为 map[string]any 且目标 map 非 nil 时递归合并，nil 源 map 不清空已有数据。
+// nil 目标 map 视为待初始化节点，由源值覆盖；其他不满足递归条件的值也由源值覆盖。
 func mergeMap(dst, src map[string]any) {
 	for k, v := range src {
 		if srcMap, ok := v.(map[string]any); ok {
-			if dstMap, ok := dst[k].(map[string]any); ok {
+			if dstMap, ok := dst[k].(map[string]any); ok && dstMap != nil {
 				mergeMap(dstMap, srcMap)
 				continue
 			}

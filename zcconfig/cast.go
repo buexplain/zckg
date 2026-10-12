@@ -11,8 +11,8 @@ import (
 // 优先使用直接类型断言，若不匹配则尝试通过 reflect 进行类型转换，
 // 对于 string 到数值类型的场景使用 strconv 做转换，
 // 对于 string 到 time.Duration 的场景使用 time.ParseDuration 做转换。
-// 此外包含两个特判分支：
-//   - 数值 → bool：C 语言惯例，零值为 false、非零为 true
+// 普通与具名 string 可互转；数值特判涵盖整数（含 uintptr）与浮点，不含 complex：
+//   - 数值 → bool（含具名 bool）：C 语言惯例，零值为 false、非零为 true
 //     （解决 .env 中 "1"/"0" 被推断为 int 后无法转 bool 的问题）；
 //   - 数值 → string：直接返回 def，防止 Go 中 int -> string 的
 //     Unicode 码点语义（65 -> "A"）陷阱。
@@ -55,7 +55,7 @@ func cast[T any](v any, def T) T {
 			if n, err := strconv.ParseInt(s, 10, rt.Bits()); err == nil {
 				return reflect.ValueOf(n).Convert(rt).Interface().(T)
 			}
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 			if n, err := strconv.ParseUint(s, 10, rt.Bits()); err == nil {
 				return reflect.ValueOf(n).Convert(rt).Interface().(T)
 			}
@@ -69,6 +69,8 @@ func cast[T any](v any, def T) T {
 			if b, err := strconv.ParseBool(s); err == nil {
 				return reflect.ValueOf(b).Convert(rt).Interface().(T)
 			}
+		case reflect.String:
+			return rv.Convert(rt).Interface().(T)
 		default:
 			return def
 		}
@@ -81,12 +83,12 @@ func cast[T any](v any, def T) T {
 		switch rv.Kind() {
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			isZero = rv.Int() == 0
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 			isZero = rv.Uint() == 0
 		case reflect.Float32, reflect.Float64:
 			isZero = rv.Float() == 0
 		}
-		return any(!isZero).(T)
+		return reflect.ValueOf(!isZero).Convert(rt).Interface().(T)
 	}
 
 	// 防护数值类型 -> string 的码点陷阱：
@@ -99,20 +101,19 @@ func cast[T any](v any, def T) T {
 	// 通过 reflect 做通用类型转换。
 	// 注意：此处采用 Go 原生类型转换语义，float -> int 向零截断（99.99 -> 99），
 	// 大位宽 -> 小位宽（如 32 位平台上 int64 -> int）可能溢出；
-	// 该截断语义已在 docs/zcconfig.md 中显式声明，调用方应保证
-	// 默认值类型与存储的配置值类型匹配。
-	if rv.IsValid() && rv.Type().ConvertibleTo(rt) {
+	// 默认值类型应与存储类型匹配；CanConvert 同时检查切片转数组所需的值长度。
+	if rv.CanConvert(rt) {
 		return rv.Convert(rt).Interface().(T)
 	}
 
 	return def
 }
 
-// isNumericKind 判断 reflect.Kind 是否为数值类型（int/uint/float 系列）。
+// isNumericKind 识别整数（含 uintptr）与浮点类型，不含 complex。
 func isNumericKind(k reflect.Kind) bool {
 	switch k {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
 		reflect.Float32, reflect.Float64:
 		return true
 	}

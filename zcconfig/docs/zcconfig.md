@@ -13,13 +13,15 @@ zcconfig 是一个轻量级配置加载与读取模块，提供两条独立的�
 
 ```
 zcconfig/
-├── cast.go            # 泛型类型转换引擎（内部）
-├── env.go             # .env 文件加载与 Env 泛型读取
-├── config.go          # 业务配置注册与 Config 泛型读取
-├── dbConfig.go        # 数据库连接配置与 DSN 生成（DBConfig / DBSlaveConfig）
-├── cast_test.go       # cast 函数测试
-├── dbConfig_test.go   # DBConfig DSN 组装测试
-└── zcconfig_test.go   # env 与 config 集成测试
+├── cast.go                        # 泛型类型转换引擎（内部）
+├── env.go                         # .env 文件加载与 Env 泛型读取
+├── config.go                      # 业务配置注册与 Config 泛型读取
+├── dbConfig.go                    # 数据库连接配置与 DSN 生成（DBConfig / DBSlaveConfig）
+├── cast_test.go                   # cast 函数测试
+├── config_extra_test.go           # 配置树深度合并与 nil map 边界测试
+├── dbConfig_test.go               # DSN 组装与真实驱动解析回读测试
+├── docs_examples_compile_test.go  # 原样提取文档完整示例并编译
+└── zcconfig_test.go               # env 与 config 集成测试
 ```
 
 ## 架构设计
@@ -81,10 +83,10 @@ zcconfig/
 │  │    1. nil → 返回 def                  │           │
 │  │    2. 直接类型断言 v.(T)             │           │
 │  │    3. string → time.ParseDuration    │           │
-│  │    4. string → strconv 精确解析      │           │
+│  │    4. string 互转或 strconv 解析     │           │
 │  │    5. 数值→bool 特判（非零为 true）   │           │
 │  │    6. 数值→string 防护（返回 def）    │           │
-│  │    7. reflect ConvertibleTo 通用转换  │           │
+│  │    7. reflect Value.CanConvert 转换  │           │
 │  │    8. 均失败 → 返回 def              │           │
 │  │                                      │           │
 │  └──────────────────────────────────────┘           │
@@ -105,7 +107,7 @@ zcconfig/
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树；`fn` 返回 nil 时静默忽略（不合并任何数据）。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。约定：`fn` 返回的 map 在 Register 之后不得再被修改（zcconfig 不拷贝返回值，直接存储引用）；若 `key` 路径中间层级已存在标量值，注册子节点会覆盖原标量为 map。 |
+| `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树；`fn` 返回 nil 时静默忽略（不合并任何数据）。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。约定：`fn` 返回的 map 在 Register 之后不得再被修改（zcconfig 不拷贝返回值，直接存储引用）；若 `key` 路径中间层级已存在标量值或 nil map，注册子节点会将其初始化为可写 map；深度合并遇到 nil 目标 map 时以源值替换；nil 源 map 不清空已有非 nil map。 |
 | `Config` | `func Config[T any](key string, def T) T` | 按 `.` 分隔的 key 递归查找嵌套 `map[string]any{}`，找到后转换为 T 类型返回。路径不存在或中间层级非 map 时返回默认值 `def`。`key` 为空字符串时查找根层的 `""` 键（`Register` 的根级合并不创建该键，通常返回 `def`）。纯读操作，使用 `RLock`。 |
 | `ConfigAll` | `func ConfigAll() map[string]any` | 返回内部配置存储的直接引用（零拷贝）。**仅限只读场景**：写操作会污染全局配置并与并发读取产生数据竞争，详见[架构约定](#架构约定)。 |
 
@@ -121,18 +123,22 @@ zcconfig/
 
 | 驱动 | 格式 | 说明 |
 |------|------|------|
-| `mysql` | `user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local` | `Charset` 为空默认 `utf8mb4`，`Loc` 为空默认 `Local`，`parseTime` 恒为 true（保证 `time.Time` 字段可直接扫描）。凭据（用户名/密码）含 `@`/`:`/`/` 由 go-sql-driver 从后向前解析正确处理、无需转义；`Database`/`Charset`/`Loc` 不应包含 `?`/`&`/`=`/`/`（驱动对参数段无转义机制） |
-| `postgres` | `host=... port=... user=... password=... dbname=... sslmode=disable` | 键值对格式；`password` / `user` / `host` / `dbname` 的值含空白、单引号或反斜杠时自动以单引号包裹并按 lib/pq 规则转义（`\` → `\\`、`'` → `\'`），简单值原样输出；`password` / `dbname` 为空时省略对应键，`host` / `port` / `user` 恒输出（空 username 也输出 `user=`），`sslmode` 恒为 disable |
+| `mysql` | `user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local` | `Charset` 为空默认 `utf8mb4`，`Loc` 为空默认 `Local`，`parseTime` 恒为 true（保证 `time.Time` 字段可直接扫描）。密码可含 `@`/`:`/`/`，用户名可含 `@`/`/`，但**不能含 `:`**：驱动把凭据中的首个冒号当作用户名与密码分隔符，且不对凭据做 URL 解码。`Database` 按路径段转义，`Loc` 按查询参数转义，均传原始值（如 `a/b`、`Asia/Shanghai`），不要预编码；字面库名 `a%2Fb` 仍表示包含 `%2F` 的库名。`Charset` 为 MySQL 专用且原样拼接，应使用有效字符集名称，不得含 `&`/`?`/`=`/`/`；逗号用于驱动支持的候选字符集列表 |
+| `postgres` | `host=... port=... user=... password=... dbname=... sslmode=disable` | 键值对格式；`password` / `user` / `host` / `dbname` 的值含空白、单引号或反斜杠时自动以单引号包裹并按 lib/pq 规则转义（`\` → `\\`、`'` → `\'`），简单值原样输出；`password` / `dbname` 为空时省略对应键，`host` / `port` / `user` 恒输出（空值写为 `host=''`、`user=''`，避免吞掉后继参数），`sslmode` 恒为 disable。忽略 `Charset` 与 `Loc` |
 | `sqlite` | `Database` 原样返回 | 连接串即文件路径，如 `:memory:` 或 `file:/path/to.db` |
 
-除上表三种标准驱动名外，`buildDSN` 还接受别名：`sqlite3` 等同 `sqlite`，`postgresql` / `pgsql` 等同 `postgres`。未知驱动返回空字符串，由调用方（如 `zcdb.NewPool`）校验报错。从库复用主库的 `Database` / `Charset` / `Loc`，仅 `Host` / `Port` / `Username` / `Password` 取自各自的 `DBSlaveConfig`；`Slaves` 为空时 `GetSlaveDSN` 返回 nil。
+DSN 格式还接受别名：`sqlite3` 等同 `sqlite`，`postgresql` / `pgsql` 等同 `postgres`。未知驱动返回空字符串，由调用方（如 `zcdb.NewPool`）校验报错。**格式别名不等于 `database/sql` 的驱动注册名**；`Driver` 为空时回退 `Dialect` 也只影响 DSN 格式，不会回填 `Driver`。对接连接池时必须导入驱动，并将 `PoolConfig.DriverName` 设为该驱动实际注册的名称：本仓库使用的 go-sql-driver/mysql、lib/pq、modernc.org/sqlite 分别注册 `mysql`、`postgres`、`sqlite`。不能把 `pgsql` 等格式别名或空 `Driver` 直接传给池。
+
+从库复用主库的 `Database` / `Charset` / `Loc`，仅 `Host` / `Port` / `Username` / `Password` 取自各自的 `DBSlaveConfig`；`Slaves` 为空时 `GetSlaveDSN` 返回 nil。
+
+以下为 MySQL 专用片段，所在文件需导入 `zcconfig`、`zcdb`，并通过 `_ "github.com/go-sql-driver/mysql"` 注册驱动；切换数据库时须同时调整驱动导入、注册名与配置字段。
 
 ```go
 zcconfig.Register("database", func() map[string]any {
     return map[string]any{
         "test_db": zcconfig.DBConfig{
-            Driver:   zcconfig.Env("DB_DRIVER", "mysql"),
-            Dialect:  zcconfig.Env("DB_DIALECT", "mysql"),
+            Driver:   "mysql",
+            Dialect:  "mysql",
             Host:     zcconfig.Env("DB_HOST", "127.0.0.1"),
             Port:     zcconfig.Env("DB_PORT", 3306),
             Username: zcconfig.Env("DB_USERNAME", "root"),
@@ -168,13 +174,13 @@ pool, err := zcdb.NewPool(zcdb.PoolConfig{
 1. v == nil              → 返回 def
 2. v.(T) 直接断言        → 命中则返回
 3. string → time.Duration → time.ParseDuration（如 "10s"、"1h30m"）
-4. string → strconv      → ParseInt / ParseUint / ParseFloat / ParseBool
-5. 数值 → bool 特判      → 零值为 false、非零为 true（C 语言惯例；
-                            兼容 .env 中 "1"/"0" 被 parseValue 推断为 int
-                            后仍需按 bool 读取的场景）
-6. 数值 → string 防护    → 直接返回 def（防止 Go 中 int→string 的 Unicode
-                            码点语义，如 65→"A" 陷阱）
-7. reflect 转换          → ConvertibleTo 检查（如 int→float64, int64→int）
+4. string 转换          → 普通/具名 string 互转，或
+                            ParseInt / ParseUint / ParseFloat / ParseBool
+5. 数值 → bool 特判      → 整数（含 uintptr）与浮点：零值 false、非零 true；
+                            支持具名 bool，不含 complex
+6. 数值 → string 防护    → 直接返回 def（包括 uintptr 和具名 string 目标，
+                            防止 65→"A" 等 Unicode 码点语义）
+7. reflect 转换          → Value.CanConvert 检查（类型及具体值均可转换）
 8. 全部失败               → 返回 def
 ```
 
@@ -188,8 +194,8 @@ pool, err := zcdb.NewPool(zcdb.PoolConfig{
 | `"-42"` | `int` | `strconv.ParseInt` | `-42` |
 | `"42"` | `int8` | `strconv.ParseInt` + 溢出检查 | `42` |
 | `"200"` | `int8` | `strconv.ParseInt` + 溢出检查 | 返回 `def`（超出范围） |
-| `"42"` | `uint` | `strconv.ParseUint` | `42` |
-| `"-1"` | `uint` | `strconv.ParseUint` | 返回 `def`（负数无法转 uint） |
+| `"42"` | `uint` / `uintptr`（含具名类型） | `strconv.ParseUint` | `42` |
+| `"-1"` | `uint` / `uintptr` | `strconv.ParseUint` | 返回 `def`（负数无法转无符号整数） |
 | `"3.14"` | `float64` | `strconv.ParseFloat` | `3.14` |
 | `"100"` | `float64` | `strconv.ParseFloat` | `100.0` |
 | `"NaN"` / `"Inf"` / `"-Inf"` | `float64` | `strconv.ParseFloat` | 返回 `def`（NaN/Inf 视为非法配置值） |
@@ -202,19 +208,25 @@ pool, err := zcdb.NewPool(zcdb.PoolConfig{
 | `"1h30m"` | `time.Duration` | `time.ParseDuration` | `90 * time.Minute` |
 | `"500ms"` | `time.Duration` | `time.ParseDuration` | `500 * time.Millisecond` |
 | `"10"` | `time.Duration` | `time.ParseDuration` | 返回 `def`（缺少时间单位） |
+| `"0"` / `"+0"` / `"-0"` | `time.Duration` | `time.ParseDuration` | `0`（零值可不带单位） |
 | `"abc"` | `int` | `strconv.ParseInt` | 返回 `def`（解析失败） |
 | `"hello"` | `string` | 直接类型断言 | `"hello"` |
+| 普通 / 具名 string（含空字符串） | 普通 / 其他具名 string | 同类型直接断言，否则 reflect 转换 | 保留字符串内容，不返回默认值 |
 | `"hello"` | `struct{}` | default 分支 | 返回 `def` |
 
 ### 非 string 源值转换表
 
 | 源值 | 目标类型 | 转换路径 | 结果 |
 |------|---------|---------|------|
-| `42` (int) | `float64` | `reflect.ConvertibleTo` | `42.0` |
-| `int64(100)` | `int` | `reflect.ConvertibleTo` | `100` |
-| `3.14` (float64) | `float32` | `reflect.ConvertibleTo` | `float32(3.14)` |
-| `42` (int) | `bool` | 数值→bool 特判 | `true`（非零为 true，零为 false，见优先级第 5 步；特判对全部数值类型生效，含 float 源，如 `99.99 (float64) → bool` 得 `true`） |
-| `99.99` (float64) | `int` | `reflect.ConvertibleTo` | `99`（向零截断，见下方截断语义声明） |
+| `42` (int) | `float64` | `reflect.Value.CanConvert` | `42.0` |
+| `int64(100)` | `int` | `reflect.Value.CanConvert` | `100` |
+| `3.14` (float64) | `float32` | `reflect.Value.CanConvert` | `float32(3.14)` |
+| `42` (int) / `uintptr(42)` / `99.99` (float64) | `bool` 或具名 bool | 数值→bool 特判 | `true`（整数含 uintptr 及浮点，零值为 false；源值也可为具名类型） |
+| `complex(1, 2)` | `bool` 或具名 bool | 不可转换 | 返回 `def`，不属于数值→bool 特判范围 |
+| `uintptr(65)` | `string` 或具名 string | 数值→string 防护 | 返回 `def`，不会得到 `"A"` |
+| `99.99` (float64) | `int` | `reflect.Value.CanConvert` | `99`（向零截断，见下方截断语义声明） |
+| `[]int{1}` | `[2]int` / `*[2]int` | 值长度不足，不可转换 | 返回原 `def`，不 panic |
+| `[]int{1, 2, 3}` | `[2]int` / `*[2]int` | `reflect.Value.CanConvert` | 转换成功，数组内容为 `[2]int{1, 2}` |
 | `true` (bool) | `int` | 不可转换 | 返回 `def` |
 | `42` (int) | `int` | 直接类型断言 | `42` |
 
@@ -240,7 +252,7 @@ NO_QUOTE=hello world
 - `=` 左侧为 key（去除首尾空格）
 - `=` 右侧为 value（去除首尾空格，再去除配对的单/双引号）
 - 无 `=` 的行（如拼写错误的 `PORT 8080`）与空 key 行（`=value`）被静默跳过，不影响其他行的解析
-- 首行的 UTF-8 BOM（`\uFEFF`）自动剥离（兼容 Windows 记事本等带 BOM 保存的文件，避免首行 key 带上 BOM 前缀而静默查不到）
+- 首行的 UTF-8 BOM（`\uFEFF`）自动剥离，剥离后再次清理首尾空白；BOM 后带空格/Tab 的 `export`、注释及空行仍按对应规则处理，也兼容 BOM 前有空白的首行
 - 值自动推断类型：`ParseInt`（按平台 int 位宽，超出范围保持 string）→ `int`，`ParseFloat`（仅含 `.eE` 的值尝试）→ `float64`，`ParseBool` → `bool`，均失败 → `string`
 - **单行上限 1MB**：超过上限的文件加载失败并返回错误（默认 `bufio.Scanner` 上限仅 64KB，zcconfig 已调大缓冲区以支持内联证书、长密钥等超长配置值）。注意：扫描缓冲区需容纳行结束符，单行恰好达到 1MB 时也会报错，实际可加载的单行长度略小于 1MB
 
@@ -271,7 +283,11 @@ NO_QUOTE=hello world
 ```go
 package main
 
-import "github.com/buexplain/zckg/zcconfig"
+import (
+    "fmt"
+
+    "github.com/buexplain/zckg/zcconfig"
+)
 
 func main() {
     // 加载 .env 文件
@@ -290,6 +306,7 @@ func main() {
 
     // .env 中不存在时会回退到 OS 环境变量
     home := zcconfig.Env("HOME", "/tmp")        // string
+    fmt.Println(port, debug, name, price, timeout, home)
 }
 ```
 
@@ -298,7 +315,11 @@ func main() {
 ```go
 package main
 
-import "github.com/buexplain/zckg/zcconfig"
+import (
+    "fmt"
+
+    "github.com/buexplain/zckg/zcconfig"
+)
 
 func main() {
     // 注册根级配置
@@ -339,7 +360,7 @@ func main() {
 
     // 获取内部配置存储的直接引用（零拷贝，仅限只读场景，详见"架构约定"）
     all := zcconfig.ConfigAll()
-    _ = all
+    fmt.Println(host, port, cacheHost, appName, debug, missing, all)
 }
 ```
 
@@ -369,9 +390,9 @@ timeout := zcconfig.Config("server.timeout", 10*time.Second)        // 30 * time
 pollInterval := zcconfig.Config("server.poll_interval", 1*time.Second) // 2 * time.Second
 ```
 
-支持的 Duration 格式遵循 Go `time.ParseDuration` 规范，如 `"10s"`、`"1h30m"`、`"500ms"`、`"100us"`、`"100ns"` 等。纯数字（如 `"10"`）缺少时间单位，解析失败返回默认值。
+支持的 Duration 格式遵循 Go `time.ParseDuration` 规范，如 `"10s"`、`"1h30m"`、`"500ms"`、`"100us"`、`"100ns"` 等。普通纯数字字符串（如 `"10"`）缺少时间单位，解析失败返回默认值；`"0"`、`"+0"`、`"-0"` 是例外，均解析为零时长。
 
-> 注意：`time.ParseDuration` 仅对 **string 源值**生效。若存储值是数值类型（如 `.env` 中 `TIMEOUT=30` 被推断为 int），会走 reflect 兜底转换为 `time.Duration` 底层 int64——`30` 得到 `30ns` 而非 `30s`。需要秒级语义时请在 `.env` 中写成带单位的字符串（如 `30s`），或以带单位的 `time.Duration` 值作为默认值。
+> 注意：`time.ParseDuration` 仅对 **string 源值**生效。若存储值是数值类型（如 `.env` 中 `TIMEOUT=30` 被推断为 int），会走 reflect 兜底转换为 `time.Duration` 底层 int64——`Env("TIMEOUT", 5*time.Second)` 仍得到 `30ns`，默认值的单位不会改变已有数值的含义。`.env` 中写成 `TIMEOUT="30"` 也会在去引号后推断为 int。需要秒级语义时请写成 `TIMEOUT=30s`，或按整数读取后显式乘以 `time.Second`。
 
 ### 多次注册深度合并
 

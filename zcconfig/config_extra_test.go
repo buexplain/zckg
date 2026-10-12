@@ -1,13 +1,180 @@
 package zcconfig
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // TestRegister_NilDataNoop 验证 Register 的 fn 返回 nil 时不做任何合并。
 func TestRegister_NilDataNoop(t *testing.T) {
-	resetForTest(t)
-	Register("app", func() map[string]any { return nil })
-	if v := Config("app.name", "fallback"); v != "fallback" {
-		t.Errorf("nil 数据注册后 Config 应返回默认值，实际 %q", v)
+	for _, key := range []string{"", "app", "app.db", "missing.child"} {
+		t.Run("key="+key, func(t *testing.T) {
+			resetForTest(t)
+			Register("app", func() map[string]any {
+				return map[string]any{"name": "kept", "db": map[string]any(nil)}
+			})
+			Register(key, func() map[string]any { return nil })
+			assertConfigTree(t, map[string]any{
+				"app": map[string]any{"name": "kept", "db": map[string]any(nil)},
+			})
+		})
+	}
+}
+
+func assertConfigTree(t *testing.T, want map[string]any) {
+	t.Helper()
+	if got := ConfigAll(); !reflect.DeepEqual(got, want) {
+		t.Errorf("ConfigAll 完整树不一致：\n期望: %#v\n实际: %#v", want, got)
+	}
+}
+
+// TestRegister_NilMapNodeInitialization 验证 nil map 目标在直接注册、递归合并和路径途经时可初始化，且保留完整树中的其他节点。
+func TestRegister_NilMapNodeInitialization(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		key  string
+		data map[string]any
+		want map[string]any
+	}{
+		{
+			name: "direct",
+			key:  "app.db",
+			data: map[string]any{"host": "localhost"},
+			want: map[string]any{"host": "localhost"},
+		},
+		{
+			name: "recursive",
+			key:  "app",
+			data: map[string]any{"db": map[string]any{"host": "localhost"}},
+			want: map[string]any{"host": "localhost"},
+		},
+		{
+			name: "root_recursive",
+			key:  "",
+			data: map[string]any{"app": map[string]any{"db": map[string]any{"host": "localhost"}}},
+			want: map[string]any{"host": "localhost"},
+		},
+		{
+			name: "path_through_nil",
+			key:  "app.db.child",
+			data: map[string]any{"host": "localhost"},
+			want: map[string]any{"child": map[string]any{"host": "localhost"}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetForTest(t)
+			Register("", func() map[string]any {
+				return map[string]any{
+					"peer": "kept",
+					"app":  map[string]any{"name": "kept", "db": map[string]any(nil)},
+				}
+			})
+			Register(tt.key, func() map[string]any { return tt.data })
+			assertConfigTree(t, map[string]any{
+				"peer": "kept",
+				"app":  map[string]any{"name": "kept", "db": tt.want},
+			})
+		})
+	}
+}
+
+// TestRegister_MapMergeBoundaries 验证 nil 源不清空非 nil 目标，双方 nil、空 map、标量和缺失节点按深合并规则处理。
+func TestRegister_MapMergeBoundaries(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		dst     any
+		src     any
+		want    any
+		missing bool
+	}{
+		{
+			name: "nil_source_keeps_existing",
+			dst:  map[string]any{"host": "kept"},
+			src:  map[string]any(nil),
+			want: map[string]any{"host": "kept"},
+		},
+		{
+			name: "both_nil",
+			dst:  map[string]any(nil),
+			src:  map[string]any(nil),
+			want: map[string]any(nil),
+		},
+		{
+			name: "nil_target_empty_source",
+			dst:  map[string]any(nil),
+			src:  map[string]any{},
+			want: map[string]any{},
+		},
+		{
+			name: "empty_target_nil_source",
+			dst:  map[string]any{},
+			src:  map[string]any(nil),
+			want: map[string]any{},
+		},
+		{
+			name: "both_empty",
+			dst:  map[string]any{},
+			src:  map[string]any{},
+			want: map[string]any{},
+		},
+		{
+			name: "empty_source_keeps_existing",
+			dst:  map[string]any{"host": "kept"},
+			src:  map[string]any{},
+			want: map[string]any{"host": "kept"},
+		},
+		{
+			name: "scalar_target_map_source",
+			dst:  "old",
+			src:  map[string]any{"host": "new"},
+			want: map[string]any{"host": "new"},
+		},
+		{
+			name: "scalar_target_nil_map_source",
+			dst:  "old",
+			src:  map[string]any(nil),
+			want: map[string]any(nil),
+		},
+		{
+			name: "nil_target_scalar_source",
+			dst:  map[string]any(nil),
+			src:  "new",
+			want: "new",
+		},
+		{
+			name: "map_target_scalar_source",
+			dst:  map[string]any{"host": "old"},
+			src:  "new",
+			want: "new",
+		},
+		{
+			name:    "missing_target_map_source",
+			missing: true,
+			src:     map[string]any{"host": "new"},
+			want:    map[string]any{"host": "new"},
+		},
+		{
+			name:    "missing_target_nil_map_source",
+			missing: true,
+			src:     map[string]any(nil),
+			want:    map[string]any(nil),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetForTest(t)
+			Register("", func() map[string]any {
+				app := map[string]any{"name": "kept"}
+				if !tt.missing {
+					app["db"] = tt.dst
+				}
+				return map[string]any{"peer": "kept", "app": app}
+			})
+			Register("app", func() map[string]any { return map[string]any{"db": tt.src} })
+			assertConfigTree(t, map[string]any{
+				"peer": "kept",
+				"app":  map[string]any{"name": "kept", "db": tt.want},
+			})
+		})
 	}
 }
 

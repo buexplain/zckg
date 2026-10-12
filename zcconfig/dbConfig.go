@@ -2,6 +2,7 @@ package zcconfig
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"unicode"
 )
@@ -16,8 +17,8 @@ import (
 //	zcconfig.Register("database", func() map[string]any {
 //		config := map[string]any{}
 //		config["test_db"] = zcconfig.DBConfig{
-//			Driver:   zcconfig.Env("DB_DRIVER", "mysql"),
-//			Dialect:  zcconfig.Env("DB_DIALECT", "mysql"),
+//			Driver:   "mysql",
+//			Dialect:  "mysql",
 //			Host:     zcconfig.Env("DB_HOST", "127.0.0.1"),
 //			Port:     zcconfig.Env("DB_PORT", 3306),
 //			Username: zcconfig.Env("DB_USERNAME", "root"),
@@ -39,33 +40,41 @@ import (
 //	// 从库 DSN 列表：从库复用主库的 Database / Charset / Loc
 //	slaveDSNs := testDB.GetSlaveDSN()
 //
+//	// 建池前由调用方导入驱动；本例需 import _ "github.com/go-sql-driver/mysql" 注册 "mysql"。
+//	// Driver 必须是实际的 database/sql 注册名；生成 DSN 不注册驱动，也不回填 Driver。
 //	pool, err := zcdb.NewPool(zcdb.PoolConfig{
 //		DriverName: testDB.Driver,
 //		DSN:        masterDSN,
 //		SlaveDSNs:  slaveDSNs,
 //	})
 type DBConfig struct {
-	Driver   string          // 驱动名（"mysql"、"postgres"、"sqlite"）
-	Dialect  string          // 数据库方言（"mysql"、"postgres"、"sqlite"）
+	Driver   string          // 调用方实际使用的 database/sql 驱动注册名；DSN 格式别名不代表已注册该驱动
+	Dialect  string          // 数据库方言；仅在 Driver 为空时用于选择 DSN 格式，不回填 Driver
 	Host     string          // 数据库服务器地址，如 "127.0.0.1" 或 "db.example.com"
 	Port     int             // 数据库服务器端口，如 MySQL 默认 3306、PostgreSQL 默认 5432
-	Username string          // 数据库登录用户名
-	Password string          // 数据库登录密码
-	Database string          // 目标数据库名称
-	Charset  string          // 连接字符集，如 "utf8mb4"（MySQL）或 "UTF8"（PostgreSQL）
-	Loc      string          // 时区，默认是：Local
+	Username string          // 数据库登录用户名；MySQL DSN 不支持含冒号的用户名，百分号转义不能解决此限制
+	Password string          // 数据库登录密码；MySQL 密码可含 @、:、/，按原文输出，不做 URL 转义
+	Database string          // 原始数据库名称（MySQL 生成时做路径转义，不要预编码）；SQLite 为原始 DSN
+	Charset  string          // 仅 MySQL：合法字符集名或逗号分隔列表，如 "utf8mb4,utf8"，原样输出；PostgreSQL 忽略
+	Loc      string          // 仅 MySQL：原始时区名，如 "Asia/Shanghai"，不要预编码；为空时默认 "Local"
 	Slaves   []DBSlaveConfig // 从库配置列表
 }
 
-// GetMasterDSN 返回主库的连接字符串（DSN），可直接传给 zcdb.PoolConfig.DSN。
+// GetMasterDSN 返回主库的连接字符串（DSN），可传给 zcdb.PoolConfig.DSN；
+// 建池时仍需调用方导入驱动并提供实际的 database/sql 注册名。
 //
-// 按 Driver（为空时回退 Dialect）选择 DSN 格式：
+// 按 Driver（为空时回退 Dialect）选择 DSN 格式；postgresql/pgsql 视为 postgres，
+// sqlite3 视为 sqlite。这些规则仅选择格式，不注册驱动，也不修改 Driver。
 //
 //   - mysql：user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local
-//     （Charset 为空时默认 "utf8mb4"，Loc 为空时默认 "Local"，parseTime 恒为 true）
+//     （Database 使用 url.PathEscape，Loc 使用 url.QueryEscape，输入均为原文，不识别预编码；
+//     Charset 为合法字符集名或逗号分隔列表，原样输出，空时默认 "utf8mb4"；
+//     Loc 空时默认 "Local"，parseTime 恒为 true；用户名不能含冒号，密码可含 @、:、/，
+//     凭据不做 URL 转义，百分号转义不能用于表达用户名中的冒号）
 //   - postgres：host=... port=... user=... password=... dbname=... sslmode=disable
-//     （键值对格式；含空白/单引号/反斜杠的值自动以单引号包裹并按 lib/pq 规则转义；
-//     sslmode 恒为 disable）
+//     （键值对格式；空值或含空白/单引号/反斜杠的值以单引号包裹并按 lib/pq 规则转义；
+//     host/port/user 恒输出，空 host/user 使用两个单引号表示；
+//     空 password/dbname 省略，仍可受驱动环境或默认值影响；sslmode 恒为 disable，Charset/Loc 不使用）
 //   - sqlite：Database 原样返回（":memory:" 或文件路径，如 "file:/path/to.db"）
 //
 // 未知驱动返回空字符串，由调用方（如 zcdb.NewPool）校验报错。
@@ -99,7 +108,7 @@ func (d DBConfig) buildDSN(host string, port int, username, password string) str
 		// sqlite 的连接串就是数据库文件路径（或 ":memory:"）
 		return d.Database
 	case "postgres", "postgresql", "pgsql":
-		// lib/pq 键值对格式：值含空白/单引号/反斜杠时单引号包裹并转义，避免被误切分
+		// lib/pq 键值对格式：空值或含空白/单引号/反斜杠时单引号包裹并转义，避免吞掉后续参数
 		dsn := fmt.Sprintf("host=%s port=%d user=%s",
 			escapePostgresValue(host), port, escapePostgresValue(username))
 		if password != "" {
@@ -119,17 +128,17 @@ func (d DBConfig) buildDSN(host string, port int, username, password string) str
 			loc = "Local"
 		}
 		return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=true&loc=%s",
-			username, password, host, port, d.Database, charset, loc)
+			username, password, host, port, url.PathEscape(d.Database), charset, url.QueryEscape(loc))
 	default:
 		return ""
 	}
 }
 
 // escapePostgresValue 转义 lib/pq 键值对 DSN 中的单个值。
-// 值含空白、单引号或反斜杠时以单引号包裹并按 lib/pq 规则转义（\ → \\、' → \'），
-// 简单值原样返回，保持与既有输出一致。
+// 空值输出两个单引号，防止后续 key=value 被吞作当前值；含空白、单引号或反斜杠时
+// 以单引号包裹并按 lib/pq 规则转义（\ → \\、' → \'），非空简单值原样返回。
 func escapePostgresValue(v string) string {
-	if !strings.ContainsAny(v, "'\\") && strings.IndexFunc(v, unicode.IsSpace) < 0 {
+	if v != "" && !strings.ContainsAny(v, "'\\") && strings.IndexFunc(v, unicode.IsSpace) < 0 {
 		return v
 	}
 	// 顺序敏感：先转义反斜杠，再转义单引号，否则会把刚引入的反斜杠二次转义
@@ -143,6 +152,6 @@ func escapePostgresValue(v string) string {
 type DBSlaveConfig struct {
 	Host     string // 数据库服务器地址，如 "127.0.0.1" 或 "db.example.com"
 	Port     int    // 数据库服务器端口，如 MySQL 默认 3306、PostgreSQL 默认 5432
-	Username string // 数据库登录用户名
-	Password string // 数据库登录密码
+	Username string // 数据库登录用户名；MySQL DSN 不支持含冒号的用户名，百分号转义不能解决此限制
+	Password string // 数据库登录密码；MySQL 密码可含 @、:、/，按原文输出，不做 URL 转义
 }

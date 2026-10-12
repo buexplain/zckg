@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func writeTestFile(t *testing.T, content string) string {
@@ -637,6 +638,44 @@ func TestLoadEnv_Utf8Bom(t *testing.T) {
 	}
 }
 
+// TestLoadEnv_BOMIndentedFirstLine 验证 BOM 后缩进的 export、含等号注释、普通键与空行，并保留 BOM 前空白的兼容性。
+func TestLoadEnv_BOMIndentedFirstLine(t *testing.T) {
+	for _, leading := range []struct {
+		name  string
+		value string
+	}{
+		{"bom_first", ""},
+		{"whitespace_before_bom", " \t"},
+	} {
+		for _, indent := range []struct {
+			name  string
+			value string
+		}{
+			{"spaces", "  "},
+			{"tabs", "\t\t"},
+		} {
+			for _, tt := range []struct {
+				name  string
+				first string
+				want  map[string]any
+			}{
+				{"export", "ExPoRt \tFIRST=ok", map[string]any{"FIRST": "ok", "SECOND": "kept"}},
+				{"comment", "# COMMENT=must_not_load", map[string]any{"SECOND": "kept"}},
+				{"key", "FIRST=ok", map[string]any{"FIRST": "ok", "SECOND": "kept"}},
+				{"blank", "", map[string]any{"SECOND": "kept"}},
+			} {
+				t.Run(leading.name+"/"+indent.name+"/"+tt.name, func(t *testing.T) {
+					resetForTest(t)
+					loadTestEnv(t, leading.value+"\ufeff"+indent.value+tt.first+"\n \texport SECOND=kept\n")
+					if got := EnvAll(); !reflect.DeepEqual(got, tt.want) {
+						t.Errorf("EnvAll 完整键值集合不一致：期望 %#v，实际 %#v", tt.want, got)
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestEnv_NilInterfaceDefKeyExists 验证键存在、目标为接口类型且默认值为 nil 时，
 // Env 返回 nil 而非 panic（cast 对 nil reflect.Type 的守卫，修复 P1）。
 // 绕过 LoadEnv 直接写 envData 是因为需要构造 LoadEnv 无法产生的 any 类型值
@@ -662,5 +701,259 @@ func TestConfig_NilInterfaceDefKeyExists(t *testing.T) {
 
 	if v := Config[fmt.Stringer]("app.value", nil); v != nil {
 		t.Errorf("Config[fmt.Stringer] 期望 nil，实际 %v", v)
+	}
+}
+
+// TestEnv_NamedBoolConversion 验证 .env 推断的数值与布尔值、OS 字符串均可转换为具名 bool。
+func TestEnv_NamedBoolConversion(t *testing.T) {
+	type Flag bool
+	for _, source := range []string{"file", "os"} {
+		for _, tt := range []struct {
+			input string
+			want  Flag
+		}{
+			{"0", false},
+			{"1", true},
+			{"false", false},
+			{"true", true},
+		} {
+			t.Run(source+"/"+tt.input, func(t *testing.T) {
+				resetForTest(t)
+				const key = "ZCCONFIG_NAMED_BOOL"
+				if source == "file" {
+					loadTestEnv(t, key+"="+tt.input+"\n")
+				} else {
+					t.Setenv(key, tt.input)
+				}
+				if got := Env(key, !tt.want); got != tt.want {
+					t.Errorf("Env(%q, %v) 期望 %T(%v)，实际 %T(%v)", key, !tt.want, tt.want, tt.want, got, got)
+				}
+			})
+		}
+	}
+}
+
+// TestConfig_NamedBoolConversion 验证有符号、无符号、浮点数的零与非零值以及字符串转换到具名 bool。
+func TestConfig_NamedBoolConversion(t *testing.T) {
+	type Flag bool
+	for _, tt := range []struct {
+		name  string
+		value any
+		want  Flag
+	}{
+		{"int_zero", int(0), false},
+		{"int_nonzero", int(-2), true},
+		{"uint_zero", uint(0), false},
+		{"uint_nonzero", uint(2), true},
+		{"float_zero", float64(0), false},
+		{"float_nonzero", float64(-0.25), true},
+		{"string_zero", "0", false},
+		{"string_one", "1", true},
+		{"string_false", "false", false},
+		{"string_true", "true", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetForTest(t)
+			Register("app", func() map[string]any { return map[string]any{"flag": tt.value} })
+			if got := Config("app.flag", !tt.want); got != tt.want {
+				t.Errorf("Config 源 %T(%v) 期望 %T(%v)，实际 %T(%v)", tt.value, tt.value, tt.want, tt.want, got, got)
+			}
+		})
+	}
+}
+
+// TestEnv_NamedStringConversion 验证 .env 和 OS 来源的字符串可读取为具名 string。
+func TestEnv_NamedStringConversion(t *testing.T) {
+	type Label string
+	for _, source := range []string{"file", "os"} {
+		t.Run(source, func(t *testing.T) {
+			resetForTest(t)
+			const key = "ZCCONFIG_NAMED_STRING"
+			if source == "file" {
+				loadTestEnv(t, key+"=hello\n")
+			} else {
+				t.Setenv(key, "hello")
+			}
+			if got := Env(key, Label("fallback")); got != Label("hello") {
+				t.Errorf("Env 期望 Label(hello)，实际 %T(%q)", got, got)
+			}
+		})
+	}
+}
+
+// TestConfig_NamedStringConversion 验证普通 string 与两种具名 string 在 Config 中互转，且同类型直读保持值。
+func TestConfig_NamedStringConversion(t *testing.T) {
+	type Label string
+	type Other string
+	for _, tt := range []struct {
+		name  string
+		value any
+	}{
+		{"string", "hello"},
+		{"label", Label("hello")},
+		{"other", Other("hello")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetForTest(t)
+			Register("app", func() map[string]any { return map[string]any{"label": tt.value} })
+			if got := Config("app.label", "fallback"); got != "hello" {
+				t.Errorf("源 %T 转 string 期望 hello，实际 %q", tt.value, got)
+			}
+			if got := Config("app.label", Label("fallback")); got != Label("hello") {
+				t.Errorf("源 %T 转 Label 期望 hello，实际 %q", tt.value, got)
+			}
+			if got := Config("app.label", Other("fallback")); got != Other("hello") {
+				t.Errorf("源 %T 转 Other 期望 hello，实际 %q", tt.value, got)
+			}
+		})
+	}
+}
+
+// TestConfig_SliceToArrayConversion 验证 nil、空、短切片转数组及数组指针返回非零默认值，长度足够时读取前两个元素。
+func TestConfig_SliceToArrayConversion(t *testing.T) {
+	for _, target := range []string{"array", "pointer"} {
+		for _, tt := range []struct {
+			name  string
+			value []int
+			valid bool
+		}{
+			{"nil", nil, false},
+			{"empty", []int{}, false},
+			{"short", []int{1}, false},
+			{"exact", []int{1, 2}, true},
+			{"long", []int{1, 2, 3}, true},
+		} {
+			t.Run(target+"/"+tt.name, func(t *testing.T) {
+				resetForTest(t)
+				Register("app", func() map[string]any { return map[string]any{"values": tt.value} })
+				def := [2]int{8, 9}
+				want := def
+				if tt.valid {
+					want = [2]int{1, 2}
+				}
+				if target == "array" {
+					if got := Config("app.values", def); got != want {
+						t.Errorf("Config 数组期望 %v，实际 %v", want, got)
+					}
+				} else {
+					got := Config("app.values", &def)
+					if got == nil || *got != want {
+						t.Fatalf("Config 数组指针期望指向 %v，实际 %#v", want, got)
+					}
+					if !tt.valid && got != &def {
+						t.Error("转换失败应返回原默认值指针")
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestConfig_UintptrConversion 验证 uintptr 的码点转 string 被拒绝，零与非零可转 bool，字符串可解析为 uintptr。
+func TestConfig_UintptrConversion(t *testing.T) {
+	type Label string
+	type Flag bool
+	for _, tt := range []struct {
+		name  string
+		value uintptr
+		want  bool
+	}{
+		{"zero", 0, false},
+		{"codepoint", 65, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetForTest(t)
+			Register("app", func() map[string]any { return map[string]any{"value": tt.value} })
+			if got := Config("app.value", "fallback"); got != "fallback" {
+				t.Errorf("uintptr 不应转换为码点字符串，实际 %q", got)
+			}
+			if got := Config("app.value", Label("fallback")); got != Label("fallback") {
+				t.Errorf("uintptr 不应转换为具名码点字符串，实际 %q", got)
+			}
+			if got := Config("app.value", !tt.want); got != tt.want {
+				t.Errorf("uintptr(%d) 转 bool 期望 %v，实际 %v", tt.value, tt.want, got)
+			}
+			if got := Config("app.value", Flag(!tt.want)); got != Flag(tt.want) {
+				t.Errorf("uintptr(%d) 转 Flag 期望 %v，实际 %v", tt.value, tt.want, got)
+			}
+		})
+	}
+	t.Run("string_to_uintptr", func(t *testing.T) {
+		resetForTest(t)
+		Register("app", func() map[string]any { return map[string]any{"value": "65"} })
+		if got := Config("app.value", uintptr(9)); got != uintptr(65) {
+			t.Errorf("字符串 65 转 uintptr 期望 65，实际 %d", got)
+		}
+	})
+}
+
+// TestConfig_ComplexBoolDefaults 验证 complex64/128 的零与非零值不支持转 bool，始终返回指定默认值。
+func TestConfig_ComplexBoolDefaults(t *testing.T) {
+	type Flag bool
+	for _, tt := range []struct {
+		name  string
+		value any
+	}{
+		{"complex64_zero", complex64(0)},
+		{"complex64_nonzero", complex64(1 + 2i)},
+		{"complex128_zero", complex128(0)},
+		{"complex128_nonzero", complex128(1 + 2i)},
+	} {
+		for _, def := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/default_%v", tt.name, def), func(t *testing.T) {
+				resetForTest(t)
+				Register("app", func() map[string]any { return map[string]any{"value": tt.value} })
+				if got := Config("app.value", def); got != def {
+					t.Errorf("%T(%v) 转 bool 期望默认值 %v，实际 %v", tt.value, tt.value, def, got)
+				}
+				if got := Config("app.value", Flag(def)); got != Flag(def) {
+					t.Errorf("%T(%v) 转 Flag 期望默认值 %v，实际 %v", tt.value, tt.value, def, got)
+				}
+			})
+		}
+	}
+}
+
+// TestEnv_DurationUnits 验证原始或带引号的 30 搭配 5s 默认值仍为 30ns，显式 30s 才是秒。
+func TestEnv_DurationUnits(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		input string
+		want  time.Duration
+	}{
+		{"raw_number", "30", 30 * time.Nanosecond},
+		{"double_quoted_number", `"30"`, 30 * time.Nanosecond},
+		{"single_quoted_number", "'30'", 30 * time.Nanosecond},
+		{"explicit_seconds", "30s", 30 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetForTest(t)
+			const key = "ZCCONFIG_DURATION_UNITS"
+			loadTestEnv(t, key+"="+tt.input+"\n")
+			if got := Env(key, 5*time.Second); got != tt.want {
+				t.Errorf("Env 值 %q 配默认 5s 期望 %v，实际 %v", tt.input, tt.want, got)
+			}
+		})
+	}
+}
+
+// TestConfig_DurationUnitlessStrings 验证无单位字符串 0、+0、-0 可解析，10 返回 5s 默认值。
+func TestConfig_DurationUnitlessStrings(t *testing.T) {
+	for _, tt := range []struct {
+		input string
+		want  time.Duration
+	}{
+		{"0", 0},
+		{"+0", 0},
+		{"-0", 0},
+		{"10", 5 * time.Second},
+	} {
+		t.Run(tt.input, func(t *testing.T) {
+			resetForTest(t)
+			Register("app", func() map[string]any { return map[string]any{"timeout": tt.input} })
+			if got := Config("app.timeout", 5*time.Second); got != tt.want {
+				t.Errorf("Config 字符串 %q 配默认 5s 期望 %v，实际 %v", tt.input, tt.want, got)
+			}
+		})
 	}
 }
