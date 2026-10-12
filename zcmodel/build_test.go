@@ -1882,3 +1882,124 @@ func TestBuildIndexCommentBlock_SymbolOnlyName(t *testing.T) {
 		t.Errorf("含符号索引名的产物应可解析: %v\n%s", err, structCode)
 	}
 }
+
+// TestSplitGeneratedCode 验证生成代码按「结构体名 / 方法名」拆分：
+// 两段各自携带其 Doc 注释；缺失声明返回空串；语法非法时返回解析错误。
+func TestSplitGeneratedCode(t *testing.T) {
+	t.Run("struct_and_documented_method", func(t *testing.T) {
+		code := "// UserEntity 表实体\ntype UserEntity struct {\n\tID int64\n}\n\n// ToDO 转为 DO\nfunc (e *UserEntity) ToDO() UserDO {\n\treturn UserDO{}\n}"
+		structText, methodText, err := splitGeneratedCode(code, "UserEntity", "ToDO")
+		if err != nil {
+			t.Fatalf("splitGeneratedCode() error = %v", err)
+		}
+		assertContains(t, structText, "// UserEntity 表实体", "结构体段应含前置 Doc 注释")
+		assertContains(t, structText, "type UserEntity struct", "结构体段应含结构体声明")
+		assertContains(t, methodText, "// ToDO 转为 DO", "方法段应含前置 Doc 注释")
+		assertContains(t, methodText, "func (e *UserEntity) ToDO()", "方法段应含方法声明")
+	})
+
+	t.Run("missing_declarations", func(t *testing.T) {
+		structText, methodText, err := splitGeneratedCode("", "UserEntity", "ToDO")
+		if err != nil {
+			t.Fatalf("splitGeneratedCode() error = %v", err)
+		}
+		if structText != "" || methodText != "" {
+			t.Fatalf("空代码应返回两段空串，实际 struct=%q method=%q", structText, methodText)
+		}
+	})
+
+	t.Run("syntax_error", func(t *testing.T) {
+		if _, _, err := splitGeneratedCode("type UserEntity struct {", "UserEntity", "ToDO"); err == nil {
+			t.Fatal("语法非法的生成代码应返回解析错误")
+		}
+	})
+}
+
+// TestWriteOrReplaceStruct_InvalidGeneratedCode 验证存量文件再生成时，
+// 生成代码语法非法（结构体段、方法段分别构造）返回带「生成代码存在语法错误」的错误，
+// 且错误发生在落盘之前——原文件内容逐字节不变、不残留临时文件。
+func TestWriteOrReplaceStruct_InvalidGeneratedCode(t *testing.T) {
+	cases := []struct {
+		name       string
+		entityCode string
+		doCode     string
+	}{
+		{"invalid_entity_code", "type UserEntity struct {", "type UserDO struct{}"},
+		{"invalid_do_code", "type UserEntity struct{}", "type UserDO struct {"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			filePath := filepath.Join(dir, "user.go")
+			const orig = "package model\n\ntype Keep struct {\n\tName string\n}\n"
+			if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+				t.Fatalf("写入初始文件失败: %v", err)
+			}
+
+			err := writeOrReplaceStruct(filePath, "UserEntity", tc.entityCode, "UserDO", tc.doCode, nil)
+			if err == nil || !strings.Contains(err.Error(), "生成代码存在语法错误") {
+				t.Fatalf("非法生成代码应报语法错误，实际 err=%v", err)
+			}
+			got, readErr := os.ReadFile(filePath)
+			if readErr != nil {
+				t.Fatalf("读取文件失败: %v", readErr)
+			}
+			if string(got) != orig {
+				t.Fatalf("失败后原文件应逐字节不变\nwant:\n%s\ngot:\n%s", orig, got)
+			}
+			entries, readDirErr := os.ReadDir(dir)
+			if readDirErr != nil {
+				t.Fatalf("读取目录失败: %v", readDirErr)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("失败后不应残留临时文件，实际目录项 %d 个", len(entries))
+			}
+		})
+	}
+}
+
+// TestWriteOrReplaceStruct_DropAndDedupeGeneratedDecls 验证骨架保持式合并在
+// 生成声明缺失/重复时的槽位处理：生成代码不含 DO 时，原文件中独立声明的 DO 结构体、
+// 仅含生成类型的括号块、与用户类型混排的括号块内的生成 Spec，均连同其 ToEntity 方法一并移除；
+// 同类生成声明重复出现时只保留首个槽位。
+func TestWriteOrReplaceStruct_DropAndDedupeGeneratedDecls(t *testing.T) {
+	// 只传 Entity 结构体（不含任何方法与 DO）：原文件中的全部 DO 槽位与其方法都应被移除
+	const entityOnly = "type UserEntity struct {\n\tID int64\n}"
+
+	t.Run("drop_single_decl", func(t *testing.T) {
+		orig := "package model\n\ntype UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() UserDO {\n\treturn UserDO{}\n}\n\ntype UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() UserEntity {\n\treturn UserEntity{}\n}\n"
+		got := writeAndVerify(t, orig, entityOnly, "", nil)
+		assertNotContains(t, got, "type UserDO struct", "doCode 为空应移除 DO 结构体声明")
+		assertNotContains(t, got, "func (d *UserDO) ToEntity()", "doCode 为空应移除 ToEntity 方法")
+		assertNotContains(t, got, "func (e *UserEntity) ToDO()", "entityCode 不含方法应移除旧 ToDO 方法")
+		assertContains(t, got, "type UserEntity struct", "Entity 结构体应保留")
+		typeCheckGoSource(t, got)
+	})
+
+	t.Run("drop_only_generated_block", func(t *testing.T) {
+		orig := "package model\n\ntype UserEntity struct {\n\tID int64\n}\n\ntype (\n\tUserDO struct {\n\t\tID any\n\t}\n)\n"
+		got := writeAndVerify(t, orig, entityOnly, "", nil)
+		assertNotContains(t, got, "type UserDO struct", "仅含生成类型的括号块应整块移除")
+		assertNotContains(t, got, "type (\n", "移除后不应残留空括号块")
+		typeCheckGoSource(t, got)
+	})
+
+	t.Run("drop_from_mixed_block", func(t *testing.T) {
+		orig := "package model\n\ntype UserEntity struct {\n\tID int64\n}\n\ntype (\n\tUserDO struct {\n\t\tID any\n\t}\n\n\tKeep struct {\n\t\tName string\n\t}\n)\n"
+		got := writeAndVerify(t, orig, entityOnly, "", nil)
+		assertNotContains(t, got, "type UserDO struct", "混排块内生成 Spec 应被剔除")
+		assertContains(t, got, "type (\n", "含用户类型的括号块应保留块形态")
+		assertContains(t, got, "Keep struct", "同块内的用户类型应原样保留")
+		typeCheckGoSource(t, got)
+	})
+
+	t.Run("dedupe_duplicate_generated_decls", func(t *testing.T) {
+		// 同类生成声明重复（用户手写与生成共存的历史产物）：语法合法但语义重复，解析不报错
+		orig := "package model\n\ntype UserEntity struct {\n\tID int64\n}\n\ntype UserDO struct {\n\tID any\n}\n\ntype UserDO struct {\n\tID any\n}\n"
+		got := writeAndVerify(t, orig, entityOnly, "type UserDO struct {\n\tID any\n}", nil)
+		if n := strings.Count(got, "type UserDO struct"); n != 1 {
+			t.Fatalf("重复的生成类型声明应去重为 1 份，实际 %d 份\n%s", n, got)
+		}
+		typeCheckGoSource(t, got)
+	})
+}
