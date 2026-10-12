@@ -90,8 +90,6 @@ var validOperators = map[string]bool{
 	"<": true, ">": true, "<=": true, ">=": true,
 	"LIKE": true, "NOT LIKE": true,
 	"IS": true, "IS NOT": true,
-	"IN": true, "NOT IN": true,
-	"BETWEEN": true, "NOT BETWEEN": true,
 }
 
 // validateOperator 检查运算符是否在白名单内。
@@ -161,7 +159,8 @@ func (b *Builder) Primary() *Builder {
 // 副本与原 Builder 共享同一份底层数据；编译与执行不会修改它们，因此无需复制。
 // First/Value/Paginate/CursorBy 等终端方法内部即用 Clone 避免污染调用方的 Builder。
 // 若子查询图存在环（自引用/互引用，如 TableSub/Union 传入自身），深拷贝会无限递归，
-// 此时返回携带 ErrCyclicQuery 的副本（经后续编译方法报错）而非递归崩溃。
+// 此时返回携带 ErrCyclicQuery 的副本（经后续编译方法报错）而非递归崩溃；
+// 子 Builder 携带累积错误时同样返回携带该错误的副本。
 //
 //	base := db.Builder().Table("users").Where("status", "active")
 //	admins := base.Clone().Where("role", "admin")
@@ -170,7 +169,7 @@ func (b *Builder) Primary() *Builder {
 func (b *Builder) Clone() *Builder {
 	if err := b.validateAcyclic(); err != nil {
 		// 环引用无法深拷贝（会无限递归），返回携带错误的浅副本，
-		// 后续 ToXxx 编译方法经 b.err 前置检查返回 ErrCyclicQuery。
+		// 后续 ToXxx 编译方法经 b.err 前置检查返回 ErrCyclicQuery 或子 Builder 的错误。
 		return &Builder{grammar: b.grammar, dao: b.dao, comment: b.comment, err: err}
 	}
 	return b.cloneInternal()
@@ -335,15 +334,16 @@ func cloneJoinConditions(conditions []JoinCondition) []JoinCondition {
 
 // ==================== 子查询图环检测 ====================
 
-// validateAcyclic 检测 Builder 子查询图是否存在环（自引用或互引用）。
+// validateAcyclic 检测 Builder 子查询图是否存在环（自引用或互引用），并返回任一子 Builder 的累积错误。
 // 自引用（如 b.TableSub(b, ...) / b.Union(b)）或经多个子查询位互引用会令
-// Clone 深拷贝、Grammar 编译与绑定参数收集无限递归直至栈溢出，故编译/克隆前必须拒绝。
+// Clone 深拷贝、Grammar 编译与绑定参数收集无限递归直至栈溢出，故编译/克隆前必须拒绝；
+// 子 Builder 的错误在编译时统一检查，挂入父 Builder 之后才产生的错误同样不会被静默丢弃。
 func (b *Builder) validateAcyclic() error {
 	return checkBuilderAcyclic(b, make(map[*Builder]bool), make(map[*Builder]bool))
 }
 
-// checkBuilderAcyclic 深度优先遍历 Builder 子查询图检测环。
-// visiting 记录当前 DFS 路径上的节点，命中即环；done 记录已确认无环的子树，
+// checkBuilderAcyclic 深度优先遍历 Builder 子查询图检测环并收集子节点错误。
+// visiting 记录当前 DFS 路径上的节点，命中即环；done 记录已确认无环且无错的子树，
 // 避免共享子查询（菱形引用，非环）被重复遍历。
 func checkBuilderAcyclic(b *Builder, visiting, done map[*Builder]bool) error {
 	if b == nil || done[b] {
@@ -351,6 +351,10 @@ func checkBuilderAcyclic(b *Builder, visiting, done map[*Builder]bool) error {
 	}
 	if visiting[b] {
 		return ErrCyclicQuery
+	}
+	// visiting 非空说明 b 是子节点；根节点的错误由各编译入口的前置检查负责
+	if b.err != nil && len(visiting) > 0 {
+		return b.err
 	}
 	visiting[b] = true
 	defer delete(visiting, b)

@@ -1860,7 +1860,7 @@ func TestBug_CrossJoinSub_SQL(t *testing.T) {
 }
 
 // TestBug_Pluck_ArgValidation 验证 Pluck 参数校验错误路径：
-// dest 必须是非 nil 的切片/map 指针，且列数与目标容器匹配（切片 1 列、map 2 列）。
+// dest 必须是非 nil 的切片/map 指针；切片与 keyBy map 需 1 列，标量 map 需 2 列。
 func TestBug_Pluck_ArgValidation(t *testing.T) {
 	b := newTestBuilder(NewSQLiteGrammar(), nil)
 	ctx := context.Background()

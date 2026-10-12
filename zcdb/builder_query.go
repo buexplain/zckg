@@ -239,8 +239,8 @@ func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColu
 
 // Paginate 分页查询，自动计算总数。
 // dest 必须是结构体切片指针（*[]struct）或结构体指针切片指针（*[]*struct）。
-// 内部先克隆并清除排序/分页/列后执行 COUNT，总数为 0 时不再执行数据查询；
-// 分页范围请用 ForPage/Limit+Offset 预设。
+// 先通过 ToCount 的临时状态保存机制清除排序/分页及必要列后执行 COUNT，原 Builder 状态保持不变；
+// 总数为 0 时不再执行数据查询。分页范围请用 ForPage/Limit+Offset 预设。
 //
 //	var users []User
 //	total, err := db.Builder().Table("users").ForPage(1, 20).Paginate(ctx, &users)

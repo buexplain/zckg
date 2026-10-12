@@ -149,16 +149,19 @@ func main() {
 |---|---|
 | `ErrEmptyTable` | 未设置表名（Table/TableSub）就编译或执行 |
 | `ErrInvalidStruct` | Insert/Update 传入了非结构体类型 |
-| `ErrNoFields` | 结构体无可参与写入的字段（无可导出字段，或全部字段为 nil/不可用被跳过） |
+| `ErrNoFields` | 写入或 Pluck keyBy 映射没有可用导出字段（无可导出字段，或全部字段为 nil/不可用） |
 | `ErrEmptyData` | 插入数据为空 |
 | `ErrInvalidOperator` | 运算符不在白名单内 |
 | `ErrInvalidSubQuery` | WhereExists 等方法的子查询参数类型非法 |
 | `ErrCyclicQuery` | 查询构造器的子查询图存在环（自引用/互引用，如 TableSub/Union 传入自身） |
 | `ErrInvalidWhereInValues` | JoinBuilder 的 WhereIn/WhereNotIn values 参数类型非法（仅支持 `[]any` 或 `*Builder`） |
 | `ErrInvalidAggregate` | 聚合函数不是 MAX/MIN/SUM/AVG |
-| `ErrPluckDest` / `ErrPluckColumns` | Pluck 目标类型或列数不匹配 |
-| `ErrDeleteWithoutWhere` / `ErrUpdateWithoutWhere` | 无 WHERE 的 Delete/Update 被保护机制拒绝 |
-| `ErrIncrementColumns` | Increment/Decrement 的多列参数不成对 |
+| `ErrAggregateGrouped` | 标量 Aggregate 带 GROUP BY/HAVING，应改用 Select + Find 获取分组结果 |
+| `ErrPluckDest` | Pluck 目标不是非 nil 的切片/map 指针（底层容器本身可为 nil） |
+| `ErrPluckColumns` | Pluck 列数不匹配：切片/keyBy map 需 1 列，标量 map 需 2 列 |
+| `ErrDeleteWithoutWhere` / `ErrUpdateWithoutWhere` | 无有效限定条件的 Delete/Update 被保护机制拒绝 |
+| `ErrDeleteWithJoin` | 普通 Delete 带 JOIN（应使用 DeleteJoin） |
+| `ErrIncrementColumns` | Increment/Decrement 参数不成对，或 columns/amounts 为空、长度不等 |
 | `ErrInsertUsingColumnMismatch` | InsertUsing/InsertOrIgnoreUsing 的目标列数与子查询 SELECT 列数不一致（子查询列数可静态判定时） |
 | `ErrUpsertUniqueByRequired` | PG/SQLite 的 Upsert 缺少 uniqueBy |
 | `ErrDeleteJoinNoJoin` | DeleteJoin 没有任何 JOIN |
@@ -170,4 +173,5 @@ func main() {
 | `ErrCursorColumnNull` | 游标列值为 NULL，无法继续分页 |
 | `ErrScanDest` | Scan 目标类型非法（必须是结构体或切片指针） |
 | `ErrScanConvert` | Scan 结果值类型转换失败 |
+| `ErrTxOwnerMismatch` | 事务 context 被传给另一 Pool 的 DAO |
 | `ErrDialectRequired` / `ErrUnknownDialect` / `ErrPoolRequired` | DAO 创建参数错误 |

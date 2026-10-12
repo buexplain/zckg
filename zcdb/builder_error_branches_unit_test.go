@@ -241,6 +241,52 @@ func TestBuilder_ToInsertUsingSubErrors(t *testing.T) {
 	})
 }
 
+// TestBuilder_SubBuilderErrorsPropagate 验证所有结构化子查询位置都会把内部错误
+// 传播到外层编译，包括子 Builder 挂入后才产生错误的情况。
+func TestBuilder_SubBuilderErrorsPropagate(t *testing.T) {
+	g := NewMySQLGrammar()
+	badSub := func() *Builder {
+		return newTestBuilder(g, nil).Table("sub").Where("id", "INVALID", 1)
+	}
+	for _, tc := range []struct {
+		name  string
+		build func() *Builder
+	}{
+		{"table_sub", func() *Builder { return newTestBuilder(g, nil).TableSub(badSub(), "s") }},
+		{"select_sub", func() *Builder { return newTestBuilder(g, nil).Table("root").SelectSub(badSub(), "x") }},
+		{"where_exists", func() *Builder { return newTestBuilder(g, nil).Table("root").WhereExists(badSub()) }},
+		{"where_sub", func() *Builder {
+			return newTestBuilder(g, nil).Table("root").WhereSub("id", "=", func(sub *Builder) {
+				sub.Table("sub").Where("id", "INVALID", 1)
+			})
+		}},
+		{"where_in_sub", func() *Builder {
+			return newTestBuilder(g, nil).Table("root").WhereInSub("id", func(sub *Builder) {
+				sub.Table("sub").Where("id", "INVALID", 1)
+			})
+		}},
+		{"having_nested", func() *Builder {
+			return newTestBuilder(g, nil).Table("root").GroupBy("id").HavingNested(func(nested *Builder) {
+				nested.Having("id", "INVALID", 1)
+			})
+		}},
+		{"union", func() *Builder { return newTestBuilder(g, nil).Table("root").Union(badSub()) }},
+		{"join_sub", func() *Builder { return newTestBuilder(g, nil).Table("root").JoinSub(badSub(), "s", nil) }},
+		{"mutated_after_attach", func() *Builder {
+			sub := newTestBuilder(g, nil).Table("sub")
+			outer := newTestBuilder(g, nil).Table("root").WhereExists(sub)
+			sub.Where("id", "INVALID", 1)
+			return outer
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if sql, args, err := tc.build().ToSelect(); sql != "" || args != nil || !errors.Is(err, ErrInvalidOperator) {
+				t.Fatalf("子查询错误未传播: SQL=%q args=%#v err=%v", sql, args, err)
+			}
+		})
+	}
+}
+
 // TestBuilder_ToUpsertUniqueByRequired 验证 PG/SQLite 下 ToUpsert 未指定 uniqueBy 时返回错误。
 func TestBuilder_ToUpsertUniqueByRequired(t *testing.T) {
 	for _, g := range []Grammar{NewPostgresGrammar(), NewSQLiteGrammar()} {
@@ -268,6 +314,23 @@ func TestBuilder_ToIncrementInvalidArgs(t *testing.T) {
 	}
 	if _, _, err := newTestBuilder(g, nil).Table("users").ToIncrement([]string{"a"}, nil); !errors.Is(err, ErrIncrementColumns) {
 		t.Fatalf("expected ErrIncrementColumns for length mismatch, got %v", err)
+	}
+}
+
+// TestPublicErrorMessages 验证容易误导调用方的错误文本准确描述 nil 容器、keyBy 与写入字段边界。
+func TestPublicErrorMessages(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{ErrPluckDest, "zcdb: Pluck dest must be a non-nil pointer to a slice or map"},
+		{ErrPluckColumns, "zcdb: Pluck requires 1 column for slice or keyBy map, or 2 columns for scalar map"},
+		{ErrNoFields, "zcdb: no usable exported fields for write or keyBy mapping"},
+		{ErrIncrementColumns, "zcdb: Increment/Decrement requires non-empty paired columns and amounts"},
+	} {
+		if got := tc.err.Error(); got != tc.want {
+			t.Errorf("错误文本: got %q want %q", got, tc.want)
+		}
 	}
 }
 

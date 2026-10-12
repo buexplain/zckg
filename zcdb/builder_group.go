@@ -200,6 +200,10 @@ func (b *Builder) addHavingNested(callback func(*Builder), boolean string) *Buil
 	nested := NewBuilder(b.grammar, b.dao)
 	nested.table = b.table
 	callback(nested)
+	if nested.err != nil {
+		b.err = nested.err
+		return b
+	}
 	if len(nested.havings) > 0 {
 		b.havings = append(b.havings, HavingClause{
 			Type:    "nested",

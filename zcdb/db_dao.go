@@ -10,10 +10,31 @@ import (
 // ctxTxKey 事务在 context 中的存储键
 type ctxTxKey struct{}
 
-// txFromCtx 从 context 中提取事务对象，不存在时返回 nil
+// ctxTx 事务及其所属连接池：所有权用于拒绝其它连接池的 DAO 复用该事务
+type ctxTx struct {
+	tx   *sql.Tx
+	pool *Pool
+}
+
+// txFromCtx 从 context 中提取事务对象（不校验所属连接池），不存在时返回 nil
 func txFromCtx(ctx context.Context) *sql.Tx {
-	tx, _ := ctx.Value(ctxTxKey{}).(*sql.Tx)
-	return tx
+	if v, ok := ctx.Value(ctxTxKey{}).(ctxTx); ok {
+		return v.tx
+	}
+	return nil
+}
+
+// txFor 返回 ctx 中属于当前 DAO 连接池的事务；无事务时返回 nil，
+// 事务属于其它连接池时返回 ErrTxOwnerMismatch，避免 SQL 被执行到另一个数据库。
+func (d *DBDao) txFor(ctx context.Context) (*sql.Tx, error) {
+	v, ok := ctx.Value(ctxTxKey{}).(ctxTx)
+	if !ok {
+		return nil, nil
+	}
+	if v.pool != d.pool {
+		return nil, ErrTxOwnerMismatch
+	}
+	return v.tx, nil
 }
 
 // dialectGrammar 根据方言名称推导对应的 Grammar 编译器
@@ -96,7 +117,12 @@ func (d *DBDao) Pool() *Pool {
 
 // Exec 执行原始 SQL（含慢 SQL 检测 + 读写路由），返回 sql.Result。
 // args 为 SQL 中占位符的绑定值，支持基本类型（int、string、float、bool、time.Time 等）。
+// ctx 携带其它连接池的事务时返回 ErrTxOwnerMismatch，SQL 不执行、不触发回调。
 func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Result, error) {
+	tx, err := d.txFor(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// 慢 SQL 检测：仅在配置回调时计时，避免热路径上无谓的 time.Now 开销
 	var start time.Time
 	if d.onSQL != nil {
@@ -104,10 +130,9 @@ func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Resul
 	}
 
 	var result sql.Result
-	var err error
 
 	// 事务检测：有事务走事务连接，否则走写库
-	if tx := txFromCtx(ctx); tx != nil {
+	if tx != nil {
 		result, err = tx.ExecContext(ctx, sqlStr, args...)
 	} else {
 		db := d.pool.PickWriteDB()
@@ -139,7 +164,12 @@ func (d *DBDao) QueryPrimary(ctx context.Context, sqlStr string, args ...any) (*
 }
 
 // query Query/QueryPrimary 共用实现：primary 为 true 时强制写连接。
+// ctx 携带其它连接池的事务时返回 ErrTxOwnerMismatch，SQL 不执行、不触发回调。
 func (d *DBDao) query(ctx context.Context, sqlStr string, primary bool, args ...any) (*sql.Rows, error) {
+	tx, err := d.txFor(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// 慢 SQL 检测：仅在配置回调时计时，避免热路径上无谓的 time.Now 开销
 	var start time.Time
 	if d.onSQL != nil {
@@ -147,10 +177,9 @@ func (d *DBDao) query(ctx context.Context, sqlStr string, primary bool, args ...
 	}
 
 	var rows *sql.Rows
-	var err error
 
 	// 事务检测：有事务走事务连接；否则按 primary 路由读/写库
-	if tx := txFromCtx(ctx); tx != nil {
+	if tx != nil {
 		rows, err = tx.QueryContext(ctx, sqlStr, args...)
 	} else {
 		var db *sql.DB
@@ -176,10 +205,14 @@ func (d *DBDao) query(ctx context.Context, sqlStr string, primary bool, args ...
 // Transaction 开启事务，通过 context 传播。
 // 回调返回 nil → Commit；返回 error → Rollback。
 // 回调 panic → defer Rollback 兜底，确保事务始终回滚。
-// 嵌套调用时检测到 ctx 中已有事务，直接传播（不再开新事务）。
+// 嵌套调用时检测到 ctx 中已有同一连接池的事务，直接传播（不再开新事务）；
+// 共享同一 Pool 的不同 DAO 也复用该事务。ctx 中的事务属于其它连接池时返回 ErrTxOwnerMismatch，
+// 不执行回调，也不开启第二个独立事务（不存在跨库原子事务）。
 func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) error) error {
-	// 嵌套事务检测：ctx 中已有事务则直接传播
-	if tx := txFromCtx(ctx); tx != nil {
+	// 嵌套事务检测：ctx 中已有本连接池的事务则直接传播
+	if tx, err := d.txFor(ctx); err != nil {
+		return err
+	} else if tx != nil {
 		return fn(ctx)
 	}
 
@@ -190,7 +223,7 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 	}
 
 	// 将事务绑定到 ctx
-	txCtx := context.WithValue(ctx, ctxTxKey{}, tx)
+	txCtx := context.WithValue(ctx, ctxTxKey{}, ctxTx{tx: tx, pool: d.pool})
 
 	// 标记事务是否已终结（提交或回滚完成）
 	settled := false

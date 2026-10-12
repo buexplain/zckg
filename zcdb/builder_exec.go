@@ -161,6 +161,9 @@ func (b *Builder) Upsert(ctx context.Context, data any, uniqueBy []string, updat
 //	affected, err := db.Builder().Table("users").Where("id", "=", 1).Update(ctx, &user)
 //	// SQL: UPDATE `users` SET `name` = ?, `age` = ? WHERE `id` = ?
 func (b *Builder) Update(ctx context.Context, data any) (int64, error) {
+	if err := b.validateWriteBuilder(); err != nil {
+		return 0, err
+	}
 	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 WhereRaw("1=1")
 	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
 		return 0, ErrUpdateWithoutWhere
@@ -191,6 +194,9 @@ func (b *Builder) Increment(ctx context.Context, column string, amount any, extr
 	if err != nil {
 		return 0, err
 	}
+	if err := b.validateWriteBuilder(); err != nil {
+		return 0, err
+	}
 	// 破坏性操作保护：复用 Update 的无 WHERE 拒绝机制
 	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
 		return 0, ErrUpdateWithoutWhere
@@ -216,6 +222,9 @@ func (b *Builder) Increment(ctx context.Context, column string, amount any, extr
 func (b *Builder) Decrement(ctx context.Context, column string, amount any, extra ...any) (int64, error) {
 	columns, amounts, err := parseIncDecArgs(column, amount, extra)
 	if err != nil {
+		return 0, err
+	}
+	if err := b.validateWriteBuilder(); err != nil {
 		return 0, err
 	}
 	// 破坏性操作保护：复用 Update 的无 WHERE 拒绝机制
@@ -259,14 +268,20 @@ func parseIncDecArgs(column string, amount any, extra []any) ([]string, []any, e
 }
 
 // Delete 删除数据，返回受影响行数。
-// 无 WHERE 条件时默认拒绝执行（防误操作全表删除），
-// 确需全表删除请显式调用 Force()。
+// 无有效 WHERE 条件时默认拒绝执行（防误操作全表删除），确需全表删除请显式调用 Force()。
+// 普通 Delete 不编译 JOIN，存在 JOIN 时返回 ErrDeleteWithJoin（Force 也不放行），按关联删除请用 DeleteJoin。
 //
 //	affected, err := db.Builder().Table("users").Where("id", "=", 1).Delete(ctx)
 //	// SQL: DELETE FROM `users` WHERE `id` = ?
 func (b *Builder) Delete(ctx context.Context) (int64, error) {
-	// 破坏性操作保护：无有效 WHERE/JOIN 限定条件时拒绝执行，需显式 Force() 或 WhereRaw("1=1")
-	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
+	if err := b.validateWriteBuilder(); err != nil {
+		return 0, err
+	}
+	if len(b.joins) > 0 {
+		return 0, ErrDeleteWithJoin
+	}
+	// 破坏性操作保护：无有效 WHERE 限定条件时拒绝执行，需显式 Force() 或 WhereRaw("1=1")
+	if !b.force && !b.hasEffectiveWhere() {
 		return 0, ErrDeleteWithoutWhere
 	}
 
@@ -294,9 +309,12 @@ func (b *Builder) Delete(ctx context.Context) (int64, error) {
 //	// PG SQL:     DELETE FROM "users" USING "orders" WHERE ...
 //	// SQLite SQL: DELETE FROM "users" WHERE "id" IN (SELECT ...)
 //
-// 无 WHERE 条件时默认拒绝执行（同 Delete）；带条件的 JOIN 本身视为有效限定。
+// 无有效 WHERE 条件时默认拒绝执行（同 Delete）；带条件的 JOIN 本身视为有效限定。
 func (b *Builder) DeleteJoin(ctx context.Context) (int64, error) {
-	// 破坏性操作保护：复用 Delete 的无 WHERE 拒绝机制（hasEffectiveJoin 已覆盖 join 限定场景）
+	if err := b.validateWriteBuilder(); err != nil {
+		return 0, err
+	}
+	// 破坏性操作保护：DeleteJoin 真实编译 JOIN，带条件的 JOIN 计为有效限定
 	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
 		return 0, ErrDeleteWithoutWhere
 	}
@@ -314,31 +332,121 @@ func (b *Builder) DeleteJoin(ctx context.Context) (int64, error) {
 	return result.RowsAffected()
 }
 
-// hasEffectiveWhere 判断是否存在实际生效的 WHERE 条件。
-// 排除空嵌套（如 WhereNested 传入空回调）、空 WhereRaw（编译后为空串）等伪条件，
-// 防止空条件绕过无 WHERE 保护导致全表删除/更新。
+// validateWriteBuilder 在破坏性操作保护前返回 Builder 图中的既有错误，避免被安全守卫掩盖。
+func (b *Builder) validateWriteBuilder() error {
+	if b.err != nil {
+		return b.err
+	}
+	return b.validateAcyclic()
+}
+
+// hasEffectiveWhere 判断 WHERE 是否实际收窄了操作范围：
+// 按 SQL 优先级（AND 先于 OR）把条件静态归约为恒真/恒假/未知，仅「未知」与「恒假」计为有效限定。
+// 空嵌套组、空 WhereRaw 编译时被跳过，不计入；空 WhereNotIn（编译为 1 = 1）与
+// 子查询无有效条件的 EXISTS/NOT EXISTS 不按行收窄，计为恒真；空 WhereIn（0 = 1）计为恒假。
+// 因此普通条件与空 WhereNotIn 形成的 OR 恒真组合同样被拒绝。
 func (b *Builder) hasEffectiveWhere() bool {
-	for _, w := range b.wheres {
-		switch w.Type {
-		case WhereTypeNested, WhereTypeExists, WhereTypeNotExists:
-			if w.Nested != nil && w.Nested.hasEffectiveWhere() {
-				return true
+	t := evalWhereTruth(b.wheres)
+	return t == truthUnknown || t == truthFalse
+}
+
+type whereTruth int
+
+const (
+	truthAbsent  whereTruth = iota // 编译后不产生任何条件
+	truthTrue                      // 静态恒真，不收窄范围
+	truthFalse                     // 静态恒假
+	truthUnknown                   // 依赖行数据，视为有效限定
+)
+
+// evalWhereTruth 按编译输出的平铺形式 w1 AND w2 OR w3 归约：先求各 AND 链，再对链取 OR。
+func evalWhereTruth(wheres []WhereClause) whereTruth {
+	result, chain := truthAbsent, truthAbsent
+	for _, w := range wheres {
+		t := evalWhereClauseTruth(w)
+		if t == truthAbsent {
+			continue
+		}
+		if chain != truthAbsent && w.Boolean == "OR" {
+			result = orTruth(result, chain)
+			chain = truthAbsent
+		}
+		chain = andTruth(chain, t)
+	}
+	return orTruth(result, chain)
+}
+
+func evalWhereClauseTruth(w WhereClause) whereTruth {
+	switch w.Type {
+	case WhereTypeNested:
+		if w.Nested == nil {
+			return truthAbsent
+		}
+		t := evalWhereTruth(w.Nested.wheres)
+		if w.Not {
+			switch t {
+			case truthTrue:
+				return truthFalse
+			case truthFalse:
+				return truthTrue
 			}
-		case WhereTypeRaw:
-			// 空串/纯空白 Raw 编译后会被跳过，不产生任何条件，不得计为有效限定
-			if strings.TrimSpace(w.SQL) != "" {
-				return true
-			}
-		default:
-			return true
+		}
+		return t
+	case WhereTypeExists, WhereTypeNotExists:
+		if w.Nested == nil {
+			return truthAbsent
+		}
+		if evalWhereTruth(w.Nested.wheres) == truthUnknown {
+			return truthUnknown
+		}
+		return truthTrue
+	case WhereTypeRaw:
+		if strings.TrimSpace(w.SQL) == "" {
+			return truthAbsent
+		}
+	case WhereTypeIn:
+		if len(w.Values) == 0 {
+			return truthFalse
+		}
+	case WhereTypeNotIn:
+		if len(w.Values) == 0 {
+			return truthTrue
 		}
 	}
-	return false
+	return truthUnknown
+}
+
+func andTruth(a, b whereTruth) whereTruth {
+	switch {
+	case a == truthAbsent:
+		return b
+	case b == truthAbsent:
+		return a
+	case a == truthFalse || b == truthFalse:
+		return truthFalse
+	case a == truthUnknown || b == truthUnknown:
+		return truthUnknown
+	}
+	return truthTrue
+}
+
+func orTruth(a, b whereTruth) whereTruth {
+	switch {
+	case a == truthAbsent:
+		return b
+	case b == truthAbsent:
+		return a
+	case a == truthTrue || b == truthTrue:
+		return truthTrue
+	case a == truthUnknown || b == truthUnknown:
+		return truthUnknown
+	}
+	return truthFalse
 }
 
 // hasEffectiveJoin 判断是否存在带条件的 JOIN。
-// UPDATE/DELETE 中 JOIN 的 ON/Where 条件同样限定操作范围，
-// 视为有效限定条件；无条件 JOIN 会产生笛卡尔积，不视为限定。
+// Update 系列与 DeleteJoin 会真实编译 JOIN，其 ON 条件同样限定操作范围，
+// 视为有效限定条件；无条件 JOIN 会产生笛卡尔积，不视为限定。普通 Delete 不编译 JOIN，不使用本判定。
 func (b *Builder) hasEffectiveJoin() bool {
 	for _, j := range b.joins {
 		if len(j.Conditions) > 0 {

@@ -356,6 +356,10 @@ func (b *Builder) WhereNested(callback func(*Builder)) *Builder {
 	nested := NewBuilder(b.grammar, b.dao)
 	nested.table = b.table
 	callback(nested)
+	if nested.err != nil {
+		b.err = nested.err
+		return b
+	}
 	if len(nested.wheres) > 0 {
 		b.wheres = append(b.wheres, WhereClause{
 			Type:    WhereTypeNested,
@@ -378,6 +382,10 @@ func (b *Builder) OrWhereNested(callback func(*Builder)) *Builder {
 	nested := NewBuilder(b.grammar, b.dao)
 	nested.table = b.table
 	callback(nested)
+	if nested.err != nil {
+		b.err = nested.err
+		return b
+	}
 	if len(nested.wheres) > 0 {
 		b.wheres = append(b.wheres, WhereClause{
 			Type:    WhereTypeNested,
@@ -691,6 +699,10 @@ func (b *Builder) addWhereNot(callback func(*Builder), boolean string) *Builder 
 	nested := NewBuilder(b.grammar, b.dao)
 	nested.table = b.table
 	callback(nested)
+	if nested.err != nil {
+		b.err = nested.err
+		return b
+	}
 	if len(nested.wheres) > 0 {
 		b.wheres = append(b.wheres, WhereClause{
 			Type:    WhereTypeNested,
@@ -779,6 +791,10 @@ func (b *Builder) addWhereAny(callback func(*Builder), boolean string, not bool)
 	nested := NewBuilder(b.grammar, b.dao)
 	nested.table = b.table
 	callback(nested)
+	if nested.err != nil {
+		b.err = nested.err
+		return b
+	}
 	if len(nested.wheres) > 0 {
 		for i := range nested.wheres {
 			nested.wheres[i].Boolean = "OR"

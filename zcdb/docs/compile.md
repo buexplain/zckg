@@ -6,7 +6,7 @@ Builder 的所有终端执行方法（Find/Insert/Update 等）内部都是"先 
 - 将 SQL 交给其它组件执行（如分批任务、自定义连接）；
 - 单元测试中断言生成的 SQL。
 
-所有 ToXxx 方法返回 `(sql string, args []any, err error)` 三元组（`ToTruncate` 只返回 `(sql, err)`）。Builder 状态在链式构造中已产生的错误（如非法运算符）会在编译时统一返回。
+所有 ToXxx 方法返回 `(sql string, args []any, err error)` 三元组（`ToTruncate` 只返回 `(sql, err)`）。Builder 本身及挂入 FROM/SELECT/WHERE/JOIN/HAVING/UNION 等位置的任意层子 Builder 在链式构造中已产生的错误（如非法运算符），都会在外层编译时统一返回；不会静默丢弃子查询错误后继续生成 SQL。
 
 ## SQL 注释的最终编译边界
 
@@ -39,7 +39,7 @@ sql, args, _ := db.Builder().Table("users").Where("status", "=", "active").ToCou
 // args: [active]
 ```
 
-包含 UNION / GROUP BY / DISTINCT 时自动将整个查询包裹为子查询再计数（保留分组数/去重语义），并自动清除分页、排序、锁子句：
+包含 UNION / GROUP BY / HAVING / DISTINCT 时自动将整个查询包裹为子查询再计数（保留分组、HAVING 筛选与去重语义），并自动清除分页、排序、锁子句。HAVING 引用显式 SELECT 别名时保留原投影：
 
 ```go
 sql, _, _ := db.Builder().Table("orders").GroupBy("user_id").ToCount()
@@ -51,7 +51,7 @@ sql, _, _ = db.Builder().Table("users").Select("city").Distinct().ToCount()
 
 ### ToExists
 
-编译存在性查询 `SELECT 1 ... LIMIT 1`，清除分页/排序/锁/SELECT 子查询列；UNION 时整体包裹子查询后附加 `LIMIT 1`：
+编译存在性查询并清除分页、排序、锁。普通查询使用 `SELECT 1 ... LIMIT 1`；UNION 为保持各分支列数一致、HAVING 为保留 SELECT 别名，都会保留原投影并整体包裹子查询后附加 `LIMIT 1`：
 
 ```go
 sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToExists()
@@ -61,7 +61,7 @@ sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToExists()
 
 ### ToAggregate
 
-编译 MAX/MIN/SUM/AVG 聚合，仅接受这四个函数名，否则返回 `ErrInvalidAggregate`。UNION 时整体包裹子查询后聚合；分页/排序/锁被自动清除：
+编译 MAX/MIN/SUM/AVG 聚合，仅接受这四个函数名，否则返回 `ErrInvalidAggregate`。UNION 时整体包裹子查询后聚合；分页/排序/锁被自动清除。带 GROUP BY 或 HAVING 时会产生多行分组语义，与标量返回值冲突，因此返回 `ErrAggregateGrouped`，应改用 `Select` + `Find` 接收各组结果：
 
 ```go
 sql, args, _ := db.Builder().Table("orders").Where("status", "=", "paid").ToAggregate("MAX", "amount")
@@ -150,11 +150,18 @@ sql, err := db.Builder().Table("users").ToTruncate()
 // SQLite: DELETE FROM "users"
 ```
 
-`ToDeleteJoin` 要求至少一个 JOIN（否则 `ErrDeleteJoinNoJoin`），绑定顺序三方言一致：JOIN 条件 → WHERE 条件。
+`ToDelete` 不编译 JOIN；Builder 带 JOIN 时返回 `ErrDeleteWithJoin`，即使同时有 WHERE 或调用了 `Force()` 也不会生成 SQL。关联删除应使用 `ToDeleteJoin`。
+
+`ToDeleteJoin` 要求至少一个 JOIN（否则 `ErrDeleteJoinNoJoin`）。无派生表 JOIN 时三方言都是 ON → WHERE；带多个 `JoinSub` 时按实际 SQL 占位符顺序收集：
+
+| 方言 | `ToDeleteJoin` 绑定顺序 |
+|---|---|
+| MySQL / SQLite | 按 JOIN 逐项：该 JOIN 的派生表子查询 → 嵌套 join → ON；最后 WHERE |
+| PostgreSQL | 全部派生表子查询（JOIN 顺序）→ 全部 ON（JOIN 顺序）→ WHERE |
 
 ### ToIncrement / ToDecrement
 
-接收等长的列名切片与增量切片，编译为 `SET col = col op ?`：
+接收等长且非空的列名切片与增量切片，编译为 `SET col = col op ?`；任一切片为空或长度不等时返回 `ErrIncrementColumns`：
 
 ```go
 sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).

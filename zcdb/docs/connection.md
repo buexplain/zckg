@@ -109,7 +109,9 @@ _ = zcdb.ScanStruct(rows, &users, "zc") // 第三个参数指定标签名，缺�
 | SELECT + 锁（LockForUpdate/SharedLock） | **强制主库**（锁在从库不生效） |
 | SELECT + `Primary()` | **强制主库**（不加锁，写后读场景：从库可能因复制延迟无数据） |
 | INSERT/UPDATE/DELETE/TRUNCATE | 主库 |
-| 事务内的一切操作 | 事务连接（主库开启） |
+| 事务内、且 DAO 与事务属于同一 Pool 的操作 | 事务连接（主库开启） |
+
+事务 context 绑定创建事务的 `Pool`：同一 `Pool` 派生的不同 DAO 可以复用事务；把该 context 传给另一 `Pool` 的 DAO 时，`Exec`、`Query`、Builder 执行和 `Transaction` 都返回 `ErrTxOwnerMismatch`，不会误用原事务，也不会在另一连接池另开独立事务。
 
 ## 事务
 
@@ -138,14 +140,16 @@ err := db.Transaction(ctx, func(ctx context.Context) error {
 //   SELECT * FROM `users` WHERE `id` = ? LIMIT 1    args: [1]
 ```
 
-嵌套调用时检测到 ctx 中已有事务，直接复用（不会开启新事务），因此业务函数可以自由组合：
+嵌套调用时检测到 ctx 中已有事务，且 DAO 属于同一 `Pool` 时直接复用（不会开启新事务），因此同一连接池上的业务函数可以自由组合：
 
 ```go
 err := db.Transaction(ctx, func(ctx context.Context) error {
-	// orderService.Create 内部可能也调用了 db.Transaction，会直接复用当前事务
+	// orderService.Create 使用同一 Pool，其内部 Transaction 会复用当前事务
 	return orderService.Create(ctx, order)
 })
 ```
+
+若嵌套业务使用另一 `Pool`，必须显式结束当前事务边界后再调用；直接传递事务 context 会返回 `ErrTxOwnerMismatch`。
 
 ## 原始 SQL
 

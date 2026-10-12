@@ -5,6 +5,7 @@ package zcdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	_ "modernc.org/sqlite"
 	"path/filepath"
 	"strings"
@@ -1682,5 +1683,84 @@ func TestSQLiteInteg_TruncateSequenceStates(t *testing.T) {
 	}
 	if id != 1 {
 		t.Fatalf("Truncate 后自增应重置为 1，实际 %d", id)
+	}
+}
+
+// TestSQLiteInteg_TransactionPoolOwnership 用两个真实 SQLite 文件验证事务 context 的 Pool 归属：
+// 同一 Pool 的不同 DAO 复用事务，另一 Pool 的原始 SQL、Builder 与嵌套 Transaction 均被拒绝且不误写。
+func TestSQLiteInteg_TransactionPoolOwnership(t *testing.T) {
+	open := func(path string) (*Pool, *DBDao) {
+		t.Helper()
+		pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: path, MaxOpenConns: 1})
+		if err != nil {
+			t.Fatalf("打开 SQLite Pool 失败: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := pool.Close(); err != nil {
+				t.Errorf("关闭 SQLite Pool 失败: %v", err)
+			}
+		})
+		dao, err := NewDBDao(pool, "sqlite", nil, "", "")
+		if err != nil {
+			t.Fatalf("创建 SQLite DAO 失败: %v", err)
+		}
+		return pool, dao
+	}
+	pool1, dao1 := open(filepath.Join(t.TempDir(), "owner.db"))
+	_, dao2 := open(filepath.Join(t.TempDir(), "other.db"))
+	dao1Peer, err := NewDBDao(pool1, "sqlite", nil, "", "")
+	if err != nil {
+		t.Fatalf("创建同 Pool DAO 失败: %v", err)
+	}
+	for _, dao := range []*DBDao{dao1, dao2} {
+		crossDialectExec(t, dao, `CREATE TABLE tx_owner_items (id INTEGER PRIMARY KEY, name TEXT)`)
+	}
+
+	ctx := context.Background()
+	nestedCalled := false
+	err = dao1.Transaction(ctx, func(txCtx context.Context) error {
+		if _, err := dao1Peer.Exec(txCtx, `INSERT INTO tx_owner_items (id, name) VALUES (?, ?)`, 1, "same-pool"); err != nil {
+			return fmt.Errorf("同 Pool DAO 复用事务失败: %w", err)
+		}
+		if result, err := dao2.Exec(txCtx, `INSERT INTO tx_owner_items (id, name) VALUES (?, ?)`, 2, "wrong-pool"); result != nil || !errors.Is(err, ErrTxOwnerMismatch) {
+			t.Fatalf("跨 Pool Exec: result=%v err=%v", result, err)
+		}
+		if rows, err := dao2.Query(txCtx, `SELECT id FROM tx_owner_items`); rows != nil || !errors.Is(err, ErrTxOwnerMismatch) {
+			t.Fatalf("跨 Pool Query: rows=%v err=%v", rows, err)
+		}
+		if affected, err := dao2.Builder().Table("tx_owner_items").Insert(txCtx, struct {
+			ID   int    `db:"id"`
+			Name string `db:"name"`
+		}{ID: 3, Name: "builder"}); affected != 0 || !errors.Is(err, ErrTxOwnerMismatch) {
+			t.Fatalf("跨 Pool Builder: affected=%d err=%v", affected, err)
+		}
+		if err := dao2.Transaction(txCtx, func(context.Context) error {
+			nestedCalled = true
+			return nil
+		}); !errors.Is(err, ErrTxOwnerMismatch) {
+			t.Fatalf("跨 Pool Transaction: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("外层事务失败: %v", err)
+	}
+	if nestedCalled {
+		t.Fatal("跨 Pool Transaction 不得调用回调")
+	}
+	for _, tc := range []struct {
+		name string
+		dao  *DBDao
+		want int
+	}{
+		{"owner", dao1, 1},
+		{"other", dao2, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			count, err := tc.dao.Builder().Table("tx_owner_items").Count(ctx)
+			if err != nil || count != tc.want {
+				t.Fatalf("事务归属数据校验: count=%d want=%d err=%v", count, tc.want, err)
+			}
+		})
 	}
 }

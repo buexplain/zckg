@@ -83,7 +83,7 @@ sql, _, _ := db.Builder().Table("users").Select("city").Distinct().ToSelect()
 
 三参形式 `(列, 运算符, 值)` 与两参简写 `(列, 值)`（缺省 `=`）；运算符经白名单校验，非法时编译阶段返回 `ErrInvalidOperator`。
 
-白名单：`=` `!=` `<>` `<` `>` `<=` `>=` `LIKE` `NOT LIKE` `IS` `IS NOT` `IN` `NOT IN` `BETWEEN` `NOT BETWEEN`。
+白名单：`=` `!=` `<>` `<` `>` `<=` `>=` `LIKE` `NOT LIKE` `IS` `IS NOT`。`IN` / `NOT IN` / `BETWEEN` / `NOT BETWEEN` 需要多个值，三参基本比较会返回 `ErrInvalidOperator`；请使用 `WhereIn` / `WhereNotIn` / `WhereBetween` / `WhereNotBetween`。
 
 ```go
 sql, args, _ := db.Builder().Table("users").Where("age", ">", 25).ToSelect()
@@ -125,7 +125,7 @@ sql, args, _ = db.Builder().Table("users").WhereNotIn("status", []any{"banned", 
 // args: [banned frozen]
 ```
 
-空切片语义：`WhereIn(col, []any{})` 编译为恒假条件 `0 = 1`，`WhereNotIn(col, []any{})` 编译为恒真条件 `1 = 1`。
+空切片语义：`WhereIn(col, []any{})` 编译为恒假条件 `0 = 1`，`WhereNotIn(col, []any{})` 编译为恒真条件 `1 = 1`。恒真的空 `WhereNotIn` 不会收窄写操作范围，不能单独满足 Update/Delete 的安全保护；与 OR 组合后整体恒真时同样会被拒绝。
 
 ### WhereNull / WhereNotNull
 

@@ -464,6 +464,7 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 
 // ToDelete 编译 DELETE 语句。
 // 通过 Where() 等链式调用指定删除条件，无条件时将删除全表数据。
+// 普通 DELETE 不编译 JOIN，存在 JOIN 时返回 ErrDeleteWithJoin，按关联删除请用 ToDeleteJoin。
 //
 // 示例：
 //
@@ -484,6 +485,9 @@ func (b *Builder) ToDelete() (string, []any, error) {
 	}
 	if err := b.validateAcyclic(); err != nil {
 		return "", nil, err
+	}
+	if len(b.joins) > 0 {
+		return "", nil, ErrDeleteWithJoin
 	}
 
 	sql := b.grammar.CompileDelete(b)
@@ -584,8 +588,8 @@ func (b *Builder) saveTransientState() func() {
 
 // ToCount 编译 COUNT 查询。
 // 通过复用 CompileSelect 生成 SELECT COUNT(*) FROM ... 语句。
-// 当查询包含 UNION、GROUP BY 或 DISTINCT 时，将整个查询包裹为子查询再计数，
-// 避免生成无效 SQL 或丢失分组/去重语义（此时返回的是分组数/去重后行数）。
+// 当查询包含 UNION、GROUP BY、HAVING 或 DISTINCT 时，将整个查询包裹为子查询再计数，
+// 避免生成无效 SQL 或丢失分组/筛选/去重语义；HAVING 可引用的显式 SELECT 别名会被保留。
 //
 //	sql, args, _ := db.Builder().Table("users").Where("status", "=", "active").ToCount()
 //	// SQL:  SELECT COUNT(*) FROM `users` WHERE `status` = ?
@@ -623,10 +627,8 @@ func (b *Builder) ToCount() (string, []any, error) {
 		return b.appendSQLComment(countSQL), args, nil
 	}
 
-	// GROUP BY 查询：COUNT(*) 与分组列组合时返回每组一行，
-	// 执行端只取第一行会得到错误结果，因此将查询包裹为子查询再计数，
-	// 返回分组数量。
-	if len(b.groups) > 0 {
+	// GROUP BY/HAVING 查询先保留其分组结果，再由外层统计行数。
+	if len(b.groups) > 0 || len(b.havings) > 0 {
 		// 保存并清除分页/排序/锁，这些对计数无意义且可能干扰子查询；
 		// defer 恢复确保 panic 时状态也能完整还原
 		defer b.saveTransientState()()
@@ -634,9 +636,12 @@ func (b *Builder) ToCount() (string, []any, error) {
 		b.orders = nil
 		b.lockClause = ""
 
-		// 将列替换为常量，避免 SELECT * 与 GROUP BY 在严格模式下冲突
-		b.columns = []SelectColumn{{Value: "1", Raw: true}}
-		b.selectSubs = nil
+		// HAVING 可引用 SELECT 别名，此时必须保留调用方投影；否则用常量避免
+		// SELECT * 与 GROUP BY 在严格模式下冲突。
+		if len(b.havings) == 0 || len(b.columns) == 0 && len(b.selectSubs) == 0 {
+			b.columns = []SelectColumn{{Value: "1", Raw: true}}
+			b.selectSubs = nil
+		}
 
 		subSQL := b.grammar.CompileSelect(b, b.columns)
 		args := b.collectSelectBindings()
@@ -682,8 +687,8 @@ func (b *Builder) ToCount() (string, []any, error) {
 // ToExists 编译存在性查询：SELECT 1 ... LIMIT 1。
 // 数据库找到第一条匹配记录即返回，避免 ToCount 的 COUNT(*) 扫描所有匹配行，
 // 大表场景下存在性检查显著更快。
-// UNION 查询与 ToCount 相同：整个 UNION 包裹为子查询再附加 LIMIT 1；
-// GROUP BY/DISTINCT 场景直接编译（SELECT 1 与这些子句无冲突）。
+// UNION 查询保持各分支原投影以确保列数一致；HAVING 查询保留其依赖的 SELECT 别名；
+// 两者都整体包裹为子查询后附加 LIMIT 1。其它场景用 SELECT 1 直接检查。
 //
 //	sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToExists()
 //	// SQL:  SELECT 1 FROM `users` WHERE `id` = ? LIMIT 1
@@ -699,20 +704,23 @@ func (b *Builder) ToExists() (string, []any, error) {
 		return "", nil, err
 	}
 
-	// 保存并清除分页/排序/锁/列：存在性检查只关心是否有匹配行；
-	// defer 恢复确保 panic 时状态也能完整还原（与 ToCount/ToAggregate 共用 saveTransientState）
+	// 保存并清除分页/排序/锁：存在性检查只关心是否有匹配行；
+	// UNION 需要保持各分支列数一致，HAVING 可能引用 SELECT 别名，两者均保留原投影。
+	preserveProjection := len(b.unions) > 0 || len(b.havings) > 0
 	defer b.saveTransientState()()
 	b.limit, b.offset = 0, 0
 	b.orders = nil
 	b.lockClause = ""
-	b.columns = []SelectColumn{{Value: "1", Raw: true}}
-	b.selectSubs = nil
+	if !preserveProjection {
+		b.columns = []SelectColumn{{Value: "1", Raw: true}}
+		b.selectSubs = nil
+	}
 
 	subSQL := b.grammar.CompileSelect(b, b.columns)
 	args := b.collectSelectBindings()
 
-	// UNION 查询：整个 UNION 作为子查询后附加 LIMIT 1
-	if len(b.unions) > 0 {
+	// UNION/HAVING 查询保持原投影并整体包裹，外层只读取一行常量。
+	if preserveProjection {
 		return b.appendSQLComment("SELECT 1 FROM (" + subSQL + ") AS " + b.grammar.WrapTable("t") + " LIMIT 1"), args, nil
 	}
 	return b.appendSQLComment(subSQL + " LIMIT 1"), args, nil
@@ -720,8 +728,8 @@ func (b *Builder) ToExists() (string, []any, error) {
 
 // ToAggregate 编译聚合查询（MAX/MIN/SUM/AVG），生成 SELECT AGG(col) AS aggregate FROM ...。
 // aggregate 必须是 MAX/MIN/SUM/AVG 之一，否则返回 ErrInvalidAggregate。
-// UNION 查询与 ToCount 相同：将整个 UNION 包裹为子查询后再聚合；
-// GROUP BY/DISTINCT 场景直接编译（聚合列与这些子句无冲突，执行端取首行）。
+// UNION 查询与 ToCount 相同：将整个 UNION 包裹为子查询后再聚合。
+// GROUP BY/HAVING 会产生分组多行语义，与标量返回值冲突，返回 ErrAggregateGrouped。
 //
 //	sql, args, _ := db.Builder().Table("orders").Where("status", "=", "paid").ToAggregate("MAX", "amount")
 //	// SQL:  SELECT MAX(`amount`) AS `aggregate` FROM `orders` WHERE `status` = ?
@@ -740,6 +748,9 @@ func (b *Builder) ToAggregate(aggregate string, column string) (string, []any, e
 	case "MAX", "MIN", "SUM", "AVG":
 	default:
 		return "", nil, ErrInvalidAggregate
+	}
+	if len(b.groups) > 0 || len(b.havings) > 0 {
+		return "", nil, ErrAggregateGrouped
 	}
 
 	// 聚合表达式：AGG(wrap col) AS aggregate

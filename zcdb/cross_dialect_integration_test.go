@@ -1252,6 +1252,221 @@ func crossDialectTestWhereNotInVariants(t *testing.T, dao *DBDao) {
 	}
 }
 
+// crossDialectTestDeleteWithJoinRejected 验证普通 Delete 不会静默丢弃 JOIN，
+// 无 WHERE、有 WHERE、Force 三种入口均拒绝且不改数据；DeleteJoin 仍按关联条件执行。
+func crossDialectTestDeleteWithJoinRejected(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	crossDialectDrop(t, dao, "cross_dialect_delete_orders", "cross_dialect_delete_users")
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_delete_users (id INTEGER PRIMARY KEY, name TEXT)`)
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_delete_orders (id INTEGER PRIMARY KEY, user_id INTEGER)`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_delete_users (id, name) VALUES (1, 'a'), (2, 'b')`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_delete_orders (id, user_id) VALUES (10, 1)`)
+
+	join := func() *Builder {
+		return dao.Builder().Table("cross_dialect_delete_users").
+			Join("cross_dialect_delete_orders", "cross_dialect_delete_orders.user_id", "=", "cross_dialect_delete_users.id")
+	}
+	for _, tc := range []struct {
+		name  string
+		build func() *Builder
+	}{
+		{"without_where", join},
+		{"with_where", func() *Builder { return join().Where("cross_dialect_delete_users.id", "=", 1) }},
+		{"force", func() *Builder { return join().Force() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if affected, err := tc.build().Delete(ctx); affected != 0 || !errors.Is(err, ErrDeleteWithJoin) {
+				t.Fatalf("Delete 带 JOIN: affected=%d err=%v", affected, err)
+			}
+		})
+	}
+	if n, err := dao.Builder().Table("cross_dialect_delete_users").Count(ctx); err != nil || n != 2 {
+		t.Fatalf("被拒绝的 Delete 不得改数据: count=%d err=%v", n, err)
+	}
+	if affected, err := join().Where("cross_dialect_delete_users.id", "=", 1).DeleteJoin(ctx); err != nil || affected != 1 {
+		t.Fatalf("DeleteJoin 应正常删除关联行: affected=%d err=%v", affected, err)
+	}
+	if n, err := dao.Builder().Table("cross_dialect_delete_users").Count(ctx); err != nil || n != 1 {
+		t.Fatalf("DeleteJoin 后应剩一行: count=%d err=%v", n, err)
+	}
+}
+
+// crossDialectTestEffectiveWhereGuards 验证恒真 WHERE 组合不能授权破坏性操作，
+// 恒假空 IN 仍可安全执行且影响零行，查询端的空 NOT IN 语义保持返回全部行。
+func crossDialectTestEffectiveWhereGuards(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	crossDialectSetupScanTable(t, dao)
+	patch := crossDialectUUpd{Name: "changed"}
+	for _, tc := range []struct {
+		name string
+		run  func() (int64, error)
+		want error
+	}{
+		{"delete_empty_not_in", func() (int64, error) {
+			return dao.Builder().Table("cross_dialect_scan").WhereNotIn("id", []any{}).Delete(ctx)
+		}, ErrDeleteWithoutWhere},
+		{"update_empty_not_in", func() (int64, error) {
+			return dao.Builder().Table("cross_dialect_scan").WhereNotIn("id", []any{}).Update(ctx, patch)
+		}, ErrUpdateWithoutWhere},
+		{"delete_or_not_empty_in", func() (int64, error) {
+			return dao.Builder().Table("cross_dialect_scan").Where("id", "=", 1).OrWhereNot(func(q *Builder) {
+				q.WhereIn("id", []any{})
+			}).Delete(ctx)
+		}, ErrDeleteWithoutWhere},
+		{"delete_not_empty_in", func() (int64, error) {
+			return dao.Builder().Table("cross_dialect_scan").WhereNot(func(q *Builder) {
+				q.WhereIn("id", []any{})
+			}).Delete(ctx)
+		}, ErrDeleteWithoutWhere},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if affected, err := tc.run(); affected != 0 || !errors.Is(err, tc.want) {
+				t.Fatalf("恒真保护: affected=%d err=%v want=%v", affected, err, tc.want)
+			}
+		})
+	}
+	if affected, err := dao.Builder().Table("cross_dialect_scan").WhereIn("id", []any{}).Delete(ctx); err != nil || affected != 0 {
+		t.Fatalf("恒假空 IN 应安全执行零行: affected=%d err=%v", affected, err)
+	}
+	var ids []int64
+	if err := dao.Builder().Table("cross_dialect_scan").OrderBy("id").WhereNotIn("id", []any{}).Pluck(ctx, &ids, "id"); err != nil {
+		t.Fatalf("空 NOT IN 查询失败: %v", err)
+	}
+	if !reflect.DeepEqual(ids, []int64{1, 2}) {
+		t.Fatalf("空 NOT IN 查询应返回全部行: %v", ids)
+	}
+	assertCommentRows(t, dao, "cross_dialect_scan", []crossDialectItemRow{{1, "abc", 10}, {2, "def", 20}})
+}
+
+// crossDialectTestSubBuilderErrorsGuardWrites 验证嵌套回调错误与挂入后产生的子查询错误
+// 都会在外层写操作前返回，且不会执行任何删除。
+func crossDialectTestSubBuilderErrorsGuardWrites(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	crossDialectSetupScanTable(t, dao)
+
+	if affected, err := dao.Builder().Table("cross_dialect_scan").WhereNested(func(q *Builder) {
+		q.Where("id", "INVALID", 1)
+	}).Delete(ctx); affected != 0 || !errors.Is(err, ErrInvalidOperator) {
+		t.Fatalf("嵌套 WHERE 错误: affected=%d err=%v", affected, err)
+	}
+
+	sub := dao.Builder().Table("cross_dialect_scan").Select("id")
+	outer := dao.Builder().Table("cross_dialect_scan").WhereExists(sub)
+	sub.Where("id", "INVALID", 1)
+	if affected, err := outer.Delete(ctx); affected != 0 || !errors.Is(err, ErrInvalidOperator) {
+		t.Fatalf("挂入后子查询错误: affected=%d err=%v", affected, err)
+	}
+	if n, err := dao.Builder().Table("cross_dialect_scan").Count(ctx); err != nil || n != 2 {
+		t.Fatalf("子查询错误不得改数据: count=%d err=%v", n, err)
+	}
+}
+
+type crossDialectAggregateRow struct {
+	UserID int64   `db:"user_id"`
+	Total  float64 `db:"total"`
+}
+
+// crossDialectTestHavingTerminalQueries 验证 Count/Paginate/Exists 保留 HAVING 所需投影并返回正确分组结果。
+// MySQL/SQLite 使用 SELECT 别名锁死原缺陷；PostgreSQL 不支持 HAVING 引用同层别名，使用等价聚合表达式执行。
+func crossDialectTestHavingTerminalQueries(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	crossDialectDrop(t, dao, "cross_dialect_amounts")
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_amounts (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_amounts (id, user_id, amount) VALUES (1, 1, 10), (2, 1, 5), (3, 2, 3)`)
+
+	query := func(threshold int) *Builder {
+		b := dao.Builder().Table("cross_dialect_amounts").
+			Select("user_id").SelectRaw("SUM(amount) AS total").GroupBy("user_id")
+		if _, ok := dao.grammar.(*PostgresGrammar); ok {
+			return b.HavingRaw("SUM(amount) > ?", threshold)
+		}
+		return b.Having("total", ">", threshold)
+	}
+	if count, err := query(10).Count(ctx); err != nil || count != 1 {
+		t.Fatalf("HAVING Count: count=%d err=%v", count, err)
+	}
+	var rows []crossDialectAggregateRow
+	if total, err := query(10).OrderBy("user_id").Limit(10).Paginate(ctx, &rows); err != nil || total != 1 {
+		t.Fatalf("HAVING Paginate: total=%d rows=%#v err=%v", total, rows, err)
+	}
+	if len(rows) != 1 || rows[0].UserID != 1 || rows[0].Total != 15 {
+		t.Fatalf("HAVING Paginate 结果错误: %#v", rows)
+	}
+	if exists, err := query(10).Exists(ctx); err != nil || !exists {
+		t.Fatalf("HAVING Exists 命中: exists=%v err=%v", exists, err)
+	}
+	if exists, err := query(100).Exists(ctx); err != nil || exists {
+		t.Fatalf("HAVING Exists 未命中: exists=%v err=%v", exists, err)
+	}
+}
+
+// crossDialectTestUnionExistsProjection 验证 Exists 保留 UNION 主查询投影，
+// 两列 UNION 不会被改写为一列对两列而产生列数不一致。
+func crossDialectTestUnionExistsProjection(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	crossDialectSetupScanTable(t, dao)
+	union := dao.Builder().Table("cross_dialect_scan").Select("id", "name").Where("id", "=", 2)
+	exists, err := dao.Builder().Table("cross_dialect_scan").Select("id", "name").Where("id", "=", 1).Union(union).Exists(ctx)
+	if err != nil || !exists {
+		t.Fatalf("两列 UNION Exists: exists=%v err=%v", exists, err)
+	}
+}
+
+// crossDialectTestScalarGuards 验证基本 Where 拒绝需专用 API 的复合运算符，
+// 且标量聚合遇到 GROUP BY/HAVING 时返回明确错误而不执行不确定的首行语义。
+func crossDialectTestScalarGuards(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	crossDialectSetupScanTable(t, dao)
+	for _, op := range []string{"IN", "NOT IN", "BETWEEN", "NOT BETWEEN"} {
+		t.Run(strings.ReplaceAll(op, " ", "_"), func(t *testing.T) {
+			var rows []crossDialectItemRow
+			err := dao.Builder().Table("cross_dialect_scan").Where("id", op, []any{1, 2}).Find(ctx, &rows)
+			if !errors.Is(err, ErrInvalidOperator) {
+				t.Fatalf("基本 Where %s: %v", op, err)
+			}
+		})
+	}
+	for _, build := range []func() *Builder{
+		func() *Builder { return dao.Builder().Table("cross_dialect_scan").GroupBy("name") },
+		func() *Builder { return dao.Builder().Table("cross_dialect_scan").HavingRaw("COUNT(*) > 0") },
+	} {
+		if value, err := build().Max(ctx, "num"); value != 0 || !errors.Is(err, ErrAggregateGrouped) {
+			t.Fatalf("分组标量聚合: value=%v err=%v", value, err)
+		}
+	}
+}
+
+// crossDialectTestDeleteJoinSubBindingOrder 用两个带绑定的派生表 JOIN 与两个 ON 值条件
+// 真实执行 DeleteJoin，锁死各方言按 SQL 占位符位置重排绑定参数的规则。
+func crossDialectTestDeleteJoinSubBindingOrder(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	crossDialectDrop(t, dao, "cross_dialect_bind_src2", "cross_dialect_bind_src1", "cross_dialect_bind_users")
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_bind_users (id INTEGER PRIMARY KEY, name TEXT)`)
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_bind_src1 (user_id INTEGER, marker TEXT, filter_value TEXT)`)
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_bind_src2 (user_id INTEGER, marker TEXT, filter_value TEXT)`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_bind_users (id, name) VALUES (1, 'target')`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_bind_src1 (user_id, marker, filter_value) VALUES (1, 'on1', 'sub1')`)
+	crossDialectExec(t, dao, `INSERT INTO cross_dialect_bind_src2 (user_id, marker, filter_value) VALUES (1, 'on2', 'sub2')`)
+
+	sub1 := dao.Builder().Table("cross_dialect_bind_src1").Select("user_id", "marker").Where("filter_value", "=", "sub1")
+	sub2 := dao.Builder().Table("cross_dialect_bind_src2").Select("user_id", "marker").Where("filter_value", "=", "sub2")
+	affected, err := dao.Builder().Table("cross_dialect_bind_users").
+		JoinSub(sub1, "s1", func(j *JoinBuilder) {
+			j.On("s1.user_id", "=", "cross_dialect_bind_users.id").Where("s1.marker", "=", "on1")
+		}).
+		JoinSub(sub2, "s2", func(j *JoinBuilder) {
+			j.On("s2.user_id", "=", "cross_dialect_bind_users.id").Where("s2.marker", "=", "on2")
+		}).
+		Where("cross_dialect_bind_users.name", "=", "target").
+		DeleteJoin(ctx)
+	if err != nil || affected != 1 {
+		t.Fatalf("多 JoinSub DeleteJoin: affected=%d err=%v", affected, err)
+	}
+	if count, err := dao.Builder().Table("cross_dialect_bind_users").Count(ctx); err != nil || count != 0 {
+		t.Fatalf("多 JoinSub DeleteJoin 后应为空: count=%d err=%v", count, err)
+	}
+}
+
 // crossDialectTestNullSafeExpression 覆盖空安全比较传入 Expression 值时的内联编译分支。
 func crossDialectTestNullSafeExpression(t *testing.T, dao *DBDao) {
 	ctx := context.Background()

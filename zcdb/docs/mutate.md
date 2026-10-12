@@ -166,7 +166,7 @@ affected, err := db.Builder().Table("users").Where("id", "=", 1).
 // args: [100 1 1]
 ```
 
-extra 长度为奇数（不成对）或列名不是 string 时返回 `ErrIncrementColumns`。
+便捷方法的 extra 长度为奇数（不成对）或列名不是 string 时返回 `ErrIncrementColumns`；纯编译 `ToIncrement` / `ToDecrement` 的 columns、amounts 为空或长度不等时也返回该错误。
 
 ## Delete / DeleteJoin
 
@@ -175,6 +175,8 @@ affected, err := db.Builder().Table("users").Where("id", "=", 1).Delete(ctx)
 // SQL:  DELETE FROM `users` WHERE `id` = ?
 // args: [1]
 ```
+
+普通 `Delete` 不编译 JOIN；Builder 带 JOIN 时返回 `ErrDeleteWithJoin`，请改用 `DeleteJoin`。
 
 `DeleteJoin` 按关联条件删除主表行，三方言实现路径不同：
 
@@ -212,15 +214,18 @@ SQLite 特殊处理：`DELETE FROM` 不会重置 AUTOINCREMENT 序列，`Truncat
 
 `Update`、`Increment`、`Decrement`、`Delete`、`DeleteJoin` 在**无有效限定条件**时默认拒绝执行，防止误操作全表：
 
-| 操作 | 无 WHERE/JOIN 时的错误 |
-|---|---|
-| Update / Increment / Decrement | `ErrUpdateWithoutWhere` |
-| Delete / DeleteJoin | `ErrDeleteWithoutWhere` |
+| 操作 | 拒绝原因 | 错误 |
+|---|---|---|
+| Update / Increment / Decrement | 无有效 WHERE/JOIN | `ErrUpdateWithoutWhere` |
+| Delete / DeleteJoin | 无有效 WHERE/JOIN | `ErrDeleteWithoutWhere` |
+| Delete | Builder 带 JOIN（无论是否有 WHERE/Force） | `ErrDeleteWithJoin` |
 
 "有效限定"的判定规则：
 
-- 存在至少一个 WHERE 条件（空嵌套回调不算，防止绕过保护）；
-- 或存在**带 ON 条件**的 JOIN（无条件 JOIN 产生笛卡尔积，不视为限定）。
+- WHERE 条件整体能静态收窄范围：按 SQL 优先级（AND 先于 OR）把条件归约为恒真/恒假/依赖行数据，只有"依赖行数据"或"恒假"计为有效。空嵌套回调与空 `WhereRaw` 编译时被跳过，不计入；空列表 `WhereNotIn`（编译为 `1 = 1`）以及子查询无有效条件的 `WhereExists`/`WhereNotExists` 不按行收窄，计为恒真，因此 `WhereNotIn("id", []any{})` 单独使用或普通条件与空 `WhereNotIn` 形成的 OR 恒真组合都会被拒绝；空列表 `WhereIn`（`0 = 1`）计为恒假，放行但不影响任何行；
+- 或存在**带 ON 条件**的 JOIN（无条件 JOIN 产生笛卡尔积，不视为限定）。该规则只适用于 `Update`/`Increment`/`Decrement`/`DeleteJoin`，它们会真实编译 JOIN。
+
+普通 `Delete` / `ToDelete` 不编译 JOIN：只要 Builder 带有 JOIN 就返回 `ErrDeleteWithJoin`（`Force()` 也不放行），避免 JOIN 限定被静默丢弃后变成全表删除；按关联删除请使用 `DeleteJoin`。
 
 确需全表更新/删除时显式调用 `Force()`：
 

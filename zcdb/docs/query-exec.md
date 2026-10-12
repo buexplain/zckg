@@ -59,12 +59,12 @@ exists, err := db.Builder().Table("users").Where("email", "=", "a@t.com").Exists
 // args: [a@t.com]
 ```
 
-- `Count`：包含 UNION / GROUP BY / DISTINCT 时自动包裹子查询计数，保留分组/去重语义（见[编译文档](compile.md)的 ToCount）；
-- `Exists`：走 `SELECT 1 ... LIMIT 1`，命中首行即返回，大表存在性检查显著快于 `Count`。
+- `Count`：包含 UNION / GROUP BY / HAVING / DISTINCT 时自动包裹子查询计数，保留分组、HAVING 筛选与去重语义（见[编译文档](compile.md)的 ToCount）；
+- `Exists`：普通查询走 `SELECT 1 ... LIMIT 1`；UNION/HAVING 保留原投影并整体包裹，避免 UNION 列数失配或丢失 HAVING 别名。命中首行即返回。
 
 ## Max / Min / Sum / Avg
 
-聚合方法返回 `float64`，生成 `SELECT AGG(col) AS aggregate FROM ...`：
+聚合方法返回单个 `float64`，生成 `SELECT AGG(col) AS aggregate FROM ...`。带 GROUP BY/HAVING 时返回 `ErrAggregateGrouped`，请改用 `Select` + `Find` 接收多组结果：
 
 ```go
 maxAge, err := db.Builder().Table("users").Max(ctx, "age")

@@ -92,10 +92,10 @@ func mysqlCommentCompileExpected() map[string]commentCompileExpected {
 		"truncate":            {"TRUNCATE TABLE `users`", nil},
 		"count":               {"SELECT COUNT(*) FROM `users` WHERE `id` = ?", []any{7}},
 		"count_union":         {"SELECT COUNT(*) FROM ((SELECT `name` FROM `users` WHERE `id` = ?) UNION (SELECT `name` FROM `admins` WHERE `rank` > ?)) AS `t`", []any{7, 9}},
-		"count_group":         {"SELECT COUNT(*) FROM (SELECT 1 FROM `users` WHERE `id` = ? GROUP BY `name` HAVING COUNT(*) > ?) AS `t`", []any{7, 2}},
+		"count_group":         {"SELECT COUNT(*) FROM (SELECT `name` FROM `users` WHERE `id` = ? GROUP BY `name` HAVING COUNT(*) > ?) AS `t`", []any{7, 2}},
 		"count_distinct":      {"SELECT COUNT(*) FROM (SELECT DISTINCT `name` FROM `users` WHERE `id` = ?) AS `t`", []any{7}},
 		"exists":              {"SELECT 1 FROM `users` WHERE `id` = ? LIMIT 1", []any{7}},
-		"exists_union":        {"SELECT 1 FROM ((SELECT 1 FROM `users` WHERE `id` = ?) UNION (SELECT `name` FROM `admins` WHERE `rank` > ?)) AS `t` LIMIT 1", []any{7, 9}},
+		"exists_union":        {"SELECT 1 FROM ((SELECT `name` FROM `users` WHERE `id` = ?) UNION (SELECT `name` FROM `admins` WHERE `rank` > ?)) AS `t` LIMIT 1", []any{7, 9}},
 		"aggregate":           {"SELECT SUM(`age`) AS `aggregate` FROM `users` WHERE `id` = ?", []any{7}},
 		"aggregate_union":     {"SELECT MAX(`name`) AS `aggregate` FROM ((SELECT `name` FROM `users` WHERE `id` = ?) UNION (SELECT `name` FROM `admins` WHERE `rank` > ?)) AS `t`", []any{7, 9}},
 		"increment":           {"UPDATE `users` INNER JOIN `profiles` ON `users`.`id` = `profiles`.`user_id` AND `profiles`.`active` = ? SET `wallet` = `wallet` + ?, `level` = `level` + ? WHERE `id` = ?", []any{99, 100, 2, 7}},
@@ -174,6 +174,9 @@ func TestMySQLCompile_SQLCommentTransientState(t *testing.T) {
 						want := mysqlCommentCompileExpected()[branch]
 						if branch == "count_distinct" {
 							want = commentCompileExpected{"SELECT COUNT(*) FROM (SELECT DISTINCT `name`, (SELECT `name` FROM `source` WHERE `score` > ?) AS `picked` FROM `users` WHERE `id` = ?) AS `t`", []any{11, 7}}
+						}
+						if branch == "count_group" {
+							want = commentCompileExpected{"SELECT COUNT(*) FROM (SELECT `name`, (SELECT `name` FROM `source` WHERE `score` > ?) AS `picked` FROM `users` WHERE `id` = ? GROUP BY `name` HAVING COUNT(*) > ?) AS `t`", []any{11, 7, 2}}
 						}
 						sql, args, err = tc.compile(b)
 						assertCommentCompileResult(t, commentCompileExpected{want.sql + " /* state:query */", want.args}, sql, args, err)
