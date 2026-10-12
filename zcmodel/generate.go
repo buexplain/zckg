@@ -17,7 +17,7 @@ import (
 // 处理流程：
 //  1. 校验数据库方言、表名（防路径穿越）、表名推导的结构体名（须为导出标识符）、输出文件名
 //     （Input.FileName 或表名，不得触发 Go 文件名构建规则）、列映射 tag 名和 JSON tag 命名风格；
-//  2. 复制列信息（nil 列报错），为副本中未显式指定的字段补充字段名（toPascalCase）、字段类型（formatStructFieldType）
+//  2. 复制列信息（nil 列报错），为副本中未显式指定的字段补充字段名（ToPascalCase）、字段类型（formatStructFieldType）
 //     和 JSON tag 值（formatJSONTag），不改动调用方传入的数据；
 //  3. 检测转换后字段名为空/非法标识符/未导出/与生成方法 ToDO、ToEntity 同名/重复的列并报错，
 //     避免产出无法编译或无法映射的代码；
@@ -37,7 +37,7 @@ func Generate(input Input) error {
 		return err
 	}
 	// 结构体名由表名推导，前置校验其为合法的导出标识符（如 public.users、_2fa、_用户 均不满足）
-	baseName := toPascalCase(input.TableName)
+	baseName := ToPascalCase(input.TableName)
 	if !token.IsIdentifier(baseName) || !token.IsExported(baseName) {
 		return fmt.Errorf("表名 %s 推导出的结构体名前缀 %q 不是合法的导出 Go 标识符", input.TableName, baseName)
 	}
@@ -72,7 +72,7 @@ func Generate(input Input) error {
 	// 处理结构体字段名字和类型
 	for i := range columns {
 		if columns[i].StructFieldInfo.Name == "" {
-			columns[i].StructFieldInfo.Name = toPascalCase(columns[i].Name)
+			columns[i].StructFieldInfo.Name = ToPascalCase(columns[i].Name)
 		}
 		if columns[i].StructFieldInfo.Type == "" {
 			columns[i].StructFieldInfo.Type = formatStructFieldType(input.Dialect, columns[i].Type)

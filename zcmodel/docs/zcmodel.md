@@ -25,7 +25,7 @@ zcmodel/
 ├── input.go                # 对外数据结构：Input、Column、StructFieldInfo、IndexInfo、NameCase、Dialect
 ├── generate.go             # 入口 Generate：校验、补全字段信息、组装生成代码并写文件
 ├── build.go                # 代码拼装：结构体/方法字符串生成、AST 增量写文件（writeOrReplaceStruct）
-├── toCase.go               # 命名风格转换：splitWords、toPascalCase、formatJSONTag 等
+├── toCase.go               # 命名风格转换：SplitWords、ToPascalCase、formatJSONTag 等
 ├── columnTypeToGoType.go   # 列类型归一化与方言类型映射表
 ├── *_test.go               # 单元测试与集成测试（集成测试对接真实 MySQL/PostgreSQL/SQLite）
 └── docs/
@@ -44,7 +44,7 @@ zcmodel/
       ② 校验表名（防路径穿越与非法标识符）
          ├─ 拒绝空名、"." / ".."、路径分隔符（/、\）与 Windows 非法字符（<>:"|?*）
          ├─ 首字符须为 ASCII 字母或下划线
-         └─ 推导出的结构体名前缀（toPascalCase(TableName)）须为导出 Go 标识符
+         └─ 推导出的结构体名前缀（ToPascalCase(TableName)）须为导出 Go 标识符
             （拒绝 public.users、user$x、_2fa、_用户 等）
                                  │
       ③ 确定输出文件名（Input.FileName，空则取 TableName）
@@ -56,7 +56,7 @@ zcmodel/
       ⑤ 补全每列的 StructFieldInfo（只作用于副本，不修改调用方数据；Columns 含 nil 报错）
          ├─ 校验 JsonTagValueCase（非空且非法 → 报错）
          ├─ JsonTagValue 为空且 JsonTagValueCase 非空 → formatJSONTag（按 NameCase 转换）
-         ├─ Name 为空        → toPascalCase（列名转 PascalCase）
+         ├─ Name 为空        → ToPascalCase（列名转 PascalCase）
          ├─ Type 为空        → formatStructFieldType（方言映射，未命中兜底 string）
          └─ Type 为 time.Time 且 Import 为空 → Import = "time"
                                  │
@@ -100,7 +100,7 @@ func Generate(input Input) error
 | `表名非法: xxx` | `TableName` 为 `.` 或 `..` |
 | `表名包含非法字符: xxx` | `TableName` 含路径分隔符（`/`、`\`）或 Windows 非法文件名字符（`< > : " | ? *`） |
 | `表名首字符必须为 ASCII 字母或下划线: xxx` | `TableName` 首字符为数字或非 ASCII 字符（如中文表名），会推导出无法编译的结构体名 |
-| `表名 xxx 推导出的结构体名前缀 xxx 不是合法的导出 Go 标识符` | 首字符合法但 `toPascalCase(TableName)` 不是导出标识符：含 `.`（如 schema 限定名 `public.users`）、含 `$`（如 `user$x`）、下划线后接数字（`_2fa` → `2fa`）或中文（`_用户` → `用户`，未导出） |
+| `表名 xxx 推导出的结构体名前缀 xxx 不是合法的导出 Go 标识符` | 首字符合法但 `ToPascalCase(TableName)` 不是导出标识符：含 `.`（如 schema 限定名 `public.users`）、含 `$`（如 `user$x`）、下划线后接数字（`_2fa` → `2fa`）或中文（`_用户` → `用户`，未导出） |
 | `表名 xxx 用作文件名 xxx.go 会触发 Go 文件名规则（原因），请通过 Input.FileName 指定文件名` | `FileName` 为空且表名会触发 Go 文件名构建规则：`_` 开头（被 go 工具忽略）、`_test` 后缀（成为测试文件）、`_GOOS` / `_GOARCH` / `_GOOS_GOARCH` 后缀（如 `order_linux`，成为平台构建约束）。以 `.` 开头的表名在此前已被「表名首字符」校验拒绝，不进入本分支 |
 | `文件名非法: xxx` | 显式 `FileName` 为 `.` 或 `..` |
 | `文件名包含非法字符: xxx` | 显式 `FileName` 含路径分隔符或 Windows 非法文件名字符 |
@@ -109,7 +109,7 @@ func Generate(input Input) error
 | `列映射 tag 名非法: xxx` | `ColumnTagName` 非空且含空格/控制字符、`:`、`"`、反引号或 DEL，不能作为 struct tag 的 key |
 | `列[n] 为 nil` | `Columns` 的第 n 个元素（下标从 0 起）为 nil |
 | `不支持的 json tag 命名风格: xxx` | `JsonTagValueCase` 非空但不是合法的 `NameCase` 枚举值 |
-| `列 xxx 转换后的字段名为空` | 列名经 `toPascalCase` 转换后为空（如纯分隔符列名） |
+| `列 xxx 转换后的字段名为空` | 列名经 `ToPascalCase` 转换后为空（如纯分隔符列名） |
 | `列 xxx 转换后的字段名 xxx 不是合法的 Go 标识符` | 转换后字段名数字开头等（如列名 `2fa_code`）；请在 `StructFieldInfo.Name` 显式指定合法名称 |
 | `列 xxx 转换后的字段名 xxx 不是导出标识符（首字符须为大写字母），请通过 StructFieldInfo.Name 指定导出名` | 字段名首字符不是大写字母（如中文列名 `用户名`、显式指定的 `_`）：未导出字段会被 json 与 zcdb 映射静默跳过，`_` 也无法在互转方法中引用 |
 | `列 xxx 转换后的字段名 xxx 与生成方法同名，请通过 StructFieldInfo.Name 改名` | 字段名为 `ToDO` 或 `ToEntity`（如列名 `to_entity`、`to_d_o`），与生成的互转方法冲突，无法编译 |
@@ -151,7 +151,7 @@ type Column struct {
 }
 
 type StructFieldInfo struct {
-    Name         string // 结构体字段名；留空则由列名自动推导（toPascalCase）
+    Name         string // 结构体字段名；留空则由列名自动推导（ToPascalCase）
     Type         string // 结构体字段类型；留空则由列类型自动映射（未命中兜底 string）
     Import       string // Type 对应的 import 路径（如 time.Time 需 "time"）；留空不引入包
     JsonTagValue string // json tag 的值；留空时按 JsonTagValueCase 自动推导
@@ -376,7 +376,9 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 
 ## 命名转换规则
 
-### splitWords：任意风格拆词
+`toCase.go` 中的命名转换函数均为导出 API，可直接复用：`SplitWords`、`ToPascalCase`、`ToLowerCamel`、`ToUpperCamel`、`ToLowerSnake`、`ToUpperSnake`、`ToLowerKebab`、`ToUpperKebab`。其中除 `SplitWords`、`ToPascalCase` 接收字符串外，其余六个接收 `SplitWords` 的单词列表并拼接为对应风格。
+
+### SplitWords：任意风格拆词
 
 拆词是全部命名转换的基础，规则：
 
@@ -384,7 +386,7 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 - 小写 → 大写转换处拆分（`userName` → `user | Name`）；
 - 连续大写后接小写时，在最后一个大写前拆分（`HTTPServer` → `HTTP | Server`）。
 
-### toPascalCase：结构体名 / 字段名
+### ToPascalCase：结构体名 / 字段名
 
 任意风格输入统一转为 PascalCase（每个单词仅首字母大写，其余转小写），唯一特例是单词 `id`（不区分大小写）统一转为 `ID`：
 
@@ -582,7 +584,7 @@ columns := []*zcmodel.Column{
 ## 注意事项
 
 1. **输出目录名即包名（仅新建文件）**：新建生成文件时，`OutputDir` 绝对路径的最后一级目录名被用作 `package` 名（相对路径 `.` 解析为当前目录的实际名称），请保证它是合法的 Go 包名（如 `model`），位于根目录等无法推导时回退为 `main`；`OutputDir` 不得为空（返回「输出目录为空」）；存量文件再生成时尊重原 package 声明，不受目录名影响。
-2. **表名与文件名经主动校验**：输出文件名默认为 `{TableName}.go`（不做大小写转换），可用 `Input.FileName` 覆盖；`Generate` 会主动校验——拒绝空表名、`.` / `..`、路径分隔符与 Windows 非法文件名字符，首字符必须为 ASCII 字母或下划线，且表名经 `toPascalCase` 推导出的结构体名前缀必须是合法的导出 Go 标识符（拒绝 `public.users`、`_2fa` 等）；文件名还不得触发 Go 文件名规则（`_` / `.` 开头被 go 工具忽略、`_test` 后缀被当作测试文件、`_linux` / `_amd64` 等后缀被当作平台构建约束），表名触发时请通过 `FileName` 另行指定。非法时返回明确错误（而非依赖操作系统或编译器报错）。
+2. **表名与文件名经主动校验**：输出文件名默认为 `{TableName}.go`（不做大小写转换），可用 `Input.FileName` 覆盖；`Generate` 会主动校验——拒绝空表名、`.` / `..`、路径分隔符与 Windows 非法文件名字符，首字符必须为 ASCII 字母或下划线，且表名经 `ToPascalCase` 推导出的结构体名前缀必须是合法的导出 Go 标识符（拒绝 `public.users`、`_2fa` 等）；文件名还不得触发 Go 文件名规则（`_` / `.` 开头被 go 工具忽略、`_test` 后缀被当作测试文件、`_linux` / `_amd64` 等后缀被当作平台构建约束），表名触发时请通过 `FileName` 另行指定。非法时返回明确错误（而非依赖操作系统或编译器报错）。
 3. **未知列类型兜底为 string**：映射表未覆盖的列类型（如 PG 的自定义类型）默认映射为 `string`，避免生成非法代码；需要精确类型时请显式指定 `StructFieldInfo.Type` 与 `Import`。
 4. **MySQL 的 BOOL 实际是 TINYINT(1)**：从真实 MySQL 读到的 BOOL/BOOLEAN 列，其存储类型为 `tinyint`，映射结果为 `int` 而非 `bool`。
 5. **SQLite 不支持字段注释**：SQLite 元数据中没有列注释，通过 zcdb Schema 读取时 `Comment` 恒为空，因此生成的 `description` tag 也恒为空；若手工构造 SQLite 方言的列并填写 `Comment`，仍会正常生成该 tag。

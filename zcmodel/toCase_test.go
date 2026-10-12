@@ -31,7 +31,7 @@ func TestFormatJSONTag(t *testing.T) {
 	}
 }
 
-// TestToPascalCase 验证 toPascalCase 对多种输入风格转换为 PascalCase，单词 id 统一转为 ID
+// TestToPascalCase 验证 ToPascalCase 对多种输入风格转换为 PascalCase，单词 id 统一转为 ID
 func TestToPascalCase(t *testing.T) {
 	tests := []struct {
 		name string
@@ -53,8 +53,8 @@ func TestToPascalCase(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := toPascalCase(tt.in); got != tt.want {
-				t.Errorf("toPascalCase(%q) = %q, want %q", tt.in, got, tt.want)
+			if got := ToPascalCase(tt.in); got != tt.want {
+				t.Errorf("ToPascalCase(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -86,7 +86,7 @@ func TestLowerFirst(t *testing.T) {
 	}
 }
 
-// TestSplitWords 验证 splitWords 的拆分规则：分隔符、小写到大写边界、连续大写后接小写边界
+// TestSplitWords 验证 SplitWords 的拆分规则：分隔符、小写到大写边界、连续大写后接小写边界
 func TestSplitWords(t *testing.T) {
 	tests := []struct {
 		name string
@@ -107,8 +107,8 @@ func TestSplitWords(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := splitWords(tt.in); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("splitWords(%q) = %v, want %v", tt.in, got, tt.want)
+			if got := SplitWords(tt.in); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("SplitWords(%q) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -121,20 +121,20 @@ func TestToCase_各命名风格(t *testing.T) {
 		fn   func() string
 		want string
 	}{
-		{"toLowerCamel", func() string { return toLowerCamel([]string{"user", "id"}) }, "userId"},
-		{"toLowerCamel_首单词全小写", func() string { return toLowerCamel([]string{"User", "ID"}) }, "userId"},
-		{"toLowerCamel_单单词", func() string { return toLowerCamel([]string{"ID"}) }, "id"},
-		{"toLowerCamel_空列表", func() string { return toLowerCamel(nil) }, ""},
-		{"toUpperCamel", func() string { return toUpperCamel([]string{"user", "id"}) }, "UserId"},
-		{"toUpperCamel_空列表", func() string { return toUpperCamel(nil) }, ""},
-		{"toLowerSnake", func() string { return toLowerSnake([]string{"user", "ID"}) }, "user_id"},
-		{"toLowerSnake_空列表", func() string { return toLowerSnake(nil) }, ""},
-		{"toUpperSnake", func() string { return toUpperSnake([]string{"user", "id"}) }, "USER_ID"},
-		{"toUpperSnake_空列表", func() string { return toUpperSnake(nil) }, ""},
-		{"toLowerKebab", func() string { return toLowerKebab([]string{"user", "id"}) }, "user-id"},
-		{"toLowerKebab_空列表", func() string { return toLowerKebab(nil) }, ""},
-		{"toUpperKebab", func() string { return toUpperKebab([]string{"user", "id"}) }, "USER-ID"},
-		{"toUpperKebab_空列表", func() string { return toUpperKebab(nil) }, ""},
+		{"ToLowerCamel", func() string { return ToLowerCamel([]string{"user", "id"}) }, "userId"},
+		{"ToLowerCamel_首单词全小写", func() string { return ToLowerCamel([]string{"User", "ID"}) }, "userId"},
+		{"ToLowerCamel_单单词", func() string { return ToLowerCamel([]string{"ID"}) }, "id"},
+		{"ToLowerCamel_空列表", func() string { return ToLowerCamel(nil) }, ""},
+		{"ToUpperCamel", func() string { return ToUpperCamel([]string{"user", "id"}) }, "UserId"},
+		{"ToUpperCamel_空列表", func() string { return ToUpperCamel(nil) }, ""},
+		{"ToLowerSnake", func() string { return ToLowerSnake([]string{"user", "ID"}) }, "user_id"},
+		{"ToLowerSnake_空列表", func() string { return ToLowerSnake(nil) }, ""},
+		{"ToUpperSnake", func() string { return ToUpperSnake([]string{"user", "id"}) }, "USER_ID"},
+		{"ToUpperSnake_空列表", func() string { return ToUpperSnake(nil) }, ""},
+		{"ToLowerKebab", func() string { return ToLowerKebab([]string{"user", "id"}) }, "user-id"},
+		{"ToLowerKebab_空列表", func() string { return ToLowerKebab(nil) }, ""},
+		{"ToUpperKebab", func() string { return ToUpperKebab([]string{"user", "id"}) }, "USER-ID"},
+		{"ToUpperKebab_空列表", func() string { return ToUpperKebab(nil) }, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -146,7 +146,7 @@ func TestToCase_各命名风格(t *testing.T) {
 }
 
 // TestToCase_EmptyWordSkipped 验证各命名风格转换函数对单词列表中的空串元素按跳过处理
-// （覆盖 toPascalCase/toLowerCamel/toUpperCamel/toLowerSnake/toUpperSnake/toLowerKebab/toUpperKebab
+// （覆盖 ToPascalCase/ToLowerCamel/ToUpperCamel/ToLowerSnake/ToUpperSnake/ToLowerKebab/ToUpperKebab
 // 内部的 w == "" continue 防御分支）。
 func TestToCase_EmptyWordSkipped(t *testing.T) {
 	emptyWord := []string{"user", "", "id"}
@@ -157,15 +157,15 @@ func TestToCase_EmptyWordSkipped(t *testing.T) {
 		fn   func() string
 		want string
 	}{
-		{"toPascalCase_空单词", func() string { return toPascalCase("user__id") }, "UserID"},
-		{"toLowerCamel_空单词", func() string { return toLowerCamel(emptyWord) }, "userId"},
-		{"toLowerCamel_前导空", func() string { return toLowerCamel(leadingEmpty) }, "User"},
-		{"toUpperCamel_空单词", func() string { return toUpperCamel(emptyWord) }, "UserId"},
-		{"toUpperCamel_前导空", func() string { return toUpperCamel(leadingEmpty) }, "User"},
-		{"toLowerSnake_空单词", func() string { return toLowerSnake(emptyWord) }, "user_id"},
-		{"toUpperSnake_空单词", func() string { return toUpperSnake(emptyWord) }, "USER_ID"},
-		{"toLowerKebab_空单词", func() string { return toLowerKebab(emptyWord) }, "user-id"},
-		{"toUpperKebab_空单词", func() string { return toUpperKebab(emptyWord) }, "USER-ID"},
+		{"ToPascalCase_空单词", func() string { return ToPascalCase("user__id") }, "UserID"},
+		{"ToLowerCamel_空单词", func() string { return ToLowerCamel(emptyWord) }, "userId"},
+		{"ToLowerCamel_前导空", func() string { return ToLowerCamel(leadingEmpty) }, "User"},
+		{"ToUpperCamel_空单词", func() string { return ToUpperCamel(emptyWord) }, "UserId"},
+		{"ToUpperCamel_前导空", func() string { return ToUpperCamel(leadingEmpty) }, "User"},
+		{"ToLowerSnake_空单词", func() string { return ToLowerSnake(emptyWord) }, "user_id"},
+		{"ToUpperSnake_空单词", func() string { return ToUpperSnake(emptyWord) }, "USER_ID"},
+		{"ToLowerKebab_空单词", func() string { return ToLowerKebab(emptyWord) }, "user-id"},
+		{"ToUpperKebab_空单词", func() string { return ToUpperKebab(emptyWord) }, "USER-ID"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

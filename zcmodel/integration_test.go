@@ -588,10 +588,10 @@ func generateAndVerify(t *testing.T, dao *zcdb.DBDao, dialect Dialect, database 
 }
 
 // fieldNameOf 将列名 c_tinyint 转换为生成的字段名 CTinyint。
-// 直接委托被测的 toPascalCase，避免 helper 自行实现一套命名规则后与实现分叉
+// 直接委托被测的 ToPascalCase，避免 helper 自行实现一套命名规则后与实现分叉
 // （如 id → ID 的特例、连字符/驼峰混合输入）。
 func fieldNameOf(colName string) string {
-	return toPascalCase(colName)
+	return ToPascalCase(colName)
 }
 
 // ==================== §3.4 样板：真实元数据一键生成 ====================

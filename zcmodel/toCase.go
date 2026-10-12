@@ -9,30 +9,30 @@ import (
 // formatJSONTag 根据列名和命名风格生成 JSON tag 的值
 // 支持的风格：lowerCamel、upperCamel、lowerSnake、upperSnake、lowerKebab、upperKebab
 func formatJSONTag(colName string, jsonTagValueCase NameCase) string {
-	words := splitWords(colName)
+	words := SplitWords(colName)
 	switch jsonTagValueCase {
 	case NameCaseLowerCamel:
-		return toLowerCamel(words)
+		return ToLowerCamel(words)
 	case NameCaseUpperCamel:
-		return toUpperCamel(words)
+		return ToUpperCamel(words)
 	case NameCaseLowerSnake:
-		return toLowerSnake(words)
+		return ToLowerSnake(words)
 	case NameCaseUpperSnake:
-		return toUpperSnake(words)
+		return ToUpperSnake(words)
 	case NameCaseLowerKebab:
-		return toLowerKebab(words)
+		return ToLowerKebab(words)
 	case NameCaseUpperKebab:
-		return toUpperKebab(words)
+		return ToUpperKebab(words)
 	default:
 		return ""
 	}
 }
 
-// toPascalCase 将任意风格的名称（表名/列名）转换为 Go 规范的 PascalCase 风格，
+// ToPascalCase 将任意风格的名称（表名/列名）转换为 Go 规范的 PascalCase 风格，
 // 单词 "id"（不区分大小写）统一转换为 "ID"。
 // 支持的输入风格包括：snake_case、camelCase、PascalCase、kebab-case、UPPER_SNAKE 等混合风格。
-func toPascalCase(s string) string {
-	words := splitWords(s)
+func ToPascalCase(s string) string {
+	words := SplitWords(s)
 	var buf bytes.Buffer
 	for _, w := range words {
 		if w == "" {
@@ -50,8 +50,8 @@ func toPascalCase(s string) string {
 	return buf.String()
 }
 
-// toLowerCamel 将单词列表转换为 lowerCamel 风格，如 getUserById
-func toLowerCamel(words []string) string {
+// ToLowerCamel 将单词列表转换为 lowerCamel 风格，如 getUserById
+func ToLowerCamel(words []string) string {
 	if len(words) == 0 {
 		return ""
 	}
@@ -72,8 +72,8 @@ func toLowerCamel(words []string) string {
 	return buf.String()
 }
 
-// toUpperCamel 将单词列表转换为 UpperCamel（PascalCase）风格，如 GetUserById
-func toUpperCamel(words []string) string {
+// ToUpperCamel 将单词列表转换为 UpperCamel（PascalCase）风格，如 GetUserById
+func ToUpperCamel(words []string) string {
 	var buf bytes.Buffer
 	for _, w := range words {
 		if w == "" {
@@ -87,8 +87,8 @@ func toUpperCamel(words []string) string {
 	return buf.String()
 }
 
-// toLowerSnake 将单词列表转换为 lower_snake 风格，如 user_id
-func toLowerSnake(words []string) string {
+// ToLowerSnake 将单词列表转换为 lower_snake 风格，如 user_id
+func ToLowerSnake(words []string) string {
 	parts := make([]string, 0, len(words))
 	for _, w := range words {
 		if w == "" {
@@ -99,8 +99,8 @@ func toLowerSnake(words []string) string {
 	return strings.Join(parts, "_")
 }
 
-// toUpperSnake 将单词列表转换为 UPPER_SNAKE 风格，如 USER_ID
-func toUpperSnake(words []string) string {
+// ToUpperSnake 将单词列表转换为 UPPER_SNAKE 风格，如 USER_ID
+func ToUpperSnake(words []string) string {
 	parts := make([]string, 0, len(words))
 	for _, w := range words {
 		if w == "" {
@@ -111,8 +111,8 @@ func toUpperSnake(words []string) string {
 	return strings.Join(parts, "_")
 }
 
-// toLowerKebab 将单词列表转换为 lower-kebab 风格，如 user-id
-func toLowerKebab(words []string) string {
+// ToLowerKebab 将单词列表转换为 lower-kebab 风格，如 user-id
+func ToLowerKebab(words []string) string {
 	parts := make([]string, 0, len(words))
 	for _, w := range words {
 		if w == "" {
@@ -123,8 +123,8 @@ func toLowerKebab(words []string) string {
 	return strings.Join(parts, "-")
 }
 
-// toUpperKebab 将单词列表转换为 UPPER-KEBAB 风格，如 USER-ID
-func toUpperKebab(words []string) string {
+// ToUpperKebab 将单词列表转换为 UPPER-KEBAB 风格，如 USER-ID
+func ToUpperKebab(words []string) string {
 	parts := make([]string, 0, len(words))
 	for _, w := range words {
 		if w == "" {
@@ -146,13 +146,13 @@ func lowerFirst(s string) string {
 	return string(runes)
 }
 
-// splitWords 将任意风格的字符串拆分为单词列表。
+// SplitWords 将任意风格的字符串拆分为单词列表。
 // 支持的输入风格包括：snake_case、camelCase、PascalCase、kebab-case、UPPER_SNAKE 等混合风格。
 // 拆分规则：
 //   - 下划线 (_)、连字符 (-) 和空格作为分隔符
 //   - 小写→大写转换处拆分（如 userName → user | Name）
 //   - 连续大写后接小写时，在最后一个大写前拆分（如 HTTPServer → HTTP | Server）
-func splitWords(s string) []string {
+func SplitWords(s string) []string {
 	if s == "" {
 		return nil
 	}
