@@ -1,6 +1,7 @@
 package zcdb
 
 import (
+	"context"
 	"testing"
 )
 
@@ -63,5 +64,63 @@ func TestNewSchemaInspector_Unsupported(t *testing.T) {
 	_, err := NewSchemaInspector(dao)
 	if err == nil {
 		t.Error("expected error for nil grammar, got nil")
+	}
+}
+
+// brokenQueryDAO 构造可完成建连、但连接池已关闭的 DAO：任何 Query/Exec 返回
+// "sql: database is closed"。用于覆盖元数据查询在连接不可用时的失败分支——
+// 数据库健康时这些分支无法触达。
+func brokenQueryDAO(t *testing.T, dialect string) *DBDao {
+	t.Helper()
+	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:", MaxOpenConns: 1})
+	if err != nil {
+		t.Fatalf("建连失败: %v", err)
+	}
+	dao, err := NewDBDao(pool, dialect, nil, "", "")
+	if err != nil {
+		t.Fatalf("创建 DAO 失败: %v", err)
+	}
+	if err := pool.Close(); err != nil {
+		t.Fatalf("关闭连接池失败: %v", err)
+	}
+	return dao
+}
+
+// TestSchemaInspector_ClosedPoolQueryErrors 验证三方言的 Tables/Columns/Indexes
+// 在连接不可用时如实上报查询错误（查询失败分支）。
+func TestSchemaInspector_ClosedPoolQueryErrors(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		s    SchemaInspector
+	}{
+		{"mysql", &MySQLSchemaInspector{dao: brokenQueryDAO(t, "mysql")}},
+		{"postgres", &PostgresSchemaInspector{dao: brokenQueryDAO(t, "postgres")}},
+		{"sqlite", &SQLiteSchemaInspector{dao: brokenQueryDAO(t, "sqlite")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.s.Tables(ctx); err == nil {
+				t.Error("Tables 在连接不可用时应上报查询错误")
+			}
+			if _, err := tc.s.Columns(ctx, "users"); err == nil {
+				t.Error("Columns 在连接不可用时应上报查询错误")
+			}
+			if _, err := tc.s.Indexes(ctx, "users"); err == nil {
+				t.Error("Indexes 在连接不可用时应上报查询错误")
+			}
+		})
+	}
+}
+
+// TestSQLiteSchemaInspector_IndexHelperQueryErrors 覆盖 PRAGMA 子查询 helper 的查询失败分支：
+// Indexes 在 sqlitePrimaryIndex 失败时即短路，两个 helper 需单独驱动。
+func TestSQLiteSchemaInspector_IndexHelperQueryErrors(t *testing.T) {
+	ctx := context.Background()
+	s := &SQLiteSchemaInspector{dao: brokenQueryDAO(t, "sqlite")}
+	if _, err := s.sqliteIndexList(ctx, `"users"`); err == nil {
+		t.Error("sqliteIndexList 在连接不可用时应上报查询错误")
+	}
+	if _, err := s.sqliteIndexColumns(ctx, `"idx_users"`); err == nil {
+		t.Error("sqliteIndexColumns 在连接不可用时应上报查询错误")
 	}
 }

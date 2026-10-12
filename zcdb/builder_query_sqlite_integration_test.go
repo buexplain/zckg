@@ -680,3 +680,14 @@ func TestSQLiteInteg_NewApi_Aggregate(t *testing.T) {
 		t.Errorf("Min empty: expected sql.ErrNoRows, got %v", err)
 	}
 }
+
+// TestSQLiteInteg_AggregateScanError 验证聚合结果无法扫描为 float64 时如实上报错误：
+// users.name 为 TEXT，MAX(name) 返回文本，扫描进 sql.NullFloat64 失败（聚合 Scan 错误分支）。
+func TestSQLiteInteg_AggregateScanError(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	setupSQLiteUsersTable(t, db)
+
+	if _, err := db.Builder().Table("users").Max(context.Background(), "name"); err == nil {
+		t.Fatal("MAX(text) 结果无法转为 float64，应返回扫描错误")
+	}
+}

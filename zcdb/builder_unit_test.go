@@ -1704,6 +1704,148 @@ func TestBug_HasEffectiveWhere(t *testing.T) {
 	}
 }
 
+// TestBug_WhereTruthAndOr 以判定表锁定 andTruth/orTruth 的全部输入组合语义。
+// 二者是 hasEffectiveWhere 静态归约的原子算子：absent 为恒等元，
+// and 遇 false 得 false、遇 unknown 得 unknown；or 遇 true 得 true、否则 unknown，全 false 才 false。
+func TestBug_WhereTruthAndOr(t *testing.T) {
+	cases := []struct {
+		a, b    whereTruth
+		wantAnd whereTruth
+		wantOr  whereTruth
+		name    string
+	}{
+		{truthAbsent, truthAbsent, truthAbsent, truthAbsent, "absent/absent"},
+		{truthAbsent, truthTrue, truthTrue, truthTrue, "absent/true"},
+		{truthAbsent, truthFalse, truthFalse, truthFalse, "absent/false"},
+		{truthAbsent, truthUnknown, truthUnknown, truthUnknown, "absent/unknown"},
+		{truthTrue, truthAbsent, truthTrue, truthTrue, "true/absent"},
+		{truthTrue, truthTrue, truthTrue, truthTrue, "true/true"},
+		{truthTrue, truthFalse, truthFalse, truthTrue, "true/false"},
+		{truthTrue, truthUnknown, truthUnknown, truthTrue, "true/unknown"},
+		{truthFalse, truthAbsent, truthFalse, truthFalse, "false/absent"},
+		{truthFalse, truthTrue, truthFalse, truthTrue, "false/true"},
+		{truthFalse, truthFalse, truthFalse, truthFalse, "false/false"},
+		{truthFalse, truthUnknown, truthFalse, truthUnknown, "false/unknown"},
+		{truthUnknown, truthAbsent, truthUnknown, truthUnknown, "unknown/absent"},
+		{truthUnknown, truthTrue, truthUnknown, truthTrue, "unknown/true"},
+		{truthUnknown, truthFalse, truthFalse, truthUnknown, "unknown/false"},
+		{truthUnknown, truthUnknown, truthUnknown, truthUnknown, "unknown/unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := andTruth(tc.a, tc.b); got != tc.wantAnd {
+				t.Errorf("andTruth(%d,%d)=%d want %d", tc.a, tc.b, got, tc.wantAnd)
+			}
+			if got := orTruth(tc.a, tc.b); got != tc.wantOr {
+				t.Errorf("orTruth(%d,%d)=%d want %d", tc.a, tc.b, got, tc.wantOr)
+			}
+		})
+	}
+}
+
+// nestedBuilder 构造仅承载 wheres 的嵌套 Builder，供直接驱动真值求值函数。
+func nestedBuilder(wheres ...WhereClause) *Builder {
+	b := newTestBuilder(NewMySQLGrammar(), nil)
+	b.wheres = wheres
+	return b
+}
+
+// TestBug_EvalWhereClauseTruth 以判定表锁定单条 WhereClause 的真值归类，
+// 覆盖 Nested/Exists 的 Nested==nil 防御分支、NOT 取反的 true/false 互换，
+// 以及 Raw/In/NotIn 的恒真恒假特例。
+func TestBug_EvalWhereClauseTruth(t *testing.T) {
+	cases := []struct {
+		name string
+		w    WhereClause
+		want whereTruth
+	}{
+		{"basic", WhereClause{Type: WhereTypeBasic, Column: "a", Operator: "=", Value: 1, Boolean: "AND"}, truthUnknown},
+		{"nested_nil", WhereClause{Type: WhereTypeNested, Nested: nil}, truthAbsent},
+		{"nested_empty", WhereClause{Type: WhereTypeNested, Nested: nestedBuilder()}, truthAbsent},
+		{"nested_unknown", WhereClause{Type: WhereTypeNested, Nested: nestedBuilder(WhereClause{Type: WhereTypeBasic, Boolean: "AND"})}, truthUnknown},
+		{"nested_not_unknown", WhereClause{Type: WhereTypeNested, Nested: nestedBuilder(WhereClause{Type: WhereTypeBasic, Boolean: "AND"}), Not: true}, truthUnknown},
+		{"nested_not_absent", WhereClause{Type: WhereTypeNested, Nested: nestedBuilder(), Not: true}, truthAbsent},
+		{"nested_not_true", WhereClause{Type: WhereTypeNested, Nested: nestedBuilder(WhereClause{Type: WhereTypeNotIn, Boolean: "AND"}), Not: true}, truthFalse},
+		{"nested_not_false", WhereClause{Type: WhereTypeNested, Nested: nestedBuilder(WhereClause{Type: WhereTypeIn, Boolean: "AND"}), Not: true}, truthTrue},
+		{"exists_nil", WhereClause{Type: WhereTypeExists, Nested: nil}, truthAbsent},
+		{"exists_empty", WhereClause{Type: WhereTypeExists, Nested: nestedBuilder()}, truthTrue},
+		{"exists_unknown", WhereClause{Type: WhereTypeExists, Nested: nestedBuilder(WhereClause{Type: WhereTypeBasic, Boolean: "AND"})}, truthUnknown},
+		{"not_exists_empty", WhereClause{Type: WhereTypeNotExists, Nested: nestedBuilder()}, truthTrue},
+		{"raw_blank", WhereClause{Type: WhereTypeRaw, SQL: "   "}, truthAbsent},
+		{"raw_sql", WhereClause{Type: WhereTypeRaw, SQL: "1=1"}, truthUnknown},
+		{"in_empty", WhereClause{Type: WhereTypeIn}, truthFalse},
+		{"in_nonempty", WhereClause{Type: WhereTypeIn, Values: []any{1}}, truthUnknown},
+		{"not_in_empty", WhereClause{Type: WhereTypeNotIn}, truthTrue},
+		{"not_in_nonempty", WhereClause{Type: WhereTypeNotIn, Values: []any{1}}, truthUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := evalWhereClauseTruth(tc.w); got != tc.want {
+				t.Errorf("evalWhereClauseTruth(%+v)=%d want %d", tc.w, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBug_EvalWhereTruthChain 锁定平铺 AND/OR 链的归约顺序：
+// 先按 OR 切分 AND 链，再对链结果取 OR；absent 子句被跳过不参与归约。
+func TestBug_EvalWhereTruthChain(t *testing.T) {
+	unknown := WhereClause{Type: WhereTypeBasic, Boolean: "AND"}
+	falsy := WhereClause{Type: WhereTypeIn, Boolean: "AND"}
+	truthy := WhereClause{Type: WhereTypeNotIn, Boolean: "AND"}
+	absent := WhereClause{Type: WhereTypeRaw, SQL: ""}
+
+	cases := []struct {
+		name   string
+		wheres []WhereClause
+		want   whereTruth
+	}{
+		{"empty", nil, truthAbsent},
+		{"all_absent", []WhereClause{absent, absent}, truthAbsent},
+		{"single_unknown", []WhereClause{unknown}, truthUnknown},
+		{"and_unknown_falsy", []WhereClause{unknown, falsy}, truthFalse},
+		{"and_unknown_truthy", []WhereClause{unknown, truthy}, truthUnknown},
+		{"and_truthy_truthy", []WhereClause{truthy, truthy}, truthTrue},
+		{"chain_broken_by_or", []WhereClause{unknown, {Type: WhereTypeBasic, Boolean: "OR"}}, truthUnknown},
+		{"falsy_and_anything_true", []WhereClause{falsy, unknown, {Type: WhereTypeBasic, Boolean: "OR"}}, truthUnknown},
+		{"absent_skipped_in_chain", []WhereClause{absent, unknown, absent}, truthUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := evalWhereTruth(tc.wheres); got != tc.want {
+				t.Errorf("evalWhereTruth(%+v)=%d want %d", tc.wheres, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBug_HasEffectiveWhereThroughPublicAPI 从公开 API 侧锁定保护判定：
+// NOT 包裹恒真组（空 WhereNotIn）归约为恒假、EXISTS 包裹未知条件归约为有效限定，
+// 使「NOT (恒真组)」这类组合不被误当作恒真而放行破坏性操作。
+func TestBug_HasEffectiveWhereThroughPublicAPI(t *testing.T) {
+	// NOT (空 NotIn) → 恒假，属有效限定（收窄为永假，无行被改动）
+	b := newTestBuilder(NewMySQLGrammar(), nil).WhereNot(func(q *Builder) {
+		q.WhereNotIn("id", []any{})
+	})
+	if !b.hasEffectiveWhere() {
+		t.Error("NOT (empty NotIn) 应归约为恒假并计为有效限定")
+	}
+
+	// EXISTS 内为未知条件 → 依赖行数据，计为有效限定
+	b = newTestBuilder(NewMySQLGrammar(), nil).WhereExists(func(q *Builder) {
+		q.Table("orders").SelectRaw("1").Where("orders.user_id", "=", 1)
+	})
+	if !b.hasEffectiveWhere() {
+		t.Error("EXISTS(未知条件) 应计为有效限定")
+	}
+
+	// EXISTS 空子查询（无任何条件）→ 恒真，不收窄范围
+	b = newTestBuilder(NewMySQLGrammar(), nil).WhereExists(func(q *Builder) {})
+	if b.hasEffectiveWhere() {
+		t.Error("EXISTS(空条件) 应归约为恒真，不构成有效限定")
+	}
+}
+
 // TestBug_ToExistsSQL 验证 ToExists 生成 SELECT 1 ... LIMIT 1
 // （而非 COUNT(*) 全表计数），且不破坏原 Builder 状态。
 func TestBug_ToExistsSQL(t *testing.T) {

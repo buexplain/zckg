@@ -298,3 +298,96 @@ func TestPool_AddSlaveCloseRace(t *testing.T) {
 		t.Errorf("关闭后 PickReadDB 应回退主库，实际返回从库")
 	}
 }
+
+// TestPool_AddSlaveUnknownDriver 验证 AddSlave 在驱动未注册时经 sql.Open 失败返回错误，
+// 且不把从库写入池。
+func TestPool_AddSlaveUnknownDriver(t *testing.T) {
+	master, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open master failed: %v", err)
+	}
+	t.Cleanup(func() { _ = master.Close() })
+
+	pool := &Pool{
+		master:     master,
+		driverName: "zcdb_test_driver_never_registered",
+	}
+	if err := pool.AddSlave("slave1"); err == nil {
+		t.Fatal("未知驱动时 AddSlave 应返回 sql.Open 错误")
+	}
+	if got := pool.PickReadDB(); got != pool.master {
+		t.Error("AddSlave 失败后不应把从库写入池")
+	}
+}
+
+// closeErrConn 测试专用驱动连接：Close 恒返回 errForcedConnClose，
+// 用于验证 Pool.Close 把主库/从库关闭失败的原始错误上报调用方。
+type closeErrConn struct{}
+
+// errForcedConnClose 是 closeErrConn.Close 返回的哨兵错误。
+var errForcedConnClose = errors.New("forced conn close error")
+
+func (closeErrConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("closeErrConn: Prepare not supported")
+}
+
+func (closeErrConn) Close() error { return errForcedConnClose }
+
+func (closeErrConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("closeErrConn: Begin not supported")
+}
+
+// closeErrDriver 测试专用驱动：Open 返回 Close 恒失败的连接。
+type closeErrDriver struct{}
+
+func (closeErrDriver) Open(name string) (driver.Conn, error) { return closeErrConn{}, nil }
+
+var (
+	registerCloseErrDriverOnce sync.Once
+)
+
+// registerCloseErrDriver 注册测试驱动（进程内仅一次）。
+func registerCloseErrDriver() {
+	registerCloseErrDriverOnce.Do(func() {
+		sql.Register("zcdb_test_close_err_driver", closeErrDriver{})
+	})
+}
+
+// openCloseErrDB 打开一个使用 closeErrDriver 的 *sql.DB，并通过一次 Ping 让连接进入空闲池
+// （database/sql 惰性建连：真实连接必须先被使用，Close 时才有连接可关）。
+func openCloseErrDB(t *testing.T, name string) *sql.DB {
+	t.Helper()
+	registerCloseErrDriver()
+	db, err := sql.Open("zcdb_test_close_err_driver", name)
+	if err != nil {
+		t.Fatalf("open %s failed: %v", name, err)
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping %s failed: %v", name, err)
+	}
+	return db
+}
+
+// TestPool_CloseReportsConnCloseError 验证 Pool.Close 如实上报主库与从库的连接关闭错误：
+// 主库关闭失败写入 firstErr；主库正常而从库关闭失败时同样上报（两个分支分别覆盖）。
+func TestPool_CloseReportsConnCloseError(t *testing.T) {
+	t.Run("master_close_error", func(t *testing.T) {
+		pool := &Pool{master: openCloseErrDB(t, "master")}
+		if err := pool.Close(); !errors.Is(err, errForcedConnClose) {
+			t.Fatalf("主库关闭失败应上报原始错误，实际 %v", err)
+		}
+	})
+	t.Run("slave_close_error", func(t *testing.T) {
+		master, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			t.Fatalf("open master failed: %v", err)
+		}
+		if err := master.PingContext(context.Background()); err != nil {
+			t.Fatalf("ping master failed: %v", err)
+		}
+		pool := &Pool{master: master, slaves: []*sql.DB{openCloseErrDB(t, "slave")}}
+		if err := pool.Close(); !errors.Is(err, errForcedConnClose) {
+			t.Fatalf("从库关闭失败应上报原始错误，实际 %v", err)
+		}
+	})
+}

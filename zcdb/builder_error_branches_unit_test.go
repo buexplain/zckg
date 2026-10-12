@@ -651,3 +651,78 @@ func TestBuilder_NilEmbeddedPointerSkips(t *testing.T) {
 		}
 	})
 }
+
+// TestBuilder_WriteGuardValidateError 验证终端写方法在 Builder 图已携带错误时
+// 经 validateWriteBuilder 提前短路返回该既有错误，而不是被「无 WHERE 拒绝」守卫掩盖。
+// 每个子用例断言的是 b.err 的值本身（ErrInvalidOperator），以此与 ErrUpdateWithoutWhere /
+// ErrDeleteJoinNoJoin 区分，证明短路发生在守卫判定之前。
+func TestBuilder_WriteGuardValidateError(t *testing.T) {
+	ctx := context.Background()
+	g := NewMySQLGrammar()
+
+	broken := func() *Builder {
+		b := newTestBuilder(g, nil).Table("users")
+		b.err = ErrInvalidOperator
+		return b
+	}
+
+	t.Run("Update", func(t *testing.T) {
+		if _, err := broken().Update(ctx, userInsert{Name: "a"}); !errors.Is(err, ErrInvalidOperator) {
+			t.Fatalf("expected ErrInvalidOperator, got %v", err)
+		}
+	})
+	t.Run("Increment", func(t *testing.T) {
+		if _, err := broken().Increment(ctx, "age", 1); !errors.Is(err, ErrInvalidOperator) {
+			t.Fatalf("expected ErrInvalidOperator, got %v", err)
+		}
+	})
+	t.Run("Decrement", func(t *testing.T) {
+		if _, err := broken().Decrement(ctx, "age", 1); !errors.Is(err, ErrInvalidOperator) {
+			t.Fatalf("expected ErrInvalidOperator, got %v", err)
+		}
+	})
+	t.Run("DeleteJoin", func(t *testing.T) {
+		if _, err := broken().DeleteJoin(ctx); !errors.Is(err, ErrInvalidOperator) {
+			t.Fatalf("expected ErrInvalidOperator, got %v", err)
+		}
+	})
+}
+
+// TestBuilder_NestedCallbackErrorPropagation 验证 OrWhereNested/OrWhereNot/WhereNone/OrWhereAny
+// 在回调内累积错误时把该错误提升给父 Builder，且不追加（半成品）嵌套条件。
+func TestBuilder_NestedCallbackErrorPropagation(t *testing.T) {
+	g := NewMySQLGrammar()
+	badCallback := func(q *Builder) { q.Where("x", "INVALID", 1) }
+
+	cases := []struct {
+		name  string
+		build func(*Builder) *Builder
+	}{
+		{"OrWhereNested", func(b *Builder) *Builder { return b.OrWhereNested(badCallback) }},
+		{"OrWhereNot", func(b *Builder) *Builder { return b.OrWhereNot(badCallback) }},
+		{"WhereNone", func(b *Builder) *Builder { return b.WhereNone(badCallback) }},
+		{"OrWhereAny", func(b *Builder) *Builder { return b.OrWhereAny(badCallback) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := tc.build(newTestBuilder(g, nil).Table("users"))
+			if _, _, err := b.ToSelect(); !errors.Is(err, ErrInvalidOperator) {
+				t.Fatalf("回调内错误应提升给父 Builder，实际 %v", err)
+			}
+			if len(b.wheres) != 0 {
+				t.Fatalf("回调出错时不应追加嵌套条件，实际 wheres=%d", len(b.wheres))
+			}
+		})
+	}
+}
+
+// TestBuilder_ToDeleteRejectsJoin 验证编译层 ToDelete 在 Builder 存在 JOIN 时返回 ErrDeleteWithJoin：
+// 普通 Delete 不编译 JOIN（执行层已在调用前拦截），此处锁定 ToDelete 自身的防线，Force 亦不放行。
+func TestBuilder_ToDeleteRejectsJoin(t *testing.T) {
+	b := newTestBuilder(NewMySQLGrammar(), nil).Table("users").Force().JoinOn("orders", func(jb *JoinBuilder) {
+		jb.On("orders.user_id", "=", "users.id")
+	})
+	if _, _, err := b.ToDelete(); !errors.Is(err, ErrDeleteWithJoin) {
+		t.Fatalf("expected ErrDeleteWithJoin, got %v", err)
+	}
+}
