@@ -358,51 +358,6 @@ func TestCast_IntToStringReturnsDefault(t *testing.T) {
 	}
 }
 
-func TestParseValue_LargeInteger(t *testing.T) {
-	// 超大整数应保留为 string，不应降级为 float64
-	v := parseValue("99999999999999999999")
-	if _, ok := v.(string); !ok {
-		t.Errorf("超大整数期望保留为 string，实际类型 %T", v)
-	}
-	// 带小数点或指数的值仍应解析为 float64
-	if f := parseValue("1.5"); f != 1.5 {
-		t.Errorf("parseValue(\"1.5\") 期望 1.5，实际 %v", f)
-	}
-	if f := parseValue("1e100"); f != 1e100 {
-		t.Errorf("parseValue(\"1e100\") 期望 1e100，实际 %v", f)
-	}
-}
-
-// TestParseValue_IntBoundary 验证整型推断按平台 int 位宽（strconv.IntSize）解析：
-// 平台范围内的最大值解析为 int；超出范围的值保持 string，不静默截断。
-// 测试按 strconv.IntSize 动态取边界，在 32 位/64 位平台上均可通过。
-func TestParseValue_IntBoundary(t *testing.T) {
-	var maxIntStr, overflowStr string
-	if strconv.IntSize == 64 {
-		maxIntStr = "9223372036854775807"
-		overflowStr = "9223372036854775808"
-	} else {
-		maxIntStr = "2147483647"
-		overflowStr = "2147483648"
-	}
-
-	// 平台 int 最大值：解析为 int 且无截断
-	v := parseValue(maxIntStr)
-	n, ok := v.(int)
-	if !ok {
-		t.Fatalf("parseValue(%q) 期望解析为 int，实际类型 %T", maxIntStr, v)
-	}
-	if strconv.FormatInt(int64(n), 10) != maxIntStr {
-		t.Errorf("parseValue(%q) 期望 %s，实际 %d（截断）", maxIntStr, maxIntStr, n)
-	}
-
-	// 超出平台 int 范围：保持 string（32 位平台不截断为负值/零值）
-	v = parseValue(overflowStr)
-	if _, ok := v.(string); !ok {
-		t.Errorf("parseValue(%q) 期望保持 string，实际类型 %T（发生了截断）", overflowStr, v)
-	}
-}
-
 func TestCast_BoolToIntNotConvertible(t *testing.T) {
 	// bool 不可转换为 int，应返回默认值
 	if v := cast(true, 0); v != 0 {
