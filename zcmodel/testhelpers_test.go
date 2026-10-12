@@ -2,8 +2,14 @@ package zcmodel
 
 import (
 	"fmt"
+	"go/ast"
+	"go/importer"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -67,6 +73,39 @@ func writeAndVerify(t *testing.T, initialContent, entityCode, doCode string, nee
 	return string(content)
 }
 
+// typeCheckGoSource 把 src 作为一个独立的单文件 package 做编译级类型检查（go/types，规则与编译器前端一致），
+// 能发现 imported and not used、字段与方法同名、未定义标识符等 go/parser 层面发现不了的错误。
+func typeCheckGoSource(t *testing.T, src string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "gen.go", src, 0)
+	if err != nil {
+		t.Fatalf("产物解析失败: %v\n%s", err, truncateForLog(src))
+	}
+	conf := types.Config{Importer: importer.Default()}
+	if _, err := conf.Check(f.Name.Name, fset, []*ast.File{f}, nil); err != nil {
+		t.Fatalf("产物未通过编译级类型检查: %v\n%s", err, truncateForLog(src))
+	}
+}
+
+// importPathsOf 用 AST 提取 src 中全部 import 路径（按出现顺序），解析失败即 Fatal。
+func importPathsOf(t *testing.T, src string) []string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), "gen.go", src, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("产物解析失败: %v\n%s", err, truncateForLog(src))
+	}
+	var paths []string
+	for _, spec := range f.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("import 路径非法: %v", err)
+		}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
 // truncateForLog 截断过长的实际内容，避免单条失败信息淹没测试输出。
 func truncateForLog(s string) string {
 	const max = 2000
@@ -99,5 +138,23 @@ func assertContainsAll(t *testing.T, got string, wants []string, desc string) {
 	t.Helper()
 	for _, want := range wants {
 		assertContains(t, got, want, desc)
+	}
+}
+
+// assertDeclOrder 断言 subs 各片段在 got 中按给定顺序出现（以 strings.Index 首个命中位置比较）。
+// 任一缺失即 Fatal（后续顺序判断失去意义）；发现逆序即报告该片段位置错误。
+// 用于锁定「骨架保持式合并」的顶层声明顺序。
+func assertDeclOrder(t *testing.T, got string, subs []string, desc string) {
+	t.Helper()
+	last := -1
+	for _, s := range subs {
+		idx := strings.Index(got, s)
+		if idx < 0 {
+			t.Fatalf("%s：输出缺少 %q\n%s", desc, s, truncateForLog(got))
+		}
+		if idx < last {
+			t.Errorf("%s：顺序错误，%q 位置不正确\n实际:\n%s", desc, s, truncateForLog(got))
+		}
+		last = idx
 	}
 }

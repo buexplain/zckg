@@ -2,6 +2,7 @@ package zcmodel
 
 import (
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
@@ -254,6 +255,36 @@ func TestBuildStruct_JsonTagValueWithBacktick(t *testing.T) {
 	}
 }
 
+// TestBuildStruct_ColumnTagValueWithSpecialChars 验证列映射 tag 的值（列名）与 json/ddl 一样经 sanitizeTagValue 转义：
+// PG/SQLite 引号标识符可含双引号、反斜杠、换行，未转义时 Lookup 会静默读出截断值或失败并连带吞掉后续 tag；
+// 转义后从 AST 提取的 tag 经 reflect.StructTag.Lookup 完整还原列名，且后续 ddl tag 不受影响。
+// 反引号列名按 sanitizeTagValue 的既有规则替换为单引号（保证语法合法）。
+func TestBuildStruct_ColumnTagValueWithSpecialChars(t *testing.T) {
+	cases := []struct{ name, col, want string }{
+		{"双引号", `a"b`, `a"b`},
+		{"反斜杠", `a\b`, `a\b`},
+		{"换行", "a\nb", "a\nb"},
+		{"反引号替换为单引号", "a`b", "a'b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cols := []Column{{Name: tc.col, Type: "text", StructFieldInfo: StructFieldInfo{Name: "F", Type: "string"}}}
+			got := buildStruct("TEntity", cols, false, "", "db", nil)
+			file, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors)
+			if err != nil {
+				t.Fatalf("生成代码存在语法错误: %v\n%s", err, got)
+			}
+			tag := reflect.StructTag(fieldTagOf(file, "F"))
+			if v, ok := tag.Lookup("db"); !ok || v != tc.want {
+				t.Errorf("db tag 还原失败: Lookup = (%q, %v), want %q\n%s", v, ok, tc.want, got)
+			}
+			if v, ok := tag.Lookup("ddl"); !ok || v != "text" {
+				t.Errorf("后续 ddl tag 应完整可读: Lookup = (%q, %v)\n%s", v, ok, got)
+			}
+		})
+	}
+}
+
 // TestWriteOrReplaceStruct_NewFile 验证文件不存在时创建新文件
 func TestWriteOrReplaceStruct_NewFile(t *testing.T) {
 	entityCode := "type UserEntity struct {\n\tID int\n}"
@@ -336,11 +367,13 @@ var Extra = 1
 	if strings.Count(got, "type UserEntity struct {") != 1 || strings.Count(got, "type UserDO struct {") != 1 {
 		t.Errorf("重新生成后生成代码出现多次:\n%s", got)
 	}
-	// 布局顺序：Entity 生成代码 < Entity 自定义方法 < DO 生成代码 < DO 自定义方法 < 其他用户代码
+	// 骨架保持式：声明顺序与原文件完全一致（用户自定义方法原位保留，不再归位到生成代码之后）
 	order := []string{
 		"type UserEntity struct {",
-		"func (e *UserEntity) Hello() string {",
+		"func (e *UserEntity) ToDO()",
 		"type UserDO struct {",
+		"func (d *UserDO) ToEntity()",
+		"func (e *UserEntity) Hello() string {",
 		"func (d *UserDO) World() string {",
 		"var Extra = 1",
 	}
@@ -352,7 +385,7 @@ var Extra = 1
 			continue
 		}
 		if idx < last {
-			t.Errorf("布局顺序错误: %s 应位于 %s 之后", s, order[0])
+			t.Errorf("骨架顺序错误: %s 应位于 %s 之后", s, order[0])
 		}
 		last = idx
 	}
@@ -587,7 +620,7 @@ var Extra = 1
 }
 
 // TestWriteOrReplaceStruct_KeepUserTypeInMixedBlock 验证 type 块中混有用户类型时，
-// 再生成仅剔除生成的类型（按 Spec 粒度），用户类型及其注释完整保留。
+// 再生成按 Spec 粒度就地替换生成的结构体（块形态保留），用户类型及其注释完整保留。
 func TestWriteOrReplaceStruct_KeepUserTypeInMixedBlock(t *testing.T) {
 	orig := `package model
 
@@ -624,9 +657,13 @@ func MyFunc() {}
 		"MyHelper struct {",
 		"func MyFunc() {",
 	}, "混合 type 块中的用户代码应保留")
-	// 生成类型各只一份（块内的旧声明被剔除）
-	if strings.Count(got, "type UserEntity struct {") != 1 || strings.Count(got, "type UserDO struct {") != 1 {
+	// 骨架保持式：生成类型各只保留一份——块内的 Entity Spec 就地替换（块形态保留，故不带 type 关键字），
+	// 块外的 DO 为独立声明
+	if strings.Count(got, "UserEntity struct {") != 1 || strings.Count(got, "type UserDO struct {") != 1 {
 		t.Errorf("生成类型应各只保留一份:\n%s", got)
+	}
+	if !strings.Contains(got, "type (") {
+		t.Errorf("混合 type 块形态应保留:\n%s", got)
 	}
 	// 生成文件必须可解析
 	fset := token.NewFileSet()
@@ -768,8 +805,8 @@ func TestWriteOrReplaceStruct_ReadOnlyDir(t *testing.T) {
 }
 
 // TestWriteOrReplaceStruct_ValueReceiverCustomMethod 验证值接收者自定义方法
-// （如 func (e UserEntity) Validate() error）与指针接收者同样归位到对应结构体生成代码之后，
-// 而非落入文件末尾的"其他用户代码"。
+// （如 func (e UserEntity) Validate() error）与指针接收者一样被识别为用户声明，并在骨架中原地保留，
+// 既不被当作生成方法移除，也不被归位到生成代码之后。
 func TestWriteOrReplaceStruct_ValueReceiverCustomMethod(t *testing.T) {
 	orig := `package model
 
@@ -808,11 +845,13 @@ func FreeFunc() {}
 		"func (d UserDO) Tag() string {",
 		"func FreeFunc() {",
 	}, "值接收者自定义方法与无接收者函数应保留")
-	// 布局顺序：Entity 生成代码 < Entity 值接收者方法 < DO 生成代码 < DO 值接收者方法 < 其他函数
+	// 骨架保持式：声明顺序与原文件一致（值接收者自定义方法/无接收者函数均原位保留，不再归位）
 	order := []string{
 		"type UserEntity struct {",
-		"func (e UserEntity) Validate() error {",
+		"func (e *UserEntity) ToDO()",
 		"type UserDO struct {",
+		"func (d *UserDO) ToEntity()",
+		"func (e UserEntity) Validate() error {",
 		"func (d UserDO) Tag() string {",
 		"func FreeFunc() {",
 	}
@@ -824,7 +863,7 @@ func FreeFunc() {}
 			continue
 		}
 		if idx < last {
-			t.Errorf("布局顺序错误: %s 位置不正确\n输出:\n%s", s, got)
+			t.Errorf("骨架顺序错误: %s 位置不正确\n输出:\n%s", s, got)
 		}
 		last = idx
 	}
@@ -863,7 +902,7 @@ func (d *UserDO) ToEntity() {}
 	// 游离注释与用户类型均保留
 	assertContains(t, got, "// 游离注释：不与任何类型绑定", "混合 type 块中的游离注释应保留")
 	assertContains(t, got, "MyHelper struct {", "混合 type 块中的用户类型应保留")
-	if strings.Count(got, "type UserEntity struct {") != 1 {
+	if strings.Count(got, "UserEntity struct {") != 1 {
 		t.Errorf("生成类型应只保留一份:\n%s", got)
 	}
 	// 生成文件必须可解析
@@ -873,13 +912,213 @@ func (d *UserDO) ToEntity() {}
 	}
 }
 
-// TestWriteOrReplaceStruct_PkgNameFallback 覆盖包名推导回退分支：
-// 相对路径（无目录部分）的 Dir 为 "."，包名回退为 "main"。
-// 用 t.Chdir 把工作目录切到临时目录，既保持"无目录部分"的相对路径语义，
+// TestWriteOrReplaceStruct_KeepDeclLevelComments 验证再生成保留不附着于任何声明 Doc 的用户注释：
+// 声明之间的游离注释、//go:generate 指令、位于声明 End() 之后的行尾注释（var/type/func 及 package 行）、
+// 文件尾注释，以及位于被移除生成代码（类型与方法）之前的游离注释（顺延给下一个保留声明）均不得丢失，行尾注释仍在原行；
+// 被移除生成声明自身的 Doc 注释随之丢弃。产物须通过编译级类型检查，且再生成幂等（二次生成逐字节相同）。
+func TestWriteOrReplaceStruct_KeepDeclLevelComments(t *testing.T) {
+	orig := `package model // PKG-TRAILING
+
+import "fmt"
+
+// FREE-BEFORE-ENTITY: 位于生成代码之前的游离注释
+
+// OLD-ENTITY-DOC
+type UserEntity struct {
+	ID int
+}
+
+func (e *UserEntity) ToDO() {}
+
+//go:generate echo hello
+
+// FREE: 游离注释
+
+var X = 1 // TRAILING: 行尾注释
+
+type Y int // TRAILING2
+
+func F() { fmt.Println() } // TRAILING3
+
+type UserDO struct {
+	ID any
+}
+
+// FREE-BEFORE-METHOD: 位于生成方法之前的游离注释
+
+func (d *UserDO) ToEntity() {}
+
+// EOF: 文件尾注释
+`
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+
+	assertContainsAll(t, got, []string{
+		"// FREE-BEFORE-ENTITY: 位于生成代码之前的游离注释",
+		"// FREE-BEFORE-METHOD: 位于生成方法之前的游离注释",
+		"// FREE: 游离注释",
+	}, "声明级游离注释应保留")
+	for _, re := range []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^package model // PKG-TRAILING$`),
+		regexp.MustCompile(`(?m)^//go:generate echo hello$`),
+		regexp.MustCompile(`(?m)^var X = 1 // TRAILING: 行尾注释$`),
+		regexp.MustCompile(`(?m)^type Y int // TRAILING2$`),
+		regexp.MustCompile(`(?m)^func F\(\) \{ fmt\.Println\(\) \} // TRAILING3$`),
+	} {
+		if !re.MatchString(got) {
+			t.Errorf("指令/行尾注释应保留在原行，未匹配 %v\n实际内容:\n%s", re, truncateForLog(got))
+		}
+	}
+	if !strings.HasSuffix(strings.TrimSpace(got), "// EOF: 文件尾注释") {
+		t.Errorf("文件尾注释应保留在产物末尾，实际内容:\n%s", truncateForLog(got))
+	}
+	assertNotContains(t, got, "// OLD-ENTITY-DOC", "被移除生成声明自身的 Doc 注释应随之丢弃")
+	typeCheckGoSource(t, got)
+
+	if again := writeAndVerify(t, got, entityCode, doCode, nil); again != got {
+		t.Errorf("再生成应幂等\n第一次:\n%s\n第二次:\n%s", got, again)
+	}
+}
+
+// TestWriteOrReplaceStruct_RemoveUnusedImports 验证再生成时移除旧生成代码引用过、
+// 而新生成代码与保留的用户代码都不再引用的 import spec（如删去最后一个时间列后的 time）：
+// 单行 import 整体移除；import 块只移除该 spec 所在整行（连同其 Doc 与尾注释，CRLF 文件同样不留空行）、
+// 保留其他 spec；与其他 spec 同行时只剔除该 spec（连同其后的分号，否则残留空 spec 导致语法错误）；
+// 用户代码仍引用该包时保留。每个场景的产物都须通过编译级类型检查（排除 imported and not used）。
+func TestWriteOrReplaceStruct_RemoveUnusedImports(t *testing.T) {
+	// oldGenerated 为旧生成代码：Entity 含 time.Time 字段，ToEntity 中对 time.Time 做类型断言
+	const oldGenerated = `type UserEntity struct {
+	ID        int64
+	CreatedAt time.Time
+}
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID        any
+	CreatedAt any
+}
+
+func (d *UserDO) ToEntity() {
+	if _, ok := d.CreatedAt.(time.Time); ok {
+	}
+}
+`
+	// 新生成代码已不含时间列，也不再需要任何 import
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	tests := []struct {
+		name        string
+		orig        string
+		wantImports []string
+	}{
+		{
+			name:        "单行 import 整体移除",
+			orig:        "package model\n\nimport \"time\"\n\n" + oldGenerated,
+			wantImports: nil,
+		},
+		{
+			name:        "import 块只移除不再引用的 spec",
+			orig:        "package model\n\nimport (\n\t\"fmt\"\n\t\"time\" // 时间\n)\n\n" + oldGenerated + "\nvar _ = fmt.Sprint\n",
+			wantImports: []string{"fmt"},
+		},
+		{
+			name:        "用户代码仍引用时保留",
+			orig:        "package model\n\nimport \"time\"\n\n" + oldGenerated + "\nvar Timeout = time.Second\n",
+			wantImports: []string{"time"},
+		},
+		{
+			name:        "被移除 spec 的 Doc 注释随之移除",
+			orig:        "package model\n\nimport (\n\t\"fmt\"\n\t// 时间包\n\t\"time\"\n)\n\n" + oldGenerated + "\nvar _ = fmt.Sprint\n",
+			wantImports: []string{"fmt"},
+		},
+		{
+			// 被移除 spec 置于块中间：残留空行若紧贴左右括号会被 gofmt 吞掉，夹在两个 spec 之间才可观测
+			name:        "CRLF 文件移除整行不留空行",
+			orig:        strings.ReplaceAll("package model\n\nimport (\n\t\"fmt\"\n\t\"time\" // 时间\n\t\"strings\"\n)\n\n"+oldGenerated+"\nvar _ = fmt.Sprint\nvar _ = strings.ToUpper\n", "\n", "\r\n"),
+			wantImports: []string{"fmt", "strings"},
+		},
+		{
+			name:        "同行多个 spec 时剔除位于行尾的 spec",
+			orig:        "package model\n\nimport (\n\t\"fmt\"; \"time\"\n)\n\n" + oldGenerated + "\nvar _ = fmt.Sprint\n",
+			wantImports: []string{"fmt"},
+		},
+		{
+			// 被移除 spec 后紧跟分号时须连同分号剔除，残留的 ; 会构成缺少路径的空 spec
+			name:        "同行多个 spec 时剔除位于行首的 spec",
+			orig:        "package model\n\nimport (\n\t\"time\"; \"fmt\"\n)\n\n" + oldGenerated + "\nvar _ = fmt.Sprint\n",
+			wantImports: []string{"fmt"},
+		},
+		{
+			name:        "同行多个 spec 时剔除位于中间的 spec",
+			orig:        "package model\n\nimport (\n\t\"fmt\"; \"time\"; \"strings\"\n)\n\n" + oldGenerated + "\nvar _ = fmt.Sprint\nvar _ = strings.ToUpper\n",
+			wantImports: []string{"fmt", "strings"},
+		},
+		{
+			name:        "单行括号块中剔除首个 spec",
+			orig:        "package model\n\nimport (\"time\"; \"fmt\")\n\n" + oldGenerated + "\nvar _ = fmt.Sprint\n",
+			wantImports: []string{"fmt"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := writeAndVerify(t, tt.orig, entityCode, doCode, nil)
+			if gotImports := importPathsOf(t, got); !reflect.DeepEqual(gotImports, tt.wantImports) {
+				t.Errorf("import = %v, want %v\n实际内容:\n%s", gotImports, tt.wantImports, truncateForLog(got))
+			}
+			assertNotContains(t, got, "// 时间", "被移除 spec 的尾注释应随整行移除")
+			if regexp.MustCompile(`import \([^)]*\n[ \t]*\n[^)]*\)`).MatchString(got) {
+				t.Errorf("移除 spec 后 import 块内不应残留空行\n实际内容:\n%s", truncateForLog(got))
+			}
+			typeCheckGoSource(t, got)
+		})
+	}
+}
+
+// TestImportLocalName 验证 import spec 绑定包名的判定：具名别名取别名、无别名取路径末段；
+// _ 与 . 导入、"C"、末段非合法标识符（yaml.v3）与主版本后缀（/v2）返回空串——
+// 空串意味着包名不可知，再生成时这些 import 不会被当作未引用而移除。
+func TestImportLocalName(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"无别名取末段", `"net/http"`, "http"},
+		{"具名别名", `t "time"`, "t"},
+		{"空白导入", `_ "time"`, ""},
+		{"点导入", `. "time"`, ""},
+		{"cgo", `"C"`, ""},
+		{"末段非合法标识符", `"gopkg.in/yaml.v3"`, ""},
+		{"主版本后缀", `"github.com/a/b/v2"`, ""},
+		{"以 v 开头的普通包名", `"example.com/vendorx"`, "vendorx"},
+		{"单字母 v", `"example.com/v"`, "v"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, err := parser.ParseFile(token.NewFileSet(), "", "package p\n\nimport "+tt.src+"\n", parser.ImportsOnly)
+			if err != nil {
+				t.Fatalf("解析 import 失败: %v", err)
+			}
+			if got := importLocalName(f.Imports[0]); got != tt.want {
+				t.Errorf("importLocalName(%s) = %q, want %q", tt.src, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWriteOrReplaceStruct_PkgNameFromAbsDir 验证新建文件的包名按输出目录绝对路径的末级目录名推导：
+// 相对路径（无目录部分，Dir 为 "."）也解析为当前工作目录的实际名称，而不是回退为 main。
+// 用 t.Chdir 把工作目录切到临时目录下的 model 目录，既保持"无目录部分"的相对路径语义，
 // 又避免在仓库目录下生成文件（残留与并行 go test 竞争）。
-func TestWriteOrReplaceStruct_PkgNameFallback(t *testing.T) {
-	t.Chdir(t.TempDir())
-	const filePath = "zcmodel_fallback_probe_output.go"
+func TestWriteOrReplaceStruct_PkgNameFromAbsDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	t.Chdir(dir)
+	const filePath = "zcmodel_pkgname_probe_output.go"
 
 	entityCode := "type FallBackEntity struct {\n\tID int\n}"
 	doCode := "type FallBackDO struct {\n\tID any\n}"
@@ -890,8 +1129,32 @@ func TestWriteOrReplaceStruct_PkgNameFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取生成文件失败: %v", err)
 	}
-	if !strings.HasPrefix(string(content), "package main\n") {
-		t.Fatalf("无目录部分的相对路径应回退为 package main，实际:\n%s", content)
+	if !strings.HasPrefix(string(content), "package model\n") {
+		t.Fatalf("无目录部分的相对路径应取当前目录名 model 作包名，实际:\n%s", content)
+	}
+}
+
+// TestPackageNameOf 验证包名推导：普通目录取末级目录名；位于根目录（末级名为路径分隔符）时回退为 main。
+func TestPackageNameOf(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("获取工作目录失败: %v", err)
+	}
+	root := filepath.VolumeName(wd) + string(filepath.Separator)
+	tests := []struct {
+		name     string
+		filePath string
+		want     string
+	}{
+		{"普通目录", filepath.Join(t.TempDir(), "model", "user.go"), "model"},
+		{"根目录回退 main", root + "user.go", "main"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := packageNameOf(tt.filePath); got != tt.want {
+				t.Errorf("packageNameOf(%q) = %q, want %q", tt.filePath, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -910,7 +1173,7 @@ func TestWriteOrReplaceStruct_ReadFileFails(t *testing.T) {
 
 // TestWriteOrReplaceStruct_SingleImportDocAndComment 覆盖单行 import 声明
 // （无括号）合并缺失 import 的路径：ImportSpec 的 Doc/尾注释经 specSpan 保留，
-// import 声明自身的 Doc 经 mergeMissingImports 的 first.Doc 分支保留，并展开为块形式。
+// import 声明自身的 Doc 经 renderImport 展开分支保留，并展开为块形式。
 func TestWriteOrReplaceStruct_SingleImportDocAndComment(t *testing.T) {
 	orig := `package model
 
@@ -927,7 +1190,7 @@ var _ = fmt.Sprintf
 }
 
 // TestWriteOrReplaceStruct_MixedBlockDocAndTrailing 覆盖混合 type 块剔除生成类型时
-// GenDecl 自身 Doc 注释保留（removeGeneratedSpecs 的 d.Doc 分支），
+// GenDecl 自身 Doc 注释保留（renderTypeBlock 的 d.Doc 分支），
 // 以及生成类型 Spec 带尾注释时的区间剔除（specSpan 的 TypeSpec.Comment 分支）。
 func TestWriteOrReplaceStruct_MixedBlockDocAndTrailing(t *testing.T) {
 	orig := `package model
@@ -988,7 +1251,7 @@ type UserEntity struct {
 }
 
 // TestWriteOrReplaceStruct_NamedImportWithDoc 覆盖 specSpan 的 ImportSpec.Doc 分支
-// 与 mergeMissingImports 的命名导入（Name 非空）分支：块内带文档注释的别名导入
+// 与已有导入统计跳过命名导入（Name 非空）的分支：块内带文档注释的别名导入
 // 应完整保留，缺失的标准导入仍可追加。
 func TestWriteOrReplaceStruct_NamedImportWithDoc(t *testing.T) {
 	orig := `package model
@@ -1007,6 +1270,226 @@ type UserEntity struct {
 	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
 	assertContainsAll(t, got, []string{"// fmt alias doc", `f "fmt"`, `"time"`},
 		"带文档注释的别名导入应保留且缺失的标准导入应追加")
+}
+
+// TestWriteOrReplaceStruct_SkeletonKeepsUserDeclPosition 锁定「骨架保持式合并」的核心契约：
+// 用户声明（含 Entity/DO 上的自定义方法）在原位保留，不因再生成被搬动到生成代码之后。
+// 用例把用户方法刻意插在 Entity 结构体与 ToDO 方法之间，再生成后它仍应留在该位置。
+func TestWriteOrReplaceStruct_SkeletonKeepsUserDeclPosition(t *testing.T) {
+	orig := `package model
+
+type UserEntity struct {
+	ID int
+}
+
+// 用户方法：插在 Entity 结构体与 ToDO 之间
+func (e *UserEntity) Between() int {
+	return e.ID
+}
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+
+var Extra = 1
+`
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+
+	// 顺序必须与原文件一致：Entity 结构体 < Between < ToDO < DO 结构体 < ToEntity < Extra
+	assertDeclOrder(t, got, []string{
+		"type UserEntity struct {",
+		"func (e *UserEntity) Between() int {",
+		"func (e *UserEntity) ToDO()",
+		"type UserDO struct {",
+		"func (d *UserDO) ToEntity()",
+		"var Extra = 1",
+	}, "用户声明应原位保留")
+	assertContains(t, got, "return e.ID", "用户方法体应完整保留")
+}
+
+// TestWriteOrReplaceStruct_MissingGenDeclsPairedInsertion 锁定缺失生成声明「紧跟配对声明」的落点：
+// Entity 结构体↔ToDO、DO 结构体↔ToEntity 互为配对，结构体缺失补在其方法之前、方法缺失补在其结构体之后。
+func TestWriteOrReplaceStruct_MissingGenDeclsPairedInsertion(t *testing.T) {
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	cases := []struct {
+		name  string
+		orig  string
+		order []string
+	}{
+		{
+			name: "Entity 结构体缺失补在其 ToDO 方法前",
+			orig: "package model\n\nfunc (e *UserEntity) ToDO() {}\n\nvar Extra = 1\n",
+			order: []string{
+				"type UserEntity struct {",
+				"func (e *UserEntity) ToDO()",
+				"type UserDO struct {",
+				"func (d *UserDO) ToEntity()",
+				"var Extra = 1",
+			},
+		},
+		{
+			name: "DO 结构体缺失补在其 ToEntity 方法前",
+			orig: "package model\n\ntype UserEntity struct {\n\tID int\n}\n\nfunc (e *UserEntity) ToDO() {}\n\nfunc (d *UserDO) ToEntity() {}\n",
+			order: []string{
+				"type UserEntity struct {",
+				"func (e *UserEntity) ToDO()",
+				"type UserDO struct {",
+				"func (d *UserDO) ToEntity()",
+			},
+		},
+		{
+			name: "ToEntity 方法缺失补在其 DO 结构体后",
+			orig: "package model\n\ntype UserEntity struct {\n\tID int\n}\n\nfunc (e *UserEntity) ToDO() {}\n\ntype UserDO struct {\n\tID any\n}\n",
+			order: []string{
+				"type UserEntity struct {",
+				"func (e *UserEntity) ToDO()",
+				"type UserDO struct {",
+				"func (d *UserDO) ToEntity()",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := writeAndVerify(t, tc.orig, entityCode, doCode, nil)
+			assertDeclOrder(t, got, tc.order, tc.name)
+			typeCheckGoSource(t, got)
+		})
+	}
+}
+
+// TestWriteOrReplaceStruct_MissingGenDeclsUnpairedFallback 锁定无配对时的落点：
+// 生成声明追加到原文件最后一个生成声明之后；原文件没有任何生成声明时，按标准顺序
+// （Entity 结构体 → ToDO → DO 结构体 → ToEntity）置于首个用户声明之前。
+func TestWriteOrReplaceStruct_MissingGenDeclsUnpairedFallback(t *testing.T) {
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	want := []string{
+		"type UserEntity struct {",
+		"func (e *UserEntity) ToDO()",
+		"type UserDO struct {",
+		"func (d *UserDO) ToEntity()",
+		"var Extra = 1",
+	}
+	for _, tc := range []struct{ name, orig string }{
+		{"首次引入 DO 块追加到生成区末尾",
+			"package model\n\ntype UserEntity struct {\n\tID int\n}\n\nfunc (e *UserEntity) ToDO() {}\n\nvar Extra = 1\n"},
+		{"无任何生成声明时置于首个用户声明之前",
+			"package model\n\nvar Extra = 1\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := writeAndVerify(t, tc.orig, entityCode, doCode, nil)
+			assertDeclOrder(t, got, want, tc.name)
+			typeCheckGoSource(t, got)
+		})
+	}
+}
+
+// TestWriteOrReplaceStruct_SingleSpecTypeBlockNormalized 锁定仅含一个生成 Spec 的 type 括号块
+// 以独立声明形态输出（不保留括号块），与首次生成的形态一致。
+func TestWriteOrReplaceStruct_SingleSpecTypeBlockNormalized(t *testing.T) {
+	orig := `package model
+
+type (
+	UserEntity struct {
+		ID int
+	}
+)
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+`
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertNotContains(t, got, "type (", "单 spec 生成类型应展开为独立声明、不保留括号块")
+	assertDeclOrder(t, got, []string{
+		"type UserEntity struct {",
+		"func (e *UserEntity) ToDO()",
+		"type UserDO struct {",
+		"func (d *UserDO) ToEntity()",
+	}, "单 spec 括号块展开后的声明顺序")
+	typeCheckGoSource(t, got)
+}
+
+// TestWriteOrReplaceStruct_EmptyGeneratedSegmentRemovesSlot 锁定生成代码不含某声明（该段为空）时，
+// 原文件中对应的旧槽位被移除，其余声明照常原位替换。
+func TestWriteOrReplaceStruct_EmptyGeneratedSegmentRemovesSlot(t *testing.T) {
+	orig := `package model
+
+type UserEntity struct {
+	ID int
+}
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+`
+	// 生成代码只含结构体、不含互转方法
+	entityCode := "type UserEntity struct {\n\tID int64\n}"
+	doCode := "type UserDO struct {\n\tID any\n}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertNotContains(t, got, "func (e *UserEntity) ToDO()", "生成段为空时旧 ToDO 槽位应被移除")
+	assertNotContains(t, got, "func (d *UserDO) ToEntity()", "生成段为空时旧 ToEntity 槽位应被移除")
+	assertContains(t, got, "type UserEntity struct {", "结构体照常原位替换")
+	assertContains(t, got, "int64", "新结构体内容应生效")
+	typeCheckGoSource(t, got)
+}
+
+// TestWriteOrReplaceStruct_MixedBlockGeneratedSpecKeepsNewDoc 锁定混合 type 块内生成 Spec 就地替换为
+// 「Spec 形态」时保留新生成的 doc 注释（含索引块），旧 doc 随旧 Spec 一并丢弃。
+func TestWriteOrReplaceStruct_MixedBlockGeneratedSpecKeepsNewDoc(t *testing.T) {
+	orig := `package model
+
+type (
+	// OLD-DOC 旧注释
+	UserEntity struct {
+		ID int
+	}
+
+	// MyHelper 用户类型
+	MyHelper struct {
+		X int
+	}
+)
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+`
+	entityCode := "// UserEntity 新表注释\n//\n// 索引:\n//   - PRIMARY KEY (id)\ntype UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContainsAll(t, got, []string{
+		"// UserEntity 新表注释",
+		"//   - PRIMARY KEY (id)",
+		"MyHelper struct {",
+	}, "混合块内生成 Spec 应携带新 doc，用户类型保留")
+	assertNotContains(t, got, "OLD-DOC", "旧生成 Spec 的 doc 应随 Spec 一并丢弃")
+	assertContains(t, got, "type (", "混合 type 块形态应保留")
+	fset := token.NewFileSet()
+	if _, err := parser.ParseFile(fset, "", got, parser.AllErrors); err != nil {
+		t.Fatalf("产物解析失败: %v\n%s", err, got)
+	}
 }
 
 // ==================== ddl 片段组装（assembleDDLFragment） ====================
@@ -1061,7 +1544,8 @@ func TestAssembleDDLFragment_Default(t *testing.T) {
 
 // TestAssembleDDLFragment_ExtraWhiteList 验证 MySQL EXTRA 的白名单过滤与固定输出顺序：
 // 仅 auto_increment、on update CURRENT_TIMESTAMP、VIRTUAL GENERATED、STORED GENERATED 四项保留，
-// 按白名单顺序以大写形态输出；DEFAULT_GENERATED 是噪音、其余标记（如 NDB 的 STORAGE DISK）不在白名单，一律过滤。
+// 按白名单顺序以大写形态输出，ON UPDATE 项保留紧随其后的 (n) 精度（括号内须为数字）；
+// DEFAULT_GENERATED 是噪音、其余标记（如 NDB 的 STORAGE DISK）不在白名单，一律过滤。
 func TestAssembleDDLFragment_ExtraWhiteList(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1076,6 +1560,11 @@ func TestAssembleDDLFragment_ExtraWhiteList(t *testing.T) {
 		{"多项按白名单顺序而非输入顺序", "timestamp", "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", "timestamp NOT NULL ON UPDATE CURRENT_TIMESTAMP"},
 		{"非白名单标记过滤", "varchar(10)", "STORAGE DISK", "varchar(10) NOT NULL"},
 		{"匹配大小写不敏感", "bigint", "AUTO_INCREMENT", "bigint NOT NULL AUTO_INCREMENT"},
+		// MySQL 8.4 实测：datetime(3)/timestamp(6) 的 EXTRA 形如 on update CURRENT_TIMESTAMP(3)，精度须随 ON UPDATE 保留
+		{"ON UPDATE 保留精度", "datetime(3)", "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)", "datetime(3) NOT NULL ON UPDATE CURRENT_TIMESTAMP(3)"},
+		{"ON UPDATE 保留多位精度", "timestamp(6)", "on update CURRENT_TIMESTAMP(6)", "timestamp(6) NOT NULL ON UPDATE CURRENT_TIMESTAMP(6)"},
+		{"括号内非数字不视为精度", "datetime", "on update CURRENT_TIMESTAMP(x)", "datetime NOT NULL ON UPDATE CURRENT_TIMESTAMP"},
+		{"空括号不视为精度", "datetime", "on update CURRENT_TIMESTAMP()", "datetime NOT NULL ON UPDATE CURRENT_TIMESTAMP"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1194,7 +1683,8 @@ func TestBuildStructDocComment(t *testing.T) {
 }
 
 // TestSanitizeCommentLine 验证换行净化：LF、CRLF、CR 均替换为单个空格（CRLF 不被拆成两个空格），
-// 无换行的文本原样返回。
+// 无换行的文本原样返回；连续两个单引号/反引号之间插入零宽空格 U+200B（三连及以上逐对插入，
+// 结果中不再残留任何相邻引号对）。
 func TestSanitizeCommentLine(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"LF", "a\nb", "a b"},
@@ -1202,6 +1692,10 @@ func TestSanitizeCommentLine(t *testing.T) {
 		{"CR", "a\rb", "a b"},
 		{"无换行原样", "正常 文本", "正常 文本"},
 		{"空串", "", ""},
+		{"单个单引号原样", "it's", "it's"},
+		{"连续两个单引号", "默认''", "默认'\u200b'"},
+		{"连续三个单引号", "'''", "'\u200b'\u200b'"},
+		{"连续两个反引号", "``x``", "`\u200b`x`\u200b`"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1222,5 +1716,169 @@ func TestBuildStruct_TableCommentNewlineRegression(t *testing.T) {
 	}
 	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
 		t.Errorf("净化后的产物应可解析: %v\n%s", err, got)
+	}
+}
+
+// TestBuildStruct_DocCommentQuotesSurviveGofmt 回归锁死：表注释、索引名与索引列文本中的连续单引号/反引号
+// 经 gofmt（go/format 对声明级 doc 注释做智能引号规范化）后不得被改写为弯引号 ” / “；
+// 断言 gofmt 前后 doc 注释逐字节一致，且去掉零宽空格后仍是原文。
+func TestBuildStruct_DocCommentQuotesSurviveGofmt(t *testing.T) {
+	cols := []Column{{Name: "id", StructFieldInfo: StructFieldInfo{Name: "ID", Type: "int64"}}}
+	indexes := []IndexInfo{{Name: "idx_''a", Columns: []string{"lower(''x'')"}}}
+	got := buildStruct("TEntity", cols, false, "默认值为'' 或 ``x``", "db", indexes)
+	formatted, err := format.Source([]byte("package model\n\n" + got + "\n"))
+	if err != nil {
+		t.Fatalf("产物无法通过 gofmt: %v\n%s", err, got)
+	}
+	out := string(formatted)
+	assertNotContains(t, out, "”", "doc 注释不应出现右弯引号")
+	assertNotContains(t, out, "“", "doc 注释不应出现左弯引号")
+	plain := strings.ReplaceAll(out, "\u200b", "")
+	assertContainsAll(t, plain, []string{
+		"// 默认值为'' 或 ``x``\n",
+		"//   - KEY idx_''a (lower(''x''))\n",
+	}, "去掉零宽空格后应还原原文")
+}
+
+// ==================== 原子写入（writeFileAtomic） ====================
+
+// TestWriteFileAtomic_StatErrorNonNotExist 覆盖 writeFileAtomic 中
+// os.Stat 返回「非 NotExist」错误时直接上报的分支（如权限错误/非法文件名）。
+func TestWriteFileAtomic_StatErrorNonNotExist(t *testing.T) {
+	dir := t.TempDir()
+
+	var filePath string
+	if runtime.GOOS == "windows" {
+		// Windows：非法文件名字符使 CreateFile 返回 ERROR_INVALID_NAME（非 NotExist）
+		filePath = filepath.Join(dir, "bad|name.go")
+	} else {
+		// Unix：无权限目录使 Stat 返回 EACCES（非 NotExist）
+		blocked := filepath.Join(dir, "noperm")
+		if err := os.MkdirAll(blocked, 0755); err != nil {
+			t.Fatalf("创建目录失败: %v", err)
+		}
+		if err := os.Chmod(blocked, 0); err != nil {
+			t.Fatalf("修改目录权限失败: %v", err)
+		}
+		// Cleanup 中故意忽略错误：仅恢复临时目录权限，失败不影响断言结果（测试结束即随 TempDir 删除）
+		t.Cleanup(func() { _ = os.Chmod(blocked, 0755) })
+		filePath = filepath.Join(blocked, "inner.go")
+	}
+
+	err := writeFileAtomic(filePath, []byte("package x"))
+	if err == nil {
+		t.Fatal("期望 Stat 返回非 NotExist 错误并上报，实际成功")
+	}
+}
+
+// TestWriteFileAtomic_CreateTempFails 覆盖目标目录不存在时
+// os.Stat 返回 NotExist（使用默认 0644）后 CreateTemp 失败的分支。
+func TestWriteFileAtomic_CreateTempFails(t *testing.T) {
+	root := t.TempDir()
+	missingDir := filepath.Join(root, "no_such_dir")
+	filePath := filepath.Join(missingDir, "a.go")
+	err := writeFileAtomic(filePath, []byte("package x"))
+	if err == nil || !strings.Contains(err.Error(), "创建临时文件失败") {
+		t.Fatalf("期望创建临时文件失败错误，实际: %v", err)
+	}
+	// 不存在的父目录不应被隐式创建（writeFileAtomic 不负责建目录）
+	if _, statErr := os.Stat(missingDir); !os.IsNotExist(statErr) {
+		t.Fatalf("父目录 no_such_dir 不应被隐式创建，os.Stat 返回: %v", statErr)
+	}
+}
+
+// TestWriteFileAtomic_RenameFails 覆盖 rename 替换目标失败的分支：
+// 目标路径已存在且为目录时，各平台的覆盖式 rename 均失败。
+func TestWriteFileAtomic_RenameFails(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "adir")
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	err := writeFileAtomic(target, []byte("package x"))
+	if err == nil || !strings.Contains(err.Error(), "替换目标文件失败") {
+		t.Fatalf("期望替换目标文件失败错误，实际: %v", err)
+	}
+
+	// rename 失败后 defer 应清理临时文件：父目录内只应剩下目标条目
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("读取父目录失败: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "adir" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("rename 失败后不应有临时文件残留，父目录实际条目: %v", names)
+	}
+	// 目标未被破坏：仍是原来的目录
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("目标路径应仍存在: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("rename 失败后目标路径应仍为目录，不应被替换为文件")
+	}
+}
+
+// TestBuildStruct_CompositePrimaryKey 验证联合主键：多列均生成 primary_key:"true"
+// （主键在 DDL 中是表级约束而非列内联属性，故不并入 ddl 片段，仅由该 tag 与索引块呈现）。
+func TestBuildStruct_CompositePrimaryKey(t *testing.T) {
+	cols := []Column{
+		{Name: "user_id", Type: "bigint", Nullable: boolPtr(false), PrimaryKey: true, StructFieldInfo: StructFieldInfo{Name: "UserID", Type: "int64"}},
+		{Name: "role_id", Type: "bigint", Nullable: boolPtr(false), PrimaryKey: true, StructFieldInfo: StructFieldInfo{Name: "RoleID", Type: "int64"}},
+		{Name: "granted_at", Type: "datetime", Nullable: boolPtr(false), StructFieldInfo: StructFieldInfo{Name: "GrantedAt", Type: "time.Time"}},
+	}
+	got := buildStruct("UserRoleEntity", cols, false, "", "db", nil)
+	if n := strings.Count(got, `primary_key:"true"`); n != 2 {
+		t.Errorf("联合主键应标记两列，实际标记 %d 处:\n%s", n, got)
+	}
+	if strings.Contains(got, "granted_at\" primary_key") {
+		t.Errorf("非主键列不应带 primary_key tag:\n%s", got)
+	}
+	// 主键标记位于 ddl 之前（tag 顺序 json → db → primary_key → ddl → description）
+	assertContains(t, got, "`db:\"user_id\" primary_key:\"true\" ddl:\"bigint NOT NULL\"`", "主键列的 tag 顺序")
+	// ddl 片段不含 PRIMARY KEY 约束文本（表级信息由 primary_key tag 与索引块承载）
+	assertNotContains(t, got, "ddl:\"bigint NOT NULL PRIMARY KEY", "ddl 片段不应内联主键约束")
+}
+
+// TestBuildStruct_EmptyColumnsWithIndexes 覆盖「空列 + 非空索引」组合：
+// 结构体为空但索引块照常渲染（数据驱动，两者各自独立），且产物可被 go/parser 解析。
+func TestBuildStruct_EmptyColumnsWithIndexes(t *testing.T) {
+	indexes := []IndexInfo{{Name: "PRIMARY", Columns: []string{"id"}, Unique: true, Primary: true}}
+	got := buildStruct("EmptyEntity", nil, false, "空表", "db", indexes)
+	want := "// 空表\n//\n// 索引:\n//   - PRIMARY KEY (id)\ntype EmptyEntity struct {\n}"
+	if got != want {
+		t.Errorf("空列 + 非空索引的产物错误\ngot:  %q\nwant: %q", got, want)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
+		t.Errorf("产物应可解析: %v\n%s", err, got)
+	}
+}
+
+// TestBuildIndexCommentBlock_SymbolOnlyName 覆盖纯符号索引名（如 MySQL 函数索引的内部名、用户自造的符号名）：
+// 不校验列名/索引名合法性，原样呈现（索引块是提示性元数据，严格校验会误报表达式索引），
+// 且符号文本不会破坏注释行结构（产物仍可解析）。
+func TestBuildIndexCommentBlock_SymbolOnlyName(t *testing.T) {
+	got := buildIndexCommentBlock([]IndexInfo{
+		{Name: "-|-", Columns: []string{"a"}},
+		{Name: "#expr_idx", Columns: []string{"#expr"}, Unique: true},
+	})
+	want := []string{
+		"//   - UNIQUE KEY #expr_idx (#expr)",
+		"//   - KEY -|- (a)",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("索引块行数错误\ngot:  %q\nwant: %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("索引块第 %d 行错误\ngot:  %q\nwant: %q", i+1, got[i], want[i])
+		}
+	}
+	structCode := buildStruct("TEntity", []Column{{Name: "a", Type: "text", StructFieldInfo: StructFieldInfo{Name: "A", Type: "string"}}}, false, "T 表", "db", []IndexInfo{{Name: "-|-", Columns: []string{"a"}}})
+	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+structCode, parser.AllErrors); err != nil {
+		t.Errorf("含符号索引名的产物应可解析: %v\n%s", err, structCode)
 	}
 }

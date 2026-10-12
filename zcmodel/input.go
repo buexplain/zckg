@@ -41,6 +41,7 @@ type Input struct {
 	Database         string      // 数据库名
 	Dialect          Dialect     // 数据库方言（"mysql"、"postgres"、"sqlite"）
 	TableName        string      // 表名（支持任意命名风格，用于推导文件名和结构体名）
+	FileName         string      // 输出文件名（不含 .go 扩展名）；空则取 TableName
 	TableComment     string      // 表注释
 	ColumnTagName    string      // 表字段的结构体字段的 tag 名称（如 "column"、"db" 等）
 	JsonTagValueCase NameCase    // JSON tag 的命名风格，空值不生成 json tag
@@ -73,7 +74,8 @@ type Column struct {
 	Comment string
 	// 是否可空；nil 表示未知，ddl 片段省略 NULL 标记；true 生成 NULL，false 生成 NOT NULL
 	Nullable *bool
-	// 默认值（nil 表示无默认值，含显式 DEFAULT NULL），方言原生格式：
+	// 默认值，nil 表示无默认值（MySQL 的显式 DEFAULT NULL 在元数据中与之不可区分；
+	// PG/SQLite 的显式 DEFAULT NULL 为非 nil 的方言原样值），方言原生格式：
 	// MySQL 为裸值（active）、PostgreSQL 为表达式（'active'::character varying）、SQLite 为字面量；
 	// 非 nil 时在 ddl 片段中追加 DEFAULT 段（判定只看指针不看值，空串渲染为 DEFAULT ''）
 	Default *string

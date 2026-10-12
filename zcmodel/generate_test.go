@@ -1,6 +1,7 @@
 package zcmodel
 
 import (
+	"fmt"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -357,7 +359,8 @@ func TestGenerate_CustomTypeImport(t *testing.T) {
 	}
 }
 
-// TestGenerate_TableNameEscape 验证 TableName 含路径穿越/非法字符/非法首字符（含中文表名）时
+// TestGenerate_TableNameEscape 验证 TableName 含路径穿越/非法字符/非法首字符（含中文表名）、
+// 或推导出的结构体名不是导出标识符（schema 限定名、含 $、下划线后接数字/中文）时
 // 拒绝生成并给出明确错误，且输出目录外无文件逃逸。
 func TestGenerate_TableNameEscape(t *testing.T) {
 	base := t.TempDir()
@@ -380,6 +383,12 @@ func TestGenerate_TableNameEscape(t *testing.T) {
 		// 非 ASCII 首字符（中文表名）与数字开头会推导出无法编译的标识符，须前置报明确错误（ZCM-02）
 		{"中文表名", "订单", "表名首字符必须为 ASCII 字母或下划线"},
 		{"数字开头表名", "2_order", "表名首字符必须为 ASCII 字母或下划线"},
+		// 首字符合法但推导出的结构体名不是导出标识符：须前置报错，而非兜底的语法错误或静默产出未导出类型
+		{"schema 限定表名", "public.users", "不是合法的导出 Go 标识符"},
+		{"含点表名", "user.order", "不是合法的导出 Go 标识符"},
+		{"含美元符表名", "user$x", "不是合法的导出 Go 标识符"},
+		{"下划线后接数字", "_2fa", "不是合法的导出 Go 标识符"},
+		{"下划线后接中文", "_用户", "不是合法的导出 Go 标识符"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -408,22 +417,160 @@ func TestGenerate_TableNameEscape(t *testing.T) {
 	}
 }
 
-// TestGenerate_UnderscoreTableName 验证下划线开头的表名合法（首字符校验允许下划线），可正常生成。
-func TestGenerate_UnderscoreTableName(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	input := Input{
-		OutputDir:     dir,
-		Database:      "test_db",
-		Dialect:       DialectMysql,
-		TableName:     "_user",
-		ColumnTagName: "db",
-		Columns:       []*Column{{Name: "id", Type: "bigint"}},
+// TestGenerate_FileNameConflictWithGoRules 验证文件名（默认取表名，或显式的 Input.FileName）触发 Go 文件名构建规则时报错且不写出任何文件：
+// _ 开头被 go 工具忽略、_test 后缀成为测试文件、_GOOS / _GOARCH / _GOOS_GOARCH 后缀成为平台约束。
+// 来源为表名时错误须提示通过 Input.FileName 改名；显式 FileName 同样受该规则约束。
+func TestGenerate_FileNameConflictWithGoRules(t *testing.T) {
+	tests := []struct {
+		name      string
+		tableName string
+		fileName  string
+		wantErr   []string
+	}{
+		{"下划线开头表名", "_user", "", []string{"_user.go", "被 go 工具忽略", "Input.FileName"}},
+		{"_test 后缀表名", "user_test", "", []string{"user_test.go", "测试文件", "Input.FileName"}},
+		{"GOOS 后缀表名", "order_linux", "", []string{"order_linux.go", "平台构建约束", "Input.FileName"}},
+		{"本机 GOOS 后缀表名", "log_windows", "", []string{"log_windows.go", "平台构建约束", "Input.FileName"}},
+		{"GOARCH 后缀表名", "stat_amd64", "", []string{"stat_amd64.go", "平台构建约束", "Input.FileName"}},
+		{"GOOS_GOARCH 后缀表名", "x_linux_arm64", "", []string{"x_linux_arm64.go", "平台构建约束", "Input.FileName"}},
+		{"显式文件名下划线开头", "user", "_user", []string{"文件名 _user.go", "被 go 工具忽略"}},
+		{"显式文件名 GOOS 后缀", "user", "user_darwin", []string{"文件名 user_darwin.go", "平台构建约束"}},
 	}
-	if err := Generate(input); err != nil {
-		t.Fatalf("下划线开头表名应合法，Generate() error = %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "model")
+			err := Generate(Input{
+				OutputDir: dir,
+				Dialect:   DialectMysql,
+				TableName: tt.tableName,
+				FileName:  tt.fileName,
+				Columns:   []*Column{{Name: "id", Type: "bigint"}},
+			})
+			if err == nil {
+				t.Fatalf("期望返回错误，实际为 nil")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("错误信息应包含 %q，实际: %v", want, err)
+				}
+			}
+			// 校验先于建目录，失败时输出目录不应被创建
+			if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+				t.Errorf("生成失败时不应创建输出目录: %v", statErr)
+			}
+		})
 	}
-	if _, err := os.Stat(filepath.Join(dir, "_user.go")); err != nil {
-		t.Errorf("应生成 _user.go: %v", err)
+}
+
+// TestGenerate_FileNameOverride 验证 Input.FileName 覆盖默认文件名：产物写入 {FileName}.go，
+// 结构体名仍由表名推导；不触发文件名规则的普通表名（含与 GOOS 同名但无下划线前缀的 linux）照常使用表名。
+func TestGenerate_FileNameOverride(t *testing.T) {
+	tests := []struct {
+		name      string
+		tableName string
+		fileName  string
+		wantFile  string
+		wantType  string
+	}{
+		{"下划线开头表名改名", "_user", "user", "user.go", "type UserEntity struct {"},
+		{"GOOS 后缀表名改名", "order_linux", "order_linux_tbl", "order_linux_tbl.go", "type OrderLinuxEntity struct {"},
+		{"无下划线前缀的 GOOS 同名表名", "linux", "", "linux.go", "type LinuxEntity struct {"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "model")
+			if err := Generate(Input{
+				OutputDir: dir,
+				Dialect:   DialectMysql,
+				TableName: tt.tableName,
+				FileName:  tt.fileName,
+				Columns:   []*Column{{Name: "id", Type: "bigint"}},
+			}); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("读取输出目录失败: %v", err)
+			}
+			if len(entries) != 1 || entries[0].Name() != tt.wantFile {
+				t.Fatalf("输出目录应只有 %s，实际: %v", tt.wantFile, entries)
+			}
+			content, err := os.ReadFile(filepath.Join(dir, tt.wantFile))
+			if err != nil {
+				t.Fatalf("读取生成文件失败: %v", err)
+			}
+			assertContains(t, string(content), tt.wantType, "结构体名应由表名推导")
+		})
+	}
+}
+
+// TestGenerate_InvalidFileName 验证显式 Input.FileName 的路径安全校验：拒绝 "." / ".."、路径分隔符、
+// Windows 非法文件名字符与多余的 .go 扩展名，错误信息含具体原因，且输出目录外无文件逃逸。
+func TestGenerate_InvalidFileName(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "model")
+	tests := []struct {
+		name     string
+		fileName string
+		wantErr  string
+	}{
+		{"点", ".", "文件名非法"},
+		{"双点", "..", "文件名非法"},
+		{"路径穿越", "../escaped", "文件名包含非法字符"},
+		{"反斜杠", `a\b`, "文件名包含非法字符"},
+		{"冒号", "a:b", "文件名包含非法字符"},
+		{"带 .go 扩展名", "user.go", "文件名不应包含 .go 扩展名"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := snapshotFiles(t, base)
+			err := Generate(Input{
+				OutputDir: dir,
+				Dialect:   DialectMysql,
+				TableName: "user",
+				FileName:  tt.fileName,
+				Columns:   []*Column{{Name: "id", Type: "bigint"}},
+			})
+			if err == nil {
+				t.Fatalf("FileName=%q 期望返回错误，实际为 nil", tt.fileName)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("FileName=%q 错误信息应包含 %q，实际: %v", tt.fileName, tt.wantErr, err)
+			}
+			if after := snapshotFiles(t, base); !reflect.DeepEqual(after, before) {
+				t.Errorf("FileName=%q 生成产生了文件\nbefore: %v\nafter:  %v", tt.fileName, before, after)
+			}
+		})
+	}
+}
+
+// TestGoFileNameConflict 逐条锁定 goFileNameConflict 的判定：触发规则时返回对应原因，普通文件名返回空串。
+// 平台后缀由 go/build 判定，大写的 _LINUX 不是平台约束、首个下划线之前的 GOOS 名（linux_user）也不是。
+func TestGoFileNameConflict(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"user", ""},
+		{"user_info", ""},
+		{"linux", ""},
+		{"linux_user", ""},
+		{"order_LINUX", ""},
+		{"_user", "以 _ 或 . 开头的文件会被 go 工具忽略"},
+		{".user", "以 _ 或 . 开头的文件会被 go 工具忽略"},
+		{"user_test", "_test 后缀会使其被识别为测试文件"},
+		{"user_linux_test", "_test 后缀会使其被识别为测试文件"},
+		{"order_linux", "文件名后缀会被识别为 GOOS/GOARCH 平台构建约束"},
+		{"order_windows", "文件名后缀会被识别为 GOOS/GOARCH 平台构建约束"},
+		{"order_386", "文件名后缀会被识别为 GOOS/GOARCH 平台构建约束"},
+		{"order_js_wasm", "文件名后缀会被识别为 GOOS/GOARCH 平台构建约束"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := goFileNameConflict(tt.name); got != tt.want {
+				t.Errorf("goFileNameConflict(%q) = %q, want %q", tt.name, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -621,41 +768,59 @@ func TestGenerate_ExistingFileSyntaxError(t *testing.T) {
 	}
 }
 
-// TestGenerate_ChineseColumnName 验证中文列名生成合法 Go 标识符，且产物与 gofmt 标准输出逐字节一致
-// （对齐按 rune 宽度，见 Minor-2）。
+// TestGenerate_ChineseColumnName 验证中文列名转换出的字段名首字符不是大写字母（未导出，会被 json 与 zcdb 映射
+// 静默跳过）时前置报错并提示 StructFieldInfo.Name、不写出文件；通过 StructFieldInfo.Name 指定导出名后正常生成，
+// 列映射 tag 保留中文列名，且产物与 gofmt 标准输出逐字节一致。
 func TestGenerate_ChineseColumnName(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "model")
-	input := Input{
-		OutputDir:        dir,
-		Database:         "test_db",
-		Dialect:          DialectMysql,
-		TableName:        "user_info",
-		ColumnTagName:    "db",
-		JsonTagValueCase: NameCaseLowerCamel,
-		Columns: []*Column{
-			{Name: "id", Type: "bigint"},
-			{Name: "用户表", Type: "varchar(255)", Comment: "中文列名注释"},
-		},
+	newInput := func(dir string, fieldName string) Input {
+		return Input{
+			OutputDir:        dir,
+			Database:         "test_db",
+			Dialect:          DialectMysql,
+			TableName:        "user_info",
+			ColumnTagName:    "db",
+			JsonTagValueCase: NameCaseLowerCamel,
+			Columns: []*Column{
+				{Name: "id", Type: "bigint"},
+				{Name: "用户表", Type: "varchar(255)", Comment: "中文列名注释", StructFieldInfo: StructFieldInfo{Name: fieldName}},
+			},
+		}
 	}
-	if err := Generate(input); err != nil {
-		t.Fatalf("中文列名应生成合法代码，Generate() error = %v", err)
-	}
-	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
-	if err != nil {
-		t.Fatalf("读取生成文件失败: %v", err)
-	}
-	// 中文是合法 Go 标识符，字段名保留原样
-	if !regexp.MustCompile(`用户表\s+string\s+`).Match(content) {
-		t.Errorf("中文列名字段生成错误:\n%s", content)
-	}
-	// 产物必须与 gofmt 标准输出逐字节一致
-	formatted, err := format.Source(content)
-	if err != nil {
-		t.Fatalf("生成产物无法通过 gofmt: %v", err)
-	}
-	if string(formatted) != string(content) {
-		t.Errorf("生成产物与 gofmt 输出不一致\ngot:\n%s\nwant:\n%s", content, formatted)
-	}
+	t.Run("未指定字段名报错", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "model")
+		err := Generate(newInput(dir, ""))
+		if err == nil {
+			t.Fatalf("中文列名未指定导出字段名应报错，实际为 nil")
+		}
+		for _, want := range []string{`"用户表"`, "不是导出标识符", "StructFieldInfo.Name"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("错误信息应包含 %q，实际: %v", want, err)
+			}
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, "user_info.go")); !os.IsNotExist(statErr) {
+			t.Errorf("生成失败时不应写出文件: %v", statErr)
+		}
+	})
+	t.Run("指定导出字段名后生成", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "model")
+		if err := Generate(newInput(dir, "UserTable")); err != nil {
+			t.Fatalf("Generate() error = %v", err)
+		}
+		content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+		if err != nil {
+			t.Fatalf("读取生成文件失败: %v", err)
+		}
+		if !regexp.MustCompile("(?m)^\\s+UserTable\\s+string\\s+`json:\"用户表\" db:\"用户表\" ddl:\"varchar\\(255\\)\" description:\"中文列名注释\"`$").Match(content) {
+			t.Errorf("中文列名字段生成错误:\n%s", content)
+		}
+		formatted, err := format.Source(content)
+		if err != nil {
+			t.Fatalf("生成产物无法通过 gofmt: %v", err)
+		}
+		if string(formatted) != string(content) {
+			t.Errorf("生成产物与 gofmt 输出不一致\ngot:\n%s\nwant:\n%s", content, formatted)
+		}
+	})
 }
 
 // TestGenerate_DuplicateFieldNames 验证不同列转换后字段名重复时报错（如 user_name 与 userName 均转换为 UserName）。
@@ -676,11 +841,155 @@ func TestGenerate_DuplicateFieldNames(t *testing.T) {
 	if err == nil {
 		t.Fatalf("字段名重复应报错，实际为 nil")
 	}
-	if !strings.Contains(err.Error(), "重复") {
-		t.Errorf("错误信息应说明字段名重复: %v", err)
+	// 精确断言错误文本：列名与字段名一律以 %q（双引号）输出，与文档「字段名以 %q 输出」的声明一致
+	const want = `列 "user_name" 与 "userName" 转换后的字段名重复: "UserName"`
+	if err.Error() != want {
+		t.Errorf("字段名重复错误信息不符\nwant: %s\ngot:  %s", want, err.Error())
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "user_info.go")); !os.IsNotExist(statErr) {
 		t.Errorf("生成失败时不应写出文件: %v", statErr)
+	}
+}
+
+// TestGenerate_UnusableFieldNames 验证能通过 token.IsIdentifier 却无法编译或无法映射的字段名前置报错且不写出文件：
+// 与生成方法 ToDO/ToEntity 同名（列名 to_entity、to_d_o 转换而来或显式指定）会产生「字段与方法同名」编译错误；
+// 显式指定的空白标识符 _ 不是导出标识符，在 ToDO/ToEntity 中无法被引用。错误信息须含列名与改名提示。
+func TestGenerate_UnusableFieldNames(t *testing.T) {
+	tests := []struct {
+		name      string
+		colName   string
+		fieldName string
+		wantErr   string
+	}{
+		{"列名转换为 ToEntity", "to_entity", "", "与生成方法同名"},
+		{"列名转换为 ToDO", "to_d_o", "", "与生成方法同名"},
+		{"显式指定 ToDO", "x", "ToDO", "与生成方法同名"},
+		{"显式指定空白标识符", "x", "_", "不是导出标识符"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "model")
+			err := Generate(Input{
+				OutputDir: dir,
+				Dialect:   DialectMysql,
+				TableName: "user_info",
+				Columns:   []*Column{{Name: tt.colName, Type: "text", StructFieldInfo: StructFieldInfo{Name: tt.fieldName}}},
+			})
+			if err == nil {
+				t.Fatalf("列 %q 期望返回错误，实际为 nil", tt.colName)
+			}
+			for _, want := range []string{strconv.Quote(tt.colName), tt.wantErr, "StructFieldInfo.Name"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("错误信息应包含 %q，实际: %v", want, err)
+				}
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "user_info.go")); !os.IsNotExist(statErr) {
+				t.Errorf("生成失败时不应写出文件: %v", statErr)
+			}
+		})
+	}
+}
+
+// TestGenerate_NilColumn 验证 Columns 含 nil 元素时返回带下标的错误（而非解引用 panic），且不创建输出目录。
+func TestGenerate_NilColumn(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	err := Generate(Input{
+		OutputDir: dir,
+		Dialect:   DialectMysql,
+		TableName: "user_info",
+		Columns:   []*Column{{Name: "id", Type: "bigint"}, nil},
+	})
+	if err == nil || err.Error() != "列[1] 为 nil" {
+		t.Fatalf("期望错误 %q，实际: %v", "列[1] 为 nil", err)
+	}
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Errorf("生成失败时不应创建输出目录: %v", statErr)
+	}
+}
+
+// TestGenerate_EmptyOutputDir 验证 OutputDir 为空串时返回「输出目录为空」，
+// 而非 os.MkdirAll("") 的系统错误，且不会在当前工作目录写出文件。
+func TestGenerate_EmptyOutputDir(t *testing.T) {
+	wd := t.TempDir()
+	t.Chdir(wd)
+	err := Generate(Input{
+		Dialect:   DialectMysql,
+		TableName: "user_info",
+		Columns:   []*Column{{Name: "id", Type: "bigint"}},
+	})
+	if err == nil || err.Error() != "输出目录为空" {
+		t.Fatalf("期望错误 %q，实际: %v", "输出目录为空", err)
+	}
+	entries, readErr := os.ReadDir(wd)
+	if readErr != nil {
+		t.Fatalf("读取工作目录失败: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("工作目录不应出现文件: %v", entries)
+	}
+}
+
+// TestGenerate_StructCommentQualifiedName 验证结构体注释中的表限定名：Database 非空时为 {Database}.{TableName}，
+// 为空时只呈现表名，不出现残缺的 .table 前缀。
+func TestGenerate_StructCommentQualifiedName(t *testing.T) {
+	tests := []struct {
+		name     string
+		database string
+		want     []string
+	}{
+		{"有数据库名", "test_db", []string{
+			"// UserInfoEntity test_db.user_info 表，entity结构体，常用于数据库读取操作。\n",
+			"// UserInfoDO test_db.user_info 表，do结构体，常用于数据库写入操作。\n",
+		}},
+		{"无数据库名", "", []string{
+			"// UserInfoEntity user_info 表，entity结构体，常用于数据库读取操作。\n",
+			"// UserInfoDO user_info 表，do结构体，常用于数据库写入操作。\n",
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "model")
+			if err := Generate(Input{
+				OutputDir: dir,
+				Database:  tt.database,
+				Dialect:   DialectMysql,
+				TableName: "user_info",
+				Columns:   []*Column{{Name: "id", Type: "bigint"}},
+			}); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+			if err != nil {
+				t.Fatalf("读取生成文件失败: %v", err)
+			}
+			got := string(content)
+			assertContainsAll(t, got, tt.want, "结构体注释的表限定名")
+			assertNotContains(t, got, " .user_info", "不应出现残缺的 .table 限定名")
+		})
+	}
+}
+
+// TestGenerate_InvalidColumnTagName 验证 ColumnTagName 不能作为 reflect.StructTag 的 key（含空格、控制字符、
+// 冒号、双引号、反引号、DEL）时前置报错且不创建输出目录；合法 key（如 db）由其余 Generate 用例覆盖。
+func TestGenerate_InvalidColumnTagName(t *testing.T) {
+	for _, tagName := range []string{"a b", "a\tb", "a:b", `a"b`, "a`b", "a\x7fb"} {
+		t.Run(strconv.Quote(tagName), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "model")
+			err := Generate(Input{
+				OutputDir:     dir,
+				Dialect:       DialectMysql,
+				TableName:     "user_info",
+				ColumnTagName: tagName,
+				Columns:       []*Column{{Name: "id", Type: "bigint"}},
+			})
+			want := fmt.Sprintf("列映射 tag 名非法: %q", tagName)
+			if err == nil || err.Error() != want {
+				t.Fatalf("期望错误 %q，实际: %v", want, err)
+			}
+			if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+				t.Errorf("生成失败时不应创建输出目录: %v", statErr)
+			}
+		})
 	}
 }
 
@@ -812,6 +1121,8 @@ func (e *UserInfoEntity) Now() mytime.Time {
 	if !regexp.MustCompile(`CreatedAt\s+time\.Time`).MatchString(got) {
 		t.Errorf("新增列 CreatedAt 生成错误:\n%s", got)
 	}
+	// 编译级校验：别名导入与补充的标准导入共存、生成代码引用默认包名 time 可用（非 imported and not used）
+	typeCheckGoSource(t, got)
 }
 
 // sampleColumns 返回 §3.4 样板的列定义（MySQL 8 元数据形态：Nullable/Default/PrimaryKey/Extra 均显式给出）。
@@ -968,5 +1279,26 @@ func TestGenerate_NoGeneratedMarker(t *testing.T) {
 		if official.MatchString(line) {
 			t.Errorf("产物第 %d 行匹配官方生成标记正则: %q", i+1, line)
 		}
+	}
+}
+
+// TestIsPathWithinDir_RelError 覆盖 filepath.Rel 报错时 isPathWithinDir 直接返回 false 的分支。
+// 相对目录与绝对路径混用时 filepath.Rel 在各平台均报错：Rel 比较两侧「是否以分隔符开头」，
+// 不一致即报错（Windows 上还叠加卷名不同）。
+// 由于返回 false 也可能来自后续的 ".." 前缀检查分支，先断言 Rel 确实报错，确保覆盖目标分支。
+func TestIsPathWithinDir_RelError(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("获取工作目录失败: %v", err)
+	}
+	const relDir = "relative/dir"
+	absPath := filepath.Join(wd, "abs.go")
+
+	// 前提校验：与 isPathWithinDir 内部一致地传入 Clean 后的路径
+	if _, relErr := filepath.Rel(filepath.Clean(relDir), filepath.Clean(absPath)); relErr == nil {
+		t.Fatalf("前提不成立：filepath.Rel(%q, %q) 未报错，本用例无法覆盖 Rel 错误分支", relDir, absPath)
+	}
+	if isPathWithinDir(relDir, absPath) {
+		t.Fatal("相对目录与绝对路径混用时 Rel 报错，应返回 false")
 	}
 }

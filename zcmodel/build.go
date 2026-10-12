@@ -14,6 +14,17 @@ import (
 	"strings"
 )
 
+// genKind 标识骨架中的生成声明种类（Entity/DO 结构体、ToDO/ToEntity 方法），
+// 其枚举顺序即生成声明的标准排列顺序。
+type genKind int
+
+const (
+	genEntType  genKind = iota // Entity 结构体
+	genToDO                    // Entity 上的 ToDO 方法
+	genDoType                  // DO 结构体
+	genToEntity                // DO 上的 ToEntity 方法
+)
+
 // buildToDOMethod 生成 Entity 的 ToDO 转换方法。
 // 支持传入已有 DO 实例进行复用；Entity 字段为值类型，直接赋给 DO 的 any 字段，无需 nil 判断。
 func buildToDOMethod(entityName, doName string, columns []Column) string {
@@ -72,21 +83,31 @@ func sanitizeTagValue(v string) string {
 
 // sanitizeCommentLine 将文本中的换行/回车替换为空格，避免注释被撑断成裸行导致生成代码语法错误。
 // TableComment、索引名与索引列文本进入 doc 注释前统一经此净化。
+// gofmt 会把 doc 注释中连续两个单引号/反引号规范化为弯引号，因此在相邻两个引号之间插入
+// 零宽空格 U+200B 阻止改写，使注释读起来与原文一致。
 func sanitizeCommentLine(s string) string {
-	return strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ").Replace(s)
+	s = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ").Replace(s)
+	for _, pair := range []string{"''", "``"} {
+		for strings.Contains(s, pair) {
+			s = strings.ReplaceAll(s, pair, pair[:1]+"\u200b"+pair[1:])
+		}
+	}
+	return s
 }
 
 // ddlExtraWhiteList 是 ddl 片段允许渲染的 MySQL EXTRA 标记：marker 为大小写不敏感的匹配串，
 // output 为 DDL 惯例的大写输出形态，切片顺序即片段内的输出顺序（保证产物稳定）。
+// precision 为 true 的项会追加 EXTRA 中紧随 marker 的 (n) 精度（如 CURRENT_TIMESTAMP(3)）。
 // DEFAULT_GENERATED 不在白名单内——默认值已由 DEFAULT 段呈现，属元数据噪音。
 var ddlExtraWhiteList = []struct {
-	marker string
-	output string
+	marker    string
+	output    string
+	precision bool
 }{
-	{"auto_increment", "AUTO_INCREMENT"},
-	{"on update current_timestamp", "ON UPDATE CURRENT_TIMESTAMP"},
-	{"virtual generated", "VIRTUAL GENERATED"},
-	{"stored generated", "STORED GENERATED"},
+	{"auto_increment", "AUTO_INCREMENT", false},
+	{"on update current_timestamp", "ON UPDATE CURRENT_TIMESTAMP", true},
+	{"virtual generated", "VIRTUAL GENERATED", false},
+	{"stored generated", "STORED GENERATED", false},
 }
 
 // assembleDDLFragment 组装字段的类 DDL 列定义片段：{Type} [{NULL|NOT NULL}] [DEFAULT 值] [EXTRA 白名单项]。
@@ -122,7 +143,8 @@ func formatDDLDefault(v string) string {
 	return v
 }
 
-// ddLExtraParts 按白名单顺序取出 EXTRA 中允许渲染的标记（大小写不敏感匹配），输出 DDL 惯例的大写形态。
+// ddLExtraParts 按白名单顺序取出 EXTRA 中允许渲染的标记（大小写不敏感匹配），输出 DDL 惯例的大写形态，
+// ON UPDATE CURRENT_TIMESTAMP 保留其后的 (n) 精度。
 // 生成列（VIRTUAL/STORED GENERATED）必须保留：该列不可写，片段是 DO 侧唯一能提示这一点的地方。
 func ddLExtraParts(extra string) []string {
 	if extra == "" {
@@ -131,11 +153,34 @@ func ddLExtraParts(extra string) []string {
 	lower := strings.ToLower(extra)
 	var parts []string
 	for _, item := range ddlExtraWhiteList {
-		if strings.Contains(lower, item.marker) {
-			parts = append(parts, item.output)
+		i := strings.Index(lower, item.marker)
+		if i < 0 {
+			continue
 		}
+		out := item.output
+		if item.precision {
+			out += precisionSuffix(lower[i+len(item.marker):])
+		}
+		parts = append(parts, out)
 	}
 	return parts
+}
+
+// precisionSuffix 返回 s 开头形如 (n) 的精度后缀（n 为一位或多位数字），不存在时返回空串。
+func precisionSuffix(s string) string {
+	if !strings.HasPrefix(s, "(") {
+		return ""
+	}
+	end := strings.IndexByte(s, ')')
+	if end < 2 {
+		return ""
+	}
+	for _, r := range s[1:end] {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return s[:end+1]
 }
 
 // buildStructDocComment 组装结构体 doc 注释：首行为 comment，其后追加索引注释块（无索引时不追加）。
@@ -196,6 +241,7 @@ func buildIndexCommentBlock(indexes []IndexInfo) []string {
 // comment 非空或 indexes 非空时在 type 声明前生成 doc 注释（含索引块）。
 // useAny 为 true 时字段类型使用 any（用于 DO 结构体），为 false 时使用具体类型（用于 Entity 结构体）。
 // columnTagName 指定结构体字段的 tag 名称（如 "column"、"db" 等），为空时不生成列名 tag，避免产生空 tag 名 `:"colname"`。
+// json、列映射、ddl、description 的 tag 值均经 sanitizeTagValue 转义，含引号、反斜杠、换行的列名也能经反射完整还原。
 func buildStruct(name string, columns []Column, useAny bool, comment string, columnTagName string, indexes []IndexInfo) string {
 	// 计算字段名和类型的最大宽度，用于对齐
 	maxNameLen, maxTypeLen := 0, 0
@@ -229,7 +275,7 @@ func buildStruct(name string, columns []Column, useAny bool, comment string, col
 			tagParts = append(tagParts, fmt.Sprintf("json:\"%s\"", sanitizeTagValue(col.StructFieldInfo.JsonTagValue)))
 		}
 		if columnTagName != "" {
-			tagParts = append(tagParts, fmt.Sprintf("%s:\"%s\"", columnTagName, col.Name))
+			tagParts = append(tagParts, fmt.Sprintf("%s:\"%s\"", columnTagName, sanitizeTagValue(col.Name)))
 		}
 		if col.PrimaryKey {
 			tagParts = append(tagParts, `primary_key:"true"`)
@@ -333,19 +379,125 @@ func writeGeneratedFile(filePath string, content []byte) error {
 	return writeFileAtomic(filePath, formatted)
 }
 
-// writeOrReplaceStruct 将 Entity 和 DO 结构体（含关联方法）写入文件。
-// 文件最终布局为：原文件头（build tags、文件级注释、原 package 行）+ imports + Entity 生成代码 +
-// Entity 自定义方法 + DO 生成代码 + DO 自定义方法 + 其他用户代码。
-// 若文件已存在，通过 AST 解析识别并移除旧的生成代码（Entity/DO 结构体、ToDO/ToEntity 方法，
-// 含值接收者版本），保留用户自定义代码（含 Entity/DO 上的自定义方法，指针/值接收者均识别）并按上述布局重新组织；
+// packageNameOf 推导新建文件的 Go 包名：取输出文件所在目录的绝对路径末级目录名，
+// 使相对路径 "." 也能解析为当前目录的实际名称；无法推导（Abs 失败、位于根目录）时回退为 "main"。
+func packageNameOf(filePath string) string {
+	dir, err := filepath.Abs(filepath.Dir(filePath))
+	if err != nil {
+		return "main"
+	}
+	name := filepath.Base(dir)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return "main"
+	}
+	return name
+}
+
+// importLocalName 返回 import spec 在文件内绑定的包名，无法确定时返回空串：
+// 具名别名取别名；_ 与 . 导入、"C" 不绑定可移除的包名；无别名时按 goimports 惯例取路径末段，
+// 末段不是合法标识符（如 yaml.v3）或为主版本后缀（如 v2）时实际包名不可知，返回空串。
+func importLocalName(spec *ast.ImportSpec) string {
+	if spec.Name != nil {
+		if spec.Name.Name == "_" || spec.Name.Name == "." {
+			return ""
+		}
+		return spec.Name.Name
+	}
+	path, err := strconv.Unquote(spec.Path.Value)
+	if err != nil || path == "C" {
+		return ""
+	}
+	name := path[strings.LastIndex(path, "/")+1:]
+	if !token.IsIdentifier(name) {
+		return ""
+	}
+	if len(name) > 1 && name[0] == 'v' && strings.Trim(name[1:], "0123456789") == "" {
+		return ""
+	}
+	return name
+}
+
+// collectSelectorRefs 收集节点内选择器表达式 X.Sel 中作为 X 的标识符名（包名引用的候选集合）。
+func collectSelectorRefs(node ast.Node, into map[string]bool) {
+	ast.Inspect(node, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if id, ok := sel.X.(*ast.Ident); ok {
+				into[id.Name] = true
+			}
+		}
+		return true
+	})
+}
+
+// splitGeneratedCode 把生成代码块拆成结构体声明段与方法声明段，后者可能为空：
+// 结构体段为名为 structName 的 type 声明（含其 Doc 注释），方法段为名为 methodName 的函数声明（含其 Doc 注释）。
+// 之所以要拆分，是因为骨架保持式合并按「逐声明独立槽位」替换——Entity 结构体与 ToDO 方法、
+// DO 结构体与 ToEntity 方法在原文件中各自占一个槽位，必须能分别原位替换。
+// 生成代码本身非法时返回错误（落盘前还有 go/format 全量自校验兜底）。
+func splitGeneratedCode(code, structName, methodName string) (structText, methodText string, err error) {
+	src := "package p\n\n" + code + "\n"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return "", "", err
+	}
+	tf := fset.File(f.Pos())
+	off := func(p token.Pos) int { return tf.Offset(p) }
+	for _, decl := range f.Decls {
+		start := off(decl.Pos())
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			if d.Doc != nil {
+				start = off(d.Doc.Pos())
+			}
+			for _, spec := range d.Specs {
+				if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name.Name == structName {
+					structText = src[start:off(decl.End())]
+				}
+			}
+		case *ast.FuncDecl:
+			if d.Doc != nil {
+				start = off(d.Doc.Pos())
+			}
+			if d.Name.Name == methodName {
+				methodText = src[start:off(decl.End())]
+			}
+		}
+	}
+	return structText, methodText, nil
+}
+
+// writeOrReplaceStruct 将 Entity 和 DO 结构体（含关联方法）写入文件，采用「骨架保持式合并」。
+//
+// 骨架 = 原文件顶层的元素序列（原文件头、package 行、import、各顶层声明、文件尾注释）。
+// 合并时骨架的排列结构原封不动——有哪些声明、按什么顺序、各自在什么位置都不变：
+// 属于生成区的声明（Entity/DO 结构体、ToDO/ToEntity 方法）在各自原位替换为新内容，
+// 用户声明（含其前置游离注释、同行尾注释、声明间游离注释与文件尾注释）原样留在原位。
+// 因此表结构变化时 git diff 只呈现生成区那几处变更，用户代码不产生位置漂移的噪音。
+//
+// 生成声明按「逐声明独立槽位」识别与替换：Entity 结构体、ToDO、DO 结构体、ToEntity 各占一个槽位，
+// 即使它们之间夹着用户代码也不搬动。生成声明在原文件中缺失时（首次引入 DO、用户手删过 ToDO 等）
+// 按配对落点补入：Entity 结构体↔ToDO、DO 结构体↔ToEntity 互为配对，结构体缺失补在其方法前、
+// 方法缺失补在其结构体后；两个都缺或都无配对时，追加到最后一个生成声明之后
+// （原文件没有任何生成声明时置于首个用户声明之前），并按标准顺序
+// Entity 结构体 → ToDO → DO 结构体 → ToEntity 排列。
+// 同类生成声明出现多份时（如用户手写的值接收者 ToDO 与生成的指针接收者 ToDO 共存），
+// 首个槽位原位替换、其余重复槽位移除，避免同名方法共存导致编译失败。
+//
+// type 声明块按 Spec 粒度处理：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，
+// 用户类型（含各自注释）与块内不附着于任何 Spec 的游离注释原样保留；仅含一个生成 Spec 的声明
+// 以独立声明形态输出（不保留括号块），与首次生成的形态保持一致。
+//
 // go/parser 不会把 package 声明之前的 build tags/文件级注释放进 file.Decls，重建时按源码偏移
-// 显式前置保留，已有文件的包名尊重原文件，仅新建文件使用目录推导包名。
-// type 声明块按 Spec 粒度过滤：块中混有用户类型时按源码偏移剔除生成的类型，用户类型（含各自注释）
-// 与块内不附着于任何 Spec 的游离注释均原样保留。
+// 显式前置保留；已有文件的包名尊重原文件，仅新建文件使用目录推导包名（见 packageNameOf）。
 // 最终产物统一经 go/format 格式化并原子写入，保留原文件权限位。
+//
 // neededImports 为生成代码引用的包（如 time.Time 需要 time），写入时若文件缺少对应 import 会自动补上
-// （合并进原第一个 import 块，避免形成两个 import 块）；
+// （合并进第一个保留的 import 块，避免形成两个 import 块）；
 // 存量文件以别名（含 _、. 导入）引入所需包时不视为已存在，仍会补充默认导入，保证生成代码可编译。
+// 反向地，旧生成代码引用过、而新生成代码与保留的用户代码都不再引用的 import spec 会被移除
+// （如删去最后一个时间列后的 time），块内 spec 全部移除时整个 import 声明一并移除；
+// _、. 导入、"C" 及包名无法由路径确定的 import 不做移除。
 // filePath: 输出文件路径
 // entityName: Entity 结构体名
 // entityCode: Entity 结构体及 ToDO 方法的生成代码
@@ -353,18 +505,14 @@ func writeGeneratedFile(filePath string, content []byte) error {
 // doCode: DO 结构体及 ToEntity 方法的生成代码
 // neededImports: 生成代码需要导入的包路径列表
 func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode string, neededImports []string) error {
-	// 从输出目录路径推导 Go 包名，无法推导时回退为 "main"（仅用于新建文件）
-	pkgName := filepath.Base(filepath.Dir(filePath))
-	if pkgName == "" || pkgName == "." || pkgName == "/" {
-		pkgName = "main"
-	}
+	pkgName := packageNameOf(filePath)
 
 	// 文件不存在时直接创建，自动引入生成代码需要的 import
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		return writeGeneratedFile(filePath, []byte(buildFileContent(pkgName, entityCode, doCode, neededImports)))
 	}
 
-	// 读取并解析现有文件
+	// 读取现有文件
 	origContent, err := os.ReadFile(filePath)
 	if err != nil {
 		return err
@@ -375,91 +523,178 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		return writeGeneratedFile(filePath, []byte(buildFileContent(pkgName, entityCode, doCode, neededImports)))
 	}
 
+	// 把生成代码拆成四个声明（Entity 结构体、ToDO、DO 结构体、ToEntity），供逐声明原位替换。
+	// 某段为空表示生成代码不含该声明（如调用方只传结构体）；此时该生成声明不写入，原文件中的旧槽位一并移除。
+	entStructText, toDOMethodText, err := splitGeneratedCode(entityCode, entityName, "ToDO")
+	if err != nil {
+		return fmt.Errorf("生成代码存在语法错误: %v", err)
+	}
+	doStructText, toEntityMethodText, err := splitGeneratedCode(doCode, doName, "ToEntity")
+	if err != nil {
+		return fmt.Errorf("生成代码存在语法错误: %v", err)
+	}
+	genText := map[genKind]string{
+		genEntType:  entStructText,
+		genToDO:     toDOMethodText,
+		genDoType:   doStructText,
+		genToEntity: toEntityMethodText,
+	}
+	// genSpecText 为结构体的「Spec 形态」文本：去掉 type 关键字、保留 Doc 注释，
+	// 用于把新结构体就地替换进 type (…) 块（块内 Spec 不带 type 关键字）。
+	specTextFor := func(declText, name string) string {
+		marker := "type "
+		if i := strings.Index(declText, marker+name); i >= 0 {
+			return declText[:i] + declText[i+len(marker):]
+		}
+		return declText
+	}
+	genSpecText := map[genKind]string{
+		genEntType: specTextFor(entStructText, entityName),
+		genDoType:  specTextFor(doStructText, doName),
+	}
+
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filePath, origContent, parser.ParseComments)
 	if err != nil {
 		return fmt.Errorf("解析文件失败: %v", err)
 	}
 	tf := fset.File(file.Pos())
+	off := func(p token.Pos) int { return tf.Offset(p) }
 
-	// 保留 package 声明之前的全部原文（build tags、文件级注释）与原 package 行：
-	// go/parser 不把它们放进 file.Decls，重建时必须显式前置，否则再生成会静默丢失。
-	// 已有文件的包名尊重原文件，不强制改为输出目录推导的包名。
-	pkgOffset := tf.Offset(file.Package)
-	fileHeader := origContent[:pkgOffset]
-	pkgClause := origContent[pkgOffset:tf.Offset(file.Name.End())]
-
-	// getDeclSource 从原始文件内容中截取声明的源码文本，包含前置 Doc 注释
-	getDeclSource := func(decl ast.Decl) string {
-		start := tf.Offset(decl.Pos())
-		end := tf.Offset(decl.End())
+	// declStarts[i] 为第 i 个声明的起始偏移（含前置 Doc 注释）
+	declStarts := make([]int, len(file.Decls))
+	for i, decl := range file.Decls {
+		declStarts[i] = off(decl.Pos())
 		switch d := decl.(type) {
 		case *ast.GenDecl:
 			if d.Doc != nil {
-				start = tf.Offset(d.Doc.Pos())
+				declStarts[i] = off(d.Doc.Pos())
 			}
 		case *ast.FuncDecl:
 			if d.Doc != nil {
-				start = tf.Offset(d.Doc.Pos())
+				declStarts[i] = off(d.Doc.Pos())
 			}
 		}
-		return string(origContent[start:end])
+	}
+	// nextStart 返回第 i 个声明之后的下一个声明起点（无则为文件末尾），作为同行尾注释的扩展上限
+	nextStart := func(i int) int {
+		if i+1 < len(declStarts) {
+			return declStarts[i+1]
+		}
+		return len(origContent)
+	}
+	// lineCommentEnd 若 end 之后同一行（仅隔空格/制表符）紧跟注释组、且注释组起点早于 limit，
+	// 返回该注释组的结束偏移，否则原样返回 end。用于把 `var X = 1 // c`、`func F() {} // c`
+	// 这类位于声明 End() 之后的行尾注释并入声明区间。
+	lineCommentEnd := func(end, limit int) int {
+		for _, cg := range file.Comments {
+			from := off(cg.Pos())
+			if from < end {
+				continue
+			}
+			if from >= limit || strings.TrimLeft(string(origContent[end:from]), " \t") != "" {
+				break
+			}
+			return off(cg.End())
+		}
+		return end
+	}
+
+	// 保留 package 声明之前的全部原文（build tags、文件级注释）与原 package 行（含同行尾注释）：
+	// go/parser 不把它们放进 file.Decls，重建时必须显式前置，否则再生成会静默丢失。
+	// 已有文件的包名尊重原文件，不强制改为输出目录推导的包名。
+	pkgOffset := off(file.Package)
+	pkgEnd := lineCommentEnd(off(file.Name.End()), nextStart(-1))
+	fileHeader := origContent[:pkgOffset]
+	pkgClause := origContent[pkgOffset:pkgEnd]
+
+	// generatedTypeKind 判断 TypeSpec 是否为生成的结构体声明，并返回其种类：
+	// Entity 结构体（genEntType）或 DO 结构体（genDoType）；非生成类型返回 false。
+	generatedTypeKind := func(spec ast.Spec) (genKind, bool) {
+		typeSpec, ok := spec.(*ast.TypeSpec)
+		if !ok {
+			return 0, false
+		}
+		switch typeSpec.Name.Name {
+		case entityName:
+			return genEntType, true
+		case doName:
+			return genDoType, true
+		}
+		return 0, false
 	}
 
 	// isGeneratedTypeSpec 判断 TypeSpec 是否为生成的结构体声明（Entity/DO）
 	isGeneratedTypeSpec := func(spec ast.Spec) bool {
-		typeSpec, ok := spec.(*ast.TypeSpec)
-		return ok && (typeSpec.Name.Name == entityName || typeSpec.Name.Name == doName)
+		_, ok := generatedTypeKind(spec)
+		return ok
 	}
 
 	// specSpan 返回单个 Spec 的源码区间 [from, to)，包含其前置 Doc 注释与尾注释；
 	// 无注释时退化为 Spec 自身的源码区间。
 	specSpan := func(spec ast.Spec) (from, to int) {
-		from = tf.Offset(spec.Pos())
-		to = tf.Offset(spec.End())
+		from = off(spec.Pos())
+		to = off(spec.End())
 		switch s := spec.(type) {
 		case *ast.ImportSpec:
 			if s.Doc != nil {
-				from = tf.Offset(s.Doc.Pos())
+				from = off(s.Doc.Pos())
 			}
 			if s.Comment != nil {
-				to = tf.Offset(s.Comment.End())
+				to = off(s.Comment.End())
 			}
 		case *ast.TypeSpec:
 			if s.Doc != nil {
-				from = tf.Offset(s.Doc.Pos())
+				from = off(s.Doc.Pos())
 			}
 			if s.Comment != nil {
-				to = tf.Offset(s.Comment.End())
+				to = off(s.Comment.End())
 			}
 		}
 		return from, to
 	}
 
-	// getSpecSource 从原始文件内容中截取单个 Spec 的源码文本（含 Doc 与尾注释）
-	getSpecSource := func(spec ast.Spec) string {
-		from, to := specSpan(spec)
-		return string(origContent[from:to])
+	// lineSpan 把 [from, to) 扩展为整行区间（含行首缩进与行尾换行），仅当该区间独占若干整行时生效；
+	// 与其他 spec 同行时连同其后的分号一并剔除（残留的 ; 会构成缺少路径的空 spec），否则原样返回；
+	// 用于移除 import spec 时不留下空行或语法错误。
+	lineSpan := func(from, to int) (int, int) {
+		ls := from
+		for ls > 0 && (origContent[ls-1] == ' ' || origContent[ls-1] == '\t') {
+			ls--
+		}
+		le := to
+		for le < len(origContent) && (origContent[le] == ' ' || origContent[le] == '\t' || origContent[le] == '\r') {
+			le++
+		}
+		if (ls == 0 || origContent[ls-1] == '\n') && le < len(origContent) && origContent[le] == '\n' {
+			return ls, le + 1
+		}
+		if le < len(origContent) && origContent[le] == ';' {
+			le++
+			for le < len(origContent) && (origContent[le] == ' ' || origContent[le] == '\t') {
+				le++
+			}
+			return from, le
+		}
+		return from, to
 	}
 
-	// removeGeneratedSpecs 在混合 type 声明块中按源码偏移剔除生成的类型 Spec（含其 Doc 注释与尾注释），
-	// 其余内容（保留的用户类型 Spec、块内游离注释、原格式）原样保留。
-	// 相比用 go/printer 重写过滤后的 AST，此法不重建声明节点，
-	// 块内不附着于任何 Spec 的游离注释不会被丢弃。
-	removeGeneratedSpecs := func(d *ast.GenDecl) string {
-		start := tf.Offset(d.Pos())
-		end := tf.Offset(d.End())
-		if d.Doc != nil {
-			start = tf.Offset(d.Doc.Pos())
-		}
+	// renderTypeBlock 在 type 声明块（区间 [start, end)）中就地替换生成的类型 Spec：
+	// 每个生成 Spec 的「Doc 注释 + 声明 + 尾注释」区间整体换为新结构体文本
+	// （新文本为空表示该生成声明不再生成，即剔除），用户类型 Spec、块级 Doc 注释、
+	// 块内游离注释与其余原文原样保留。相比用 go/printer 重写过滤后的 AST，
+	// 此法不重建声明节点，块内不附着于任何 Spec 的游离注释不会被丢弃。
+	renderTypeBlock := func(d *ast.GenDecl, start, end int) string {
 		var sb strings.Builder
 		last := start
 		for _, spec := range d.Specs {
-			if !isGeneratedTypeSpec(spec) {
+			k, ok := generatedTypeKind(spec)
+			if !ok {
 				continue
 			}
 			from, to := specSpan(spec)
 			sb.WriteString(string(origContent[last:from]))
+			sb.WriteString(genSpecText[k])
 			last = to
 		}
 		sb.WriteString(string(origContent[last:end]))
@@ -498,36 +733,123 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		return false
 	}
 
-	// 分类收集用户代码和 import 声明
-	// 用户代码分为三类：
-	//   1. Entity 上的自定义方法（指针/值接收者均识别，放在 Entity 生成代码后面）
-	//   2. DO 上的自定义方法（指针/值接收者均识别，放在 DO 生成代码后面）
-	//   3. 其他用户代码（放在最后）
-	var importDecls []string
-	var firstImportDecl *ast.GenDecl
-	var entityMethodDecls []string
-	var doMethodDecls []string
-	var userDecls []string
-	existingImports := make(map[string]bool)
-
+	// 预扫描包名引用：oldGenRefs 为旧生成代码引用的包名候选，usedRefs 为新生成代码与保留的用户代码引用的包名候选。
+	// 旧生成代码引用过、而 usedRefs 中不再出现的 import spec 在重建时移除，避免产物 imported and not used。
+	oldGenRefs := make(map[string]bool)
+	usedRefs := make(map[string]bool)
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
-				if firstImportDecl == nil {
-					firstImportDecl = d
+				continue
+			}
+			if d.Tok == token.TYPE {
+				for _, spec := range d.Specs {
+					if isGeneratedTypeSpec(spec) {
+						collectSelectorRefs(spec, oldGenRefs)
+					} else {
+						collectSelectorRefs(spec, usedRefs)
+					}
 				}
-				importDecls = append(importDecls, getDeclSource(decl))
+				continue
+			}
+			collectSelectorRefs(d, usedRefs)
+		case *ast.FuncDecl:
+			if isGeneratedMethod(d) {
+				collectSelectorRefs(d, oldGenRefs)
+			} else {
+				collectSelectorRefs(d, usedRefs)
+			}
+		default:
+			collectSelectorRefs(decl, usedRefs)
+		}
+	}
+	genFile, err := parser.ParseFile(token.NewFileSet(), "", "package p\n\n"+entityCode+"\n\n"+doCode+"\n", 0)
+	if err != nil {
+		return fmt.Errorf("生成代码存在语法错误: %v", err)
+	}
+	collectSelectorRefs(genFile, usedRefs)
+
+	neededSet := make(map[string]bool, len(neededImports))
+	for _, p := range neededImports {
+		neededSet[p] = true
+	}
+	removedSpecs := make(map[ast.Spec]bool)
+	droppedImportDecls := make(map[*ast.GenDecl]bool)
+	for _, decl := range file.Decls {
+		d, ok := decl.(*ast.GenDecl)
+		if !ok || d.Tok != token.IMPORT {
+			continue
+		}
+		removed := 0
+		for _, spec := range d.Specs {
+			impSpec, ok := spec.(*ast.ImportSpec)
+			if !ok {
+				continue
+			}
+			name := importLocalName(impSpec)
+			path, _ := strconv.Unquote(impSpec.Path.Value)
+			if name != "" && oldGenRefs[name] && !usedRefs[name] && !neededSet[path] {
+				removedSpecs[spec] = true
+				removed++
+			}
+		}
+		if removed > 0 && removed == len(d.Specs) {
+			droppedImportDecls[d] = true
+		}
+	}
+
+	// 骨架保持式分类：以原文件顶层声明序列为骨架，逐个槽位（slot）收集，顺序即原顺序。
+	// 生成声明槽位只保留其前置游离注释前缀，正文留到组装阶段用新内容替换；
+	// 用户槽位保存完整正文（含前置游离注释、声明本体与同行尾注释），原位原样输出。
+	// import 声明单独收集，统一前置到 package 行之后。
+	type importEntry struct {
+		decl       *ast.GenDecl
+		lead       string // 前置游离注释
+		start, end int    // 声明区间（含 Doc 与同行尾注释）
+	}
+	type slot struct {
+		isGen  bool    // 是否为生成声明槽位（原位替换）
+		hasGen bool    // 该槽位是否承载生成声明（混合 type 块承载块内生成类型时为 true）
+		kind   genKind // isGen 为 true 时有效
+		text   string  // 用户槽位：完整正文；生成槽位：仅保留的前置游离注释前缀
+	}
+	var imports []importEntry
+	var slots []slot
+	carrierIdx := make(map[genKind]int) // 生成声明种类 → 承载它的槽位索引
+	seenGen := make(map[genKind]bool)   // 已建立槽位的生成声明种类（重复出现时去重）
+	existingImports := make(map[string]bool)
+
+	prev := pkgEnd
+	pending := "" // 被移除声明之前的游离注释，顺延给下一个保留声明
+	takeLead := func(lead string) string {
+		s := strings.TrimLeft(pending+lead, " \t\r\n")
+		pending = ""
+		return s
+	}
+
+	for i, decl := range file.Decls {
+		start := declStarts[i]
+		end := lineCommentEnd(off(decl.End()), nextStart(i))
+		lead := string(origContent[prev:start])
+		prev = end
+		body := string(origContent[start:end])
+
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			if d.Tok == token.IMPORT {
+				if droppedImportDecls[d] {
+					pending += lead
+					continue
+				}
+				imports = append(imports, importEntry{decl: d, lead: takeLead(lead), start: start, end: end})
 				// 记录现有文件已导入的包路径，供 neededImports 校验缺失时补充。
 				// 仅统计无别名的导入：别名导入（含 _ 与 . 导入）绑定的是非默认包名，
 				// 生成代码引用的默认包名（如 time.Time 的 time）仍不可用，
 				// 不记入已存在，允许补充标准导入（两种导入可合法共存）。
 				for _, spec := range d.Specs {
 					impSpec, ok := spec.(*ast.ImportSpec)
-					if !ok {
-						continue
-					}
-					if impSpec.Name != nil {
+					if !ok || removedSpecs[spec] || impSpec.Name != nil {
 						continue
 					}
 					if path, err := strconv.Unquote(impSpec.Path.Value); err == nil {
@@ -537,52 +859,83 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 				continue
 			}
 			if d.Tok == token.TYPE {
-				// type 声明按 Spec 粒度判定：仅当块内混有用户类型时才需要部分过滤
-				generated, kept := 0, 0
+				// 统计块内 Spec：有效的生成 Spec、用户 Spec、不再生成的生成 Spec
+				genCount, userCount, dropCount := 0, 0, 0
 				for _, spec := range d.Specs {
-					if isGeneratedTypeSpec(spec) {
-						generated++
+					if k, ok := generatedTypeKind(spec); ok {
+						if genText[k] == "" {
+							dropCount++
+						} else {
+							genCount++
+						}
 					} else {
-						kept++
+						userCount++
 					}
 				}
-				if generated == 0 {
-					// 无生成类型，整体保留
-					userDecls = append(userDecls, getDeclSource(decl))
-					continue
+				switch {
+				case genCount == 0 && dropCount == 0:
+					// 纯用户 type 声明块：整块原位保留
+					slots = append(slots, slot{text: takeLead(lead) + body})
+				case genCount == 0 && userCount == 0:
+					// 块内仅含不再生成的生成类型：整块移除，前置游离注释顺延
+					pending += lead
+				case genCount == 0:
+					// 块内含用户类型，仅剔除不再生成的生成 Spec
+					slots = append(slots, slot{text: takeLead(lead) + renderTypeBlock(d, start, end)})
+				case len(d.Specs) == 1 && userCount == 0 && dropCount == 0:
+					// 单一生成类型（标准的独立 type 声明，或仅含一个生成类型的括号块）：
+					// 以独立声明形态就地替换，不保留括号块，与首次生成的形态一致
+					k, _ := generatedTypeKind(d.Specs[0])
+					if seenGen[k] {
+						pending += lead
+						continue
+					}
+					seenGen[k] = true
+					slots = append(slots, slot{isGen: true, hasGen: true, kind: k, text: takeLead(lead)})
+					carrierIdx[k] = len(slots) - 1
+				default:
+					// 混合 type 块（含用户类型，或含多个生成类型）：保留块形态，
+					// 块内生成 Spec 就地替换、不再生成的生成 Spec 剔除，用户 Spec 与游离注释原样保留
+					slots = append(slots, slot{hasGen: true, text: takeLead(lead) + renderTypeBlock(d, start, end)})
+					for _, spec := range d.Specs {
+						if k, ok := generatedTypeKind(spec); ok && genText[k] != "" && !seenGen[k] {
+							seenGen[k] = true
+							carrierIdx[k] = len(slots) - 1
+						}
+					}
 				}
-				if kept == 0 {
-					// 全部为生成类型，整体移除
-					continue
-				}
-				// 混合 type 块：按源码偏移剔除生成的类型 Spec，用户类型与块内游离注释原样保留
-				userDecls = append(userDecls, removeGeneratedSpecs(d))
 				continue
 			}
-			// 其他 GenDecl（var/const）：整体保留
-			userDecls = append(userDecls, getDeclSource(decl))
+			// 其他 GenDecl（var/const）：整块原位保留
+			slots = append(slots, slot{text: takeLead(lead) + body})
 		case *ast.FuncDecl:
 			if isGeneratedMethod(d) {
+				k := genToEntity
+				if receiverTypeName(d) == entityName {
+					k = genToDO
+				}
+				// 生成代码不含该声明（genToText 为空）或该种类已有槽位时不再输出，避免重名方法共存
+				if genText[k] == "" || seenGen[k] {
+					pending += lead
+					continue
+				}
+				seenGen[k] = true
+				slots = append(slots, slot{isGen: true, hasGen: true, kind: k, text: takeLead(lead)})
+				carrierIdx[k] = len(slots) - 1
 				continue
 			}
-			// 判断是否为 Entity 或 DO 上的自定义方法（指针/值接收者均识别并归位）
-			switch receiverTypeName(d) {
-			case entityName:
-				entityMethodDecls = append(entityMethodDecls, getDeclSource(decl))
-				continue
-			case doName:
-				doMethodDecls = append(doMethodDecls, getDeclSource(decl))
-				continue
-			}
-			userDecls = append(userDecls, getDeclSource(decl))
+			// 用户方法（含 Entity/DO 上的自定义方法）：不再归位，原位保留
+			slots = append(slots, slot{text: takeLead(lead) + body})
 		default:
 			// 未知声明类型（防御性）：原样保留，避免任何用户代码丢失
-			userDecls = append(userDecls, getDeclSource(decl))
+			slots = append(slots, slot{text: takeLead(lead) + body})
 		}
 	}
+	// 文件尾：最后一个声明之后的注释，以及顺延到末尾仍未被认领的游离注释
+	tail := strings.TrimSpace(pending + string(origContent[prev:]))
 
-	// 重建文件：文件头 + 原 package 行 + imports + Entity生成代码 + Entity自定义方法 + DO生成代码 + DO自定义方法 + 其他用户代码
-	// 生成代码需要的 import 缺失时自动补充：若文件已有 import 声明则合并进原第一个 import 块
+	// 重建文件：文件头 + 原 package 行 + imports + Entity生成代码 + Entity自定义方法 + DO生成代码 + DO自定义方法 + 其他用户代码 + 文件尾注释
+	// 生成代码需要的 import 缺失时自动补充：若文件仍有保留的 import 声明则合并进第一个
 	// （避免形成两个 import 块），否则新建一个 import 声明。
 	var missingImports []string
 	for _, p := range neededImports {
@@ -590,43 +943,122 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 			missingImports = append(missingImports, p)
 		}
 	}
-	// mergeMissingImports 将缺失的 import 路径合并进原第一个 import 声明块：
-	// 已为 import (…) 块时按源码偏移在右括号前插入新 spec，其余原文（含注释）不变；
+	// renderImport 输出保留的 import 声明：按源码偏移剔除 removedSpecs（连同所在整行），
+	// 并把 missing 合并进来——已为 import (…) 块时在右括号前插入新 spec，其余原文（含注释）不变；
 	// 单个 import "x" 时展开为 import (…) 块，保留原块 Doc 注释与各 spec 原文（含尾注释）。
-	mergeMissingImports := func(first *ast.GenDecl, missing []string) string {
-		declStart := tf.Offset(first.Pos())
-		declEnd := tf.Offset(first.End())
-		if first.Doc != nil {
-			declStart = tf.Offset(first.Doc.Pos())
-		}
+	renderImport := func(e importEntry, missing []string) string {
+		d := e.decl
 		var newLines strings.Builder
 		for _, p := range missing {
 			newLines.WriteString("\t")
 			newLines.WriteString(strconv.Quote(p))
 			newLines.WriteString("\n")
 		}
-		if first.Lparen.IsValid() {
-			rparen := tf.Offset(first.Rparen)
-			return string(origContent[declStart:rparen]) + newLines.String() + string(origContent[rparen:declEnd])
+		if !d.Lparen.IsValid() {
+			if len(missing) == 0 {
+				return string(origContent[e.start:e.end])
+			}
+			var sb strings.Builder
+			tailFrom := off(d.End())
+			for _, spec := range d.Specs {
+				from, to := specSpan(spec)
+				sb.WriteString("\t")
+				sb.WriteString(string(origContent[from:to]))
+				sb.WriteString("\n")
+				if to > tailFrom {
+					tailFrom = to
+				}
+			}
+			if tailFrom > e.end {
+				tailFrom = e.end
+			}
+			sb.WriteString(newLines.String())
+			return string(origContent[e.start:off(d.Pos())]) + "import (\n" + sb.String() + ")" + string(origContent[tailFrom:e.end])
 		}
 		var sb strings.Builder
-		for _, spec := range first.Specs {
-			sb.WriteString("\t")
-			sb.WriteString(getSpecSource(spec))
-			sb.WriteString("\n")
+		last := e.start
+		for _, spec := range d.Specs {
+			if !removedSpecs[spec] {
+				continue
+			}
+			from, to := lineSpan(specSpan(spec))
+			sb.WriteString(string(origContent[last:from]))
+			last = to
 		}
+		rparen := off(d.Rparen)
+		sb.WriteString(string(origContent[last:rparen]))
 		sb.WriteString(newLines.String())
-		return string(origContent[declStart:tf.Offset(first.Pos())]) + "import (\n" + sb.String() + ")"
+		sb.WriteString(string(origContent[rparen:e.end]))
+		return sb.String()
 	}
-	if len(missingImports) > 0 {
-		if firstImportDecl != nil {
-			importDecls[0] = mergeMissingImports(firstImportDecl, missingImports)
+	var importDecls []string
+	for i, e := range imports {
+		var missing []string
+		if i == 0 {
+			missing = missingImports
+		}
+		importDecls = append(importDecls, e.lead+renderImport(e, missing))
+	}
+	if len(imports) == 0 && len(missingImports) > 0 {
+		importDecls = append(importDecls, buildImportDecl(missingImports))
+	}
+
+	// 计算缺失生成声明的落点。配对：Entity 结构体↔ToDO、DO 结构体↔ToEntity。
+	// 结构体缺失补在其方法之前、方法缺失补在其结构体之后；两个都缺或都无配对时，
+	// 追加到最后一个生成声明之后（无任何生成声明时置于首个用户声明之前）。
+	// beforeMap[i] 表示在原槽位 slots[i] 之前插入的生成声明（i == len(slots) 表示置于末尾）。
+	beforeMap := make(map[int][]genKind)
+	var unpaired []genKind
+	for _, pc := range []struct {
+		self, partner genKind
+		after         bool
+	}{
+		{genEntType, genToDO, false},
+		{genToDO, genEntType, true},
+		{genDoType, genToEntity, false},
+		{genToEntity, genDoType, true},
+	} {
+		if _, ok := carrierIdx[pc.self]; ok || genText[pc.self] == "" {
+			continue // 已存在，或新代码不生成该声明
+		}
+		if pidx, ok := carrierIdx[pc.partner]; ok {
+			pos := pidx
+			if pc.after {
+				pos = pidx + 1
+			}
+			beforeMap[pos] = append(beforeMap[pos], pc.self)
+			continue
+		}
+		unpaired = append(unpaired, pc.self)
+	}
+	if len(unpaired) > 0 {
+		sort.Slice(unpaired, func(i, j int) bool { return unpaired[i] < unpaired[j] })
+		base := 0
+		for i, s := range slots {
+			if s.hasGen {
+				base = i + 1
+			}
+		}
+		beforeMap[base] = append(beforeMap[base], unpaired...)
+	}
+
+	// 按骨架顺序输出各槽位：生成声明槽位在原位替换为新内容，用户槽位原样，缺失的生成声明按落点插入。
+	var out []string
+	for i := 0; i <= len(slots); i++ {
+		for _, k := range beforeMap[i] {
+			out = append(out, genText[k])
+		}
+		if i == len(slots) {
+			break
+		}
+		if s := slots[i]; s.isGen {
+			out = append(out, s.text+genText[s.kind])
 		} else {
-			importDecls = append([]string{buildImportDecl(missingImports)}, importDecls...)
+			out = append(out, s.text)
 		}
 	}
 
-	// 重建产物：原文件头 + 原 package 行 + imports + 生成代码 + 用户代码。
+	// 重建产物：原文件头 + 原 package 行 + imports + 骨架槽位（原序）+ 文件尾注释。
 	// 存量文件 package 声明之前的原文（build tags、文件级注释）按原文前置保留，不做任何补写。
 	var buf bytes.Buffer
 	buf.Write(fileHeader)
@@ -640,24 +1072,17 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 	}
 
 	buf.WriteString("\n")
-	buf.WriteString(entityCode)
-
-	for _, m := range entityMethodDecls {
-		buf.WriteString("\n\n")
-		buf.WriteString(m)
+	for i, s := range out {
+		if i > 0 {
+			buf.WriteString("\n\n")
+		}
+		buf.WriteString(s)
 	}
-
-	buf.WriteString("\n\n")
-	buf.WriteString(doCode)
-
-	for _, m := range doMethodDecls {
-		buf.WriteString("\n\n")
-		buf.WriteString(m)
-	}
-
-	for _, u := range userDecls {
-		buf.WriteString("\n\n")
-		buf.WriteString(u)
+	if tail != "" {
+		if len(out) > 0 {
+			buf.WriteString("\n\n")
+		}
+		buf.WriteString(tail)
 	}
 	buf.WriteString("\n")
 

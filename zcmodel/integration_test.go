@@ -21,12 +21,25 @@ import (
 
 // ==================== 数据库连接辅助（参考 zcdb 集成测试） ====================
 
+// 集成测试数据库 DSN（集中定义，与 zcdb 集成测试保持一致）。需要真实数据库时的本地环境：
+//
+//	docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+//	docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+const (
+	sqliteTestDSN  = "file:zcmodel_integ?mode=memory&cache=shared"
+	mysqlTestDSN   = "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local"
+	pgAdminTestDSN = "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable"
+	pgAppTestDSN   = pgAdminTestDSN + " dbname=zckg_test_integ"
+)
+
 // openSQLiteDAO 打开共享内存 SQLite 数据库，测试结束后自动关闭。
+// 连接池限制为单连接：共享内存库的可见性依赖同一连接串，单连接顺序访问最贴合其语义。
 func openSQLiteDAO(t *testing.T) *zcdb.DBDao {
 	t.Helper()
 	pool, err := zcdb.NewPool(zcdb.PoolConfig{
-		DriverName: "sqlite",
-		DSN:        "file:zcmodel_integ?mode=memory&cache=shared",
+		DriverName:   "sqlite",
+		DSN:          sqliteTestDSN,
+		MaxOpenConns: 1,
 	})
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
@@ -42,12 +55,14 @@ func openSQLiteDAO(t *testing.T) *zcdb.DBDao {
 }
 
 // openMySQLDAO 打开本地 MySQL 连接（与 zcdb 集成测试同一 DSN），不可用时跳过测试。
+// 连接池限制为单连接：下方用 USE 切换测试库，多连接会串库。
 // docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
 func openMySQLDAO(t *testing.T) *zcdb.DBDao {
 	t.Helper()
 	pool, err := zcdb.NewPool(zcdb.PoolConfig{
-		DriverName: "mysql",
-		DSN:        "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true&loc=Local",
+		DriverName:   "mysql",
+		DSN:          mysqlTestDSN,
+		MaxOpenConns: 1,
 	})
 	if err != nil {
 		t.Skipf("mysql 不可用，跳过集成测试: %v", err)
@@ -70,46 +85,51 @@ func openMySQLDAO(t *testing.T) *zcdb.DBDao {
 }
 
 // openPgDAO 打开本地 PostgreSQL 连接（与 zcdb 集成测试同一 DSN），不可用时跳过测试。
+// 管理连接用于建库后显式关闭，再以独立连接池连到测试库（单连接，避免池化影响串行断言）。
 // docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
 func openPgDAO(t *testing.T) *zcdb.DBDao {
 	t.Helper()
 	adminPool, err := zcdb.NewPool(zcdb.PoolConfig{
-		DriverName: "postgres",
-		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable",
+		DriverName:   "postgres",
+		DSN:          pgAdminTestDSN,
+		MaxOpenConns: 1,
 	})
 	if err != nil {
 		t.Skipf("postgres 不可用，跳过集成测试: %v", err)
 	}
 	// 连接池创建成功即注册清理，避免后续 NewDBDao 失败时泄漏；Pool.Close 幂等，可与 dao.Close 共存
 	t.Cleanup(func() { _ = adminPool.Close() })
-	dao, err := zcdb.NewDBDao(adminPool, "postgres", nil, "", "")
+	adminDao, err := zcdb.NewDBDao(adminPool, "postgres", nil, "", "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}
-	t.Cleanup(func() { _ = dao.Close() })
-	if err := dao.Pool().Ping(context.Background()); err != nil {
+	if err := adminDao.Pool().Ping(context.Background()); err != nil {
 		t.Skipf("postgres 不可用，跳过集成测试: %v", err)
 	}
 	// 创建测试数据库（若不存在）
-	exists, err := dao.Builder().Table("pg_database").Where("datname", "=", "zckg_test_integ").Exists(context.Background())
+	exists, err := adminDao.Builder().Table("pg_database").Where("datname", "=", "zckg_test_integ").Exists(context.Background())
 	if err != nil {
 		t.Fatalf("failed to check database existence: %v", err)
 	}
 	if !exists {
-		mustExec(t, dao, "CREATE DATABASE zckg_test_integ")
+		mustExec(t, adminDao, "CREATE DATABASE zckg_test_integ")
 	}
-	_ = dao.Close()
+	// 管理连接使命完成，显式关闭并上报错误（不再依赖 cleanup 二次关闭）
+	if err := adminDao.Close(); err != nil {
+		t.Fatalf("关闭管理连接失败: %v", err)
+	}
 
 	// 重新连接到测试数据库
 	testPool, err := zcdb.NewPool(zcdb.PoolConfig{
-		DriverName: "postgres",
-		DSN:        "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=zckg_test_integ",
+		DriverName:   "postgres",
+		DSN:          pgAppTestDSN,
+		MaxOpenConns: 1,
 	})
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
 	t.Cleanup(func() { _ = testPool.Close() })
-	dao, err = zcdb.NewDBDao(testPool, "postgres", nil, "", "")
+	dao, err := zcdb.NewDBDao(testPool, "postgres", nil, "", "")
 	if err != nil {
 		t.Fatalf("failed to create postgres dao: %v", err)
 	}
@@ -126,7 +146,7 @@ func mustExec(t *testing.T, dao *zcdb.DBDao, query string, args ...any) {
 	}
 }
 
-// ==================== 建表 DDL（覆盖各方言映射表支持的全部存储类型） ====================
+// ==================== 建表 DDL（按方言覆盖映射表支持的存储类型） ====================
 
 // mysqlAllTypesDDL MySQL 表，覆盖 makeColumnTypeToGoTypeMap 中 MySQL 的全部存储类型键。
 const mysqlAllTypesDDL = `CREATE TABLE all_types (
@@ -164,7 +184,8 @@ const mysqlAllTypesDDL = `CREATE TABLE all_types (
 	c_longblob    LONGBLOB COMMENT 'longblob 大二进制'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 
-// pgAllTypesDDL PostgreSQL 表，覆盖 makeColumnTypeToGoTypeMap 中 Postgres 的全部存储类型键。
+// pgAllTypesDDL PostgreSQL 表，覆盖 makeColumnTypeToGoTypeMap 中 Postgres 除 "int" 外的全部存储类型键：
+// "int" 键不可由建表构造——PG 将声明的 INT 归一为 integer，元数据不会返回 "int"。
 // 注意：PostgreSQL 建表语法不支持内联 COMMENT 子句（与 MySQL 不同），
 // 字段注释由 addPgColumnComments 在建表后通过 COMMENT ON COLUMN 补充。
 const pgAllTypesDDL = `CREATE TABLE all_types (
