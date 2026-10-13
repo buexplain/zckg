@@ -288,7 +288,7 @@ func main() {
 
 2. **handler 分级执行**：handler 按 level 升序分批执行，同级别内并发、级别间串行。应利用级别来表达资源间的依赖关系（如先通知外部系统停止下发数据，再关闭连接），同级别内的 handler 应互相独立。
 
-3. **handler panic 隔离**：每个 handler 有独立的 `recover`，单个 panic 会被 `slog.Error` 记录（含所在 level），不影响同级别或后续级别的 handler 执行，也不影响 `Listen` 最终返回。
+3. **handler panic 隔离**：每个 handler 有独立的 `recover`，单个 panic 会被 `slog.Error` 记录（本模块框架日志统一带 `zckg=zcquit` 标识，并以 `shutdownLevel` 字段标记所在级别），不影响同级别或后续级别的 handler 执行，也不影响 `Listen` 最终返回。
 
 4. **注册时机与监听就绪**：`AddSigHandler` 先校验、加锁追加、解锁，再初始化监听，首次返回前 `signal.Notify` 已完成，本次 handler 已入表。该保证不覆盖后续注册，也不保证清理尚未开始：全部资源 handler 仍须在任何退出触发前注册。handler 内追加不会死锁，但快照已固化，新增 handler 不执行；退出后再追加也不会重新启动监听或执行清理。
 

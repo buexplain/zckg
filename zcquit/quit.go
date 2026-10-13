@@ -178,7 +178,7 @@ func executeShutdown(sig os.Signal) {
 	// 按级别从小到大分批执行：同级别内 handler 并发执行，级别间串行等待
 	for _, level := range levels {
 		handlers := snapshot[level]
-		slog.Default().Info("开始执行退出处理函数", "level", level, "count", len(handlers))
+		slog.Default().Info("开始执行退出处理函数", "zckg", "zcquit", "shutdownLevel", level, "count", len(handlers))
 		wg := sync.WaitGroup{}
 		for _, handler := range handlers {
 			wg.Add(1)
@@ -187,7 +187,7 @@ func executeShutdown(sig os.Signal) {
 				defer wg.Done()
 				defer func() {
 					if panicErr := recover(); panicErr != nil {
-						slog.Default().Error("退出处理函数运行时发生 panic", "level", level, "panicErr", panicErr)
+						slog.Default().Error("退出处理函数运行时发生 panic", "zckg", "zcquit", "shutdownLevel", level, "panicErr", panicErr)
 					}
 				}()
 				h(sig)
@@ -195,7 +195,7 @@ func executeShutdown(sig os.Signal) {
 		}
 		// 等待当前级别所有 handler 执行完毕，再进入下一级别
 		wg.Wait()
-		slog.Default().Info("退出处理函数执行完成", "level", level)
+		slog.Default().Info("退出处理函数执行完成", "zckg", "zcquit", "shutdownLevel", level)
 	}
 
 	// 步骤 3：通知 listen goroutine 退出，避免退出流程完成后其永久阻塞造成泄漏。
