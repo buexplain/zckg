@@ -6,7 +6,7 @@ package zcdb
 import (
 	"context"
 	_ "github.com/lib/pq"
-	"log"
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -51,7 +51,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 		t.Skipf("postgres unavailable, skipping integration test: %v", err)
 	}
 	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
-		log.Default().Println(sqlStr, args)
+		slog.Default().Info("slow sql", "sql", sqlStr, "args", args)
 	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
@@ -81,7 +81,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
 	dao, err = NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
-		log.Default().Println(sqlStr, args)
+		slog.Default().Info("slow sql", "sql", sqlStr, "args", args)
 	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)

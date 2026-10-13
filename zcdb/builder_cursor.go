@@ -23,7 +23,7 @@ import (
 //
 //     var user User
 //     for err := range db.Builder().Table("users").OrderBy("id", "ASC").Cursor(ctx, &user) {
-//     if err != nil { log.Fatal(err) }
+//     if err != nil { slog.Default().Error(err.Error()); os.Exit(1) }
 //     fmt.Println(user.Name)
 //     }
 //     // SQL: SELECT * FROM `users` ORDER BY `id` ASC（一次执行，逐行扫描）
@@ -101,7 +101,7 @@ func (b *Builder) Cursor(ctx context.Context, dest any) iter.Seq[error] {
 //
 //     var user User
 //     for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
-//     if err != nil { log.Fatal(err) }
+//     if err != nil { slog.Default().Error(err.Error()); os.Exit(1) }
 //     fmt.Println(user.Name)
 //     }
 //     // 每批 SQL 形如: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 101（首批无 WHERE 游标条件）

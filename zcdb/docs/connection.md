@@ -191,7 +191,7 @@ err = db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &or
 db, err := zcdb.NewDBDao(pool, "mysql",
 	func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 		if elapsed > 200*time.Millisecond {
-			log.Printf("slow sql (%s): %s %v", elapsed, sqlStr, args)
+			slog.Default().Info("slow sql", "elapsed", elapsed, "sql", sqlStr, "args", args)
 		}
 	}, "", "")
 ```

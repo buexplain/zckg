@@ -6,7 +6,7 @@ package zcdb
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	_ "modernc.org/sqlite"
 	"testing"
 	"time"
@@ -26,7 +26,7 @@ func openSQLiteTestDB(t *testing.T) *DBDao {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
 	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
-		log.Default().Println(sqlStr, args)
+		slog.Default().Info("slow sql", "sql", sqlStr, "args", args)
 	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)

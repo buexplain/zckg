@@ -7,7 +7,7 @@ import (
 	"context"
 	"database/sql"
 	_ "github.com/go-sql-driver/mysql"
-	"log"
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -78,7 +78,7 @@ func openMySQLTestDB(t *testing.T) *DBDao {
 		t.Skipf("mysql unavailable, skipping integration test: %v", err)
 	}
 	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
-		log.Default().Println(sqlStr, args)
+		slog.Default().Info("slow sql", "sql", sqlStr, "args", args)
 	}, "", testComment)
 	if err != nil {
 		t.Fatalf("failed to open mysql: %v", err)

@@ -147,7 +147,8 @@ total, err := db.Builder().Table("users").
 var user User
 for err := range db.Builder().Table("users").OrderBy("id", "ASC").Cursor(ctx, &user) {
 	if err != nil {
-		log.Fatal(err)
+		slog.Default().Error(err.Error())
+		os.Exit(1)
 	}
 	fmt.Println(user.Name) // 每次迭代覆盖写入同一个 user
 }
@@ -164,7 +165,8 @@ dest 要求：结构体指针（如 `*User`），字段按 db 标签匹配列名
 var user User
 for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
 	if err != nil {
-		log.Fatal(err)
+		slog.Default().Error(err.Error())
+		os.Exit(1)
 	}
 	process(user)
 }
@@ -250,10 +252,10 @@ ScanStruct 系列可能返回以下哨兵错误（均可用 `errors.Is` 匹配�
 ```go
 if err := zcdb.ScanStruct(rows, &user); err != nil {
     if errors.Is(err, zcdb.ErrScanConvert) {
-        log.Printf("数据转换失败: %v", err)
+        slog.Default().Error("数据转换失败", "err", err)
     }
     if errors.Is(err, sql.ErrNoRows) {
-        log.Println("未找到记录")
+        slog.Default().Info("未找到记录")
     }
 }
 ```

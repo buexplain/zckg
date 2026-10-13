@@ -104,7 +104,7 @@ func traceMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request
 func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     start := time.Now()
     err := next(w, r)   // 原样传递，不替换
-    log.Printf("%s %s cost=%s", r.Method, r.URL.Path, time.Since(start))
+    slog.Default().Info("http request", "method", r.Method, "path", r.URL.Path, "cost", time.Since(start))
     return err
 }
 ```
@@ -158,7 +158,7 @@ func responseLogger(ctx context.Context, w http.ResponseWriter, r *http.Request,
     // 后置逻辑：获取 handler 的 Res
     res, resErr := zchttp.BoundResFromContext[MyRes](ctx)
     if resErr == nil {
-        log.Printf("response: %+v", res)
+        slog.Default().Info("response", "res", res)
     }
     return err
 }
@@ -174,7 +174,7 @@ func responseLogger(ctx context.Context, w http.ResponseWriter, r *http.Request,
 func recoverError(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     err := next(w, r)
     if err != nil {
-        log.Printf("handler error: %v", err)
+        slog.Default().Error("handler error", "err", err)
         // 可选择返回 nil 拦截错误，或继续向上返回 err
     }
     return err
@@ -195,7 +195,7 @@ DefaultPanicHandler(w, r, recovered)
 
 ```go
 engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
-    log.Printf("panic: %v", recovered)
+    slog.Default().Error("panic", "recovered", recovered)
     w.WriteHeader(http.StatusInternalServerError)
 }
 ```
@@ -228,7 +228,7 @@ api.GET("/users", listUsers)
 func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     start := time.Now()
     err := next(w, r)
-    log.Printf("%s %s cost=%s", r.Method, r.URL.Path, time.Since(start))
+    slog.Default().Info("http request", "method", r.Method, "path", r.URL.Path, "cost", time.Since(start))
     return err
 }
 

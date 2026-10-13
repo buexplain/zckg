@@ -12,7 +12,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -247,7 +248,7 @@ func connectionMdExamples(ctx context.Context) error {
 	dbSlow, err := zcdb.NewDBDao(pool, "mysql",
 		func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
 			if elapsed > 200*time.Millisecond {
-				log.Printf("slow sql (%s): %s %v", elapsed, sqlStr, args)
+				slog.Default().Info("slow sql", "elapsed", elapsed, "sql", sqlStr, "args", args)
 			}
 		}, "", "")
 	if err != nil {
@@ -626,7 +627,8 @@ func queryExecMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 
 	for err := range db.Builder().Table("users").OrderBy("id", "ASC").Cursor(ctx, &user) {
 		if err != nil {
-			log.Fatal(err)
+			slog.Default().Error(err.Error())
+			os.Exit(1)
 		}
 		fmt.Println(user.Name)
 	}
@@ -634,13 +636,15 @@ func queryExecMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 	process := func(u User) { _ = u }
 	for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
 		if err != nil {
-			log.Fatal(err)
+			slog.Default().Error(err.Error())
+			os.Exit(1)
 		}
 		process(user)
 	}
 	for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id", true) {
 		if err != nil {
-			log.Fatal(err)
+			slog.Default().Error(err.Error())
+			os.Exit(1)
 		}
 	}
 
