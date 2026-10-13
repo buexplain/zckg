@@ -56,6 +56,7 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 			if !isDefaultSupported(f.Type) {
 				// 情况 1：类型不支持（如 time.Time / struct 类型）
 				slog.Warn("default tag on unsupported type, ignored",
+					"zckg", "zchttp",
 					"route", method+" "+path,
 					"handler", handlerLoc,
 					"struct", t.Name(),
@@ -66,6 +67,7 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 				// 情况 2：值类型字段在非"值嵌套可达"的 struct 中。
 				// 注册阶段因路径上有 nil 指针/切片/map 也无法到达。
 				slog.Warn("default tag on value field in non-value-reachable struct, never applied",
+					"zckg", "zchttp",
 					"route", method+" "+path,
 					"handler", handlerLoc,
 					"struct", t.Name(),
@@ -76,6 +78,7 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 				// 情况 3：指针字段在非"默认值可达"的 struct 中。
 				// 如 map 值类型为切片/数组时，applyDefaults 无法穿透，请求阶段永不填充。
 				slog.Warn("default tag on pointer field in non-defaults-reachable struct, never applied",
+					"zckg", "zchttp",
 					"route", method+" "+path,
 					"handler", handlerLoc,
 					"struct", t.Name(),

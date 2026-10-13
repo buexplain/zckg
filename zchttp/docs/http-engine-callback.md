@@ -60,6 +60,8 @@ type Response struct {
 | `DefaultNotFoundHandler` | 未命中路由时调用。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构（`{data: null, code: 404, message: "not found"}`），状态码统一为 404；若已写入则跳过 |
 | `DefaultPanicHandler` | 捕获 panic 时调用。通过 `slog.Error` 将 panic 值与完整堆栈输出到服务端日志。若响应尚未被写入，根据 `WantHtml(r)` 决定返回 HTML 或统一 JSON 结构，两者均只含通用消息 `internal server error`（不向客户端暴露堆栈，防泄漏服务端内部结构），状态码统一为 500；若已写入则跳过 |
 
+除业务自行触发的日志外，`zchttp` 引擎与上述默认回调产生的服务端日志（`slog.Warn` / `slog.Error`）均携带 `zckg=zchttp` 字段，便于依赖 zckg 的业务方区分日志来源。
+
 默认 JSON 响应由进程级池化的 `json.Encoder` 编码（关闭 HTML 转义）：`res` 中的 `<`、`>`、`&` 字符**原样输出**，不再转义为 `\u003c`、`\u003e`、`\u0026`。若业务上需要转义后的输出，请自行替换 `OnResponse` 回调。
 
 ### WantHtml
@@ -96,6 +98,7 @@ func WantHtml(r *http.Request) bool
 func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) {
     stack := debug.Stack()
     slog.Error("panic recovered",
+        "zckg", "zchttp",
         "method", r.Method,
         "path", r.URL.Path,
         "error", recovered,

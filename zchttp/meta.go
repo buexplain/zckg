@@ -155,6 +155,7 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 			}
 			if f.Type.Kind() == reflect.Ptr {
 				slog.Warn("unexported embedded pointer struct is not supported for binding, its fields are skipped; use an exported type name or value embedding",
+					"zckg", "zchttp",
 					"struct", t.Name(),
 					"field", f.Name,
 					"embedded", f.Type.String(),
@@ -174,6 +175,7 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 			if embeddedType.Kind() == reflect.Struct {
 				if visiting[embeddedType] {
 					slog.Warn("recursive embedded struct detected, embedding skipped",
+						"zckg", "zchttp",
 						"struct", t.Name(),
 						"field", f.Name,
 						"embedded", embeddedType.String(),
@@ -235,6 +237,7 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 					fm.timeLocation = loc
 				} else {
 					slog.Warn("invalid time_location tag, falling back to time.Local",
+						"zckg", "zchttp",
 						"tag_value", locTag,
 						"struct", t.Name(),
 						"field", f.Name,

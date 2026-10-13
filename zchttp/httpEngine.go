@@ -140,7 +140,7 @@ func DefaultResponseHandler(w http.ResponseWriter, r *http.Request, res any) {
 	if err == nil {
 		return
 	}
-	slog.Error("json encode failed in DefaultResponseHandler", "error", err, "path", r.URL.Path)
+	slog.Error("json encode failed in DefaultResponseHandler", "zckg", "zchttp", "error", err, "path", r.URL.Path)
 	if errors.Is(err, errJSONEncode) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -156,7 +156,7 @@ func DefaultErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	if IsResponseWritten(w) {
 		return
 	}
-	slog.Error("request failed with internal error", "error", err, "method", r.Method, "path", r.URL.Path)
+	slog.Error("request failed with internal error", "zckg", "zchttp", "error", err, "method", r.Method, "path", r.URL.Path)
 	if WantHtml(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -166,7 +166,7 @@ func DefaultErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
 	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusInternalServerError, Message: "internal server error"}); encErr != nil {
-		slog.Error("json encode failed in DefaultErrorHandler", "error", encErr, "path", r.URL.Path)
+		slog.Error("json encode failed in DefaultErrorHandler", "zckg", "zchttp", "error", encErr, "path", r.URL.Path)
 	}
 }
 
@@ -187,7 +187,7 @@ func DefaultValidationErrorHandler(w http.ResponseWriter, r *http.Request, err e
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
 	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusBadRequest, Message: err.Error()}); encErr != nil {
-		slog.Error("json encode failed in DefaultValidationErrorHandler", "error", encErr, "path", r.URL.Path)
+		slog.Error("json encode failed in DefaultValidationErrorHandler", "zckg", "zchttp", "error", encErr, "path", r.URL.Path)
 	}
 }
 
@@ -196,6 +196,7 @@ func DefaultValidationErrorHandler(w http.ResponseWriter, r *http.Request, err e
 func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) {
 	stack := debug.Stack()
 	slog.Error("panic recovered",
+		"zckg", "zchttp",
 		"method", r.Method,
 		"path", r.URL.Path,
 		"error", recovered,
@@ -213,7 +214,7 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
 	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusInternalServerError, Message: "internal server error"}); encErr != nil {
-		slog.Error("json encode failed in DefaultPanicHandler", "error", encErr, "path", r.URL.Path)
+		slog.Error("json encode failed in DefaultPanicHandler", "zckg", "zchttp", "error", encErr, "path", r.URL.Path)
 	}
 }
 
@@ -232,7 +233,7 @@ func DefaultNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	if encErr := encodeJSON(w, Response{Data: nil, Code: http.StatusNotFound, Message: "not found"}); encErr != nil {
-		slog.Error("json encode failed in DefaultNotFoundHandler", "error", encErr, "path", r.URL.Path)
+		slog.Error("json encode failed in DefaultNotFoundHandler", "zckg", "zchttp", "error", encErr, "path", r.URL.Path)
 	}
 }
 
@@ -240,6 +241,7 @@ func invokePanicHandler(handler PanicHandler, w http.ResponseWriter, r *http.Req
 	defer func() {
 		if handlerPanic := recover(); handlerPanic != nil {
 			slog.Error("panic handler panicked",
+				"zckg", "zchttp",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"error", handlerPanic,
