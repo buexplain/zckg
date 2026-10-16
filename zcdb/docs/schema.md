@@ -11,7 +11,7 @@ if err != nil {
 }
 ```
 
-也可直接用 `zcdb.NewSchemaInspector(dao)` 创建，非内置方言的 Grammar 会返回错误。
+也可直接用 `zcdb.NewSchemaInspector(dao)` 创建，非内置方言的 Grammar 会返回 `ErrSchemaGrammarNotSupported`（错误消息带出实际类型）。
 
 ## Tables：查询所有用户表
 

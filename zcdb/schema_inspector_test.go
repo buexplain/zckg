@@ -2,6 +2,8 @@ package zcdb
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -58,12 +60,34 @@ func TestNewSchemaInspector_SQLite(t *testing.T) {
 	}
 }
 
-// TestNewSchemaInspector_Unsupported 验证不支持的方言返回错误。
+// unsupportedGrammar 是仅用于覆盖 NewSchemaInspector 兜底分支的 Grammar 桩：
+// 嵌入接口即可满足 Grammar，且不属于三个内置类型。
+type unsupportedGrammar struct{ Grammar }
+
+// TestNewSchemaInspector_Unsupported 验证非内置方言（含 nil Grammar）返回
+// ErrSchemaGrammarNotSupported、不返回半成品 inspector，且自定义类型会出现在消息里。
 func TestNewSchemaInspector_Unsupported(t *testing.T) {
-	dao := &DBDao{grammar: nil}
-	_, err := NewSchemaInspector(dao)
-	if err == nil {
-		t.Error("expected error for nil grammar, got nil")
+	tests := []struct {
+		name        string
+		grammar     Grammar
+		wantTypeMsg string // 期望出现在消息中的类型名；空表示只校验哨兵
+	}{
+		{name: "nil grammar", grammar: nil},
+		{name: "非内置 Grammar", grammar: unsupportedGrammar{}, wantTypeMsg: "zcdb.unsupportedGrammar"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inspector, err := NewSchemaInspector(&DBDao{grammar: tt.grammar})
+			if !errors.Is(err, ErrSchemaGrammarNotSupported) {
+				t.Fatalf("错误未匹配 ErrSchemaGrammarNotSupported：%v", err)
+			}
+			if tt.wantTypeMsg != "" && !strings.Contains(err.Error(), tt.wantTypeMsg) {
+				t.Errorf("错误消息应带出实际 Grammar 类型 %q，got %q", tt.wantTypeMsg, err.Error())
+			}
+			if inspector != nil {
+				t.Errorf("失败时应返回 nil inspector，got %T", inspector)
+			}
+		})
 	}
 }
 

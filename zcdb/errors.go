@@ -26,6 +26,9 @@ var (
 	ErrPgUnionLockNotSupported = errors.New("zcdb: PostgreSQL does not support LOCK with UNION queries")
 	ErrSQLiteLockNotSupported  = errors.New("zcdb: SQLite does not support LOCK clauses")
 
+	// ErrSchemaGrammarNotSupported SchemaInspector 只支持内置三方言的 Grammar（错误消息带出实际类型）
+	ErrSchemaGrammarNotSupported = errors.New("zcdb: unsupported grammar type for schema inspection")
+
 	// ErrInvalidOperator 运算符不在白名单内
 	ErrInvalidOperator = errors.New("zcdb: invalid operator")
 

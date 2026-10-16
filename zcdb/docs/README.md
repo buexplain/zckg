@@ -163,7 +163,7 @@ func main() {
 | `ErrDeleteWithJoin` | 普通 Delete 带 JOIN（应使用 DeleteJoin） |
 | `ErrIncrementColumns` | Increment/Decrement 参数不成对，或 columns/amounts 为空、长度不等 |
 | `ErrInsertUsingColumnMismatch` | InsertUsing/InsertOrIgnoreUsing 的目标列数与子查询 SELECT 列数不一致（子查询列数可静态判定时） |
-| `ErrRawPlaceholderMismatch` | `CompileRaw` 的原始 SQL 占位符数量与绑定参数数量不一致 |
+| `ErrRawPlaceholderMismatch` | `CompileRaw` 的原始 SQL 占位符数量或 `$N` 编号与参数个数不一致 |
 | `ErrRawValueNotInlinable` | `CompileRaw` 的参数值无法内联成 SQL 字面量（类型不支持、NaN/Inf、Valuer 取值失败） |
 | `ErrUpsertUniqueByRequired` | PG/SQLite 的 Upsert 缺少 uniqueBy |
 | `ErrDeleteJoinNoJoin` | DeleteJoin 没有任何 JOIN |
@@ -177,3 +177,4 @@ func main() {
 | `ErrScanConvert` | Scan 结果值类型转换失败 |
 | `ErrTxOwnerMismatch` | 事务 context 被传给另一 Pool 的 DAO |
 | `ErrDialectRequired` / `ErrUnknownDialect` / `ErrPoolRequired` | DAO 创建参数错误 |
+| `ErrSchemaGrammarNotSupported` | 用非内置方言的 Grammar 创建 SchemaInspector（仅内置三方言，消息带出实际类型） |

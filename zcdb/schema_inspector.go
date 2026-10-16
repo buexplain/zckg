@@ -56,6 +56,7 @@ type SchemaInspector interface {
 }
 
 // NewSchemaInspector 根据 DBDao 的 Grammar 类型创建对应的 SchemaInspector。
+// 非内置方言的 Grammar 返回 ErrSchemaGrammarNotSupported，错误消息带出实际类型。
 func NewSchemaInspector(dao *DBDao) (SchemaInspector, error) {
 	switch dao.grammar.(type) {
 	case *MySQLGrammar:
@@ -65,6 +66,6 @@ func NewSchemaInspector(dao *DBDao) (SchemaInspector, error) {
 	case *SQLiteGrammar:
 		return &SQLiteSchemaInspector{dao: dao}, nil
 	default:
-		return nil, fmt.Errorf("zcdb: unsupported grammar type for schema inspection: %T", dao.grammar)
+		return nil, fmt.Errorf("%w: %T", ErrSchemaGrammarNotSupported, dao.grammar)
 	}
 }
