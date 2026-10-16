@@ -203,3 +203,47 @@ sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).
 > Expression 内容**不会被参数化、不做标识符包裹、不做任何转义**，直接拼接进 SQL。请勿将用户输入拼入 Expression，防 SQL 注入。
 >
 > 占位符边界：请勿在 Expression 内容中使用 `?` 占位符——它没有任何配对的绑定参数：INSERT VALUES 与 Raw 子句中 `?` 会原样保留（PostgreSQL 方言下成为非法占位符），PostgreSQL 的 UPDATE SET 路径还会把 `?` 转为 `$N` 并占用占位符编号（仅框架内部自增/自减编译依赖该机制）。
+
+## 原始 SQL 内联编译（CompileRaw）
+
+需要把一条带 `?` 的原始 SQL 与参数合成**一条完整 SQL**（不含占位符、不需要参数）时用 `Grammar.CompileRaw`——典型场景是手工执行、日志留档、贴给 DBA 复核。Grammar 实例经 `db.Grammar()` 取得：
+
+```go
+sqlStr, err := db.Grammar().CompileRaw(
+	"UPDATE `users` SET `name` = ?, `updated_at` = ? WHERE `id` = ?",
+	[]any{"张三", zcdb.NewExpression("NOW()"), 7})
+// MySQL：      UPDATE `users` SET `name` = '张三', `updated_at` = NOW() WHERE `id` = 7
+// PostgreSQL： UPDATE "users" SET "name" = '张三', "updated_at" = NOW() WHERE "id" = 7
+// 产物无需参数即可执行：db.Exec(ctx, sqlStr)
+```
+
+也可以直接吃 Builder 编译出来的产物（PostgreSQL 下是 `$N` + args，`CompileRaw` 会按编号取值内联，无需自己把 `$1` 改写成 `?`）：
+
+```go
+sqlStr, args, _ := db.Builder().Table("users").Where("id", "=", 7).ToSelect()
+complete, err := db.Grammar().CompileRaw(sqlStr, args)
+```
+
+> **安全警示**：产物把参数值直接写成了 SQL 文本，等于放弃占位符绑定这道注入防线。绝不允许把不可信输入（用户提交、请求体、密钥）当作 args 传入；`Expression` 参数同样原样内嵌，安全责任归调用方。常规执行请继续走 Builder 或带参数的 `Exec`/`Query`。
+
+值内联规则（`Expression` 原样内嵌）：
+
+| 值类型 | MySQL | PostgreSQL | SQLite |
+|---|---|---|---|
+| string | 单引号包裹，单引号写成两个；反斜杠、换行、NUL、Ctrl-Z 按默认转义模式处理 | 单引号包裹，单引号写成两个（默认 `standard_conforming_strings=on`，反斜杠是普通字符） | 同 PostgreSQL |
+| bool | `1` / `0` | `TRUE` / `FALSE` | `1` / `0` |
+| 整数、浮点 | 裸写（最短表示；`NaN`/`Inf` 报错） | 同左 | 同左 |
+| time.Time | `'2026-10-16 12:34:56.789'` | `'2026-10-16 12:34:56.789+08:00'` | `'2026-10-16 12:34:56.789'` |
+| []byte | `X'00FF'` | `'\x00ff'::bytea` | `X'00FF'` |
+| nil / nil 指针 / nil 字节切片 | `NULL` | `NULL` | `NULL` |
+| driver.Valuer | 取 `Value()` 后按上表处理（含 `sql.NullString` 等） | 同左 | 同左 |
+
+时间按值自身的挂钟时间格式化，**不做时区换算**；命名标量类型（如 `type Status int`）按底层类型处理；nil 指针（含类型化 nil）写 `NULL`，但**非 nil 指针不解引用**——即使该类型实现了 `driver.Valuer` 也报错，避免隐式解引用。结构体、map、非字节切片、chan、complex 等一律返回 `ErrRawValueNotInlinable`（不做 `fmt` 兜底，避免静默产出非法 SQL），`NaN`/`Inf` 与 Valuer 取值失败同样报错，错误消息携带参数位置。
+
+其它边界：
+
+- 占位符与参数按出现顺序一一对应，数量不一致返回 `ErrRawPlaceholderMismatch`（消息含两侧实际数量），失败时产物为空串；
+- 占位符形态与方言自身一致：MySQL/SQLite 认 `?`、产物保持 `?`；PostgreSQL 认 `$N`——按编号取参数内联，编号须落在 `1..参数个数` 内且最大编号等于参数个数（同 `lib/pq` 与引擎的契约，允许重复引用同一编号、允许区间内未被引用的参数）。`?` 在 PostgreSQL 里是 jsonb 键存在操作符等运算符，故**一律按普通字符处理**、不参与占位符识别；
+- **只识别代码区**：字符串字面量（`'...'`、MySQL 的 `"..."`）、引号标识符（`` `...` ``）、行注释（`--`，MySQL 另有 `#`）、块注释与 PostgreSQL 美元引用（`$$...$$` / `$tag$...$tag$`）里的 `?` / `$N` 都是字面内容、原样保留——`name LIKE '%?%'` 不会被改写。这条判定与引擎一致，由集成测试 [sql_scan_engine_parity_integration_test.go](../sql_scan_engine_parity_integration_test.go) 逐构造比对「扫描器计数 vs 引擎要求参数个数」锁死。MySQL 字符串里的反斜杠按默认转义模式处理（`NO_BACKSLASH_ESCAPES` 未覆盖），PostgreSQL 的 `E'...'` 按转义字符串处理；未覆盖的语法（SQLite 的 `[...]` 标识符、MySQL 的 `/*! */` 可执行注释、PostgreSQL 的 `U&'...'`）见 sqlScan.go；
+- MySQL/SQLite 的连续 `??` 按**两个占位符**计；注意裸 `??` 在引擎侧本就是语法错误（只有 PostgreSQL 的 `?` 是运算符），写成 `??` 属于误用形态——PostgreSQL 下 `?` 是普通字符，jsonb 键存在操作符直接写 `?` 即可；
+- 不追加 DAO 默认注释；内联不产生 `$N` 占位符、也不触碰 Grammar 的编译期计数器，可并发调用。

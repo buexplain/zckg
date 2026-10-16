@@ -1,6 +1,7 @@
 package zcdb
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -35,6 +36,21 @@ type Grammar interface {
 	CompileDeleteJoin(b *Builder) string
 	// CompileTruncate 编译 TRUNCATE 语句
 	CompileTruncate(b *Builder) string
+	// CompileRaw 把一条带 ? 占位符的原始 SQL 与绑定参数内联成一条**可直接执行**的完整 SQL：
+	// 产物不含占位符、也不需要参数，用于手工执行、日志留档或交给其它组件。
+	//
+	// 安全警示：产物把参数值写成了 SQL 文本，等于放弃占位符绑定这一注入防线。
+	// 绝不允许把不可信输入（用户提交、请求体、密钥）当作 args 传入；Expression 参数同样
+	// 原样内嵌，安全责任归调用方。
+	//
+	// 占位符与参数按出现顺序一一对应，数量不一致返回 ErrRawPlaceholderMismatch；
+	// 参数值无法内联（类型不支持、NaN/Inf、Valuer 报错）返回 ErrRawValueNotInlinable，
+	// 值内联规则见 rawLiteral.go（nil→NULL、字符串加引号转义、数值裸写、bool/时间/字节按方言）。
+	// 占位符识别与数据库引擎的解析一致：只认代码区，字符串字面量、引号标识符、注释与
+	// PostgreSQL 美元引用中的 `?` / `$N` 都是字面内容（见 sqlScan.go 的已知未覆盖语法）。
+	// 形态随方言而定：MySQL/SQLite 认 `?`；PostgreSQL 只认 `$N`——“`?` 在 PostgreSQL 里是
+	// jsonb 键存在操作符等运算符”，故 `?` 一律按普通字符处理。产物不追加 DAO 默认注释。
+	CompileRaw(sqlStr string, args []any) (string, error)
 	// WrapColumn 引用列标识符
 	WrapColumn(column string) string
 	// WrapTable 引用表标识符
@@ -52,27 +68,138 @@ func intToStr(n int) string {
 	return strconv.Itoa(n)
 }
 
-// replaceRawExpression 将原始 SQL 中的 ? 与 bindings 按位置对应：
+// replaceRawExpression 将原始 SQL 代码区中的 ? 与 bindings 按位置对应：
 // Expression 直接内嵌为 SQL 文本，其余值保留 ? 占位符。
-// 用于 MySQL/SQLite 方言（? 占位符风格）。
-func replaceRawExpression(sql string, bindings []any) string {
+// 字符串字面量、引号标识符与注释内的 ? 是字面内容，原样保留（与引擎的解析一致）。
+func replaceRawExpression(sql string, bindings []any, syntax sqlScanSyntax) string {
 	if len(bindings) == 0 {
 		return sql
 	}
 	var buf strings.Builder
 	buf.Grow(len(sql) + 8)
 	bi := 0
-	for i := 0; i < len(sql); i++ {
-		if sql[i] == '?' && bi < len(bindings) {
-			if expr, ok := bindings[bi].(Expression); ok {
-				buf.WriteString(expr.Value())
+	for _, segment := range splitSQLCode(sql, syntax) {
+		if !segment.code {
+			buf.WriteString(segment.text)
+			continue
+		}
+		for i := 0; i < len(segment.text); i++ {
+			if segment.text[i] == '?' && bi < len(bindings) {
+				if expr, ok := bindings[bi].(Expression); ok {
+					buf.WriteString(expr.Value())
+				} else {
+					buf.WriteByte('?')
+				}
+				bi++
 			} else {
-				buf.WriteByte('?')
+				buf.WriteByte(segment.text[i])
 			}
-			bi++
-		} else {
-			buf.WriteByte(sql[i])
 		}
 	}
 	return buf.String()
+}
+
+// compileRaw 把 ? 风格方言（MySQL/SQLite）原始 SQL 代码区中的 ? 按位置替换为参数的字面量，
+// 产出单条可直接执行的 SQL。字符串字面量、引号标识符与注释内的 ? 是字面内容，原样保留。
+func compileRaw(sqlStr string, args []any, syntax sqlScanSyntax, style rawLiteralStyle) (string, error) {
+	segments := splitSQLCode(sqlStr, syntax)
+	placeholders := 0
+	for _, segment := range segments {
+		if segment.code {
+			placeholders += strings.Count(segment.text, "?")
+		}
+	}
+	if err := checkRawPlaceholders(placeholders, len(args)); err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	buf.Grow(len(sqlStr) + 16)
+	argIndex := 0
+	for _, segment := range segments {
+		if !segment.code {
+			buf.WriteString(segment.text)
+			continue
+		}
+		for i := 0; i < len(segment.text); i++ {
+			if segment.text[i] != '?' {
+				buf.WriteByte(segment.text[i])
+				continue
+			}
+			literal, err := inlineRawLiteral(args[argIndex], style, argIndex+1)
+			if err != nil {
+				return "", err
+			}
+			argIndex++
+			buf.WriteString(literal)
+		}
+	}
+	return buf.String(), nil
+}
+
+// checkRawPlaceholders 校验占位符数量与参数数量一致，不一致时返回携带两侧实际数量的
+// ErrRawPlaceholderMismatch；此时编译产物为空串，调用方不会误用半成品 SQL。
+func checkRawPlaceholders(placeholders, args int) error {
+	if placeholders != args {
+		return fmt.Errorf("%w: sql has %d placeholder(s), got %d arg(s)", ErrRawPlaceholderMismatch, placeholders, args)
+	}
+	return nil
+}
+
+// numberedDigits 返回 sqlStr[at] 处 $N 占位符的连续数字位数；该位置不是 $N 时返回 0。
+func numberedDigits(sqlStr string, at int) int {
+	if sqlStr[at] != '$' {
+		return 0
+	}
+	digits := 0
+	for i := at + 1; i < len(sqlStr) && sqlStr[i] >= '0' && sqlStr[i] <= '9'; i++ {
+		digits++
+	}
+	return digits
+}
+
+// compileRawNumbered 编译 PostgreSQL 的 $N 形态原始 SQL：按编号取参数内联为字面量。
+// 只在代码区识别 $N——字符串字面量、引号标识符、注释与美元引用内的 $N 是字面内容，原样保留；
+// 同理，`?` 在任何位置都不是占位符（PostgreSQL 里它是 jsonb 键存在操作符等运算符）。
+// 校验与 lib/pq 的执行契约一致：编号须落在 1..len(args) 内，且最大编号等于参数个数
+// （允许同一编号重复引用，也允许区间内未被引用的参数）；不满足返回 ErrRawPlaceholderMismatch，
+// 此时产物为空串。
+func compileRawNumbered(sqlStr string, args []any, syntax sqlScanSyntax, style rawLiteralStyle) (string, error) {
+	var buf strings.Builder
+	buf.Grow(len(sqlStr) + 16)
+	maxIndex := 0
+	for _, segment := range splitSQLCode(sqlStr, syntax) {
+		if !segment.code {
+			buf.WriteString(segment.text)
+			continue
+		}
+		text := segment.text
+		for i := 0; i < len(text); i++ {
+			digits := numberedDigits(text, i)
+			if digits == 0 {
+				buf.WriteByte(text[i])
+				continue
+			}
+			placeholder := text[i : i+1+digits]
+			index, err := strconv.Atoi(text[i+1 : i+1+digits])
+			if err != nil || index < 1 || index > len(args) {
+				return "", fmt.Errorf("%w: %s is out of range for %d arg(s)", ErrRawPlaceholderMismatch, placeholder, len(args))
+			}
+			literal, err := inlineRawLiteral(args[index-1], style, index)
+			if err != nil {
+				return "", err
+			}
+			if index > maxIndex {
+				maxIndex = index
+			}
+			buf.WriteString(literal)
+			i += digits
+		}
+	}
+	if maxIndex == 0 && len(args) > 0 {
+		return "", fmt.Errorf("%w: sql has no $N placeholder but got %d arg(s)", ErrRawPlaceholderMismatch, len(args))
+	}
+	if maxIndex != len(args) {
+		return "", fmt.Errorf("%w: sql references up to $%d but got %d arg(s)", ErrRawPlaceholderMismatch, maxIndex, len(args))
+	}
+	return buf.String(), nil
 }

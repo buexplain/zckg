@@ -21,17 +21,28 @@ func (g *PostgresGrammar) cloneForCompile() *PostgresGrammar {
 	return &PostgresGrammar{}
 }
 
-// convertRawPlaceholders 将原始 SQL 中的 ? 依次替换为 $N 占位符，
+// convertRawPlaceholders 将原始 SQL 代码区中的 ? 依次替换为 $N 占位符，
 // bindings 中的 Expression 直接内嵌为 SQL 文本且不占用占位符编号；
-// 连续两个 ?? 转义为字面 ?（jsonb 键存在操作符），不消耗绑定。
+// 代码区里连续两个 ?? 转义为字面 ?（jsonb 键存在操作符），不消耗绑定。
+// 字符串字面量、引号标识符、注释与美元引用内的 ? 是字面内容，原样保留——
+// 引擎同样不会把它们当占位符，否则形如 name LIKE '%?%' 的片段会被悄悄改写成 '%$1%'。
 func (g *PostgresGrammar) convertRawPlaceholders(sql string, bindings []any) string {
 	var buf strings.Builder
 	buf.Grow(len(sql) + 8)
 	bi := 0
-	for i := 0; i < len(sql); i++ {
-		if sql[i] == '?' {
+	for _, segment := range splitSQLCode(sql, pgScanSyntax) {
+		if !segment.code {
+			buf.WriteString(segment.text)
+			continue
+		}
+		text := segment.text
+		for i := 0; i < len(text); i++ {
+			if text[i] != '?' {
+				buf.WriteByte(text[i])
+				continue
+			}
 			// ?? 转义为字面 ?（jsonb 键存在操作符），不占绑定
-			if i+1 < len(sql) && sql[i+1] == '?' {
+			if i+1 < len(text) && text[i+1] == '?' {
 				buf.WriteByte('?')
 				i++
 				continue
@@ -45,8 +56,6 @@ func (g *PostgresGrammar) convertRawPlaceholders(sql string, bindings []any) str
 				bi++
 			}
 			buf.WriteString(g.nextParam())
-		} else {
-			buf.WriteByte(sql[i])
 		}
 	}
 	return buf.String()
@@ -55,6 +64,18 @@ func (g *PostgresGrammar) convertRawPlaceholders(sql string, bindings []any) str
 // NewPostgresGrammar 创建一个 PostgreSQL 语法编译器
 func NewPostgresGrammar() *PostgresGrammar {
 	return &PostgresGrammar{}
+}
+
+// CompileRaw 把 PostgreSQL 编译产物形态（$N + args）内联成可执行的完整 SQL：$N 取第 N 个参数，
+// 编号须落在 1..参数个数内且最大编号等于参数个数（同 lib/pq 与引擎的契约），允许重复引用同一编号、
+// 允许区间内未被引用的参数。
+// 只认 $N：PostgreSQL 里 `?` 是 jsonb 键存在操作符等运算符，故 `?` 一律按普通字符处理；
+// $N 同样只在代码区识别，字符串字面量、引号标识符、注释与美元引用内的 $N 原样保留（见 sqlScan.go）。
+// 值内联规则：字符串只转义单引号（默认 standard_conforming_strings=on，反斜杠是普通字符）、
+// bool 写 TRUE/FALSE、时间带偏移、字节写 '\x..'::bytea，Expression 原样内嵌。
+// 内联不产生 $N 占位符，故不涉及接收者的参数计数器，可并发调用。安全警示见 Grammar 接口说明。
+func (g *PostgresGrammar) CompileRaw(sqlStr string, args []any) (string, error) {
+	return compileRawNumbered(sqlStr, args, pgScanSyntax, pgRawLiteralStyle)
 }
 
 // nextParam 生成下一个占位符并返回

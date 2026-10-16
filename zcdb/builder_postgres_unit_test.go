@@ -39,6 +39,33 @@ func TestPostgresGrammar_RawPlaceholderEscape(t *testing.T) {
 			expected: `SELECT * FROM "users" WHERE "a" ? $1 AND "b" = $2`,
 			args:     []any{"k", 1},
 		},
+		{
+			name:     "LiteralQuestionMarkIsNotPlaceholder",
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw(`name LIKE '%?%' AND age > ?`, 18),
+			expected: `SELECT * FROM "users" WHERE name LIKE '%?%' AND age > $1`,
+			args:     []any{18},
+		},
+		{
+			name:     "LiteralQuestionMarkWithoutBinding",
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw(`name LIKE '%?%'`),
+			expected: `SELECT * FROM "users" WHERE name LIKE '%?%'`,
+			args:     []any{},
+		},
+		{
+			// 不写转义的后果：代码区的 ? 被当占位符编译成 $1（且没消耗绑定），
+			// 产物在 PostgreSQL 上执行报语法错误——这正是 jsonb 键存在操作符要写成 ?? 的原因。
+			name:     "SingleQuestionMarkBecomesPlaceholder",
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw(`"options" ? 'k'`),
+			expected: `SELECT * FROM "users" WHERE "options" $1 'k'`,
+			args:     []any{},
+		},
+		{
+			// 字符串字面量里的 ?? 不是转义写法，原样保留（占位符与转义只在代码区生效）。
+			name:     "DoubleQuestionMarkInsideLiteralIsKept",
+			builder:  newTestBuilder(g, nil).Table("users").WhereRaw(`name = 'a??b' AND id = ?`, 1),
+			expected: `SELECT * FROM "users" WHERE name = 'a??b' AND id = $1`,
+			args:     []any{1},
+		},
 	}
 
 	for _, tt := range tests {

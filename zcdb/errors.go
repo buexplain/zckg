@@ -71,6 +71,12 @@ var (
 	// ErrDeleteJoinNoJoin DeleteJoin 要求至少一个 JOIN
 	ErrDeleteJoinNoJoin = errors.New("zcdb: DeleteJoin requires at least one JOIN")
 
+	// ErrRawPlaceholderMismatch CompileRaw 的原始 SQL 占位符数量与绑定参数数量不一致
+	ErrRawPlaceholderMismatch = errors.New("zcdb: raw SQL placeholder count does not match args count")
+
+	// ErrRawValueNotInlinable CompileRaw 的参数值无法内联成 SQL 字面量（类型不支持、NaN/Inf、Valuer 报错）
+	ErrRawValueNotInlinable = errors.New("zcdb: raw SQL arg cannot be inlined as a SQL literal")
+
 	// ErrDeleteWithJoin 普通 Delete/ToDelete 不编译 JOIN，带 JOIN 时拒绝以免 JOIN 限定被静默丢弃
 	ErrDeleteWithJoin = errors.New("zcdb: Delete does not compile JOIN clauses, use DeleteJoin instead")
 

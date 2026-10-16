@@ -138,7 +138,7 @@ func main() {
 | [query-builder.md](query-builder.md) | SELECT 构造：表与列、WHERE、JOIN、分组、排序分页、UNION、锁、Comment、Clone |
 | [query-exec.md](query-exec.md) | 查询执行：Find/First/Value/Count/Exists/聚合/Pluck/Paginate/游标迭代 |
 | [mutate.md](mutate.md) | 写操作：Insert/Upsert/Update/Increment/Delete/DeleteJoin/Truncate 与安全防护 |
-| [compile.md](compile.md) | ToXxx 纯编译系列与 Expression 原始表达式 |
+| [compile.md](compile.md) | ToXxx 纯编译系列、原始 SQL 内联编译（CompileRaw）与 Expression 原始表达式 |
 | [schema.md](schema.md) | Schema 元数据查询（表列表、字段信息） |
 
 ## 错误变量速查
@@ -163,6 +163,8 @@ func main() {
 | `ErrDeleteWithJoin` | 普通 Delete 带 JOIN（应使用 DeleteJoin） |
 | `ErrIncrementColumns` | Increment/Decrement 参数不成对，或 columns/amounts 为空、长度不等 |
 | `ErrInsertUsingColumnMismatch` | InsertUsing/InsertOrIgnoreUsing 的目标列数与子查询 SELECT 列数不一致（子查询列数可静态判定时） |
+| `ErrRawPlaceholderMismatch` | `CompileRaw` 的原始 SQL 占位符数量与绑定参数数量不一致 |
+| `ErrRawValueNotInlinable` | `CompileRaw` 的参数值无法内联成 SQL 字面量（类型不支持、NaN/Inf、Valuer 取值失败） |
 | `ErrUpsertUniqueByRequired` | PG/SQLite 的 Upsert 缺少 uniqueBy |
 | `ErrDeleteJoinNoJoin` | DeleteJoin 没有任何 JOIN |
 | `ErrPgUnionLockNotSupported` | PostgreSQL 下 UNION + 锁 |

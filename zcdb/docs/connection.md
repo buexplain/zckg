@@ -72,6 +72,8 @@ defer db.Close()
 
 `db.Pool()` 返回 DAO 持有的底层连接池，供调用方直接管理生命周期（`AddSlave`/`Ping`/`Close`）或获取 `*sql.DB`；`db.Close()` 即委托给该池的 `Close`。
 
+`db.Grammar()` 返回 DAO 按 `dialect` 推导出的 SQL 编译器（`MySQLGrammar`/`PostgresGrammar`/`SQLiteGrammar`），供在 Builder 之外自行编译 SQL：独立生成 SQL 文本、拼装自定义子查询，或把带 `?` 的原始 SQL 与参数内联成一条完整可执行 SQL（`CompileRaw`，见[编译](compile.md)）。返回值与 DAO 内部是**同一实例**，只读使用：内置三方言实现均无对外可写状态（MySQL/SQLite 无字段，PostgreSQL 的参数计数器只在单次编译的克隆副本上累加），因此调用它不会改变 DAO 后续编译与执行行为，并发调用也安全。与 Builder 编译路径的差别是：直接调用 Grammar 不追加 DAO 默认注释。
+
 ## 自定义列映射标签
 
 结构体与数据库列的映射默认读取 `db` 标签，可在创建 DAO 时通过 `NewDBDao` 的第四个参数改为任意标签名（如与其它 ORM 共用结构体时复用其标签），初始化后不可变更：
@@ -153,7 +155,7 @@ err := db.Transaction(ctx, func(ctx context.Context) error {
 
 ## 原始 SQL
 
-不适合用 Builder 表达的语句可直接走 DAO。`Exec`、`Query`、`QueryPrimary` 均原文透传：不会添加 DAO 默认注释，也不剥离调用方手工添加的注释。
+不适合用 Builder 表达的语句可直接走 DAO。`Exec`、`Query`、`QueryPrimary` 均原文透传：不会添加 DAO 默认注释，也不剥离调用方手工添加的注释，**也不转换占位符**——`?` 由驱动解释，PostgreSQL（`lib/pq`）只接受 `$1`、`$2`…，因此 PostgreSQL 下上面的示例要写成 `$n`；若要把原始 SQL 变成一条**不需要参数**的完整 SQL（手工执行、日志留档），用 `db.Grammar().CompileRaw` 内联参数——它按方言自身的占位符形态识别：MySQL/SQLite 写 `?`、PostgreSQL 写 `$n`（也正是 PostgreSQL 下 Builder 编译产物的形态），见[编译](compile.md)的「原始 SQL 内联编译」。
 
 ```go
 // Exec：写语句（走写库或事务连接）

@@ -22,6 +22,14 @@ func (g *MySQLGrammar) UpdateSetBeforeJoin() bool {
 	return false
 }
 
+// CompileRaw 把带 ? 占位符的原始 SQL 与参数内联成可执行的完整 SQL：
+// 字符串转义单引号与反斜杠（MySQL 默认转义模式）、bool 写 1/0、时间写 DATETIME 文本、
+// 字节写 X'..'，Expression 原样内嵌。字符串字面量、引号标识符与注释内的 ? 是字面内容，
+// 不参与占位符识别（与引擎解析一致）。安全警示与完整规则见 Grammar 接口说明。
+func (g *MySQLGrammar) CompileRaw(sqlStr string, args []any) (string, error) {
+	return compileRaw(sqlStr, args, mysqlScanSyntax, mysqlRawLiteralStyle)
+}
+
 // WrapColumn 使用反引号引用列名。
 // 包含括号的表达式（如 COUNT(*)、YEAR(col)）不会被引用。
 func (g *MySQLGrammar) WrapColumn(column string) string {
@@ -137,7 +145,7 @@ func (g *MySQLGrammar) CompileSelect(b *Builder, columns []SelectColumn) string 
 				sql.WriteString(", ")
 			}
 			if group.Raw != "" {
-				sql.WriteString(replaceRawExpression(group.Raw, group.Bindings))
+				sql.WriteString(replaceRawExpression(group.Raw, group.Bindings, mysqlScanSyntax))
 			} else {
 				sql.WriteString(g.WrapColumn(group.Column))
 			}
@@ -545,7 +553,7 @@ func (g *MySQLGrammar) compileWheres(b *Builder) string {
 		case WhereTypeNotBetween:
 			clause = g.WrapColumn(w.Column) + " NOT BETWEEN ? AND ?"
 		case WhereTypeRaw:
-			clause = replaceRawExpression(w.SQL, w.Bindings)
+			clause = replaceRawExpression(w.SQL, w.Bindings, mysqlScanSyntax)
 		case WhereTypeNested:
 			if w.Nested != nil {
 				nested := g.compileWheres(w.Nested)
@@ -743,7 +751,7 @@ func (g *MySQLGrammar) compileJoinConditions(conditions []JoinCondition) string 
 				clause = g.WrapColumn(cond.First) + " " + cond.Operator + " ?"
 			}
 		case "raw":
-			clause = replaceRawExpression(cond.SQL, cond.Bindings)
+			clause = replaceRawExpression(cond.SQL, cond.Bindings, mysqlScanSyntax)
 		case "null":
 			if cond.Not {
 				clause = g.WrapColumn(cond.First) + " IS NOT NULL"
@@ -838,7 +846,7 @@ func (g *MySQLGrammar) compileHavings(b *Builder) string {
 				clause = g.WrapColumn(h.Column) + " " + h.Operator + " ?"
 			}
 		case "raw":
-			clause = replaceRawExpression(h.SQL, h.Bindings)
+			clause = replaceRawExpression(h.SQL, h.Bindings, mysqlScanSyntax)
 		case "between":
 			if h.Not {
 				clause = g.WrapColumn(h.Column) + " NOT BETWEEN ? AND ?"
