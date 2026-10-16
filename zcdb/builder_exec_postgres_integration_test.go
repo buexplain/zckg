@@ -1489,7 +1489,7 @@ func TestPgInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 	db := openPgTestDB(t)
 	setupPgUsersTable(t, db)
 
-	panicDao, err := NewDBDao(db.Pool(), "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	panicDao, err := NewDBDao(db.Pool(), "postgres", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		panic("callback boom")
 	}, "", "")
 	assertNoError(t, err)

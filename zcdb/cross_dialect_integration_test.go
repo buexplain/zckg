@@ -34,7 +34,7 @@ type commentSQLLog struct {
 }
 
 // collect 仅复制观测值，不在 DAO 会 recover 的回调内断言。
-func (l *commentSQLLog) collect(ctx context.Context, _ time.Duration, query string, args []any) {
+func (l *commentSQLLog) collect(ctx context.Context, _ Grammar, _ time.Duration, query string, args []any) {
 	l.calls = append(l.calls, commentSQLCall{query, append([]any(nil), args...), txFromCtx(ctx)})
 }
 

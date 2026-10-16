@@ -50,7 +50,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 		// 门控：PostgreSQL 不可达时跳过而非失败，保证无数据库环境下 go test 不误报
 		t.Skipf("postgres unavailable, skipping integration test: %v", err)
 	}
-	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		slog.Default().Info("slow sql", "sql", sqlStr, "args", args)
 	}, "", testComment)
 	if err != nil {
@@ -80,7 +80,7 @@ func openPgTestDB(t *testing.T) *DBDao {
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
-	dao, err = NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err = NewDBDao(pool, "postgres", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		slog.Default().Info("slow sql", "sql", sqlStr, "args", args)
 	}, "", testComment)
 	if err != nil {

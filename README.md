@@ -65,7 +65,7 @@ func main() {
 		panic(err)
 	}
 	// 第四参数为列映射标签名（空串使用 db），第五参数为 SQL 注释（空串禁用）
-	db, err := zcdb.NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	db, err := zcdb.NewDBDao(pool, "sqlite", func(ctx context.Context, grammar zcdb.Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		slog.Default().Info(sqlStr, "args", args)
 	}, "", "")
 	if err != nil {

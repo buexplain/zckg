@@ -55,15 +55,17 @@ func dialectGrammar(dialect string) (Grammar, error) {
 }
 
 // SlowSQLCallback 慢 SQL 回调函数类型。
-// 参数依次为：ctx 上下文、elapsed 耗时、sqlStr SQL 语句、args 绑定参数。
-type SlowSQLCallback func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any)
+// 参数依次为：ctx 上下文、grammar SQL 编译器、elapsed 耗时、sqlStr SQL 语句、args 绑定参数。
+// grammar 就是 DAO 持有的那个编译器（与 DBDao.Grammar 返回同一实例），供回调判断方言或自行编译；
+// 它与 DAO 共用实例、只读使用。
+type SlowSQLCallback func(ctx context.Context, grammar Grammar, elapsed time.Duration, sqlStr string, args []any)
 
 // DBDao 数据库访问对象，是面向用户的唯一入口。
 type DBDao struct {
-	pool    *Pool                                                                       // 连接池（提供 *sql.DB 和读写路由）
-	grammar Grammar                                                                     // SQL 编译器（由 dialect 推导）
-	onSQL   func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) //SQL 回调函数
-	tagName string                                                                      // 列映射结构体标签名，创建时确定、不可变更，空值使用默认的 db 标签
+	pool    *Pool           // 连接池（提供 *sql.DB 和读写路由）
+	grammar Grammar         // SQL 编译器（由 dialect 推导）
+	onSQL   SlowSQLCallback // SQL 回调函数
+	tagName string          // 列映射结构体标签名，创建时确定、不可变更，空值使用默认的 db 标签
 	comment string
 }
 
@@ -75,12 +77,12 @@ type DBDao struct {
 //	"sqlite"/"sqlite3"               → SQLiteGrammar
 //
 // onSQL 为 SQL 回调（常用于慢 SQL 检测）：非 nil 时每条经 DAO 执行的 SQL 都会回调，
-// 传入执行耗时、SQL 文本与绑定参数，阈值判断由回调内部自行决定；为 nil 时不计时（零开销）。
-// 回调内 panic 会被 recover 隔离，不影响主流程。
+// 传入 DAO 的 SQL 编译器、执行耗时、SQL 文本与绑定参数，阈值判断由回调内部自行决定；
+// 为 nil 时不计时（零开销）。回调内 panic 会被 recover 隔离，不影响主流程。
 //
 // tagName（第四参数）指定不可变的列映射标签名，空串使用 db。
 // comment（第五参数）仅为 Builder 提供不可变的默认短业务标识，按 Comment 规则有损规范化（星号/斜杠/反斜杠/控制字符替换空格、上限 255 rune）；空值无注释，禁止透传外部输入、请求体或密钥，不负责脱敏。
-func NewDBDao(pool *Pool, dialect string, onSQL func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any), tagName string, comment string) (*DBDao, error) {
+func NewDBDao(pool *Pool, dialect string, onSQL SlowSQLCallback, tagName string, comment string) (*DBDao, error) {
 	grammar, err := dialectGrammar(dialect)
 	if err != nil {
 		return nil, err
@@ -115,6 +117,16 @@ func (d *DBDao) Pool() *Pool {
 	return d.pool
 }
 
+// Grammar 返回 DAO 按 dialect 推导出的 SQL 编译器，供调用方在 Builder 之外自行编译 SQL
+// （如独立生成 SQL 文本、拼装自定义子查询）。
+// 返回值与 DAO 内部是同一实例，只读使用：内置三方言实现均无对外可写状态
+// （MySQL/SQLite 无字段；PostgreSQL 的参数计数器只在单次编译的克隆副本上累加），
+// 因此调用它不会改变 DAO 后续编译与执行行为，并发调用亦安全。
+// 注意：直接调用 Grammar 编译不追加 DAO 默认注释（与 Builder 编译路径不同）。
+func (d *DBDao) Grammar() Grammar {
+	return d.grammar
+}
+
 // Exec 执行原始 SQL（含慢 SQL 检测 + 读写路由），返回 sql.Result。
 // args 为 SQL 中占位符的绑定值，支持基本类型（int、string、float、bool、time.Time 等）。
 // ctx 携带其它连接池的事务时返回 ErrTxOwnerMismatch，SQL 不执行、不触发回调。
@@ -143,7 +155,7 @@ func (d *DBDao) Exec(ctx context.Context, sqlStr string, args ...any) (sql.Resul
 	if d.onSQL != nil {
 		func() {
 			defer func() { _ = recover() }()
-			d.onSQL(ctx, time.Since(start), sqlStr, args)
+			d.onSQL(ctx, d.grammar, time.Since(start), sqlStr, args)
 		}()
 	}
 
@@ -195,7 +207,7 @@ func (d *DBDao) query(ctx context.Context, sqlStr string, primary bool, args ...
 	if d.onSQL != nil {
 		func() {
 			defer func() { _ = recover() }()
-			d.onSQL(ctx, time.Since(start), sqlStr, args)
+			d.onSQL(ctx, d.grammar, time.Since(start), sqlStr, args)
 		}()
 	}
 

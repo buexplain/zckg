@@ -64,7 +64,7 @@ db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
 defer db.Close()
 ```
 
-第三个参数为慢 SQL 回调（见下文），第四个参数为列映射标签名（见下节，传空串使用默认 `db` 标签），第五个参数 `comment` 为默认 SQL **短业务标识**（例如服务名，空串表示无注释）。这是五参数接口，不兼容旧四参数调用；迁移时在末尾补 `""` 即可保留原 SQL 基线，函数值引用也需同步更新签名。`dialect` 为空返回 `ErrDialectRequired`，未知方言返回 `ErrUnknownDialect`，`pool` 为 nil 返回 `ErrPoolRequired`。
+第三个参数为慢 SQL 回调（见下文），第四个参数为列映射标签名（见下节，传空串使用默认 `db` 标签），第五个参数 `comment` 为默认 SQL **短业务标识**（例如服务名，空串表示无注释）。这是五参数接口，不兼容旧四参数调用；迁移时在末尾补 `""` 即可保留原 SQL 基线，函数值引用也需同步更新签名。回调类型为 `SlowSQLCallback`，签名的第二个参数是 DAO 的 SQL 编译器（`ctx, grammar, elapsed, sqlStr, args`），已有回调实现需在 `ctx` 之后补一个参数。`dialect` 为空返回 `ErrDialectRequired`，未知方言返回 `ErrUnknownDialect`，`pool` 为 nil 返回 `ErrPoolRequired`。
 
 默认注释在 DAO 创建时规范化并保存，之后不可变：将 `*`、`/`、`\` 和全部 `unicode.IsControl` 控制字符（含 C0、DEL、C1）替换为 ASCII 空格，非法 UTF-8 转 U+FFFD，去首尾空白但保留内部空格；超过 255 rune 时截断并再次去首尾空白。结果为空则不追加。规范化有损且不做脱敏，**不得透传外部输入、请求体、密码、令牌或其他秘密**；推荐固定低基数标识，避免影响 SQL 文本缓存与监控聚合。
 
@@ -189,14 +189,14 @@ err = db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &or
 
 ```go
 db, err := zcdb.NewDBDao(pool, "mysql",
-	func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	func(ctx context.Context, grammar zcdb.Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		if elapsed > 200*time.Millisecond {
 			slog.Default().Info("slow sql", "elapsed", elapsed, "sql", sqlStr, "args", args)
 		}
 	}, "", "")
 ```
 
-`NewDBDao` 的回调参数语义与 Builder 链式构造无关，作用于所有经 DAO 执行的 SQL。`slowSQLMillis` 概念由回调内部自行判断；回调为 nil 时不计时（零开销）。
+`NewDBDao` 的回调参数语义与 Builder 链式构造无关，作用于所有经 DAO 执行的 SQL。第二个参数 `grammar` 是 DAO 持有的 SQL 编译器（与 `db.Grammar()` 返回同一实例），可用于判断方言、按方言格式化 SQL 或自行编译，与 DAO 共用实例、**只读使用**。`slowSQLMillis` 概念由回调内部自行判断；回调为 nil 时不计时（零开销）。
 
 回调收到实际执行的 SQL 与原绑定参数：Builder 语句包含最终编译时追加的注释，执行层不重复追加；DAO 原始 SQL、Schema 查询及 SQLite Truncate 辅助语句不自动添加注释。分页或分批游标每条业务 SQL 分别触发回调，不能把一次方法调用当作一条 SQL。
 

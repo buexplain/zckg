@@ -1556,7 +1556,7 @@ func TestMySQLInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 	db := openMySQLTestDB(t)
 	setupMySQLUsersTable(t, db)
 
-	panicDao, err := NewDBDao(db.Pool(), "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	panicDao, err := NewDBDao(db.Pool(), "mysql", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		panic("callback boom")
 	}, "", "")
 	assertNoError(t, err)

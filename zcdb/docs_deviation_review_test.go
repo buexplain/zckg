@@ -697,7 +697,7 @@ func docReviewSQLiteDAO(t *testing.T, onSQL SlowSQLCallback) *DBDao {
 // 文档示例注释写 LIMIT 100，与实际 LIMIT 101 不符（已修订文档）。
 func TestDocReview_QueryExecMd_CursorByLimit(t *testing.T) {
 	var sqls []string
-	dao := docReviewSQLiteDAO(t, func(ctx context.Context, _ time.Duration, sqlStr string, args []any) {
+	dao := docReviewSQLiteDAO(t, func(ctx context.Context, _ Grammar, _ time.Duration, sqlStr string, args []any) {
 		sqls = append(sqls, sqlStr)
 	})
 	ctx := context.Background()
@@ -767,7 +767,7 @@ func TestDocReview_QueryExecMd_AggregateEmptySet(t *testing.T) {
 // query-exec.md：Find/First/Value 无结果行为与 First LIMIT 1；Pluck 三模式；Paginate COUNT。
 func TestDocReview_QueryExecMd_TerminalSemantics(t *testing.T) {
 	var sqls []string
-	dao := docReviewSQLiteDAO(t, func(ctx context.Context, _ time.Duration, sqlStr string, args []any) {
+	dao := docReviewSQLiteDAO(t, func(ctx context.Context, _ Grammar, _ time.Duration, sqlStr string, args []any) {
 		sqls = append(sqls, sqlStr)
 	})
 	ctx := context.Background()

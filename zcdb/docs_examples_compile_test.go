@@ -246,7 +246,7 @@ func connectionMdExamples(ctx context.Context) error {
 
 	// 慢 SQL 回调
 	dbSlow, err := zcdb.NewDBDao(pool, "mysql",
-		func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+		func(ctx context.Context, grammar zcdb.Grammar, elapsed time.Duration, sqlStr string, args []any) {
 			if elapsed > 200*time.Millisecond {
 				slog.Default().Info("slow sql", "elapsed", elapsed, "sql", sqlStr, "args", args)
 			}

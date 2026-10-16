@@ -77,7 +77,7 @@ func openMySQLTestDB(t *testing.T) *DBDao {
 		// 门控：MySQL 不可达时跳过而非失败，保证无数据库环境下 go test 不误报
 		t.Skipf("mysql unavailable, skipping integration test: %v", err)
 	}
-	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err := NewDBDao(pool, "mysql", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		slog.Default().Info("slow sql", "sql", sqlStr, "args", args)
 	}, "", testComment)
 	if err != nil {

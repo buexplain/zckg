@@ -480,7 +480,7 @@ func TestSQLiteInteg_Cursor_InvalidDestNoQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		atomic.AddInt32(&sqlCount, 1)
 	}, "", "")
 	if err != nil {
@@ -523,7 +523,7 @@ func TestSQLiteInteg_CursorBy_ExactPageBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		atomic.AddInt32(&sqlCount, 1)
 	}, "", "")
 	if err != nil {

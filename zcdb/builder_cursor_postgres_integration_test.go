@@ -324,7 +324,7 @@ func TestPgInteg_CursorBy_ExactPageBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open postgres: %v", err)
 	}
-	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err := NewDBDao(pool, "postgres", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		atomic.AddInt32(&sqlCount, 1)
 	}, "", "")
 	if err != nil {

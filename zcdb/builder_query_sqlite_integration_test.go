@@ -122,7 +122,7 @@ func TestSQLiteInteg_ExistsUsesLimit1(t *testing.T) {
 	}
 
 	var captured []string
-	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		captured = append(captured, sqlStr)
 	}, "", "")
 	if err != nil {

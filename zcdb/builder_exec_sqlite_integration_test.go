@@ -1062,7 +1062,7 @@ func TestSQLiteInteg_Truncate_NoSequenceSkipsDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	dao, err := NewDBDao(pool, "sqlite", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		mu.Lock()
 		executed = append(executed, sqlStr)
 		mu.Unlock()
@@ -1624,7 +1624,7 @@ func TestSQLiteInteg_Bug_OnSQLPanicRecovered(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteUsersTable(t, db)
 
-	panicDao, err := NewDBDao(db.Pool(), "sqlite", func(ctx context.Context, elapsed time.Duration, sqlStr string, args []any) {
+	panicDao, err := NewDBDao(db.Pool(), "sqlite", func(ctx context.Context, _ Grammar, elapsed time.Duration, sqlStr string, args []any) {
 		panic("callback boom")
 	}, "", "")
 	assertNoError(t, err)
