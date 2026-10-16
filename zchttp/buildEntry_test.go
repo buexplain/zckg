@@ -1,7 +1,9 @@
 package zchttp
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"reflect"
@@ -826,7 +828,7 @@ func TestBuildOperationMeta_NonStruct(t *testing.T) {
 	}
 }
 
-// ========== needsDeepCopy / resMeta / defaultReq 测试 ==========
+// ========== needsDeepCopy / defaultReq 测试 ==========
 
 func TestBuildEntry_NeedsDeepCopy_True(t *testing.T) {
 	type reqPtrDefault struct {
@@ -864,37 +866,6 @@ func TestBuildEntry_NeedsDeepCopy_SliceDefault(t *testing.T) {
 
 	if !entry.needsDeepCopy {
 		t.Fatal("needsDeepCopy should be true for pointer default")
-	}
-}
-
-func TestBuildEntry_ResMeta_Computed(t *testing.T) {
-	type myRes struct {
-		Name  string `json:"name"`
-		Count int    `json:"count"`
-		OK    bool   `json:"ok"`
-	}
-
-	fn := func(ctx context.Context, req testReq) (myRes, error) {
-		return myRes{}, nil
-	}
-
-	entry, err := buildEntry(fn, nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(entry.resMeta.fields) != 3 {
-		t.Fatalf("expected 3 res fields, got %d", len(entry.resMeta.fields))
-	}
-
-	names := make(map[string]bool)
-	for _, fm := range entry.resMeta.fields {
-		names[fm.name] = true
-	}
-	for _, expected := range []string{"name", "count", "ok"} {
-		if !names[expected] {
-			t.Fatalf("resMeta missing field %q", expected)
-		}
 	}
 }
 
@@ -1061,6 +1032,49 @@ func TestAttachPathParamBindings_RejectsNonScalarTarget(t *testing.T) {
 	for _, p := range []string{"i", "pp", "t", "pt", "f", "b", "str"} {
 		t.Run("accept_"+p, func(t *testing.T) {
 			NewRouter().GET("/pt/{"+p+"}", pathParamTypeHandler)
+		})
+	}
+}
+
+// TestBuildEntry_WarnsOnInertEmbeddedInRes 锁死注册期告警：Res 顶层嵌入只对 Req 生效的声明性结构体
+// （zchttp.OpenAPIMeta 操作级元信息 / zchttp.KeepRawBody 保留请求体）属静默失效的配置错误，
+// 必须告警提示；普通 Res 不产生该告警，且告警不中断注册。
+func TestBuildEntry_WarnsOnInertEmbeddedInRes(t *testing.T) {
+	type resWithMeta struct {
+		OpenAPIMeta
+		OK bool `json:"ok"`
+	}
+	type resWithRaw struct {
+		KeepRawBody
+		OK bool `json:"ok"`
+	}
+	type plainRes struct {
+		OK bool `json:"ok"`
+	}
+
+	const warnText = "embedded declaration only takes effect on Req"
+	cases := []struct {
+		name     string
+		handler  any
+		wantWarn bool
+	}{
+		{"Res 嵌入 OpenAPIMeta", func(context.Context, testReq) (resWithMeta, error) { return resWithMeta{}, nil }, true},
+		{"Res 嵌入 KeepRawBody", func(context.Context, testReq) (resWithRaw, error) { return resWithRaw{}, nil }, true},
+		{"普通 Res", func(context.Context, testReq) (plainRes, error) { return plainRes{}, nil }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+			defer slog.SetDefault(old)
+
+			if _, err := buildEntry(tc.handler, nil, nil); err != nil {
+				t.Fatalf("buildEntry 不应因无效嵌入而失败: %v", err)
+			}
+			if got := strings.Contains(buf.String(), warnText); got != tc.wantWarn {
+				t.Fatalf("告警 = %v, want %v；日志: %s", got, tc.wantWarn, buf.String())
+			}
 		})
 	}
 }

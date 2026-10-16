@@ -2799,3 +2799,87 @@ func TestSetTime_UnparseableAutoDetect(t *testing.T) {
 		t.Fatal("无法解析的时间字符串应返回错误")
 	}
 }
+
+// TestBindValues_TimeTagsOnPointerAndSliceFields 端到端锁死 time_format/time_location 在
+// *time.Time、[]time.Time、[]*time.Time 上生效：自定义 layout（不在自动探测表内）不再被静默丢弃，
+// time_location 不再丢失。历史行为：这些字段的标签被元数据层丢弃 → 自动探测失败 → bindValues 的
+// 尽力绑定语义吞掉错误，字段保持零值且无任何日志。
+func TestBindValues_TimeTagsOnPointerAndSliceFields(t *testing.T) {
+	type req struct {
+		Ptr      *time.Time   `json:"ptr" time_format:"02/01/2006" time_location:"Asia/Shanghai"`
+		Slice    []time.Time  `json:"slice" time_format:"02/01/2006" time_location:"Asia/Shanghai"`
+		SlicePtr []*time.Time `json:"slice_ptr" time_format:"02/01/2006" time_location:"Asia/Shanghai"`
+	}
+
+	got := req{}
+	meta := buildStructMeta(reflect.TypeOf(got))
+	values := map[string][]string{
+		"ptr":       {"05/03/2024"},
+		"slice":     {"05/03/2024", "06/03/2024"},
+		"slice_ptr": {"05/03/2024"},
+	}
+	if err := bindValues(reflect.ValueOf(&got), values, nil, meta); err != nil {
+		t.Fatalf("bindValues: %v", err)
+	}
+
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Skipf("本机缺少 Asia/Shanghai 时区数据，跳过: %v", err)
+	}
+	want := time.Date(2024, 3, 5, 0, 0, 0, 0, shanghai)
+	// 用位置名而非指针比较：time.LoadLocation 多次调用不保证返回同一实例
+	if got.Ptr == nil || !got.Ptr.Equal(want) || got.Ptr.Location().String() != "Asia/Shanghai" {
+		t.Fatalf("指针字段应按自定义 layout 与 Asia/Shanghai 解析: got %v", got.Ptr)
+	}
+	if len(got.Slice) != 2 || !got.Slice[0].Equal(want) || !got.Slice[1].Equal(want.AddDate(0, 0, 1)) {
+		t.Fatalf("切片元素应按相同标签逐个解析: got %v", got.Slice)
+	}
+	if len(got.SlicePtr) != 1 || got.SlicePtr[0] == nil || !got.SlicePtr[0].Equal(want) {
+		t.Fatalf("指针切片元素应按相同标签解析: got %v", got.SlicePtr)
+	}
+}
+
+// TestBindPathParams_TimeTagOnPointerAndSlice 锁死路径参数使用与 query 相同的时间标签解析：
+// *time.Time 字段按 time_format/time_location 转换（文档声明"指针与 time.Time 标签同样生效"），
+// 而切片等非标量形态在注册阶段即被拒绝（attachPathParamBindings panic），不会走到绑定。
+func TestBindPathParams_TimeTagOnPointerAndSlice(t *testing.T) {
+	type req struct {
+		When *time.Time `json:"when" time_format:"02/01/2006" time_location:"UTC"`
+	}
+	typ := reflect.TypeOf(req{})
+	meta := buildStructMeta(typ)
+
+	// 复刻 attachPathParamBindings 的取值方式：绑定参数直接复用字段元信息
+	var params []pathParamBinding
+	for i := range meta.fields {
+		fm := &meta.fields[i]
+		if fm.name != "when" {
+			continue
+		}
+		if !isScalarType(fm.field.Type) {
+			t.Fatalf("路径参数仅支持标量（含 time.Time 指针），%s 不应被判定为不支持", fm.field.Type)
+		}
+		params = append(params, pathParamBinding{
+			indices:      fm.indices,
+			timeFormat:   fm.timeFormat,
+			timeLocation: fm.timeLocation,
+		})
+	}
+	if len(params) != 1 {
+		t.Fatalf("未找到 when 字段的路径参数绑定: %v", params)
+	}
+
+	got := req{}
+	if err := bindPathParams(reflect.ValueOf(&got), params, []string{"05/03/2024"}); err != nil {
+		t.Fatalf("bindPathParams: %v", err)
+	}
+	want := time.Date(2024, 3, 5, 0, 0, 0, 0, time.UTC)
+	if got.When == nil || !got.When.Equal(want) {
+		t.Fatalf("路径参数应按 time_format 解析为 2024-03-05 UTC: got %v", got.When)
+	}
+
+	// 切片字段不是路径参数支持的形态
+	if isScalarType(reflect.TypeOf([]time.Time{})) {
+		t.Error("[]time.Time 不应被判定为标量类型")
+	}
+}

@@ -3,6 +3,7 @@ package zchttp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"runtime"
 	"strings"
@@ -30,8 +31,6 @@ type routeEntry struct {
 
 	// Req 结构体的反射元信息，注册阶段预计算，供 binding/validation/defaults 及 OpenAPI 生成使用
 	reqMeta structMeta
-	// Res 结构体的反射元信息，注册阶段预计算，供 OpenAPI 生成使用
-	resMeta structMeta
 	// Req 的 OpenAPIMeta 操作级元信息，注册阶段预计算
 	opMeta operationMeta
 	// 预填充默认值的 Req 模板，请求时浅拷贝后直接绑定
@@ -115,14 +114,9 @@ func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHan
 		}
 	}
 
-	// 预计算 Res 结构体的字段元信息（OpenAPI 生成使用，避免重复反射遍历结构体字段）
-	var resElemType reflect.Type
-	if resIsPtr {
-		resElemType = resType.Elem()
-	} else {
-		resElemType = resType
-	}
-	resMeta := buildStructMeta(resElemType)
+	// Res 只参与响应：响应 schema 不读 default/nonzero/time_format 等请求侧标签，
+	// 故注册阶段无需为 Res 预计算 structMeta；此处仅检查那些只在 Req 生效的声明性嵌入是否被误写在 Res 上。
+	warnInertEmbeddedInRes(resType)
 
 	// 获取 handler 的位置信息（用于路由冲突提示、OpenAPI 摘要、default 误用警告）
 	handlerName, handlerFile, handlerLine := "unknown", "unknown", 0
@@ -167,7 +161,6 @@ func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHan
 		resIsPtr:                  resIsPtr,
 		reqElemType:               reqElemType,
 		reqMeta:                   reqMeta,
-		resMeta:                   resMeta,
 		opMeta:                    opMeta,
 		defaultReq:                defaultReq,
 		needsDeepCopy:             needsDeepCopy,
@@ -221,6 +214,32 @@ func hasKeepRawBody(reqType reflect.Type) bool {
 		}
 	}
 	return false
+}
+
+// warnInertEmbeddedInRes 检查 Res 顶层是否嵌入了只对 Req 生效的声明性结构体并告警。
+// zchttp.OpenAPIMeta（操作级元信息）与 zchttp.KeepRawBody（保留原始请求体）都只从 Req 解析
+// （见 buildOperationMeta / hasKeepRawBody），写在 Res 上不会产生任何效果，属静默失效的配置错误。
+// 与未导出嵌入指针的处理风格一致：告警但不阻断注册。
+func warnInertEmbeddedInRes(resType reflect.Type) {
+	t := derefType(resType)
+	if t.Kind() != reflect.Struct {
+		return
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.Anonymous {
+			continue
+		}
+		switch f.Type {
+		case metaType, keepRawBodyType:
+			slog.Warn("embedded declaration only takes effect on Req, remove it from the Res struct",
+				"zckg", "zchttp",
+				"struct", t.Name(),
+				"field", f.Name,
+				"embedded", f.Type.String(),
+			)
+		}
+	}
 }
 
 // attachPathParamBindings 按参数名在 Req 的预计算元信息中查找对应字段，

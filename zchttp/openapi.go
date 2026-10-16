@@ -30,20 +30,34 @@ type OpenAPIInfo struct {
 
 // openAPIGenerator 承载一次生成过程中的可复用状态
 type openAPIGenerator struct {
-	schemas           map[string]any          // components/schemas
-	typeNames         map[reflect.Type]string // 已按 JSON 命名注册的类型 → schema 名，避免重复与循环递归
-	formTypeNames     map[reflect.Type]string // 已按 form 绑定名注册的类型（multipart 顶层请求体）→ schema 名
-	nameToType        map[string]schemaKey    // schema 名 → 注册键，用于命名去重
-	reachedViaValue   map[reflect.Type]bool   // struct 类型是否被"值嵌套"路径到达（含顶层）
-	reachedByDefaults map[reflect.Type]bool   // struct 类型是否可被 applyDefaults 递归到达
-	currentType       reflect.Type            // 当前正在生成 schema 的 struct 类型（decorate 据此判断上下文）
-	responseWrapper   any                     // 自定义响应包装结构体样例
+	schemas           map[string]any        // components/schemas
+	typeNames         map[schemaKey]string  // 已注册的类型/角色/命名规则 → schema 名，避免重复与循环递归
+	nameToType        map[string]schemaKey  // schema 名 → 注册键，用于命名去重
+	reachedViaValue   map[reflect.Type]bool // struct 类型是否被"值嵌套"路径到达（含顶层；仅请求侧）
+	reachedByDefaults map[reflect.Type]bool // struct 类型是否可被 applyDefaults 递归到达（仅请求侧）
+	currentType       reflect.Type          // 当前正在生成 schema 的 struct 类型（decorate 据此判断上下文）
+	responseWrapper   any                   // 自定义响应包装结构体样例
 }
 
-// schemaKey 区分同一类型的两种 schema：JSON 命名（encoding/json 规则）与 form 绑定名
+// schemaRole 区分同一 struct 类型参与的两种 schema 角色：
+// 请求侧读取 default/nonzero/time_format 等绑定与校验约束标签，
+// 响应侧只描述实际序列化产物，不读上述标签（响应无默认值填充、无校验，时间恒按 RFC3339 输出）。
+type schemaRole uint8
+
+const (
+	roleRequest schemaRole = iota
+	roleResponse
+)
+
+// responseSchemaSuffix 是响应角色 schema 名的固定后缀，
+// 使同一类型同时用作 Req 与 Res 时，文档中两份 schema 可以被明确区分。
+const responseSchemaSuffix = "Response"
+
+// schemaKey 区分同一类型的四类 schema：请求/响应角色 × JSON 命名（encoding/json 规则）/ form 绑定名
 type schemaKey struct {
 	t    reflect.Type
 	form bool
+	role schemaRole
 }
 
 // GenerateOpenAPI 遍历路由表，通过反射生成 OpenAPI 3.0 文档（map 形式，可序列化为 JSON）。
@@ -53,21 +67,20 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 	validateResponseWrapper(info.ResponseWrapper)
 	g := &openAPIGenerator{
 		schemas:           map[string]any{},
-		typeNames:         map[reflect.Type]string{},
-		formTypeNames:     map[reflect.Type]string{},
+		typeNames:         map[schemaKey]string{},
 		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
 		responseWrapper:   info.ResponseWrapper,
 	}
 
-	// Pass 1：收集所有 struct 类型的嵌套上下文（值嵌套 vs 指针嵌套）。
+	// Pass 1：收集请求侧所有 struct 类型的嵌套上下文（值嵌套 vs 指针嵌套）。
 	// 值嵌套（顶层 + 值类型 struct 字段）→ 注册阶段 fill 所有类型；
 	// 指针嵌套（*Struct）→ 注册阶段无法到达，仅请求阶段 fill nil 指针。
-	// 此信息在 decorate 中判断值类型字段的 default 是否应展示。
+	// 此信息在 decorate 中判断值类型字段的 default 是否应展示（default 只在请求侧 schema 出现）。
 	g.collectTypeUsages(r)
 
-	// Pass 1b：收集所有 struct 类型是否可被 applyDefaults 递归到达。
+	// Pass 1b：收集请求侧所有 struct 类型是否可被 applyDefaults 递归到达。
 	// 指针字段的 default 仅在所属 struct 可被 defaults 到达时才展示。
 	g.collectDefaultsReachability(r)
 
@@ -145,18 +158,16 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 	return doc
 }
 
-// collectTypeUsages 第一遍遍历：收集所有 struct 类型是否被"值嵌套"路径到达。
-// 值嵌套（含顶层 Req/Res 和值类型 struct 字段）→ 注册阶段 fill 所有类型；
+// collectTypeUsages 第一遍遍历：收集请求侧所有 struct 类型是否被"值嵌套"路径到达。
+// 值嵌套（含顶层 Req 和值类型 struct 字段）→ 注册阶段 fill 所有类型；
 // 指针嵌套（*Struct）或切片/map 元素 → 注册阶段无法到达，仅请求阶段 fill 指针类型。
 // 此信息在 decorate 中判断值类型字段 default 是否应展示。
+// 只遍历 Req：default 仅在请求角色 schema 中展示，响应不读该标签（见 schemaRole）。
 func (g *openAPIGenerator) collectTypeUsages(r *Router) {
 	for _, rec := range r.routes {
 		entry := rec.entry
 		if entry.reqType != nil {
 			g.walkTypeUsage(derefType(entry.reqType), true, map[reflect.Type]bool{})
-		}
-		if entry.resType != nil {
-			g.walkTypeUsage(derefType(entry.resType), true, map[reflect.Type]bool{})
 		}
 	}
 }
@@ -223,27 +234,26 @@ func (g *openAPIGenerator) walkTypeUsage(t reflect.Type, viaValue bool, visiting
 	}
 }
 
-// collectDefaultsReachability 收集所有 struct 类型是否可被 applyDefaults 递归到达。
+// collectDefaultsReachability 收集请求侧所有 struct 类型是否可被 applyDefaults 递归到达。
 // 与 collectTypeUsages 的区别：
 //   - collectTypeUsages 追踪"值嵌套"可达性（viaValue），仅值类型 default 展示依赖它
 //   - collectDefaultsReachability 追踪"默认值填充"可达性（viaDefaults），指针字段 default 展示依赖它
 //
 // 可达性规则（与 applyDefaultsWithVisiting 一致）：
-//   - 顶层 Req/Res：可达
+//   - 顶层 Req：可达
 //   - 值类型 struct 字段：继承父级可达性
 //   - 指针字段（*Struct）：继承父级可达性（applyDefaults 可跟随非 nil 指针）
 //   - 指针包裹容器（*[]Struct / *[N]Struct / *map[K]Struct）：按解包后的容器处理
 //   - 切片/数组元素：继承父级可达性（applyDefaults 可遍历切片元素）
 //   - map 值类型为 Struct 或 *Struct：继承父级可达性
 //   - map 值类型为 Slice/Array：不可达（applyDefaults 无法穿透此类多层容器）
+//
+// 只遍历 Req：default 只在请求角色 schema 中展示（Res 不执行默认值填充，也不读该标签）。
 func (g *openAPIGenerator) collectDefaultsReachability(r *Router) {
 	for _, rec := range r.routes {
 		entry := rec.entry
 		if entry.reqType != nil {
 			g.walkDefaultsReachability(derefType(entry.reqType), true, map[reflect.Type]bool{})
-		}
-		if entry.resType != nil {
-			g.walkDefaultsReachability(derefType(entry.resType), true, map[reflect.Type]bool{})
 		}
 	}
 }
@@ -374,7 +384,7 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, para
 		op["parameters"] = params
 	}
 
-	op["responses"] = g.buildResponses(resType, entry.resMeta)
+	op["responses"] = g.buildResponses(resType)
 	return op
 }
 
@@ -419,7 +429,7 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 			"name":     fm.name,
 			"in":       "query",
 			"required": fm.nonzero && !fm.hasDefault,
-			"schema":   g.typeToSchema(f.Type, f, 0),
+			"schema":   g.typeToSchema(f.Type, f, 0, roleRequest),
 		}
 		if isDeprecated(f) {
 			param["deprecated"] = true
@@ -455,7 +465,7 @@ func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta
 			"name":     fm.name,
 			"in":       "path",
 			"required": !optionalParams[fm.name],
-			"schema":   g.typeToSchema(f.Type, f, 0),
+			"schema":   g.typeToSchema(f.Type, f, 0, roleRequest),
 		}
 		if isDeprecated(f) {
 			param["deprecated"] = true
@@ -490,6 +500,7 @@ func requestBodyRequired(entry *routeEntry, paramNames map[string]bool) bool {
 // application/json 的 schema 按 encoding/json 字段规则命名（与运行时 JSON 解码一致）；
 // multipart/form-data 的顶层 schema 按 form 优先绑定名命名（与表单绑定一致）。
 // required 表示省略 body 时默认 Req 模板无法通过内建 nonzero 校验。
+// 请求体恒为请求角色：default/nonzero/time_format 等约束标签在此生效。
 func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMeta, required bool) map[string]any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
@@ -503,21 +514,20 @@ func (g *openAPIGenerator) buildRequestBody(reqType reflect.Type, meta structMet
 		"required": required,
 		"content": map[string]any{
 			contentType: map[string]any{
-				"schema": g.registerStructSchema(reqType, meta, form),
+				"schema": g.registerRequestSchema(reqType, meta, form),
 			},
 		},
 	}
 }
 
 // buildResponses 生成响应对象：成功统一返回 200（与 HttpEngine 默认响应行为一致）；响应体统一包装为 Response 结构。
-// meta 为注册阶段预计算的 Res 结构体的 structMeta，透传给下层避免重复反射。
-func (g *openAPIGenerator) buildResponses(resType reflect.Type, meta structMeta) map[string]any {
+func (g *openAPIGenerator) buildResponses(resType reflect.Type) map[string]any {
 	return map[string]any{
 		"200": map[string]any{
 			"description": "成功",
 			"content": map[string]any{
 				"application/json": map[string]any{
-					"schema": g.wrapResponseSchema(resType, meta),
+					"schema": g.wrapResponseSchema(resType),
 				},
 			},
 		},
@@ -526,15 +536,16 @@ func (g *openAPIGenerator) buildResponses(resType reflect.Type, meta structMeta)
 
 // wrapResponseSchema 将 Res 结构体包装进统一的响应结构。
 // 若设置了 responseWrapper，则通过反射推导自定义包装 schema；否则使用默认 Response{data,code,message}。
-// meta 为注册阶段预计算的 Res 结构体的 structMeta。
-func (g *openAPIGenerator) wrapResponseSchema(resType reflect.Type, meta structMeta) map[string]any {
+// Res 以响应角色注册：只描述序列化产物，不读取 default/nonzero/time_format 等请求侧标签。
+func (g *openAPIGenerator) wrapResponseSchema(resType reflect.Type) map[string]any {
 	rt := derefType(resType)
-	dataSchema := g.registerStructSchema(rt, meta, false)
-	resName := g.typeNames[rt]
+	dataSchema := g.registerResponseSchema(rt)
+	resName := g.typeNames[schemaKey{t: rt, role: roleResponse}]
 	if resName == "" {
 		resName = "AnonymousStruct"
 	}
-	wrapName := "Response_" + resName
+	// 包装层沿用文档约定的 Response_<Type>：从响应数据 schema 名去掉固定的角色后缀
+	wrapName := "Response_" + strings.TrimSuffix(resName, responseSchemaSuffix)
 	if _, ok := g.schemas[wrapName]; !ok {
 		g.schemas[wrapName] = g.buildWrapperProperties(dataSchema)
 	}
@@ -600,7 +611,7 @@ func (g *openAPIGenerator) buildWrapperProperties(dataSchema map[string]any) map
 		if f.Type.Kind() == reflect.Interface {
 			props[jsonName] = dataSchema
 		} else {
-			props[jsonName] = g.typeToSchema(f.Type, f, 0)
+			props[jsonName] = g.typeToSchema(f.Type, f, 0, roleResponse)
 		}
 	}
 	return map[string]any{
@@ -620,24 +631,49 @@ func parseJSONName(tag string) string {
 	return tag
 }
 
+// registerRequestSchema 以请求角色注册结构体 schema：属性名按 form（multipart 顶层请求体）
+// 或 encoding/json 规则生成，default/nonzero/time_format 等请求侧标签全部生效。
+// meta 为注册阶段预计算的 structMeta（routeEntry 或 buildStructMeta 现算），提供 nonzero+default 判定。
+func (g *openAPIGenerator) registerRequestSchema(t reflect.Type, meta structMeta, form bool) map[string]any {
+	return g.registerStructSchema(t, meta, form, roleRequest)
+}
+
+// registerResponseSchema 以响应角色注册结构体 schema：只描述实际序列化产物，
+// 键名按 encoding/json 规则，不读取 default/nonzero/time_format（响应无默认值填充、无校验、
+// 时间恒由 encoding/json 按 RFC3339 输出），故不需要 structMeta。
+func (g *openAPIGenerator) registerResponseSchema(t reflect.Type) map[string]any {
+	return g.registerStructSchema(t, structMeta{}, false, roleResponse)
+}
+
+// schemaBaseName 返回类型在指定角色下的 schema 基础名：请求角色用类型名，
+// 响应角色固定追加 "Response" 后缀，使同一类型的两份 schema 在文档中可区分。
+func schemaBaseName(t reflect.Type, role schemaRole) string {
+	base := t.Name()
+	if base == "" {
+		base = "AnonymousStruct"
+	}
+	if role == roleResponse {
+		base += responseSchemaSuffix
+	}
+	return base
+}
+
 // registerStructSchema 将结构体注册到 components/schemas 并返回 $ref 引用。
 // form=false 时属性集合与名称按 encoding/json 规则（jsonFields）生成，用于 application/json 请求体、
-// 响应与嵌套结构体；form=true 时按 meta 的 form 优先绑定名生成，仅用于 multipart/form-data 顶层请求体。
-// meta 为 structMeta（来自 routeEntry 或 buildStructMeta 现算），提供字段名和 nonzero+default 判定。
-func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta, form bool) map[string]any {
+// 响应与嵌套结构体；form=true 时按 meta 的 form 优先绑定名生成，仅用于 multipart/form-data 顶层请求体
+// （form 与 roleResponse 不会同时出现）。
+// meta 仅在请求角色下被读取（用于推断 required）：响应角色的调用方传空 structMeta。
+func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta, form bool, role schemaRole) map[string]any {
 	t = derefType(t)
 	if t.Kind() != reflect.Struct {
 		return map[string]any{"type": "object"}
 	}
-	names := g.typeNames
-	if form {
-		names = g.formTypeNames
-	}
-	if name, ok := names[t]; ok {
+	key := schemaKey{t: t, form: form, role: role}
+	if name, ok := g.typeNames[key]; ok {
 		return refSchema(name)
 	}
-	name := g.uniqueName(schemaKey{t: t, form: form})
-	names[t] = name
+	name := g.uniqueName(key, schemaBaseName(t, role))
+	g.typeNames[key] = name
 
 	obj := map[string]any{"type": "object"}
 	g.schemas[name] = obj // 先占位，防止循环递归
@@ -646,6 +682,17 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta,
 	prevType := g.currentType
 	g.currentType = t
 	defer func() { g.currentType = prevType }()
+
+	// required 仅请求角色输出：nonzero 是请求侧的运行时校验约束，响应无对应语义。
+	// 以 nonzero 校验实际覆盖的字段（按索引路径对齐）为准。
+	requiredAt := map[string]bool{}
+	if role == roleRequest {
+		for _, fm := range meta.fields {
+			if fm.name != "" && fm.name != "-" && fm.nonzero && !fm.hasDefault {
+				requiredAt[fmt.Sprint(fm.indices)] = true
+			}
+		}
+	}
 
 	props := map[string]any{}
 	var required []any
@@ -658,24 +705,17 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta,
 			if isIgnored(f) {
 				continue
 			}
-			props[fm.name] = g.typeToSchema(f.Type, f, 0)
-			if fm.nonzero && !fm.hasDefault {
+			props[fm.name] = g.typeToSchema(f.Type, f, 0, role)
+			if requiredAt[fmt.Sprint(fm.indices)] {
 				required = append(required, fm.name)
 			}
 		}
 	} else {
-		// required 以 nonzero 校验实际覆盖的字段（按索引路径对齐）为准
-		requiredAt := map[string]bool{}
-		for _, fm := range meta.fields {
-			if fm.name != "" && fm.name != "-" && fm.nonzero && !fm.hasDefault {
-				requiredAt[fmt.Sprint(fm.indices)] = true
-			}
-		}
 		for _, jf := range jsonFields(t) {
 			if isIgnored(jf.field) {
 				continue
 			}
-			props[jf.name] = g.typeToSchema(jf.field.Type, jf.field, 0)
+			props[jf.name] = g.typeToSchema(jf.field.Type, jf.field, 0, role)
 			if requiredAt[fmt.Sprint(jf.index)] {
 				required = append(required, jf.name)
 			}
@@ -849,66 +889,70 @@ func isValidJSONTag(s string) bool {
 }
 
 // typeToSchema 将 Go 类型映射为 JSON Schema；field 提供 default/example/description/deprecated/time_format 等信息。
+// role 决定标签生效范围：请求角色读取全部约束标签，响应角色只读纯文档标签（见 schemaRole）。
 // depth 为 Ptr/Slice/Map 链的累计嵌套深度：防自引用命名类型（type S []S / type P *P /
 // type A *B 与 type B *A 等）在容器/指针分支无限递归，超限退化为空 schema（与
 // default 分支一致）；上限复用 maxPtrDerefDepth，与 derefType/isDefaultSupportedDepth/
 // setScalar 的防环哲学一致（修复 REC-04）。Struct 分支经 registerStructSchema
 // 占位机制防环，不消耗 depth。
-func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructField, depth int) map[string]any {
+func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructField, depth int, role schemaRole) map[string]any {
 	if depth > maxPtrDerefDepth {
 		return map[string]any{}
 	}
 	if t.Kind() == reflect.Ptr {
 		if t == fileHeaderPtrType {
-			return g.decorate(map[string]any{"type": "string", "format": "binary"}, field)
+			return g.decorate(map[string]any{"type": "string", "format": "binary"}, field, role)
 		}
-		inner := g.typeToSchema(t.Elem(), field, depth+1)
+		inner := g.typeToSchema(t.Elem(), field, depth+1, role)
 		if _, isRef := inner["$ref"]; isRef {
-			return g.decorate(map[string]any{"nullable": true, "allOf": []any{inner}}, field)
+			return g.decorate(map[string]any{"nullable": true, "allOf": []any{inner}}, field, role)
 		}
 		inner["nullable"] = true
-		return g.decorate(inner, field)
+		return g.decorate(inner, field, role)
 	}
 
 	if t == timeType {
-		return g.timeSchema(field)
+		return g.timeSchema(field, role)
 	}
 
 	switch t.Kind() {
 	case reflect.String:
-		return g.decorate(map[string]any{"type": "string"}, field)
+		return g.decorate(map[string]any{"type": "string"}, field, role)
 	case reflect.Bool:
-		return g.decorate(map[string]any{"type": "boolean"}, field)
+		return g.decorate(map[string]any{"type": "boolean"}, field, role)
 	case reflect.Int, reflect.Int64:
-		return g.decorate(map[string]any{"type": "integer", "format": "int64"}, field)
+		return g.decorate(map[string]any{"type": "integer", "format": "int64"}, field, role)
 	case reflect.Int8, reflect.Int16, reflect.Int32:
-		return g.decorate(map[string]any{"type": "integer", "format": "int32"}, field)
+		return g.decorate(map[string]any{"type": "integer", "format": "int32"}, field, role)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return g.decorate(map[string]any{"type": "integer", "format": "int64", "minimum": 0}, field)
+		return g.decorate(map[string]any{"type": "integer", "format": "int64", "minimum": 0}, field, role)
 	case reflect.Float32:
-		return g.decorate(map[string]any{"type": "number", "format": "float"}, field)
+		return g.decorate(map[string]any{"type": "number", "format": "float"}, field, role)
 	case reflect.Float64:
-		return g.decorate(map[string]any{"type": "number", "format": "double"}, field)
+		return g.decorate(map[string]any{"type": "number", "format": "double"}, field, role)
 	case reflect.Slice, reflect.Array:
 		if t.Elem() == fileHeaderPtrType {
 			return g.decorate(map[string]any{
 				"type":  "array",
 				"items": map[string]any{"type": "string", "format": "binary"},
-			}, field)
+			}, field, role)
 		}
 		return g.decorate(map[string]any{
 			"type":  "array",
-			"items": g.typeToSchema(t.Elem(), emptyField, depth+1),
-		}, field)
+			"items": g.containerElementSchema(t.Elem(), field, depth, role),
+		}, field, role)
 	case reflect.Struct:
-		return g.decorate(g.registerStructSchema(t, buildStructMeta(t), false), field)
+		if role == roleResponse {
+			return g.decorate(g.registerResponseSchema(t), field, role)
+		}
+		return g.decorate(g.registerRequestSchema(t, buildStructMeta(t), false), field, role)
 	case reflect.Map:
-		valueSchema := g.typeToSchema(t.Elem(), emptyField, depth+1)
+		valueSchema := g.containerElementSchema(t.Elem(), field, depth, role)
 		schema := map[string]any{
 			"type":                 "object",
 			"additionalProperties": valueSchema,
 		}
-		result := g.decorate(schema, field)
+		result := g.decorate(schema, field, role)
 		// 非 string key 无法在标准 OpenAPI 3.0 中表达，追加到 description 中
 		if t.Key().Kind() != reflect.String {
 			keyNote := " (key type: " + t.Key().Kind().String() + ")"
@@ -924,18 +968,45 @@ func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructFiel
 	}
 }
 
-// timeSchema 依据 time_format 标签决定 time.Time 的 schema 表现（时间戳→integer，其余→date-time）
-func (g *openAPIGenerator) timeSchema(field reflect.StructField) map[string]any {
-	switch field.Tag.Get("time_format") {
-	case "unix", "unixmilli", "unixmicro", "unixnano":
-		return g.decorate(map[string]any{"type": "integer", "format": "int64"}, field)
-	default:
-		return g.decorate(map[string]any{"type": "string", "format": "date-time"}, field)
+// containerElementSchema 生成容器（切片/数组/map）元素的 schema。
+// time.Time 元素复用容器字段自身的 time_format 标签：绑定与默认值填充都按元素逐个解析，
+// schema 必须与运行时一致，否则会出现"文档写 date-time、运行时按时间戳解析"的偏离。
+// 元素不带字段级装饰（description/example/default 等只作用于容器字段自身），
+// 其余元素类型走常规递归。
+func (g *openAPIGenerator) containerElementSchema(elem reflect.Type, field reflect.StructField, depth int, role schemaRole) map[string]any {
+	base := derefType(elem)
+	if base == timeType {
+		items := g.timeSchemaForTag(field.Tag.Get("time_format"), role)
+		if elem.Kind() == reflect.Ptr {
+			items["nullable"] = true
+		}
+		return items
 	}
+	return g.typeToSchema(elem, emptyField, depth+1, role)
 }
 
-// decorate 依据字段标签补充 default / example / description / deprecated。
-// default 展示规则遵循两阶段填充语义：
+// timeSchema 依据 time_format 标签决定 time.Time 的 schema 表现（时间戳→integer，其余→date-time），
+// 并附加字段级装饰。
+// 响应角色恒为 date-time：响应由 encoding/json 序列化，time.Time 一律输出 RFC3339 字符串，
+// time_format 不参与输出，读它只会生成与实际响应不符的文档。
+func (g *openAPIGenerator) timeSchema(field reflect.StructField, role schemaRole) map[string]any {
+	return g.decorate(g.timeSchemaForTag(field.Tag.Get("time_format"), role), field, role)
+}
+
+// timeSchemaForTag 按 time_format 标签值生成 time.Time 的 schema（不含字段级装饰）。
+func (g *openAPIGenerator) timeSchemaForTag(format string, role schemaRole) map[string]any {
+	if role == roleRequest {
+		switch format {
+		case "unix", "unixmilli", "unixmicro", "unixnano":
+			return map[string]any{"type": "integer", "format": "int64"}
+		}
+	}
+	return map[string]any{"type": "string", "format": "date-time"}
+}
+
+// decorate 依据字段标签补充 default / example / description / deprecated（后三者为纯文档标签，两个角色都读）。
+// default 只在请求角色展示（响应由服务端产出，不存在"缺省值"语义；applyDefaults 也仅作用于 Req），
+// 展示规则遵循两阶段填充语义：
 //   - 注册阶段：模板预填所有零值字段，但仅限"值嵌套"路径（顶层 + 值类型 struct 字段）能到达的 struct
 //   - 请求阶段（post-bind）：仅 nil 指针字段被填充，值类型跳过
 //
@@ -947,21 +1018,23 @@ func (g *openAPIGenerator) timeSchema(field reflect.StructField) map[string]any 
 // deprecated 为纯文档标签，不查可达性，无条件写入字段自身生成的 schema 节点。
 // 嵌套 struct 的 $ref 会先经 decorate 再包装（值嵌套为 $ref 兄弟键、指针嵌套放入 allOf[0]），
 // 故同一批标签在两处各出现一份副本；渲染层忽略 $ref 副本，生效的始终是最外层键。
-func (g *openAPIGenerator) decorate(schema map[string]any, field reflect.StructField) map[string]any {
+func (g *openAPIGenerator) decorate(schema map[string]any, field reflect.StructField, role schemaRole) map[string]any {
 	if field.Tag == "" {
 		return schema
 	}
-	if def, ok := field.Tag.Lookup("default"); ok && isDefaultSupported(field.Type) {
-		// 指针类型：请求阶段 fill nil 指针 → 仅当所属 struct 可被 defaults 到达时展示
-		// 值类型：仅当所属 struct 被值嵌套到达（注册阶段 fill）才展示
-		showDefault := false
-		if field.Type.Kind() == reflect.Ptr {
-			showDefault = g.reachedByDefaults[g.currentType]
-		} else {
-			showDefault = g.reachedViaValue[g.currentType]
-		}
-		if showDefault {
-			schema["default"] = coerceExample(schema, def)
+	if role == roleRequest {
+		if def, ok := field.Tag.Lookup("default"); ok && isDefaultSupported(field.Type) {
+			// 指针类型：请求阶段 fill nil 指针 → 仅当所属 struct 可被 defaults 到达时展示
+			// 值类型：仅当所属 struct 被值嵌套到达（注册阶段 fill）才展示
+			showDefault := false
+			if field.Type.Kind() == reflect.Ptr {
+				showDefault = g.reachedByDefaults[g.currentType]
+			} else {
+				showDefault = g.reachedViaValue[g.currentType]
+			}
+			if showDefault {
+				schema["default"] = coerceExample(schema, def)
+			}
 		}
 	}
 	if ex := field.Tag.Get("example"); ex != "" {
@@ -1041,12 +1114,10 @@ func hasFileField(meta structMeta) bool {
 	return false
 }
 
-// uniqueName 为注册键分配唯一的 schema 名，重名时追加序号
-func (g *openAPIGenerator) uniqueName(key schemaKey) string {
-	base := key.t.Name()
-	if base == "" {
-		base = "AnonymousStruct"
-	}
+// uniqueName 为注册键分配唯一的 schema 名：优先使用 base，重名时追加序号。
+// base 由 schemaBaseName 按角色产生（响应角色带 "Response" 后缀），相同类型的不同角色
+// 因此得到不同名字，可直接从 schema 名分辨其用途。
+func (g *openAPIGenerator) uniqueName(key schemaKey, base string) string {
 	name := base
 	for i := 2; ; i++ {
 		owner, used := g.nameToType[name]

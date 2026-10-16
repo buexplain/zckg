@@ -48,18 +48,50 @@ type Req struct {
 
 ## 二、结构体标签总览
 
+框架读取的全部标签按「能写在哪里」分成三组：**共有**（写在 Req 或 Res 的字段上都生效）、**Req 独有**（只有 Req 读取；写在 Res 上既不改运行时行为也不改文档，属无效配置）、**Res 独有**（当前为空）。
+
+### Req 与 Res 共有
+
 | 标签 | 作用 | 说明 |
 | --- | --- | --- |
-| `json` | 绑定名 / 序列化名 | query / form / 路径参数的绑定名解析优先级：`form` > `json` > 字段名（取逗号前部分）；JSON 请求体与响应只按 `json` 标签（`encoding/json` 规则） |
-| `form` | 绑定名 | 仅作用于 query / 表单 / 路径参数，优先级高于 `json`；对 JSON 请求体无效 |
-| `default` | 默认值 | 仅对标量类型（及其切片/指针）生效；注册阶段预填充到模板，详见 `parameter-binding.md` |
-| `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，详见 `parameter-binding.md` |
-| `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`；解析失败降级并输出 `slog.Warn` |
-| `nonzero` | 非零值校验 | `"true"` 校验非零值、`"false"` 不校验；详见 `parameter-validate.md` |
-| `ignore` | 文档排除 | `ignore:"true"` 将字段从 OpenAPI 文档的 body schema 与 query 中排除，不影响绑定与校验；path 参数声明受规范强制、不受其影响，详见 `openapi.md` |
-| `example` / `description` | 文档信息 | 仅用于 OpenAPI 文档生成，详见 `openapi.md` |
+| `json` | 绑定名 / 序列化名 | query / form / 路径参数的绑定名解析优先级 `form` > `json` > 字段名（取逗号前部分）；JSON 请求体与响应只按 `json` 标签（`encoding/json` 规则）。写在 Res 上时只用到「序列化名」这一半 |
+| `ignore` | 文档排除 | `ignore:"true"` 把字段从 OpenAPI 文档中排除（请求 schema / query 或响应 schema），不影响绑定与校验；path 参数声明受规范强制、不受其影响，详见 `openapi.md` |
+| `example` | 字段示例值 | 仅用于 OpenAPI 文档生成，按字段类型自动转换为对应 JSON 类型，详见 `openapi.md` |
+| `description` | 字段描述 | 仅用于 OpenAPI 文档生成；写在 Req 内嵌的 `OpenAPIMeta` 上则为操作级描述，见「Req 独有」 |
+| `deprecated` | 字段废弃标记 | `deprecated:"true"` 使 schema 与 query / path 参数对象输出 `"deprecated": true`，废弃原因写在 `description` 中；写在 `OpenAPIMeta` 上则为操作级废弃，详见 `openapi.md` |
 
-此外，可在 `Req` 中嵌入 `zchttp.OpenAPIMeta` 声明操作级元信息（`tags`/`summary`/`description`），它是空结构体，不参与绑定与校验，详见 `openapi.md`。
+> 共有组只有两类标签：**改键名**（`json`）与**改文档**（`ignore`/`example`/`description`/`deprecated`）。Res 不参与参数绑定与校验，因此任何影响运行时行为的标签都进不了这一组。
+
+### Req 独有
+
+以下标签只在请求侧有语义——运行时填充 / 校验 / 解析，以及请求 schema 的生成。Res 不参与绑定与校验，响应时间恒由 `encoding/json` 序列化为 RFC3339 字符串，因此这些标签写在 Res 字段上不产生任何效果，响应 schema 也一律不读：
+
+| 标签 | 作用 | 说明 |
+| --- | --- | --- |
+| `form` | 绑定名 | 仅作用于 query / 表单 / 路径参数，优先级高于 `json`；对 JSON 请求体无效 |
+| `default` | 默认值 | 仅对标量类型（及其切片/指针）生效，注册阶段预填充到模板，详见 `parameter-binding.md` |
+| `nonzero` | 非零值校验 | `"true"` 校验非零值、`"false"` 不校验，并据此推断请求 schema 的 `required`，详见 `parameter-validate.md` |
+| `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，支持值、指针与单层切片的 `time.Time` 字段，详见 `parameter-binding.md` |
+| `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`，解析失败降级并输出 `slog.Warn` |
+
+**操作级标签**同样属于 Req 独有：只能写在 `Req` 中嵌入的 `zchttp.OpenAPIMeta` 上——`Res` 不参与操作级元信息解析（写在 Res 上注册时会输出 `slog.Warn`）。它是空结构体，不参与绑定与校验：
+
+| 标签 | 说明 |
+| --- | --- |
+| `tags` | 操作标签，以 `/` 分隔多个标签，如 `"A/B"` → `["A", "B"]` |
+| `summary` | 操作摘要，缺省时回退为 handler 函数名 |
+| `description` | 操作详细描述 |
+| `deprecated` | `deprecated:"true"` 标记操作为已废弃，废弃原因写在 `description` 中 |
+
+### Res 独有
+
+无。`Res` 没有专属标签，它只复用共有组里的标签。
+
+> 原因：`Res` 的职责只有「被序列化后写回客户端」——既不绑定参数、也不执行校验与默认值填充，所以请求侧那五个约束标签（`form`/`default`/`nonzero`/`time_format`/`time_location`）写在 Res 上无从生效。若要在响应侧表达「该字段总会返回」这类契约，请写在 `description` 里，不要用 `nonzero` 兼职。
+
+> 同一类型同时用作 Req 与 Res 时，OpenAPI 会生成两份 schema：请求变体用类型名（如 `User`），响应变体固定追加 `Response` 后缀（如 `UserResponse`），后者只保留共有组的标签。
+
+详见 `openapi.md`。
 
 ## 三、标签示例
 

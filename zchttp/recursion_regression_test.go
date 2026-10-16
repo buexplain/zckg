@@ -125,7 +125,7 @@ func valueOfPtr(v any) reflect.Value { return reflect.ValueOf(v) }
 func newRecGenerator() *openAPIGenerator {
 	return &openAPIGenerator{
 		schemas:           map[string]any{},
-		typeNames:         map[reflect.Type]string{},
+		typeNames:         map[schemaKey]string{},
 		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
@@ -297,7 +297,7 @@ func TestRecFix_TypeToSchemaDepthTruncation(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			g := newRecGenerator()
-			schema := g.typeToSchema(c.typ, emptyField, 0) // 修复前：栈溢出
+			schema := g.typeToSchema(c.typ, emptyField, 0, roleRequest) // 修复前：栈溢出
 			if schema == nil {
 				t.Fatalf("typeToSchema 返回 nil")
 			}
@@ -306,11 +306,11 @@ func TestRecFix_TypeToSchemaDepthTruncation(t *testing.T) {
 
 	// 对照：正常标量/切片 schema 不因深度参数退化
 	g := newRecGenerator()
-	strSchema := g.typeToSchema(reflect.TypeOf(""), emptyField, 0)
+	strSchema := g.typeToSchema(reflect.TypeOf(""), emptyField, 0, roleRequest)
 	if strSchema["type"] != "string" {
 		t.Errorf("string schema = %v, want type=string", strSchema)
 	}
-	sliceSchema := g.typeToSchema(reflect.TypeOf([]int{}), emptyField, 0)
+	sliceSchema := g.typeToSchema(reflect.TypeOf([]int{}), emptyField, 0, roleRequest)
 	if sliceSchema["type"] != "array" {
 		t.Errorf("[]int schema = %v, want type=array", sliceSchema)
 	}

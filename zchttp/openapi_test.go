@@ -408,69 +408,68 @@ func TestGenerateOpenAPI_SelfRef(t *testing.T) {
 	comps := doc["components"].(map[string]any)
 	schemas := comps["schemas"].(map[string]any)
 
-	// Category 独立 schema 必须存在（无无限递归）
-	catSchema, ok := schemas["Category"]
+	// Category 只作 Res → schema 名为 CategoryResponse；独立 schema 必须存在（无无限递归）
+	catSchema, ok := schemas["CategoryResponse"]
 	if !ok {
-		t.Fatalf("Category schema missing — possible infinite recursion?")
+		t.Fatalf("CategoryResponse schema missing — possible infinite recursion?")
 	}
 	catObj := catSchema.(map[string]any)
 	if catObj["type"] != "object" {
-		t.Errorf("Category.type = %v, want object", catObj["type"])
+		t.Errorf("CategoryResponse.type = %v, want object", catObj["type"])
 	}
 
 	catProps := catObj["properties"].(map[string]any)
 	if _, ok := catProps["id"]; !ok {
-		t.Errorf("Category.properties.id missing")
+		t.Errorf("CategoryResponse.properties.id missing")
 	}
 	if _, ok := catProps["name"]; !ok {
-		t.Errorf("Category.properties.name missing")
+		t.Errorf("CategoryResponse.properties.name missing")
 	}
 	if _, ok := catProps["parentId"]; !ok {
-		t.Errorf("Category.properties.parentId missing")
+		t.Errorf("CategoryResponse.properties.parentId missing")
 	}
 
 	// parentId: *int → integer + nullable
 	pidField := catProps["parentId"].(map[string]any)
 	if pidField["type"] != "integer" {
-		t.Errorf("Category.parentId.type = %v, want integer", pidField["type"])
+		t.Errorf("CategoryResponse.parentId.type = %v, want integer", pidField["type"])
 	}
 	if pidField["nullable"] != true {
-		t.Errorf("Category.parentId.nullable = %v, want true", pidField["nullable"])
+		t.Errorf("CategoryResponse.parentId.nullable = %v, want true", pidField["nullable"])
 	}
 
 	// 关键：children 自引用字段
 	childrenField := catProps["children"].(map[string]any)
 	if childrenField["type"] != "array" {
-		t.Errorf("Category.children.type = %v, want array", childrenField["type"])
+		t.Errorf("CategoryResponse.children.type = %v, want array", childrenField["type"])
 	}
 	if childrenField["description"] != "子分类列表" {
-		t.Errorf("Category.children.description = %v, want 子分类列表", childrenField["description"])
+		t.Errorf("CategoryResponse.children.description = %v, want 子分类列表", childrenField["description"])
 	}
 
 	// children.items: []*Category → nullable + allOf[$ref: Category]（自引用）
 	childrenItems := childrenField["items"].(map[string]any)
 	if childrenItems["nullable"] != true {
-		t.Errorf("Category.children.items.nullable = %v, want true", childrenItems["nullable"])
+		t.Errorf("CategoryResponse.children.items.nullable = %v, want true", childrenItems["nullable"])
 	}
 	childrenAllOf, ok := childrenItems["allOf"].([]any)
 	if !ok || len(childrenAllOf) != 1 {
 		t.Fatalf("Category.children.items.allOf = %v, want [{$ref}]", childrenItems)
 	}
 	allOfItem := childrenAllOf[0].(map[string]any)
-	if ref, ok := allOfItem["$ref"]; !ok || ref != "#/components/schemas/Category" {
-		t.Errorf("Category.children.items.allOf[0].$ref = %v, want #/components/schemas/Category (self-ref)", allOfItem)
+	if ref, ok := allOfItem["$ref"]; !ok || ref != "#/components/schemas/CategoryResponse" {
+		t.Errorf("CategoryResponse.children.items.allOf[0].$ref = %v, want #/components/schemas/CategoryResponse (self-ref)", allOfItem)
 	}
 
-	// required: id, name
-	catRequired := catObj["required"].([]any)
-	if len(catRequired) != 2 {
-		t.Errorf("Category.required = %v, want [id, name]", catRequired)
+	// 响应角色不输出 required：nonzero 仅请求侧有校验语义，响应不读该标签
+	if _, has := catObj["required"]; has {
+		t.Errorf("响应 schema 不应输出 required，实际: %v", catObj["required"])
 	}
 
-	// 响应中 Categories 通过 categoryListRes schema 间接引用 Category
-	resSchema, ok := schemas["categoryListRes"]
+	// 响应中 Categories 通过 categoryListResResponse schema 间接引用 CategoryResponse
+	resSchema, ok := schemas["categoryListResResponse"]
 	if !ok {
-		t.Fatalf("categoryListRes schema missing")
+		t.Fatalf("categoryListResResponse schema missing")
 	}
 	resObj := resSchema.(map[string]any)
 	resProps := resObj["properties"].(map[string]any)
@@ -479,8 +478,8 @@ func TestGenerateOpenAPI_SelfRef(t *testing.T) {
 		t.Errorf("categoryListRes.categories.type = %v, want array", catsField["type"])
 	}
 	catsItems := catsField["items"].(map[string]any)
-	if ref, ok := catsItems["$ref"]; !ok || ref != "#/components/schemas/Category" {
-		t.Errorf("categoryListRes.categories.items.$ref = %v, want #/components/schemas/Category", catsItems)
+	if ref, ok := catsItems["$ref"]; !ok || ref != "#/components/schemas/CategoryResponse" {
+		t.Errorf("categoryListRes.categories.items.$ref = %v, want #/components/schemas/CategoryResponse", catsItems)
 	}
 
 	// 可序列化（确保无循环引用）
@@ -1059,7 +1058,8 @@ func resNestedHandler(_ context.Context, _ resNestedReq) (resNestedUser, error) 
 }
 
 // TestGenerateOpenAPI_ResNested 验证响应体嵌套结构体的 OpenAPI 文档生成：
-// Response_ 包装层、值类型/指针/值切片/指针切片嵌套、自引用、description/required 传播
+// Response_ 包装层、值类型/指针/值切片/指针切片嵌套、自引用、description 传播；
+// 全部类型只作 Res → 数据 schema 名带 Response 后缀，且不输出 required/default
 func TestGenerateOpenAPI_ResNested(t *testing.T) {
 	r := NewRouter()
 	r.GET("/res-nested", resNestedHandler)
@@ -1078,8 +1078,8 @@ func TestGenerateOpenAPI_ResNested(t *testing.T) {
 	wrapProps := wrapObj["properties"].(map[string]any)
 	// data 字段应引用 resNestedUser
 	dataField := wrapProps["data"].(map[string]any)
-	if ref, ok := dataField["$ref"]; !ok || ref != "#/components/schemas/resNestedUser" {
-		t.Errorf("Response_resNestedUser.data.$ref = %v, want #/components/schemas/resNestedUser", dataField)
+	if ref, ok := dataField["$ref"]; !ok || ref != "#/components/schemas/resNestedUserResponse" {
+		t.Errorf("Response_resNestedUser.data.$ref = %v, want #/components/schemas/resNestedUserResponse", dataField)
 	}
 	// code/message 基本字段存在
 	if codeField := wrapProps["code"].(map[string]any); codeField["type"] != "integer" {
@@ -1089,8 +1089,8 @@ func TestGenerateOpenAPI_ResNested(t *testing.T) {
 		t.Errorf("Response_resNestedUser.message.type = %v, want string", msgField["type"])
 	}
 
-	// ---- resNestedUser schema（嵌套字段结构）----
-	userSchema, ok := schemas["resNestedUser"]
+	// ---- resNestedUserResponse schema（嵌套字段结构）----
+	userSchema, ok := schemas["resNestedUserResponse"]
 	if !ok {
 		t.Fatalf("resNestedUser schema missing")
 	}
@@ -1100,124 +1100,120 @@ func TestGenerateOpenAPI_ResNested(t *testing.T) {
 	// info: resNestedInfo 值类型 → 直接 $ref
 	infoField := userProps["info"].(map[string]any)
 	if infoField["description"] != "用户扩展信息" {
-		t.Errorf("resNestedUser.info.description = %v, want 用户扩展信息", infoField["description"])
+		t.Errorf("resNestedUserResponse.info.description = %v, want 用户扩展信息", infoField["description"])
 	}
-	if ref, ok := infoField["$ref"]; !ok || ref != "#/components/schemas/resNestedInfo" {
-		t.Errorf("resNestedUser.info.$ref = %v, want #/components/schemas/resNestedInfo", infoField)
+	if ref, ok := infoField["$ref"]; !ok || ref != "#/components/schemas/resNestedInfoResponse" {
+		t.Errorf("resNestedUserResponse.info.$ref = %v, want #/components/schemas/resNestedInfoResponse", infoField)
 	}
 
 	// manager: *resNestedUser 指针（自引用）→ nullable + allOf[$ref]
 	mgrField := userProps["manager"].(map[string]any)
 	if mgrField["nullable"] != true {
-		t.Errorf("resNestedUser.manager.nullable = %v, want true", mgrField["nullable"])
+		t.Errorf("resNestedUserResponse.manager.nullable = %v, want true", mgrField["nullable"])
 	}
 	if mgrField["description"] != "直属上级" {
-		t.Errorf("resNestedUser.manager.description = %v, want 直属上级", mgrField["description"])
+		t.Errorf("resNestedUserResponse.manager.description = %v, want 直属上级", mgrField["description"])
 	}
 	mgrAllOf, ok := mgrField["allOf"].([]any)
 	if !ok || len(mgrAllOf) != 1 {
 		t.Fatalf("resNestedUser.manager.allOf = %v, want [{$ref}]", mgrField)
 	}
-	if ref, ok := mgrAllOf[0].(map[string]any)["$ref"]; !ok || ref != "#/components/schemas/resNestedUser" {
-		t.Errorf("resNestedUser.manager.allOf[0].$ref = %v, want #/components/schemas/resNestedUser (self-ref)", mgrAllOf[0])
+	if ref, ok := mgrAllOf[0].(map[string]any)["$ref"]; !ok || ref != "#/components/schemas/resNestedUserResponse" {
+		t.Errorf("resNestedUserResponse.manager.allOf[0].$ref = %v, want #/components/schemas/resNestedUserResponse (self-ref)", mgrAllOf[0])
 	}
 
 	// tags: []resNestedTag 值类型切片 → array, items 为 $ref
 	tagsField := userProps["tags"].(map[string]any)
 	if tagsField["type"] != "array" {
-		t.Errorf("resNestedUser.tags.type = %v, want array", tagsField["type"])
+		t.Errorf("resNestedUserResponse.tags.type = %v, want array", tagsField["type"])
 	}
 	if tagsField["description"] != "用户标签" {
-		t.Errorf("resNestedUser.tags.description = %v, want 用户标签", tagsField["description"])
+		t.Errorf("resNestedUserResponse.tags.description = %v, want 用户标签", tagsField["description"])
 	}
 	tagsItems := tagsField["items"].(map[string]any)
-	if ref, ok := tagsItems["$ref"]; !ok || ref != "#/components/schemas/resNestedTag" {
-		t.Errorf("resNestedUser.tags.items.$ref = %v, want #/components/schemas/resNestedTag", tagsItems)
+	if ref, ok := tagsItems["$ref"]; !ok || ref != "#/components/schemas/resNestedTagResponse" {
+		t.Errorf("resNestedUserResponse.tags.items.$ref = %v, want #/components/schemas/resNestedTagResponse", tagsItems)
 	}
 
 	// details: []*resNestedDetail 指针切片 → array, items 为 nullable + allOf[$ref]
 	detField := userProps["details"].(map[string]any)
 	if detField["type"] != "array" {
-		t.Errorf("resNestedUser.details.type = %v, want array", detField["type"])
+		t.Errorf("resNestedUserResponse.details.type = %v, want array", detField["type"])
 	}
 	if detField["description"] != "地址明细" {
-		t.Errorf("resNestedUser.details.description = %v, want 地址明细", detField["description"])
+		t.Errorf("resNestedUserResponse.details.description = %v, want 地址明细", detField["description"])
 	}
 	detItems := detField["items"].(map[string]any)
 	if detItems["nullable"] != true {
-		t.Errorf("resNestedUser.details.items.nullable = %v, want true", detItems["nullable"])
+		t.Errorf("resNestedUserResponse.details.items.nullable = %v, want true", detItems["nullable"])
 	}
 	detAllOf, ok := detItems["allOf"].([]any)
 	if !ok || len(detAllOf) != 1 {
 		t.Fatalf("resNestedUser.details.items.allOf = %v, want [{$ref}]", detItems)
 	}
-	if ref, ok := detAllOf[0].(map[string]any)["$ref"]; !ok || ref != "#/components/schemas/resNestedDetail" {
-		t.Errorf("resNestedUser.details.items.allOf[0].$ref = %v, want #/components/schemas/resNestedDetail", detAllOf[0])
+	if ref, ok := detAllOf[0].(map[string]any)["$ref"]; !ok || ref != "#/components/schemas/resNestedDetailResponse" {
+		t.Errorf("resNestedUserResponse.details.items.allOf[0].$ref = %v, want #/components/schemas/resNestedDetailResponse", detAllOf[0])
 	}
 
-	// required: id, name
-	userRequired := userObj["required"].([]any)
-	if len(userRequired) != 2 {
-		t.Errorf("resNestedUser.required = %v, want [id, name]", userRequired)
+	// 响应角色不输出 required
+	if _, has := userObj["required"]; has {
+		t.Errorf("响应 schema 不应输出 required，实际: %v", userObj["required"])
 	}
 
 	// ---- 子 schema：resNestedInfo（值类型嵌套）----
-	infoSchema, ok := schemas["resNestedInfo"]
+	infoSchema, ok := schemas["resNestedInfoResponse"]
 	if !ok {
 		t.Fatalf("resNestedInfo schema missing")
 	}
 	infoObj := infoSchema.(map[string]any)
 	infoProps := infoObj["properties"].(map[string]any)
 	if infoProps["code"].(map[string]any)["description"] != "信息编码" {
-		t.Errorf("resNestedInfo.code.description = %v, want 信息编码", infoProps["code"])
+		t.Errorf("resNestedInfoResponse.code.description = %v, want 信息编码", infoProps["code"])
 	}
 	if infoProps["message"].(map[string]any)["description"] != "信息内容" {
-		t.Errorf("resNestedInfo.message.description = %v, want 信息内容", infoProps["message"])
+		t.Errorf("resNestedInfoResponse.message.description = %v, want 信息内容", infoProps["message"])
 	}
-	infoRequired := infoObj["required"].([]any)
-	if len(infoRequired) != 1 || infoRequired[0] != "code" {
-		t.Errorf("resNestedInfo.required = %v, want [code]", infoRequired)
+	if _, has := infoObj["required"]; has {
+		t.Errorf("响应 schema 不应输出 required，实际: %v", infoObj["required"])
 	}
 
 	// ---- 子 schema：resNestedTag（值切片元素）----
-	tagSchema, ok := schemas["resNestedTag"]
+	tagSchema, ok := schemas["resNestedTagResponse"]
 	if !ok {
 		t.Fatalf("resNestedTag schema missing")
 	}
 	tagObj := tagSchema.(map[string]any)
 	tagProps := tagObj["properties"].(map[string]any)
 	if tagProps["id"].(map[string]any)["description"] != "标签ID" {
-		t.Errorf("resNestedTag.id.description = %v, want 标签ID", tagProps["id"])
+		t.Errorf("resNestedTagResponse.id.description = %v, want 标签ID", tagProps["id"])
 	}
 	if tagProps["name"].(map[string]any)["description"] != "标签名称" {
-		t.Errorf("resNestedTag.name.description = %v, want 标签名称", tagProps["name"])
+		t.Errorf("resNestedTagResponse.name.description = %v, want 标签名称", tagProps["name"])
 	}
-	tagRequired := tagObj["required"].([]any)
-	if len(tagRequired) != 1 || tagRequired[0] != "id" {
-		t.Errorf("resNestedTag.required = %v, want [id]", tagRequired)
+	if _, has := tagObj["required"]; has {
+		t.Errorf("响应 schema 不应输出 required，实际: %v", tagObj["required"])
 	}
 
 	// ---- 子 schema：resNestedDetail（指针切片元素，有 default）----
-	detailSchema, ok := schemas["resNestedDetail"]
+	detailSchema, ok := schemas["resNestedDetailResponse"]
 	if !ok {
 		t.Fatalf("resNestedDetail schema missing")
 	}
 	detailObj := detailSchema.(map[string]any)
 	detailProps := detailObj["properties"].(map[string]any)
 	if detailProps["address"].(map[string]any)["description"] != "详细地址" {
-		t.Errorf("resNestedDetail.address.description = %v, want 详细地址", detailProps["address"])
+		t.Errorf("resNestedDetailResponse.address.description = %v, want 详细地址", detailProps["address"])
 	}
-	// zipCode 有 default → 不进 required
+	// 响应角色不展示 default（无"缺省值"语义），纯文档标签 description 照常生效
 	zipField := detailProps["zipCode"].(map[string]any)
-	if zipField["default"] != "000000" {
-		t.Errorf("resNestedDetail.zipCode.default = %v, want 000000", zipField["default"])
+	if _, has := zipField["default"]; has {
+		t.Errorf("响应 schema 不应展示 default，实际: %v", zipField["default"])
 	}
 	if zipField["description"] != "邮编" {
-		t.Errorf("resNestedDetail.zipCode.description = %v, want 邮编", zipField["description"])
+		t.Errorf("resNestedDetailResponse.zipCode.description = %v, want 邮编", zipField["description"])
 	}
-	detailRequired := detailObj["required"].([]any)
-	if len(detailRequired) != 1 || detailRequired[0] != "address" {
-		t.Errorf("resNestedDetail.required = %v, want [address]", detailRequired)
+	if _, has := detailObj["required"]; has {
+		t.Errorf("响应 schema 不应输出 required，实际: %v", detailObj["required"])
 	}
 
 	// ---- 可序列化（确保自引用不产生循环）----
@@ -1420,12 +1416,16 @@ func TestGenerateOpenAPI_RequiredUsesSupportedDefault(t *testing.T) {
 	})
 	doc := GenerateOpenAPI(router, OpenAPIInfo{Title: "required", Version: "1"})
 	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
-	for _, name := range []string{"requiredContractReq", "requiredContractRes"} {
-		schema := schemas[name].(map[string]any)
-		required := schema["required"].([]any)
-		if len(required) != 1 || required[0] != "when" {
-			t.Fatalf("%s.required = %v, want [when]", name, required)
-		}
+
+	// 请求角色：time.Time 的 default 不受支持 → 仍按 nonzero 推断 required
+	reqSchema := schemas["requiredContractReq"].(map[string]any)
+	if required := reqSchema["required"]; !reflect.DeepEqual(required, []any{"when"}) {
+		t.Fatalf("requiredContractReq.required = %v, want [when]", required)
+	}
+	// 响应角色：不读 nonzero/default，故不输出 required
+	resSchema := schemas["requiredContractResResponse"].(map[string]any)
+	if required, has := resSchema["required"]; has {
+		t.Fatalf("响应 schema 不应输出 required，实际: %v", required)
 	}
 }
 
@@ -1528,10 +1528,10 @@ func TestGenerateOpenAPI_CustomResponseWrapper(t *testing.T) {
 	wrapObj := wrapSchema.(map[string]any)
 	wrapProps := wrapObj["properties"].(map[string]any)
 
-	// result 字段（any 占位符）应引用 oaWrapperRes
+	// result 字段（any 占位符）应引用响应角色 schema（<Type>Response）
 	resultField := wrapProps["result"].(map[string]any)
-	if ref, ok := resultField["$ref"]; !ok || ref != "#/components/schemas/oaWrapperRes" {
-		t.Errorf("result.$ref = %v, want #/components/schemas/oaWrapperRes", resultField)
+	if ref, ok := resultField["$ref"]; !ok || ref != "#/components/schemas/oaWrapperResResponse" {
+		t.Errorf("result.$ref = %v, want #/components/schemas/oaWrapperResResponse", resultField)
 	}
 
 	// errCode 应为 integer
@@ -2345,24 +2345,33 @@ func TestHasFileFieldVariants(t *testing.T) {
 	}
 }
 
-// TestUniqueNameCollision 覆盖匿名结构体命名、重名追加序号、同注册键复用已有名，
-// 以及同一类型的 JSON 与 form 两种 schema 分配不同名的分支
+// TestUniqueNameCollision 覆盖匿名结构体命名、重名追加序号、同注册键复用已有名、
+// 同一类型的 JSON 与 form 两种 schema 分配不同名，以及响应角色固定使用 "Response" 后缀命名的分支
 func TestUniqueNameCollision(t *testing.T) {
 	g := &openAPIGenerator{nameToType: map[string]schemaKey{}}
 	t1 := reflect.TypeOf(struct{ A int }{})
 	t2 := reflect.TypeOf(struct{ B string }{})
+	anon := schemaBaseName(t1, roleRequest)
 
-	if n := g.uniqueName(schemaKey{t: t1}); n != "AnonymousStruct" {
+	if n := g.uniqueName(schemaKey{t: t1}, anon); n != "AnonymousStruct" {
 		t.Fatalf("first anonymous name = %q, want AnonymousStruct", n)
 	}
-	if n := g.uniqueName(schemaKey{t: t2}); n != "AnonymousStruct2" {
+	if n := g.uniqueName(schemaKey{t: t2}, anon); n != "AnonymousStruct2" {
 		t.Fatalf("colliding anonymous name = %q, want AnonymousStruct2", n)
 	}
-	if n := g.uniqueName(schemaKey{t: t1}); n != "AnonymousStruct" {
+	if n := g.uniqueName(schemaKey{t: t1}, anon); n != "AnonymousStruct" {
 		t.Fatalf("same type should reuse existing name, got %q", n)
 	}
-	if n := g.uniqueName(schemaKey{t: t1, form: true}); n != "AnonymousStruct3" {
+	if n := g.uniqueName(schemaKey{t: t1, form: true}, anon); n != "AnonymousStruct3" {
 		t.Fatalf("form schema of same type should get a distinct name, got %q", n)
+	}
+	// 响应角色带固定后缀：与同类型的请求 schema 名字天然不同，可直接从名字分辨用途
+	resAnon := schemaBaseName(t1, roleResponse)
+	if resAnon != "AnonymousStructResponse" {
+		t.Fatalf("response base name = %q, want AnonymousStructResponse", resAnon)
+	}
+	if n := g.uniqueName(schemaKey{t: t1, role: roleResponse}, resAnon); n != "AnonymousStructResponse" {
+		t.Fatalf("response schema name = %q, want AnonymousStructResponse", n)
 	}
 }
 
@@ -2370,8 +2379,7 @@ func TestUniqueNameCollision(t *testing.T) {
 func newTestGenerator() *openAPIGenerator {
 	return &openAPIGenerator{
 		schemas:           map[string]any{},
-		typeNames:         map[reflect.Type]string{},
-		formTypeNames:     map[reflect.Type]string{},
+		typeNames:         map[schemaKey]string{},
 		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
@@ -2387,8 +2395,11 @@ func TestOpenAPIBuilderNonStructBranches(t *testing.T) {
 	if got := g.buildRequestBody(reflect.TypeOf(0), structMeta{}, false); got != nil {
 		t.Fatalf("buildRequestBody(non-struct) = %v, want nil", got)
 	}
-	if got := g.registerStructSchema(reflect.TypeOf(0), structMeta{}, false); got["type"] != "object" {
-		t.Fatalf("registerStructSchema(non-struct) = %v, want generic object", got)
+	if got := g.registerRequestSchema(reflect.TypeOf(0), structMeta{}, false); got["type"] != "object" {
+		t.Fatalf("registerRequestSchema(non-struct) = %v, want generic object", got)
+	}
+	if got := g.registerResponseSchema(reflect.TypeOf(0)); got["type"] != "object" {
+		t.Fatalf("registerResponseSchema(non-struct) = %v, want generic object", got)
 	}
 }
 
@@ -2428,7 +2439,7 @@ func TestGenerateOpenAPI_InvalidResponseWrapperPanic(t *testing.T) {
 // TestWrapResponseSchemaNonStruct 覆盖 Res 非结构体时 AnonymousStruct 回退命名的分支
 func TestWrapResponseSchemaNonStruct(t *testing.T) {
 	g := newTestGenerator()
-	ref := g.wrapResponseSchema(reflect.TypeOf(0), structMeta{})
+	ref := g.wrapResponseSchema(reflect.TypeOf(0))
 	if ref["$ref"] != "#/components/schemas/Response_AnonymousStruct" {
 		t.Fatalf("$ref = %v, want Response_AnonymousStruct", ref["$ref"])
 	}
@@ -2727,7 +2738,7 @@ func TestGenerateOpenAPI_QueryParamSkips(t *testing.T) {
 func TestBuildPathParams_NonStruct(t *testing.T) {
 	g := &openAPIGenerator{
 		schemas:           map[string]any{},
-		typeNames:         map[reflect.Type]string{},
+		typeNames:         map[schemaKey]string{},
 		nameToType:        map[string]schemaKey{},
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
@@ -3004,7 +3015,7 @@ func TestGenerateOpenAPI_DeprecatedField(t *testing.T) {
 				ref := op["responses"].(map[string]any)["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
 				wrapper := oaDepResolveRef(t, schemas, ref, "Response_oaDepFieldBodyRes")
 				dataRef := wrapper["properties"].(map[string]any)["data"].(map[string]any)
-				res := oaDepResolveRef(t, schemas, dataRef, "oaDepFieldBodyRes")
+				res := oaDepResolveRef(t, schemas, dataRef, "oaDepFieldBodyResResponse")
 				nodes = append(nodes, res["properties"].(map[string]any)[tc.field].(map[string]any))
 			default:
 				pm := findParam(t, op["parameters"].([]any), tc.field)
@@ -4111,7 +4122,8 @@ func TestGenerateOpenAPI_JSONNamesMatchRuntimeBinding(t *testing.T) {
 
 // TestGenerateOpenAPI_MultipartKeepsFormNames 锁死 multipart/form-data 顶层请求体仍按 form 绑定名生成
 // （form:"-" 与 ignore:"true" 字段不输出），且同一类型作为 JSON 响应时另行注册为按 json 名的独立 schema
-// （form:"-" 不影响 JSON，字段名 Skip 照常输出），二者互不覆盖。
+// （form:"-" 不影响 JSON，字段名 Skip 照常输出），二者互不覆盖：
+// 请求角色取裸名，响应角色固定为 <Type>Response。
 func TestGenerateOpenAPI_MultipartKeepsFormNames(t *testing.T) {
 	r := NewRouter()
 	r.GET("/oa-json/upload", oaJSONNameUploadEcho)
@@ -4122,12 +4134,12 @@ func TestGenerateOpenAPI_MultipartKeepsFormNames(t *testing.T) {
 
 	post := paths["post"].(map[string]any)
 	ref := post["requestBody"].(map[string]any)["content"].(map[string]any)["multipart/form-data"].(map[string]any)["schema"].(map[string]any)
-	formProps := oaDepResolveRef(t, schemas, ref, "oaJSONNameUploadReq2")["properties"].(map[string]any)
+	formProps := oaDepResolveRef(t, schemas, ref, "oaJSONNameUploadReq")["properties"].(map[string]any)
 	if got := oaSortedKeys(formProps); !reflect.DeepEqual(got, []string{"file", "q"}) {
 		t.Fatalf("multipart 属性 = %v, want [file q]", got)
 	}
 
-	jsonProps := schemas["oaJSONNameUploadReq"].(map[string]any)["properties"].(map[string]any)
+	jsonProps := schemas["oaJSONNameUploadReqResponse"].(map[string]any)["properties"].(map[string]any)
 	if got := oaSortedKeys(jsonProps); !reflect.DeepEqual(got, []string{"File", "Skip", "keyword"}) {
 		t.Fatalf("JSON 响应属性 = %v, want [File Skip keyword]", got)
 	}
@@ -4135,8 +4147,8 @@ func TestGenerateOpenAPI_MultipartKeepsFormNames(t *testing.T) {
 	respRef := get["responses"].(map[string]any)["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
 	wrapper := oaDepResolveRef(t, schemas, respRef, "Response_oaJSONNameUploadReq")
 	data := wrapper["properties"].(map[string]any)["data"].(map[string]any)
-	if data["$ref"] != "#/components/schemas/oaJSONNameUploadReq" {
-		t.Fatalf("响应 data 应引用 JSON 命名 schema，实际: %v", data)
+	if data["$ref"] != "#/components/schemas/oaJSONNameUploadReqResponse" {
+		t.Fatalf("响应 data 应引用 JSON 命名的响应 schema，实际: %v", data)
 	}
 }
 
@@ -4225,5 +4237,110 @@ func TestIndexLess(t *testing.T) {
 		if got := indexLess(c.a, c.b); got != c.want {
 			t.Errorf("indexLess(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
 		}
+	}
+}
+
+// TestGenerateOpenAPI_RoleSplitConstraints 锁死请求/响应角色隔离：同一类型同时作 Req 与 Res 时生成两份
+// schema——请求变体（裸名）读取 time_format/nonzero/default；响应变体（<Type>Response）一律不读，
+// 时间恒为 date-time 字符串，不输出 required 与 default，容器内时间元素同样不按标签展开。
+func TestGenerateOpenAPI_RoleSplitConstraints(t *testing.T) {
+	type roleSplitBody struct {
+		At      time.Time    `json:"at" time_format:"unix" nonzero:"true"`
+		Note    string       `json:"note" default:"n"`
+		Days    []time.Time  `json:"days" time_format:"unix"`
+		PtrDays []*time.Time `json:"ptrDays" time_format:"unixmilli"`
+	}
+	type roleSplitReq struct {
+		Body roleSplitBody `json:"body"`
+	}
+	type roleSplitRes struct {
+		Body roleSplitBody `json:"body"`
+	}
+
+	r := NewRouter()
+	r.POST("/role-split", func(context.Context, roleSplitReq) (roleSplitRes, error) {
+		return roleSplitRes{}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "role", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+
+	reqSchema, ok := schemas["roleSplitBody"].(map[string]any)
+	if !ok {
+		t.Fatalf("请求变体 schema roleSplitBody 缺失")
+	}
+	reqProps := reqSchema["properties"].(map[string]any)
+	if at := reqProps["at"].(map[string]any); at["type"] != "integer" || at["format"] != "int64" {
+		t.Errorf("请求侧 time_format=unix 应映射为 integer: got %v", at)
+	}
+	if required := reqSchema["required"]; !reflect.DeepEqual(required, []any{"at"}) {
+		t.Errorf("请求侧 required = %v, want [at]", required)
+	}
+	if note := reqProps["note"].(map[string]any); note["default"] != "n" {
+		t.Errorf("请求侧 default 应展示: got %v", note)
+	}
+	// 容器内的时间元素同样按容器的 time_format 展开（文档与运行时一致）
+	if items := reqProps["days"].(map[string]any)["items"].(map[string]any); items["type"] != "integer" {
+		t.Errorf("请求侧 []time.Time 元素应为 integer: got %v", items)
+	}
+	ptrItems := reqProps["ptrDays"].(map[string]any)["items"].(map[string]any)
+	if ptrItems["type"] != "integer" || ptrItems["nullable"] != true {
+		t.Errorf("请求侧 []*time.Time 元素应为 nullable integer: got %v", ptrItems)
+	}
+
+	resSchema, ok := schemas["roleSplitBodyResponse"].(map[string]any)
+	if !ok {
+		t.Fatalf("响应变体 schema roleSplitBodyResponse 缺失")
+	}
+	resProps := resSchema["properties"].(map[string]any)
+	if at := resProps["at"].(map[string]any); at["type"] != "string" || at["format"] != "date-time" {
+		t.Errorf("响应侧 time_format 不参与：应为 date-time 字符串: got %v", at)
+	}
+	if required, has := resSchema["required"]; has {
+		t.Errorf("响应侧不应输出 required: got %v", required)
+	}
+	if note := resProps["note"].(map[string]any); note["default"] != nil {
+		t.Errorf("响应侧不应展示 default: got %v", note)
+	}
+	if items := resProps["days"].(map[string]any)["items"].(map[string]any); items["type"] != "string" {
+		t.Errorf("响应侧 []time.Time 元素应为 date-time 字符串: got %v", items)
+	}
+}
+
+// TestGenerateOpenAPI_ResInertTagsIgnored 锁死 Res 上的请求侧约束标签不进入文档：
+// form 不改响应键名，default/nonzero/time_format 均无效果。
+func TestGenerateOpenAPI_ResInertTagsIgnored(t *testing.T) {
+	type inertRes struct {
+		Q       string    `json:"q" form:"q_alias" nonzero:"true"`
+		Size    int       `json:"size" default:"7" nonzero:"true"`
+		Changed time.Time `json:"changed" time_format:"unix"`
+	}
+	type inertReq struct {
+		ID int `json:"id"`
+	}
+
+	r := NewRouter()
+	r.GET("/inert", func(context.Context, inertReq) (inertRes, error) { return inertRes{}, nil })
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "inert", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+
+	resSchema, ok := schemas["inertResResponse"].(map[string]any)
+	if !ok {
+		t.Fatalf("响应变体 schema inertResResponse 缺失")
+	}
+	props := resSchema["properties"].(map[string]any)
+	if _, has := props["q_alias"]; has {
+		t.Errorf("form 标签不应改变响应键名: got %v", props)
+	}
+	if _, has := props["q"]; !has {
+		t.Errorf("响应键名应取 json 名 q: got %v", props)
+	}
+	if _, has := resSchema["required"]; has {
+		t.Errorf("响应侧不应输出 required: got %v", resSchema["required"])
+	}
+	if _, has := props["size"].(map[string]any)["default"]; has {
+		t.Errorf("响应侧不应展示 default: got %v", props["size"])
+	}
+	if changed := props["changed"].(map[string]any); changed["type"] != "string" || changed["format"] != "date-time" {
+		t.Errorf("响应侧时间应恒为 date-time: got %v", changed)
 	}
 }

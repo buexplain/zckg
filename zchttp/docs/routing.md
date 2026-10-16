@@ -89,9 +89,9 @@ handler 注册时，`buildEntry` 会通过反射一次性预计算以下信息�
 
 - **handler 反射值**（`handlerVal`）：`reflect.ValueOf(handler)`，请求时直接 `Call` 调用，避免重复获取。
 - **Req/Res 类型信息**（`reqType`/`resType`/`reqElemType`/`reqIsPtr`/`resIsPtr`）：`reqElemType` 是解引用指针后的 Req 具体类型，用于 `reflect.New` 创建实例；`reqIsPtr`/`resIsPtr` 标记 handler 声明的是值还是指针，决定 core 层传入值还是传指针。
-- **Req/Res 元信息**（`reqMeta`/`resMeta`，类型 `structMeta`）：缓存 Req/Res 顶层字段的绑定名、`nonzero` 判定、`default` 标签值、`time_format`/`time_location`、文件字段标记等，绑定、校验与 OpenAPI 生成阶段直接使用。嵌套结构体的 meta 不在注册阶段计算，而是在递归校验/默认值填充首次使用时经 `cachedStructMeta` 构建，随后存入进程级缓存（`sync.Map`），后续请求直接复用，无重复反射开销。
+- **Req 元信息**（`reqMeta`，类型 `structMeta`）：缓存 Req 顶层字段的绑定名、`nonzero` 判定、`default` 标签值、`time_format`/`time_location`、文件字段标记等，绑定、校验与 OpenAPI 生成阶段直接使用。嵌套结构体的 meta 不在注册阶段计算，而是在递归校验/默认值填充首次使用时经 `cachedStructMeta` 构建，随后存入进程级缓存（`sync.Map`），后续请求直接复用，无重复反射开销。Res **不预计算 meta**：响应 schema 不读 `default`/`nonzero`/`time_format` 等请求侧标签，只用类型反射生成，注册期仅检查 Res 上是否嵌入了只在 Req 生效的声明（`OpenAPIMeta`/`KeepRawBody`，命中时输出告警）。
 - **Req 模板**（`defaultReq`）：创建 Req 实例并通过 `applyDefaults` 初始化 `default` 标签字段（注册阶段：所有零值字段均填充）。请求阶段浅拷贝复用，绑定后再次调用 `applyDefaults(requestPhase=true)` 补填动态创建的子元素（slice/数组/map/nested ptr）中的 nil 指针字段。详见[默认值机制](parameter-binding.md#六默认值机制)。
-- **操作级元信息**（`opMeta`，类型 `operationMeta`）：从 Req 嵌入的 `OpenAPIMeta` 中提取 `tags`/`summary`/`description`，供 OpenAPI 文档生成。
+- **操作级元信息**（`opMeta`，类型 `operationMeta`）：从 Req 嵌入的 `OpenAPIMeta` 中提取 `tags`/`summary`/`description`/`deprecated`（`Res` 不参与操作级元信息解析），供 OpenAPI 文档生成。
 - **中间件快照**（`middlewares`）：注册时将当前 `[全局中间件..., 分组中间件...]` 的副本固定到该路由条目，后续 `Use(...)` 不影响已注册路由。
 - **深拷贝标记**（`needsDeepCopy`）：若模板中存在非 nil 的指针/切片/map 字段或元素内含引用的数组字段，标记为需深拷贝，请求时对模板浅拷贝后通过 `deepCopyDefaults` 断开共享引用。
 - **请求阶段默认值标记**（`needsRequestPhaseDefaults`）：通过 `hasRequestPhaseDefaults` 扫描结构体树，判断是否存在带 `default` 的指针字段。仅当该标记为 `true` 时，请求阶段才执行 `applyDefaults(requestPhase=true)` 补填 nil 指针字段，避免无意义的递归遍历。

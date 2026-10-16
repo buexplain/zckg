@@ -553,3 +553,60 @@ func TestBuildStructMeta_EmbeddedFieldSkipped(t *testing.T) {
 		t.Fatal("正常嵌入字段 shown 应进入可绑定集合")
 	}
 }
+
+// TestBuildStructMeta_TimeTagsOnAllBoundForms 锁死 time_format/time_location 在绑定支持的**全部**时间字段
+// 形态上都被解析：值类型、任意层指针、单层切片（值元素/指针元素）。历史缺陷：判定条件曾写死
+// f.Type == time.Time，指针与切片字段的标签在元数据层被丢弃，绑定链路退化为自动探测
+// （自定义 layout 静默丢值、time_location 静默失效）。
+// 同时锁死反向边界：绑定链路本身不支持的形态（多层切片、*[]time.Time、map 值、非时间字段）
+// 不解析标签，避免"读了却没生效"。
+func TestBuildStructMeta_TimeTagsOnAllBoundForms(t *testing.T) {
+	type probe struct {
+		Value    time.Time            `json:"value" time_format:"02/01/2006" time_location:"Asia/Shanghai"`
+		Ptr      *time.Time           `json:"ptr" time_format:"02/01/2006" time_location:"Asia/Shanghai"`
+		PtrPtr   **time.Time          `json:"ptr_ptr" time_format:"unix" time_location:"UTC"`
+		Slice    []time.Time          `json:"slice" time_format:"02/01/2006" time_location:"Asia/Shanghai"`
+		SlicePtr []*time.Time         `json:"slice_ptr" time_format:"unix" time_location:"UTC"`
+		Nested   [][]time.Time        `json:"nested" time_format:"unix" time_location:"UTC"`
+		PtrSlice *[]time.Time         `json:"ptr_slice" time_format:"unix" time_location:"UTC"`
+		MapTime  map[string]time.Time `json:"map_time" time_format:"unix" time_location:"UTC"`
+		NotTime  []int                `json:"not_time" time_format:"unix" time_location:"UTC"`
+	}
+
+	meta := buildStructMeta(reflect.TypeOf(probe{}))
+	fieldMap := make(map[string]fieldMeta, len(meta.fields))
+	for _, fm := range meta.fields {
+		fieldMap[fm.name] = fm
+	}
+
+	bound := []struct {
+		name   string
+		format string
+		tz     string
+	}{
+		{"value", "02/01/2006", "Asia/Shanghai"},
+		{"ptr", "02/01/2006", "Asia/Shanghai"},
+		{"ptr_ptr", "unix", "UTC"},
+		{"slice", "02/01/2006", "Asia/Shanghai"},
+		{"slice_ptr", "unix", "UTC"},
+	}
+	for _, want := range bound {
+		fm, ok := fieldMap[want.name]
+		if !ok {
+			t.Fatalf("字段 %s 未进入元数据", want.name)
+		}
+		if fm.timeFormat != want.format {
+			t.Errorf("%s.timeFormat = %q, want %q", want.name, fm.timeFormat, want.format)
+		}
+		if fm.timeLocation == nil || fm.timeLocation.String() != want.tz {
+			t.Errorf("%s.timeLocation = %v, want %s", want.name, fm.timeLocation, want.tz)
+		}
+	}
+
+	for _, name := range []string{"nested", "ptr_slice", "map_time", "not_time"} {
+		fm := fieldMap[name]
+		if fm.timeFormat != "" || fm.timeLocation != nil {
+			t.Errorf("绑定不支持的形态 %s 不应解析时间标签，实际 format=%q tz=%v", name, fm.timeFormat, fm.timeLocation)
+		}
+	}
+}

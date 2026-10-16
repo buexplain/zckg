@@ -133,7 +133,7 @@ r.POST("/webhook", webhook)
 
 - **参数名即字段绑定名**：按 form > json > 字段名优先级解析，注册阶段预计算绑定关系，参数名无对应字段时注册即 panic。
 - **覆盖语义**：三级覆盖链 **path > body > query**（路径参数是更精确的意图，优先级最高；带 body 方法内部为 body > query，见上节）。
-- **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（`time_format`/`time_location` 标签同样生效）；目标字段为 slice、map、结构体等其他类型时注册即 panic。
+- **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（时间字段的 `time_format`/`time_location` 标签同样生效，指针形态也是）；目标字段为 slice、map、结构体等其他类型时注册即 panic（时间切片因此不能作路径参数）。
 - **失败语义区别于尽力绑定**：单个参数转换失败立即返回错误（包装为 `BindingError` 返回 400），而非跳过。
 - **可选参数省略**：`{name?}` 未出现在请求路径中时不写入字段，保留模板 `default` 值或零值。
 - **通配尾段**：`{name...}` 捕获剩余全部路径（已百分号解码、可含 `/`、不做路径清理）；零段命中（如 `/dify/{rest...}` 收到 `/dify`）时同可选参数省略，不写入字段。
@@ -200,6 +200,21 @@ GET /search?tags=a&tags=b&tags=c   →   Tags []string{"a","b","c"}
 
 `time.Time` 字段通过 `time_format` 与 `time_location` 标签控制解析方式。
 
+### 支持的时间字段形态
+
+两个标签对所有能被 `setScalar` 写入的时间形态生效，且**逐个元素**应用（切片中每个元素都按同一标签解析）：
+
+| 字段形态 | 是否解析标签 | 说明 |
+| --- | --- | --- |
+| `time.Time` | ✅ | 基础形态 |
+| `*time.Time` | ✅ | 任意层指针（如 `**time.Time`）均可，解析后落到最内层值 |
+| `[]time.Time` | ✅ | 切片元素逐个解析 |
+| `[]*time.Time` | ✅ | 每个元素分配独立值后解析 |
+| `[][]time.Time`、`*[]time.Time` | ❌ | 绑定链路不支持多层容器与切片指针，标签不生效（注册期不会报错，字段保持零值） |
+| `map[K]time.Time` | ❌ | map 值不参与标量绑定 |
+
+> 只有"请求侧"会解析时间：Res 结构体不参与绑定，`time.Time` 响应字段由 `encoding/json` 序列化，恒输出 RFC3339 字符串，`time_format`/`time_location` 写在 Res 上不生效。
+
 ### time_format 标签
 
 | 取值 | 含义 |
@@ -229,10 +244,14 @@ GET /search?tags=a&tags=b&tags=c   →   Tags []string{"a","b","c"}
 
 ```go
 type Req struct {
-    StartTime time.Time `json:"start_time" time_format:"unix"`
-    Date      time.Time `json:"date" time_format:"2006-01-02" time_location:"Asia/Shanghai"`
-    SlashDate time.Time `json:"slash_date" time_format:"02/01/2006"`
-    Auto      time.Time `json:"auto"`  // 自动探测 RFC3339 或时间戳
+    StartTime time.Time   `json:"start_time" time_format:"unix"`
+    Date      time.Time   `json:"date" time_format:"2006-01-02" time_location:"Asia/Shanghai"`
+    SlashDate time.Time   `json:"slash_date" time_format:"02/01/2006"`
+    Auto      time.Time   `json:"auto"`  // 自动探测 RFC3339 或时间戳
+
+    // 指针与切片形态同样按标签解析（逐元素应用）
+    ExpireAt  *time.Time  `json:"expire_at" time_format:"unix" time_location:"UTC"`
+    Days      []time.Time `json:"days" time_format:"2006-01-02" time_location:"Asia/Shanghai"`
 }
 ```
 

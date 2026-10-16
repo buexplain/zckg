@@ -229,8 +229,8 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 			}
 		}
 
-		// 时间相关标签（仅对 time.Time 类型解析）
-		if f.Type == timeType {
+		// 时间相关标签（对绑定支持的各类字段形态解析：time.Time、其指针，以及以它们为元素的单层切片）
+		if isBoundTimeType(f.Type) {
 			fm.timeFormat = f.Tag.Get("time_format")
 			if locTag := f.Tag.Get("time_location"); locTag != "" {
 				if loc, err := time.LoadLocation(locTag); err == nil {
@@ -250,6 +250,18 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 		meta.fields = append(meta.fields, fm)
 	}
 	return meta
+}
+
+// isBoundTimeType 判断字段类型是否为绑定链路支持解析的时间形态，与 binding.go 的
+// setFieldValue / parseScalar 能力保持一致：time.Time、其任意层指针，以及以它们为元素的单层切片。
+// 判定过窄会让 time_format / time_location 在指针与切片字段上被静默丢弃（元数据层丢掉标签，
+// 绑定层退化为自动探测），因此这里的形态必须与绑定实现同步维护。
+// 指针解引用复用带上限的 derefType：自引用命名类型（type P *P）必须在这里终止。
+func isBoundTimeType(t reflect.Type) bool {
+	if t.Kind() == reflect.Slice {
+		return derefType(t.Elem()) == timeType
+	}
+	return derefType(t) == timeType
 }
 
 // fieldByIndex 沿索引路径从根结构体出发定位到目标字段，中间若遇 nil 指针则自动初始化。

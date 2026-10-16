@@ -3,8 +3,8 @@ package zchttp
 // 文档-代码一致性的回归锁死测试：
 // 将经 httptest 实测确认的关键行为固化为包内测试，防止后续代码修改
 // 使行为再次偏离文档描述。涉及 DEV-01（ReadFrom 标记 written）、
-// DEV-02/DEV-03（NewEngine 默认值）、DEV-04（Res 标签参与文档生成）、
-// 合并绑定粒度表与容器嵌套深度矩阵。
+// DEV-02/DEV-03（NewEngine 默认值）、DEV-04（Res 上的请求侧约束标签不参与文档生成，
+// 响应变体以 <Type>Response 命名）、合并绑定粒度表与容器嵌套深度矩阵。
 
 import (
 	"context"
@@ -116,7 +116,8 @@ func TestDocReview_MergeBindingGranularity(t *testing.T) {
 
 // request.md 容器嵌套深度矩阵 + DEV-04：
 // 单层容器 nonzero/default 生效；多层容器均不生效；
-// Res 的 default 展示、Res 的 nonzero 推断 required（参与文档生成）。
+// Res 侧不读 default/nonzero（响应无默认值填充、无校验），同一类型的响应 schema 以 <Type>Response
+// 命名且不含请求侧约束，故两处断言分别锁死请求变体与响应变体的差异。
 type drSingleItem struct {
 	Name     string `json:"name" nonzero:"true"`
 	IsActive *bool  `json:"isActive" default:"true"`
@@ -174,25 +175,45 @@ func TestDocReview_ContainerMatrixAndOpenAPIDisplay(t *testing.T) {
 		t.Errorf("多层容器指针字段 default 不应填充: got %v", got)
 	}
 
-	// OpenAPI：单层容器 struct 的指针 default 展示、多层容器不展示；Res 标签参与文档生成
+	// OpenAPI：单层容器 struct 的指针 default 展示、多层容器不展示；请求/响应两份 schema 各按角色生成
 	doc := GenerateOpenAPI(e.Router, OpenAPIInfo{Title: "dr", Version: "1"})
 	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
 
-	single := schemas["drSingleItem"].(map[string]any)["properties"].(map[string]any)
+	// drSingleItem 同时出现在请求（drMatrixReq.Items）与响应（drMatrixRes 内嵌 drMatrixReq）两侧：
+	// 请求变体取裸名并展示 default、推断 required；响应变体带 Response 后缀且两者皆无
+	singleSchema := schemas["drSingleItem"].(map[string]any)
+	single := singleSchema["properties"].(map[string]any)
 	if single["isActive"].(map[string]any)["default"] != true {
-		t.Errorf("drSingleItem.isActive.default 应展示: got %v", single["isActive"])
+		t.Errorf("请求 schema 的 isActive.default 应展示: got %v", single["isActive"])
 	}
+	if reqList, ok := singleSchema["required"].([]any); !ok || len(reqList) != 1 || reqList[0] != "name" {
+		t.Errorf("请求 schema 的 nonzero 应推断为 required: got %v", singleSchema["required"])
+	}
+	singleResSchema := schemas["drSingleItemResponse"].(map[string]any)
+	singleRes := singleResSchema["properties"].(map[string]any)
+	if _, has := singleRes["isActive"].(map[string]any)["default"]; has {
+		t.Errorf("响应 schema 不应展示 default: got %v", singleRes["isActive"])
+	}
+	if _, has := singleResSchema["required"]; has {
+		t.Errorf("响应 schema 不应输出 required: got %v", singleResSchema["required"])
+	}
+
 	multi := schemas["drMultiItem"].(map[string]any)["properties"].(map[string]any)
 	if _, has := multi["isActive"].(map[string]any)["default"]; has {
 		t.Errorf("drMultiItem.isActive.default 不应展示: got %v", multi["isActive"])
 	}
-	resSchema := schemas["drResWithTags"].(map[string]any)
+
+	// drResWithTags 只作 Res：default 与 nonzero 都不进入文档
+	resSchema := schemas["drResWithTagsResponse"].(map[string]any)
 	resProps := resSchema["properties"].(map[string]any)
-	if d, has := resProps["addr"].(map[string]any)["default"]; !has || d != "银河系" {
-		t.Errorf("Res 的 default 应参与文档展示: got %v", resProps["addr"])
+	if _, has := resProps["addr"].(map[string]any)["default"]; has {
+		t.Errorf("Res 的 default 不应参与文档展示: got %v", resProps["addr"])
 	}
-	reqList, ok := resSchema["required"].([]any)
-	if !ok || len(reqList) != 1 || reqList[0] != "id" {
-		t.Errorf("Res 的 nonzero 应推断为 required: got %v", resSchema["required"])
+	if _, has := resSchema["required"]; has {
+		t.Errorf("Res 的 nonzero 不应推断为 required: got %v", resSchema["required"])
+	}
+	// 响应包装层仍按 Response_<Type> 约定命名（由数据 schema 名去掉固定的 Response 后缀得到）
+	if _, ok := schemas["Response_drResWithTags"]; !ok {
+		t.Errorf("响应包装层 Response_drResWithTags 缺失")
 	}
 }
