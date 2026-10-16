@@ -3,7 +3,10 @@
 // 建连与门控，测试逻辑集中于此，三方言复用同一套断言。
 // 覆盖目标：终端方法的执行期错误分支、Pluck/Cursor 扫描错误、
 // Increment/Decrement、InsertUsing/InsertOrIgnoreUsing、批量插入、
-// Upsert 退化分支、NOT IN 系列、空安全表达式、嵌套 Join 删除、事务开启失败等。
+// Upsert 退化分支、NOT IN 系列、空安全表达式、嵌套 Join 删除、事务开启失败、
+// CompileRaw 内联产物的无参执行与字面量往返、值内联的方言差异、
+// 扫描器占位符判定与引擎的一致性等。
+// 环境依赖与默认 DSN 见各方言入口文件；外部数据库不可达时由入口文件各自 Skip。
 package zcdb
 
 import (
@@ -12,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -689,6 +693,112 @@ func crossDialectCommentRawAndSchema(t *testing.T, open commentDAOOpener) {
 }
 
 // assertCommentScalarRows 处理所有 rows I/O 错误，验证恰好一行一个常量。
+// crossDialectTestCompileRawExec 验证「自产自销」不变量：本方言 Builder 编译出的 SQL + args
+// 交给本方言的 CompileRaw，产物不再残留本方言占位符、可直接无参执行，
+// 且含引号、反斜杠与多字节的值经字面量往返无损。
+func crossDialectTestCompileRawExec(t *testing.T, dao *DBDao) {
+	ctx := context.Background()
+	const table = "cross_dialect_compile_raw"
+	crossDialectDrop(t, dao, table)
+	crossDialectExec(t, dao, `CREATE TABLE cross_dialect_compile_raw (id INTEGER PRIMARY KEY, num INTEGER, label VARCHAR(64))`)
+
+	const label = `O'Brien \ 中文`
+	type row struct {
+		ID    int    `db:"id"`
+		Num   int    `db:"num"`
+		Label string `db:"label"`
+	}
+	insertSQL, insertArgs, err := dao.Builder().Table(table).ToInsert(row{ID: 1, Num: 2, Label: label})
+	if err != nil {
+		t.Fatalf("ToInsert: %v", err)
+	}
+	completeInsert, err := dao.Grammar().CompileRaw(insertSQL, insertArgs)
+	if err != nil {
+		t.Fatalf("CompileRaw 编译自己的产物失败: sql=%s args=%#v err=%v", insertSQL, insertArgs, err)
+	}
+	assertNoOwnPlaceholder(t, dao, completeInsert)
+	// 目标用法：拿着这一条 SQL 直接执行，不传任何参数。
+	result, err := dao.Exec(ctx, completeInsert)
+	if err != nil {
+		t.Fatalf("无参执行内联产物失败: sql=%s err=%v", completeInsert, err)
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		t.Fatalf("affected=%d err=%v，应为 1", n, err)
+	}
+
+	selectSQL, selectArgs, err := dao.Builder().Table(table).Select("num", "label").Where("id", "=", 1).ToSelect()
+	if err != nil {
+		t.Fatalf("ToSelect: %v", err)
+	}
+	completeSelect, err := dao.Grammar().CompileRaw(selectSQL, selectArgs)
+	if err != nil {
+		t.Fatalf("CompileRaw 编译自己的产物失败: sql=%s args=%#v err=%v", selectSQL, selectArgs, err)
+	}
+	assertNoOwnPlaceholder(t, dao, completeSelect)
+	rows, err := dao.Query(ctx, completeSelect)
+	if err != nil {
+		t.Fatalf("无参执行内联产物失败: sql=%s err=%v", completeSelect, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close rows: %v", err)
+		}
+	}()
+	if !rows.Next() {
+		t.Fatalf("未读到写入行: %v", rows.Err())
+	}
+	var num int
+	var gotLabel string
+	if err := rows.Scan(&num, &gotLabel); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if num != 2 {
+		t.Errorf("num 应为 2，实际 %d", num)
+	}
+	if gotLabel != label {
+		t.Errorf("label 往返不一致：got %q，want %q", gotLabel, label)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows 迭代错误: %v", err)
+	}
+}
+
+// TestScanParityCorpusDialectKeys 防止语料里的方言键写错导致用例静默不跑：
+// dialectSQL/byDialect 的键必须是已知方言名（键写错时该用例会在所有方言下被跳过，覆盖率凭空消失）。
+func TestScanParityCorpusDialectKeys(t *testing.T) {
+	valid := map[string]bool{"MySQL": true, "PostgreSQL": true, "SQLite": true}
+	for _, tc := range scanParityCases() {
+		for dialect := range tc.dialectSQL {
+			if !valid[dialect] {
+				t.Errorf("一致性语料 %q 的 dialectSQL 含未知方言键 %q", tc.name, dialect)
+			}
+		}
+	}
+	for _, tc := range rawLiteralExecCases() {
+		for dialect := range tc.byDialect {
+			if !valid[dialect] {
+				t.Errorf("内联语料 %q 的 byDialect 含未知方言键 %q", tc.name, dialect)
+			}
+		}
+	}
+}
+
+// assertNoOwnPlaceholder 断言内联产物不再残留本方言的占位符形态：
+// PostgreSQL 为 $N（按编号边界判定），MySQL/SQLite 为 ?。
+// 前提：调用方内联的值不含 "?"——含 ? 的值与残留占位符无法区分，这类用例不能走本断言。
+func assertNoOwnPlaceholder(t *testing.T, dao *DBDao, sqlStr string) {
+	t.Helper()
+	if _, pg := dao.grammar.(*PostgresGrammar); pg {
+		if containsNumberedPlaceholder(sqlStr) {
+			t.Errorf("PostgreSQL 内联产物不应残留 $N 占位符: %s", sqlStr)
+		}
+		return
+	}
+	if strings.Contains(sqlStr, "?") {
+		t.Errorf("%T 内联产物不应残留 ? 占位符: %s", dao.grammar, sqlStr)
+	}
+}
+
 func assertCommentScalarRows(t *testing.T, rows *sql.Rows, want int) {
 	t.Helper()
 	defer func() {
@@ -1607,4 +1717,316 @@ func crossDialectTestDeleteJoinExecError(t *testing.T, dao *DBDao) {
 	if err == nil {
 		t.Fatal("DeleteJoin 目标表不存在应报错")
 	}
+}
+
+// rawLiteralExecCase 是执行层用例：tmpl 里的 {N} 表示第 N 个占位符（按方言渲染为 ? 或 $N），
+// want 是"驱动返回值归一后的文本"逐列期望，byDialect 用于声明方言间的文本差异。
+type rawLiteralExecCase struct {
+	name      string
+	tmpl      string
+	args      []any
+	want      []string
+	byDialect map[string][]string
+}
+
+// rawLiteralExecCases 返回三方言通用的执行用例。期望值均为实测所得（见文件头说明）。
+func rawLiteralExecCases() []rawLiteralExecCase {
+	return []rawLiteralExecCase{
+		{
+			name: "字符串", tmpl: "SELECT {1}", args: []any{"abc"}, want: []string{"abc"},
+		},
+		{
+			name: "含引号反斜杠与多字节的字符串", tmpl: "SELECT {1}",
+			args: []any{`O'Brien \ 中文`}, want: []string{`O'Brien \ 中文`},
+		},
+		{
+			// 控制字符（换行/回车/Ctrl-Z）：MySQL 走转义写法、PostgreSQL/SQLite 原样保留，
+			// 三方言都必须接受并原样回读。NUL 不入本矩阵——PostgreSQL 无法在文本中存储它。
+			name: "含换行回车与 Ctrl-Z 的字符串", tmpl: "SELECT {1}",
+			args: []any{"a\nb\rc\x1ad"}, want: []string{"a\nb\rc\x1ad"},
+		},
+		{
+			name: "参数值里的问号", tmpl: "SELECT {1}", args: []any{"a?b"}, want: []string{"a?b"},
+		},
+		{
+			name: "nil 为 NULL", tmpl: "SELECT {1}", args: []any{nil}, want: []string{"NULL"},
+		},
+		{
+			name: "类型化 nil 指针为 NULL", tmpl: "SELECT {1}", args: []any{(*int)(nil)}, want: []string{"NULL"},
+		},
+		{
+			name: "nil 字节切片为 NULL", tmpl: "SELECT {1}", args: []any{[]byte(nil)}, want: []string{"NULL"},
+		},
+		{
+			name: "有符号与无符号整数", tmpl: "SELECT {1}, {2}", args: []any{int8(-8), uint32(42)},
+			want: []string{"-8", "42"},
+		},
+		{
+			name: "大整数不丢精度", tmpl: "SELECT {1}", args: []any{int64(-9007199254740993)},
+			want: []string{"-9007199254740993"},
+		},
+		{
+			name: "小数", tmpl: "SELECT {1}", args: []any{1.5}, want: []string{"1.5"},
+		},
+		{
+			name: "float32 按最短表示", tmpl: "SELECT {1}", args: []any{float32(0.1)}, want: []string{"0.1"},
+		},
+		{
+			name: "科学计数法", tmpl: "SELECT {1}", args: []any{1e21},
+			want:      []string{"1e+21"},
+			byDialect: map[string][]string{"PostgreSQL": {"1000000000000000000000"}},
+		},
+		{
+			name: "bool", tmpl: "SELECT {1}, {2}", args: []any{true, false},
+			want:      []string{"1", "0"},
+			byDialect: map[string][]string{"PostgreSQL": {"true", "false"}},
+		},
+		{
+			name: "时间", tmpl: "SELECT {1}", args: []any{rawTestTime},
+			want:      []string{"2026-10-16 12:34:56.789"},
+			byDialect: map[string][]string{"PostgreSQL": {"2026-10-16 12:34:56.789+08:00"}},
+		},
+		{
+			name: "零小数秒的时间", tmpl: "SELECT {1}",
+			args:      []any{time.Date(2026, 10, 16, 12, 34, 56, 0, time.UTC)},
+			want:      []string{"2026-10-16 12:34:56"},
+			byDialect: map[string][]string{"PostgreSQL": {"2026-10-16 12:34:56+00:00"}},
+		},
+		{
+			name: "字节", tmpl: "SELECT {1}", args: []any{[]byte{0x00, 0xff}},
+			want: []string{"\x00\xff"},
+		},
+		{
+			name: "命名字节类型", tmpl: "SELECT {1}", args: []any{rawNamedBytes{0x41, 0x42}},
+			want: []string{"AB"},
+		},
+		{
+			name: "命名标量类型", tmpl: "SELECT {1}, {2}", args: []any{rawNamedInt(7), rawNamedString("x")},
+			want: []string{"7", "x"},
+		},
+		{
+			name: "Expression 由数据库求值", tmpl: "SELECT {1}", args: []any{NewExpression("1 + 1")},
+			want: []string{"2"},
+		},
+		{
+			name: "有值 NullString", tmpl: "SELECT {1}",
+			args: []any{sql.NullString{String: "a'b", Valid: true}}, want: []string{"a'b"},
+		},
+		{
+			name: "无值 NullString", tmpl: "SELECT {1}", args: []any{sql.NullString{}}, want: []string{"NULL"},
+		},
+		{
+			name: "有值 NullInt64", tmpl: "SELECT {1}", args: []any{sql.NullInt64{Int64: 3, Valid: true}},
+			want: []string{"3"},
+		},
+		{
+			name: "多占位符按位置对应", tmpl: "SELECT {1}, {2}, {3}", args: []any{"x", 2, true},
+			want:      []string{"x", "2", "1"},
+			byDialect: map[string][]string{"PostgreSQL": {"x", "2", "true"}},
+		},
+		{
+			name: "字符串字面量里的问号不算占位符", tmpl: "SELECT '%?%', {1}", args: []any{"x"},
+			want: []string{"%?%", "x"},
+		},
+		{
+			name: "注释里的问号不算占位符", tmpl: "SELECT {1} /* 注释里的 ? */", args: []any{"x"},
+			want: []string{"x"},
+		},
+	}
+}
+
+// crossDialectTestCompileRawLiterals 验证 CompileRaw 的内联产物被本方言引擎认可：
+// 产物不再带参数、零参数执行成功，且回读值与输入值语义一致
+// （含引号/反斜杠/多字节字符串、整数与浮点、bool、时间、字节、NULL、Expression、
+// 命名类型、字面量与注释里的 ?、多占位符按位置）。
+func crossDialectTestCompileRawLiterals(t *testing.T, dao *DBDao) {
+	dialect := dialectNameOf(t, dao)
+	for _, tc := range rawLiteralExecCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlStr := renderRawPlaceholderTemplate(tc.tmpl, dialect)
+			compiled, err := dao.grammar.CompileRaw(sqlStr, tc.args)
+			if err != nil {
+				t.Fatalf("CompileRaw 编译失败: sql=%s args=%#v err=%v", sqlStr, tc.args, err)
+			}
+			// 关键：产物直接执行，不再传任何参数。
+			rows, err := dao.Query(context.Background(), compiled)
+			if err != nil {
+				t.Fatalf("数据库未接受 CompileRaw 产物: sql=%s err=%v", compiled, err)
+			}
+			defer func() {
+				if err := rows.Close(); err != nil {
+					t.Errorf("close rows: %v", err)
+				}
+			}()
+			got, ok := scanRawRow(t, rows)
+			if !ok {
+				return
+			}
+			want := tc.want
+			if override, ok := tc.byDialect[dialect]; ok {
+				want = override
+			}
+			if len(got) != len(want) {
+				t.Fatalf("列数不符：got %d %#v，want %d %#v（sql=%s）", len(got), got, len(want), want, compiled)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("第 %d 列不符：got %q，want %q（sql=%s）", i+1, got[i], want[i], compiled)
+				}
+			}
+		})
+	}
+}
+
+// scanParityCase 是一条一致性语料：tmpl 用 {N} 表示第 N 个占位符（按方言渲染），
+// dialectSQL 用于方言特有语法（键为方言名，命中时改用该 SQL）。
+type scanParityCase struct {
+	name       string
+	tmpl       string
+	dialectSQL map[string]string
+	// engineRejects 表示引擎把它当语法错误直接拒绝（没有"参数计数"可比），
+	// 此时改为断言引擎确实拒绝、且扫描器仍按其语法计数。
+	engineRejects bool
+}
+
+func scanParityCases() []scanParityCase {
+	return []scanParityCase{
+		{name: "单个占位符", tmpl: "SELECT {1}"},
+		{name: "两个占位符", tmpl: "SELECT {1}, {2}"},
+		{name: "三个占位符", tmpl: "SELECT {1}, {2}, {3}"},
+		{name: "无占位符", tmpl: "SELECT 1"},
+		{name: "字符串字面量里的问号", tmpl: "SELECT '%?%', {1}"},
+		{name: "行注释里的问号", tmpl: "SELECT {1} -- ?\n"},
+		{name: "块注释里的问号", tmpl: "SELECT {1} /* ? */"},
+		{name: "字面量与注释混合", tmpl: "SELECT {1}, '{1}' -- {1}\n"},
+		{
+			// MySQL/SQLite：-- 无空白不算注释，故 {1} 是占位符；PostgreSQL/SQLite 的 -- 永远是注释。
+			name: "破折号注释的空白要求", tmpl: "SELECT 1--{1}",
+		},
+		{
+			name: "MySQL 双引号是字符串",
+			dialectSQL: map[string]string{
+				"MySQL":      `SELECT "a?b", {1}`,
+				"PostgreSQL": `SELECT 1 AS "a?b", {1}`,
+				"SQLite":     `SELECT 1 AS "a?b", {1}`,
+			},
+		},
+		{
+			name: "MySQL/SQLite 反引号标识符",
+			dialectSQL: map[string]string{
+				"MySQL":  "SELECT 1 AS `a?b`, {1}",
+				"SQLite": "SELECT 1 AS `a?b`, {1}",
+			},
+		},
+		{
+			name:       "MySQL 的 # 行注释",
+			dialectSQL: map[string]string{"MySQL": "SELECT 1 # {1}"},
+		},
+		{
+			name:       "PostgreSQL 美元引用",
+			dialectSQL: map[string]string{"PostgreSQL": "SELECT $tag$ {1} $tag$, {1}"},
+		},
+		{
+			name:       "PostgreSQL 嵌套块注释",
+			dialectSQL: map[string]string{"PostgreSQL": "SELECT 1 /* /* {1} */ {1} */ , {1}"},
+		},
+		{
+			name:       "PostgreSQL E 字符串",
+			dialectSQL: map[string]string{"PostgreSQL": `SELECT E'\'' , {1}`},
+		},
+		{
+			name:       "PostgreSQL jsonb 键存在操作符",
+			dialectSQL: map[string]string{"PostgreSQL": `SELECT '{"a":1}'::jsonb ? 'a', {1}`},
+		},
+		{
+			name:       "PostgreSQL 编号乱序",
+			dialectSQL: map[string]string{"PostgreSQL": "SELECT {2}, {1}"},
+		},
+		{
+			name:       "PostgreSQL 重复引用同一编号",
+			dialectSQL: map[string]string{"PostgreSQL": "SELECT {1}, {1}"},
+		},
+		{
+			// 引擎把裸 ?? 当语法错误（不是两个占位符），故无可比计数；扫描器仍按两个 ? 计数。
+			name:          "MySQL 的裸 ?? 是语法错误",
+			dialectSQL:    map[string]string{"MySQL": "SELECT ??"},
+			engineRejects: true,
+		},
+		{
+			name:          "SQLite 的裸 ?? 是语法错误",
+			dialectSQL:    map[string]string{"SQLite": "SELECT ??"},
+			engineRejects: true,
+		},
+	}
+}
+
+// crossDialectTestScanEngineParity 验证扫描器的占位符判定与数据库引擎一致：
+// 逐条语料比对「扫描器计数/最大编号」与「引擎要求的参数个数」，并交叉验证
+// CompileRaw 接受的参数个数与引擎一致（多一个/少一个必须拒绝）。
+func crossDialectTestScanEngineParity(t *testing.T, dao *DBDao) {
+	dialect := dialectNameOf(t, dao)
+	syntax := scanSyntaxOf(t, dialect)
+	for _, tc := range scanParityCases() {
+		sqlStr, applies := scanParitySQL(tc, dialect)
+		if !applies {
+			continue // 该用例不适用于本方言
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			count, maxIndex := scannerPlaceholderStat(sqlStr, syntax)
+			if tc.engineRejects {
+				assertEngineRejects(t, dao, dialect, sqlStr)
+				if count != 2 {
+					t.Errorf("扫描器应把裸 ?? 记为两个占位符：got %d（sql=%s）", count, sqlStr)
+				}
+				return
+			}
+			engineCount := enginePlaceholderCount(t, dao, dialect, sqlStr)
+			scannerCount := count
+			if dialect == "PostgreSQL" {
+				scannerCount = maxIndex
+			}
+			if scannerCount != engineCount {
+				t.Fatalf("扫描器与引擎不一致：扫描器=%d，引擎=%d（sql=%s）", scannerCount, engineCount, sqlStr)
+			}
+			assertCompileRawArgCount(t, dao.grammar, sqlStr, engineCount)
+		})
+	}
+}
+
+// scanParitySQL 按方言渲染用例 SQL；返回 false 表示该用例不适用于此方言。
+func scanParitySQL(tc scanParityCase, dialect string) (string, bool) {
+	if len(tc.dialectSQL) > 0 {
+		sqlStr, ok := tc.dialectSQL[dialect]
+		if !ok {
+			return "", false
+		}
+		return renderRawPlaceholderTemplate(sqlStr, dialect), true
+	}
+	return renderRawPlaceholderTemplate(tc.tmpl, dialect), true
+}
+
+// scannerPlaceholderStat 返回扫描器在代码区看到的占位符个数与最大编号（$N）。
+func scannerPlaceholderStat(sqlStr string, syntax sqlScanSyntax) (count, maxIndex int) {
+	for _, segment := range splitSQLCode(sqlStr, syntax) {
+		if !segment.code {
+			continue
+		}
+		text := segment.text
+		for i := 0; i < len(text); i++ {
+			if digits := numberedDigits(text, i); digits > 0 {
+				if index, err := strconv.Atoi(text[i+1 : i+1+digits]); err == nil {
+					count++
+					if index > maxIndex {
+						maxIndex = index
+					}
+				}
+				i += digits
+				continue
+			}
+			if text[i] == '?' {
+				count++
+			}
+		}
+	}
+	return count, maxIndex
 }

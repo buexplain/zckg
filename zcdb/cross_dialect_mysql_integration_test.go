@@ -42,6 +42,9 @@ func TestCrossDialect_MySQL_Integration(t *testing.T) {
 		{"DeleteJoinExecError", crossDialectTestDeleteJoinExecError},
 		{"UpdateJoinNested", crossDialectTestUpdateJoinNested},
 		{"TransactionBeginError", crossDialectTestTransactionBeginError},
+		{"CompileRawLiterals", crossDialectTestCompileRawLiterals},
+		{"ScanEngineParity", crossDialectTestScanEngineParity},
+		{"CompileRawExec", crossDialectTestCompileRawExec},
 	}
 	for _, st := range subtests {
 		t.Run(st.name, func(t *testing.T) {
