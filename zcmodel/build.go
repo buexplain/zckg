@@ -472,8 +472,9 @@ func splitGeneratedCode(code, structName, methodName string) (structText, method
 // 骨架 = 原文件顶层的元素序列（原文件头、package 行、import、各顶层声明、文件尾注释）。
 // 合并时骨架的排列结构原封不动——有哪些声明、按什么顺序、各自在什么位置都不变：
 // 属于生成区的声明（Entity/DO 结构体、ToDO/ToEntity 方法）在各自原位替换为新内容，
-// 用户声明（含其前置游离注释、同行尾注释、声明间游离注释与文件尾注释）原样留在原位。
-// 因此表结构变化时 git diff 只呈现生成区那几处变更，用户代码不产生位置漂移的噪音。
+// 用户声明（含其前置游离注释、同行尾注释、声明间游离注释与文件尾注释）的内容与顺序保留在原位置。
+// 用户代码不产生位置漂移的噪音；但整个产物最终经 go/format 统一格式化（缩进、对齐、import 排序，
+// 槽位间统一以一个空行分隔），因此首次再生成可能同时出现用户区的格式类变更。
 //
 // 生成声明按「逐声明独立槽位」识别与替换：Entity 结构体、ToDO、DO 结构体、ToEntity 各占一个槽位，
 // 即使它们之间夹着用户代码也不搬动。生成声明在原文件中缺失时（首次引入 DO、用户手删过 ToDO 等）
@@ -485,8 +486,9 @@ func splitGeneratedCode(code, structName, methodName string) (structText, method
 // 首个槽位原位替换、其余重复槽位移除，避免同名方法共存导致编译失败。
 //
 // type 声明块按 Spec 粒度处理：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，
-// 用户类型（含各自注释）与块内不附着于任何 Spec 的游离注释原样保留；仅含一个生成 Spec 的声明
-// 以独立声明形态输出（不保留括号块），与首次生成的形态保持一致。
+// 重复生成的 Spec（含跨槽位重复）只保留首个、其余剔除，用户类型（含各自注释）与块内
+// 不附着于任何 Spec 的游离注释原样保留；仅含一个生成 Spec 的声明以独立声明形态输出
+// （不保留括号块），与首次生成的形态保持一致。
 //
 // go/parser 不会把 package 声明之前的 build tags/文件级注释放进 file.Decls，重建时按源码偏移
 // 显式前置保留；已有文件的包名尊重原文件，仅新建文件使用目录推导包名（见 packageNameOf）。
@@ -684,9 +686,14 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 	// （新文本为空表示该生成声明不再生成，即剔除），用户类型 Spec、块级 Doc 注释、
 	// 块内游离注释与其余原文原样保留。相比用 go/printer 重写过滤后的 AST，
 	// 此法不重建声明节点，块内不附着于任何 Spec 的游离注释不会被丢弃。
-	renderTypeBlock := func(d *ast.GenDecl, start, end int) string {
+	//
+	// 生成 Spec 按 genKind 去重：alreadySeen 为进入本块前已出现过的种类（前序独立声明或
+	// 前序块），本块内同种类也只输出首个；重复项就地剔除，避免同名类型共存。
+	// 返回值 emitted 为本次实际写入的生成种类，供调用方更新 seenGen/carrierIdx。
+	renderTypeBlock := func(d *ast.GenDecl, start, end int, alreadySeen map[genKind]bool) (string, map[genKind]bool) {
 		var sb strings.Builder
 		last := start
+		emitted := make(map[genKind]bool)
 		for _, spec := range d.Specs {
 			k, ok := generatedTypeKind(spec)
 			if !ok {
@@ -694,22 +701,35 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 			}
 			from, to := specSpan(spec)
 			sb.WriteString(string(origContent[last:from]))
-			sb.WriteString(genSpecText[k])
+			if genText[k] != "" && !alreadySeen[k] && !emitted[k] {
+				sb.WriteString(genSpecText[k])
+				emitted[k] = true
+			}
 			last = to
 		}
 		sb.WriteString(string(origContent[last:end]))
-		return sb.String()
+		return sb.String(), emitted
 	}
 
 	// receiverTypeName 返回方法接收者的类型名：指针接收者 (*Name) 与值接收者 (Name) 均返回 Name，
-	// 无接收者或接收者为其他类型（如泛型、选择器表达式）时返回空串。
+	// 括号包裹的接收者（如 (Name)、((Name))、*(Name)）先解包再判定；无接收者或接收者为其他类型
+	// （如泛型、选择器表达式）时返回空串。
+	unwrapParen := func(expr ast.Expr) ast.Expr {
+		for {
+			p, ok := expr.(*ast.ParenExpr)
+			if !ok {
+				return expr
+			}
+			expr = p.X
+		}
+	}
 	receiverTypeName := func(decl *ast.FuncDecl) string {
 		if decl.Recv == nil || len(decl.Recv.List) == 0 {
 			return ""
 		}
-		switch t := decl.Recv.List[0].Type.(type) {
+		switch t := unwrapParen(decl.Recv.List[0].Type).(type) {
 		case *ast.StarExpr:
-			if ident, ok := t.X.(*ast.Ident); ok {
+			if ident, ok := unwrapParen(t.X).(*ast.Ident); ok {
 				return ident.Name
 			}
 		case *ast.Ident:
@@ -881,7 +901,8 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 					pending += lead
 				case genCount == 0:
 					// 块内含用户类型，仅剔除不再生成的生成 Spec
-					slots = append(slots, slot{text: takeLead(lead) + renderTypeBlock(d, start, end)})
+					rendered, _ := renderTypeBlock(d, start, end, seenGen)
+					slots = append(slots, slot{text: takeLead(lead) + rendered})
 				case len(d.Specs) == 1 && userCount == 0 && dropCount == 0:
 					// 单一生成类型（标准的独立 type 声明，或仅含一个生成类型的括号块）：
 					// 以独立声明形态就地替换，不保留括号块，与首次生成的形态一致
@@ -895,13 +916,18 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 					carrierIdx[k] = len(slots) - 1
 				default:
 					// 混合 type 块（含用户类型，或含多个生成类型）：保留块形态，
-					// 块内生成 Spec 就地替换、不再生成的生成 Spec 剔除，用户 Spec 与游离注释原样保留
-					slots = append(slots, slot{hasGen: true, text: takeLead(lead) + renderTypeBlock(d, start, end)})
-					for _, spec := range d.Specs {
-						if k, ok := generatedTypeKind(spec); ok && genText[k] != "" && !seenGen[k] {
-							seenGen[k] = true
-							carrierIdx[k] = len(slots) - 1
-						}
+					// 块内生成 Spec 就地替换、不再生成的生成 Spec 与重复生成的 Spec 剔除，
+					// 用户 Spec 与游离注释原样保留
+					rendered, emitted := renderTypeBlock(d, start, end, seenGen)
+					if len(emitted) == 0 && userCount == 0 {
+						// 块内生成 Spec 均为前序重复：整块移除，前置游离注释顺延
+						pending += lead
+						continue
+					}
+					slots = append(slots, slot{hasGen: len(emitted) > 0, text: takeLead(lead) + rendered})
+					for k := range emitted {
+						seenGen[k] = true
+						carrierIdx[k] = len(slots) - 1
 					}
 				}
 				continue

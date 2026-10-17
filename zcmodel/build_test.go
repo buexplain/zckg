@@ -711,6 +711,27 @@ func (d *UserDO) ToEntity() {}
 	}
 }
 
+// TestWriteOrReplaceStruct_RemoveParenthesizedValueReceiverToDO 锁定括号包裹的值接收者
+// （func (e (UserEntity)) ToDO()）同样被识别为生成方法：再生成后原位替换为指针接收者版本，
+// 不产生同名方法共存。Go 语法允许括号接收者，且落盘语法自校验发现不了方法集冲突，
+// 必须由接收者识别逻辑保证产物可编译。
+func TestWriteOrReplaceStruct_RemoveParenthesizedValueReceiverToDO(t *testing.T) {
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	for _, recv := range []string{"(UserEntity)", "((UserEntity))", "*(UserEntity)"} {
+		t.Run(recv, func(t *testing.T) {
+			orig := "package model\n\ntype UserEntity struct {\n\tID int\n}\n\nfunc (e " + recv + ") ToDO() int {\n\treturn e.ID\n}\n\ntype UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}\n"
+			got := writeAndVerify(t, orig, entityCode, doCode, nil)
+			if n := strings.Count(got, "ToDO()"); n != 1 {
+				t.Fatalf("括号值接收者 ToDO 应被替换为唯一一份生成方法，实际 %d 份:\n%s", n, got)
+			}
+			assertNotContains(t, got, "ToDO() int", "括号值接收者 ToDO 应被移除")
+			assertContains(t, got, "func (e *UserEntity) ToDO()", "生成的指针接收者 ToDO 应保留")
+			typeCheckGoSource(t, got)
+		})
+	}
+}
+
 // TestBuildStruct_EmptyColumnTagName 验证 ColumnTagName 为空时跳过列名 tag，仅保留 json/description，
 // 且无任何 tag 的字段不输出空反引号。
 func TestBuildStruct_EmptyColumnTagName(t *testing.T) {
@@ -1965,6 +1986,9 @@ func TestWriteOrReplaceStruct_InvalidGeneratedCode(t *testing.T) {
 func TestWriteOrReplaceStruct_DropAndDedupeGeneratedDecls(t *testing.T) {
 	// 只传 Entity 结构体（不含任何方法与 DO）：原文件中的全部 DO 槽位与其方法都应被移除
 	const entityOnly = "type UserEntity struct {\n\tID int64\n}"
+	// 完整生成代码：供块内/跨槽位重复生成 Spec 的去重用例使用
+	const entityCode = "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	const doCode = "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
 
 	t.Run("drop_single_decl", func(t *testing.T) {
 		orig := "package model\n\ntype UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() UserDO {\n\treturn UserDO{}\n}\n\ntype UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() UserEntity {\n\treturn UserEntity{}\n}\n"
@@ -2000,6 +2024,39 @@ func TestWriteOrReplaceStruct_DropAndDedupeGeneratedDecls(t *testing.T) {
 		if n := strings.Count(got, "type UserDO struct"); n != 1 {
 			t.Fatalf("重复的生成类型声明应去重为 1 份，实际 %d 份\n%s", n, got)
 		}
+		typeCheckGoSource(t, got)
+	})
+
+	t.Run("dedupe_duplicate_generated_specs_in_mixed_block", func(t *testing.T) {
+		// 同一 type 块内的生成 Spec 重复：首个原位替换、其余剔除，用户类型保留
+		orig := "package model\n\ntype (\n\tUserEntity struct {\n\t\tID int\n\t}\n\tUserEntity struct {\n\t\tID string\n\t}\n\tKeep struct {\n\t\tName string\n\t}\n)\n"
+		got := writeAndVerify(t, orig, entityCode, doCode, nil)
+		if n := strings.Count(got, "UserEntity struct {"); n != 1 {
+			t.Fatalf("块内重复的生成 Spec 应去重为 1 份，实际 %d 份\n%s", n, got)
+		}
+		assertContains(t, got, "Keep struct", "同块内的用户类型应保留")
+		typeCheckGoSource(t, got)
+	})
+
+	t.Run("dedupe_block_spec_after_standalone_decl", func(t *testing.T) {
+		// 独立生成声明在前、type 块内又出现同名生成 Spec：块内重复项剔除，不残留重复类型
+		orig := "package model\n\ntype UserEntity struct {\n\tID int\n}\n\ntype (\n\tUserEntity struct {\n\t\tID string\n\t}\n\tKeep struct {\n\t\tName string\n\t}\n)\n"
+		got := writeAndVerify(t, orig, entityCode, doCode, nil)
+		if n := strings.Count(got, "UserEntity struct {"); n != 1 {
+			t.Fatalf("跨槽位重复的生成 Spec 应去重为 1 份，实际 %d 份\n%s", n, got)
+		}
+		assertContains(t, got, "Keep struct", "同块内的用户类型应保留")
+		typeCheckGoSource(t, got)
+	})
+
+	t.Run("dedupe_only_duplicate_specs_block_dropped", func(t *testing.T) {
+		// 块内全部生成 Spec 均为前序重复且无用户类型：整块移除，不残留空的 type 括号块
+		orig := "package model\n\ntype UserEntity struct {\n\tID int\n}\n\ntype (\n\tUserEntity struct {\n\t\tID string\n\t}\n\tUserEntity struct {\n\t\tID bool\n\t}\n)\n"
+		got := writeAndVerify(t, orig, entityCode, doCode, nil)
+		if n := strings.Count(got, "UserEntity struct {"); n != 1 {
+			t.Fatalf("重复的生成 Spec 应去重为 1 份，实际 %d 份\n%s", n, got)
+		}
+		assertNotContains(t, got, "type (", "全部为前序重复的生成块应整块移除")
 		typeCheckGoSource(t, got)
 	})
 }
