@@ -3442,6 +3442,24 @@ func TestNewApi_ToDeleteJoin(t *testing.T) {
 	}
 }
 
+// TestNewApi_ToDeleteJoin_TableWithParen 验证 SQLite DeleteJoin 对含 "(" 的表名
+// 仍按标识符引用主键列，而不是把 "table.id" 整体当作原始表达式（fuzz 发现）。
+func TestNewApi_ToDeleteJoin_TableWithParen(t *testing.T) {
+	g := NewSQLiteGrammar()
+	sub := newTestBuilder(g, nil).Table("orders").Select("user_id").Where("amount", ">", 100)
+	sqlStr, args, err := newTestBuilder(g, nil).Table("weird(table").
+		JoinSub(sub, "o", func(j *JoinBuilder) {
+			j.On("o.user_id", "=", "users.id")
+		}).
+		Where("id", "=", 1).
+		ToDeleteJoin()
+	assertNoError(t, err)
+	assertSQL(t,
+		`DELETE FROM "weird(table" WHERE "id" IN (SELECT "weird(table"."id" FROM "weird(table" INNER JOIN (SELECT "user_id" FROM "orders" WHERE "amount" > ?) AS "o" ON "o"."user_id" = "users"."id" WHERE "id" = ?)`,
+		sqlStr)
+	assertArgs(t, []any{100, 1}, args)
+}
+
 // TestBuilder_UpdateDeleteJoinBindingOrder 锁定 Update/DeleteJoin/Increment 在
 // "JoinOn(带值) + JoinSub(带派生表绑定与 ON 值)" 混合场景下的 args 顺序：
 // MySQL 为 JOIN → SET → WHERE；PG/SQLite 为 SET → FROM(派生表) → ON → WHERE。

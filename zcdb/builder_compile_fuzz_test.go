@@ -393,3 +393,142 @@ func runSubqueryFuzzTerminal(builder *Builder, shape uint8, variant bool, column
 		return builder.ToSelect()
 	}
 }
+
+// FuzzBuilderDeleteJoinCompile 覆盖 DELETE 与 JoinSub 的绑定形态：
+// 单 JoinSub、JoinOn+JoinSub 混合、双 JoinSub、无外层 WHERE、子查询内嵌 WhereInSub，
+// 以及带 JOIN 调用 ToDelete 的错误路径。混合 Join 在 PG/SQLite 与 MySQL/SQLite 的
+// args 排列不同，因此只断言跨方言参数数量一致，按方言校验占位符数量/顺序与确定性；
+// 精确 args 顺序由 TestBuilder_UpdateDeleteJoinBindingOrder 锁定。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcdb -run '^$' -fuzz '^FuzzBuilderDeleteJoinCompile$' -fuzztime=30s
+func FuzzBuilderDeleteJoinCompile(f *testing.F) {
+	seeds := []struct {
+		shape    uint8
+		variant  bool
+		table    string
+		column   string
+		operator string
+		value    string
+	}{
+		{0, false, "users", "status", "=", "active"},
+		{0, true, "users", "status", "=", "active"},
+		{1, false, "users", "status", "=", "active"},
+		{2, false, "users", "status", "=", "active"},
+		{3, false, "users", "status", "=", "active"},
+		{4, false, "users", "status", "=", "active"},
+		{5, false, "users", "status", "=", "active"},
+		{1, false, "", "status", "INVALID", "active"},
+		{0, false, "users", "a`b", "=", "x'y"},
+	}
+	for _, seed := range seeds {
+		f.Add(seed.shape, seed.variant, seed.table, seed.column, seed.operator, seed.value)
+	}
+
+	dialects := []builderFuzzDialect{
+		{"MySQL", NewMySQLGrammar(), mysqlScanSyntax},
+		{"PostgreSQL", NewPostgresGrammar(), pgScanSyntax},
+		{"SQLite", NewSQLiteGrammar(), sqliteScanSyntax},
+	}
+	f.Fuzz(func(t *testing.T, shape uint8, variant bool, table, column, operator, value string) {
+		if len(table) > 4<<10 || len(column) > 4<<10 || len(operator) > 256 || len(value) > 4<<10 {
+			return
+		}
+		if strings.Contains(column, "(") {
+			return
+		}
+		shape %= 6
+
+		results := make([]builderFuzzResult, len(dialects))
+		for i, dialect := range dialects {
+			builder := buildDeleteJoinFuzzBuilder(dialect.grammar, shape, variant, table, column, operator, value)
+			sql1, args1, err1 := runDeleteJoinFuzzTerminal(builder, shape)
+			sql2, args2, err2 := runDeleteJoinFuzzTerminal(builder, shape)
+			if (err1 != nil) != (err2 != nil) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
+				t.Fatalf("dialect=%s shape=%d variant=%v table=%q column=%q op=%q value=%q: repeated compile differs:\n(%q,%v,%v)\n(%q,%v,%v)",
+					dialect.name, shape, variant, table, column, operator, value, sql1, args1, err1, sql2, args2, err2)
+			}
+			results[i] = builderFuzzResult{name: dialect.name, sql: sql1, args: args1, err: err1}
+		}
+
+		allErr := results[0].err != nil
+		for _, result := range results[1:] {
+			if (result.err != nil) != allErr {
+				t.Fatalf("shape=%d variant=%v table=%q column=%q op=%q value=%q: error presence differs across dialects: %+v",
+					shape, variant, table, column, operator, value, results)
+			}
+		}
+		if allErr {
+			return
+		}
+
+		baseArgCount := len(results[0].args)
+		for i, result := range results {
+			if len(result.args) != baseArgCount {
+				t.Fatalf("shape=%d variant=%v table=%q column=%q op=%q value=%q: arg count differs: %s=%d, %s=%d",
+					shape, variant, table, column, operator, value, results[0].name, baseArgCount, result.name, len(result.args))
+			}
+			if result.name == "PostgreSQL" {
+				assertSequentialPlaceholders(t, result.name, result.sql, dialects[i].syntax, len(result.args))
+				continue
+			}
+			if got := codePlaceholderCount(result.sql, dialects[i].syntax, result.name); got != len(result.args) {
+				t.Fatalf("dialect=%s shape=%d sql=%q: %d placeholder(s), %d arg(s)", result.name, shape, result.sql, got, len(result.args))
+			}
+		}
+	})
+}
+
+// buildDeleteJoinFuzzBuilder 构造 DeleteJoin 的混合 Join 形态；子查询与 ON 条件带值，
+// 便于同时覆盖派生表、ON 条件与外层 WHERE 三处绑定位置。
+func buildDeleteJoinFuzzBuilder(g Grammar, shape uint8, variant bool, table, column, operator, value string) *Builder {
+	sub := func() *Builder {
+		return NewBuilder(g, nil).Table("orders").Select("user_id").Where("amount", ">", value)
+	}
+	on := func(j *JoinBuilder) {
+		j.On("o.user_id", "=", "users.id").Where("o.score", ">", value)
+	}
+	switch shape {
+	case 0:
+		builder := NewBuilder(g, nil).Table(table).Select("id")
+		if variant {
+			builder.LeftJoinSub(sub(), "o", on)
+		} else {
+			builder.JoinSub(sub(), "o", on)
+		}
+		return builder.Where(column, operator, value)
+	case 1:
+		return NewBuilder(g, nil).Table(table).Select("id").
+			JoinOn("profiles", func(j *JoinBuilder) {
+				j.On("profiles.user_id", "=", "users.id").Where("profiles.active", "=", value)
+			}).
+			JoinSub(sub(), "o", on).
+			Where(column, operator, value)
+	case 2:
+		second := NewBuilder(g, nil).Table("items").Select("user_id").Where("qty", ">", "fallback")
+		return NewBuilder(g, nil).Table(table).Select("id").
+			JoinSub(sub(), "o", on).
+			JoinSub(second, "i", func(j *JoinBuilder) {
+				j.On("i.user_id", "=", "users.id").Where("i.qty", ">", value)
+			}).
+			Where(column, operator, value)
+	case 3:
+		return NewBuilder(g, nil).Table(table).Select("id").JoinSub(sub(), "o", on)
+	case 4:
+		nested := NewBuilder(g, nil).Table("orders").Select("user_id").
+			WhereInSub("user_id", func(q *Builder) {
+				q.Table("profiles").Select("user_id").Where("active", "=", value)
+			}).
+			Where("amount", ">", value)
+		return NewBuilder(g, nil).Table(table).Select("id").JoinSub(nested, "o", on).Where(column, operator, value)
+	default: // shape 5：带 JOIN 调用 ToDelete，预期 ErrDeleteWithJoin
+		return NewBuilder(g, nil).Table(table).Select("id").JoinSub(sub(), "o", on).Where(column, operator, value)
+	}
+}
+
+func runDeleteJoinFuzzTerminal(builder *Builder, shape uint8) (string, []any, error) {
+	if shape == 5 {
+		return builder.ToDelete()
+	}
+	return builder.ToDeleteJoin()
+}

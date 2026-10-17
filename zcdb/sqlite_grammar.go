@@ -494,7 +494,7 @@ func (g *SQLiteGrammar) CompileDeleteJoin(b *Builder) string {
 	var sub strings.Builder
 
 	sub.WriteString("SELECT ")
-	sub.WriteString(g.WrapColumn(b.table + ".id"))
+	sub.WriteString(g.WrapTable(b.table) + "." + g.WrapColumn("id"))
 	sub.WriteString(" FROM ")
 	sub.WriteString(g.WrapTable(b.table))
 	for _, join := range b.joins {
