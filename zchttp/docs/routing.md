@@ -348,4 +348,4 @@ v1.GET("/after", handlerB)  // 应用 [logger, auth]；/before 不受影响
 路由基数树（`Router.trees`）与顺序索引（`Router.routes`）不支持动态注册后并发读取：
 
 - **必须在服务对外提供请求之前完成所有路由注册**（典型用法：启动时注册完再 `ListenAndServe`）。
-- 服务运行期间**不支持动态注册路由**。若在服务运行中调用 `GET`/`POST` 等注册方法，会触发 Go map 并发读写导致进程崩溃（`fatal error: concurrent map read and map write`）。
+- 服务运行期间**不支持动态注册路由**。若在服务运行中调用 `GET`/`POST` 等注册方法，属于数据竞争（未定义行为）：可能触发 Go map 并发读写的 `fatal error`，也可能产生不一致的路由状态，不能依赖“必然立即崩溃”来发现该误用。

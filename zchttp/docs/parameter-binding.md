@@ -51,7 +51,7 @@ GET /search?keyword=go&page=3
 >
 > JSON 请求体必须包含且仅包含一个完整 JSON 值；首个值后的空白合法，第二个 JSON 值或其他非空尾随内容会绑定失败并返回 400。空请求体保持现有 Req 模板值。
 >
-> `multipart/form-data` 的内存缓冲上限由引擎字段 `MultipartFormMaxMemory` 定义，`NewEngine` 默认 **32 MB**，超出部分由标准库写入临时文件；按需调整示例：`engine.MultipartFormMaxMemory = 64 << 20`。
+> `multipart/form-data` 的内存缓冲上限由引擎字段 `MultipartFormMaxMemory` 定义，`NewEngine` 默认 **32 MB**。文件部分的超出量由标准库写入临时文件；非文件表单值没有落盘路径，它与文件部分共享 `MultipartFormMaxMemory + 10 MB` 的内存预算，超出时绑定失败并返回 400（`multipart: message too large`）。按需调整示例：`engine.MultipartFormMaxMemory = 64 << 20`。
 
 ### 2.1 请求体大小限制（MaxBodyBytes）
 
@@ -61,9 +61,9 @@ GET /search?keyword=go&page=3
 | --- | --- |
 | `NewEngine()` 默认 **32 MB** | 超限请求在绑定阶段失败，映射为 `BindingError` 返回 **400** |
 | 显式调大（如 `engine.MaxBodyBytes = 64 << 20`） | 适用于合法的大请求体场景 |
-| 显式置 `0` | 框架不额外限制（需自行评估超大请求体导致的内存/磁盘 DoS 风险）；但解析器自身的限制仍生效：`application/x-www-form-urlencoded` 由标准库 `ParseForm` 解析，超过 10 MB 时绑定失败返回 400（`http: POST too large`），JSON 与 multipart 无此隐式上限 |
+| 显式置 `0` | 框架不额外限制（需自行评估超大请求体导致的内存/磁盘 DoS 风险）；但解析器自身的限制仍生效：`application/x-www-form-urlencoded` 由标准库 `ParseForm` 解析，超过 10 MB 时绑定失败返回 400（`http: POST too large`）；JSON 无额外隐式上限；multipart 的非文件部分仍受 `MultipartFormMaxMemory + 10 MB` 预算约束（文件部分可落盘） |
 
-两个字段的关系：`MaxBodyBytes` 是请求体的**整体入口上限**（先于任何解析生效）；`MultipartFormMaxMemory` 仅控制 multipart 解析时的**内存缓冲上限**（超出部分写入临时文件，仍受 `MaxBodyBytes` 总量约束）。需要大文件上传时两者需同步调大。
+两个字段的关系：`MaxBodyBytes` 是请求体的**整体入口上限**（先于任何解析生效）；`MultipartFormMaxMemory` 仅控制 multipart 解析时的**内存缓冲上限**（文件部分超出时写入临时文件；非文件部分共享该上限 + 10 MB，超出即失败；整体仍受 `MaxBodyBytes` 约束）。需要大文件上传时两者需同步调大。
 
 ```go
 engine := zchttp.NewEngine()
@@ -210,7 +210,7 @@ GET /search?tags=a&tags=b&tags=c   →   Tags []string{"a","b","c"}
 | `*time.Time` | ✅ | 任意层指针（如 `**time.Time`）均可，解析后落到最内层值 |
 | `[]time.Time` | ✅ | 切片元素逐个解析 |
 | `[]*time.Time` | ✅ | 每个元素分配独立值后解析 |
-| `[][]time.Time`、`*[]time.Time` | ❌ | 绑定链路不支持多层容器与切片指针，标签不生效（注册期不会报错，字段保持零值） |
+| `[][]time.Time`、`*[]time.Time` | ❌ | 绑定链路不支持多层容器与切片指针，标签不生效（注册期不会报错，字段保持绑定前值/零值，不会被写入） |
 | `map[K]time.Time` | ❌ | map 值不参与标量绑定 |
 
 > 只有"请求侧"会解析时间：Res 结构体不参与绑定，`time.Time` 响应字段由 `encoding/json` 序列化，恒输出 RFC3339 字符串，`time_format`/`time_location` 写在 Res 上不生效。
@@ -288,10 +288,12 @@ func upload(ctx context.Context, req UploadReq) (Res, error) {
 `default` 标签仅在以下类型上生效（`isDefaultSupported` 返回 true，`hasDefault` 置为 true）：
 
 - 标量：`string`、`bool`、`int/uint` 全系列、`float32`/`float64`
-- 标量指针：`*string`、`*int`、`*bool` 等
-- 标量切片：`[]string`、`[]int`、`[]*int` 等
+- 标量指针：`*string`、`*int`、`*bool` 等（任意层指针，如 `**int`）
+- 标量切片：`[]string`、`[]int`、`[]*int`、`[]**int` 等（元素必须是标量或标量指针）
 
-> ⚠️ **误用检测为告警级（非阻断）**：`default` 写在上述范围之外（如 `time.Time`、`map`、`struct`）或写在请求阶段永不可达的路径上时，注册期仅输出 `slog.Warn` 告警（含路由与 handler 位置），**不会 panic 或拒绝注册**，误用字段将"永不填充默认值"。生产环境若将日志级别调至 Error 则该提示不可见，请保持启动期日志可见并及时关注 Warn 输出。
+> 指向容器、容器的容器与数组（如 `*[]int`、`[][]int`、`[]*[]int`、`[N]int`）**不在支持范围**：`setFieldValue` 不会展开这些形态，注册期按“不支持类型”告警且永不填充；OpenAPI 也不会为它们展示 `default`（与运行时一致）。
+
+> ⚠️ **误用检测为告警级（非阻断）**：`default` 写在上述范围之外（如 `time.Time`、`map`、`struct`、`*[]int`）或写在请求阶段永不可达的路径上时，注册期仅输出 `slog.Warn` 告警（含路由与 handler 位置），**不会 panic 或拒绝注册**，误用字段将"永不填充默认值"。生产环境若将日志级别调至 Error 则该提示不可见，请保持启动期日志可见并及时关注 Warn 输出。
 
 ### 两阶段填充规则
 

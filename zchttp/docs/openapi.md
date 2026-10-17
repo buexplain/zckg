@@ -146,6 +146,8 @@ Go 原始字符串不能用反斜杠转义反引号；这里的 `\x60` 由 `refl
 
 切片类型字段的 `default` 按逗号切分后，逐元素依据 items schema 递归转换展示（如 `default:"a,b"` 展示为 `["a","b"]`，`[]int` 的 `default:"1,2"` 展示为 `[1,2]`）；Trim 后为空（`default:""`、`default:",,,"`）视为空切片 `[]`，与 Req 运行时填充语义一致。
 
+> 支持范围与 `isDefaultSupported` 一致：仅标量、标量指针（任意层）与标量切片。数组、指向容器的指针（如 `*[]T`）与容器的容器（如 `[][]T`、`[]*[]T`）即使写了 `default` 也不展示——运行时同样不会填充。
+
 `GenerateOpenAPI` 采用**三遍遍历**架构：第一遍（`collectTypeUsages`）收集每个 struct 类型的”值嵌套可达性”（`reachedViaValue` map）；第二遍（`collectDefaultsReachability`）收集每个 struct 类型是否可被 `applyDefaults` 递归到达（`reachedByDefaults` map）；第三遍构造 schema 时 `decorate` 依据这两个可达性标记决定是否输出 `default`——指针字段依赖 `reachedByDefaults`，值字段依赖 `reachedViaValue`。两遍收集都只遍历 Req（Res 不参与 default 展示），因此同一类型只出现在响应中时不会获得可达性标记。
 
 ## required 推断规则（仅 Req）
@@ -159,6 +161,7 @@ Req 字段在 OpenAPI schema 中是否标记为 `required`，按以下规则判�
 
 > `nonzero` 与 `default` 独立解析：Req 中带有受支持 `default` 的 `nonzero:”true”` 字段在运行时**仍然会校验零值**（所见即所得），但在文档中标记为可选，避免”有默认值却又必填”的矛盾。
 > 响应 schema **不输出 `required`**：`nonzero` 是请求侧的运行时校验约束，响应没有对应语义。若需要在响应 schema 中声明”该字段总会返回”，当前只能写在 `description` 里——框架不再用 `nonzero` 兼职表达响应约束。
+> 带 `json` 名的匿名嵌入在 JSON schema 中是嵌套对象：若其扁平化的 `nonzero:"true"` 子字段无法由默认值满足，父级会把该嵌入属性名加入 `required`（省略整个嵌入对象会使运行时扁平校验失败）。无 json 名的匿名嵌入本身不产生属性，其必填子字段直接列在父级 `required` 中。
 
 ## 类型映射
 

@@ -127,8 +127,8 @@ func WantHtml(r *http.Request) bool {
 	return strings.Contains(accept, "text/html") || strings.Contains(accept, "text/plain")
 }
 
-// DefaultResponseHandler 默认成功响应：若 handler 已写入响应（如文件下载、自定义 Content-Type 等）
-// 则跳过；否则以统一 JSON 结构返回 res。
+// DefaultResponseHandler 默认成功响应：若 handler 已写入响应（如文件下载、调用过 Write/Flush 等）
+// 则跳过；仅设置响应头不会跳过，自定义 Content-Type 会被默认回调覆盖。否则以统一 JSON 结构返回 res。
 // res 无法编码为 JSON（如含 func/chan 字段）时不写出任何 JSON 片段，改为 500 +
 // text/plain 正文 "internal server error"；编码成功后写入失败（如客户端断开）仅记录日志。
 func DefaultResponseHandler(w http.ResponseWriter, r *http.Request, res any) {
