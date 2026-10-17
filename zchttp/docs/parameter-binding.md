@@ -32,9 +32,11 @@ GET /search?keyword=go&page=3
 | Content-Type | 绑定方式 |
 | --- | --- |
 | `application/json` | `json.Decode` 解析请求体 |
-| `application/x-www-form-urlencoded` | `r.ParseForm()` 后绑定 `r.PostForm` |
+| `application/x-www-form-urlencoded` | 解析请求体表单后绑定（body 覆盖 query） |
 | `multipart/form-data` | `r.ParseMultipartForm(MultipartFormMaxMemory)` 后绑定表单字段与上传文件 |
 | 其他（有请求体时） | 回退按 JSON 解析 |
+
+> urlencoded body 对除 GET/DELETE/HEAD 外的**所有**方法生效（含 OPTIONS/TRACE/CONNECT）。框架不直接依赖 `net/http.ParseForm` 的方法白名单（其只对 POST/PUT/PATCH 读取 body），而是为其余方法显式补读请求体，避免同一 Content-Type 在不同方法下行为不一致。
 
 **body 覆盖 query 的粒度由解码器语义决定**（以 JSON 为例）：
 

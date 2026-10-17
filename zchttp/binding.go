@@ -8,6 +8,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -82,10 +83,11 @@ func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartM
 	case "application/json":
 		return decodeJSONBody(r.Body, reqPtr.Interface())
 	case "application/x-www-form-urlencoded":
-		if err := r.ParseForm(); err != nil {
+		values, err := parseURLEncodedBody(r)
+		if err != nil {
 			return err
 		}
-		return bindValues(reqPtr, r.PostForm, nil, meta)
+		return bindValues(reqPtr, values, nil, meta)
 	case "multipart/form-data":
 		// 超出部分由 net/http 写入临时文件
 		if err := r.ParseMultipartForm(multipartMaxMemory); err != nil {
@@ -99,6 +101,30 @@ func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartM
 		// 未知 Content-Type：若有请求体则尝试按 JSON 解析，否则不绑定
 		return decodeJSONBody(r.Body, reqPtr.Interface())
 	}
+}
+
+// parseURLEncodedBody 解析 urlencoded 请求体并返回待绑定的表单值。
+// net/http 的 ParseForm 只对 POST/PUT/PATCH 读取 body，其余方法（OPTIONS/TRACE/CONNECT）
+// 会静默忽略 body。这里用浅拷贝伪装成 POST 复用标准库完整的读取逻辑，再把表单副作用
+// 写回原请求，使"除 GET/DELETE/HEAD 外一律合并绑定 body"的契约对 urlencoded 与
+// JSON/multipart 保持一致，同时保留 ParseForm 的 10 MB 上限与错误语义。
+func parseURLEncodedBody(r *http.Request) (url.Values, error) {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		if err := r.ParseForm(); err != nil {
+			return nil, err
+		}
+		return r.PostForm, nil
+	}
+	fake := new(http.Request)
+	*fake = *r
+	fake.Method = http.MethodPost
+	if err := fake.ParseForm(); err != nil {
+		return nil, err
+	}
+	r.PostForm = fake.PostForm
+	r.Form = fake.Form
+	return r.PostForm, nil
 }
 
 // decodeJSONBody 只接受一个完整 JSON 值；空请求体合法，尾随空白之外的内容均报错。

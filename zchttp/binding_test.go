@@ -2177,6 +2177,43 @@ func TestBindRequestDataKeepRawBody(t *testing.T) {
 	})
 }
 
+// TestBindURLEncodedBodyAllBodyMethods 锁死 urlencoded body 的跨方法一致性：
+// net/http.ParseForm 只对 POST/PUT/PATCH 读取 body，框架必须为 OPTIONS/TRACE/CONNECT
+// 显式补读，保证"除 GET/DELETE/HEAD 外均合并绑定"；同时 r.PostForm/r.Form 的副作用
+// 应与 ParseForm 一致——r.Form 中 body 值在前、query 值在后。
+func TestBindURLEncodedBodyAllBodyMethods(t *testing.T) {
+	type formReq struct {
+		Name string `json:"name" form:"nick"`
+		Page int    `json:"page"`
+	}
+	meta := buildStructMeta(reflect.TypeOf(formReq{}))
+
+	for _, method := range []string{
+		http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodOptions, http.MethodTrace, http.MethodConnect,
+	} {
+		t.Run(method, func(t *testing.T) {
+			r := httptest.NewRequest(method, "/bind", strings.NewReader("nick=body&page=2"))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			r.URL.RawQuery = "nick=q&page=1"
+			reqPtr := reflect.New(reflect.TypeOf(formReq{}))
+			if err := bindRequestData(r, reqPtr, meta, 32<<20, false); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := reqPtr.Elem().Interface().(formReq)
+			if got.Name != "body" || got.Page != 2 {
+				t.Fatalf("bound %+v, want body/2 (body must override query)", got)
+			}
+			if got := r.PostForm.Get("nick"); got != "body" {
+				t.Fatalf("PostForm[nick] = %q, want body", got)
+			}
+			if values := r.Form["nick"]; len(values) != 2 || values[0] != "body" || values[1] != "q" {
+				t.Fatalf("Form[nick] = %q, want [body q] (body values before query values)", values)
+			}
+		})
+	}
+}
+
 // ======== setUnix/setUnixAuto/setTime 分支补测 ========
 
 // TestSetUnixAutoBranches 覆盖 16 位（微秒）、19 位（纳秒）与其他位数（秒）分支
@@ -2711,24 +2748,28 @@ type docMaxBodyZeroRes struct {
 }
 
 // TestBindBody_MaxBodyBytesZeroParserLimits 锁死 MaxBodyBytes=0 时“框架不额外限制、解析器自身限制仍生效”：
-// 11 MB 的 urlencoded 请求体被标准库 ParseForm 的 10 MB 固有上限拒绝（400，消息 http: POST too large）；
-// 同样 11 MB 的 JSON 请求体正常绑定（200，长度完整）。
+// 11 MB 的 urlencoded 请求体被标准库 ParseForm 的 10 MB 固有上限拒绝（400，消息 http: POST too large），
+// POST 与显式补读 body 的 OPTIONS 一致；同样 11 MB 的 JSON 请求体正常绑定（200，长度完整）。
 func TestBindBody_MaxBodyBytesZeroParserLimits(t *testing.T) {
 	router := NewRouter()
-	router.POST("/zero-limit", func(_ context.Context, req docMaxBodyZeroReq) (docMaxBodyZeroRes, error) {
+	handler := func(_ context.Context, req docMaxBodyZeroReq) (docMaxBodyZeroRes, error) {
 		return docMaxBodyZeroRes{Len: len(req.Body)}, nil
-	})
+	}
+	router.POST("/zero-limit", handler)
+	router.OPTIONS("/zero-limit", handler)
 	engine := NewEngine()
 	engine.Router = router
 	engine.MaxBodyBytes = 0
 	payload := strings.Repeat("a", 11<<20)
 
-	formReq := httptest.NewRequest(http.MethodPost, "/zero-limit", strings.NewReader("body="+payload))
-	formReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	formRec := httptest.NewRecorder()
-	engine.ServeHTTP(formRec, formReq)
-	if formRec.Code != http.StatusBadRequest || !strings.Contains(formRec.Body.String(), "http: POST too large") {
-		t.Fatalf("urlencoded 11MB: status = %d, body = %.200s, want 400 with http: POST too large", formRec.Code, formRec.Body.String())
+	for _, method := range []string{http.MethodPost, http.MethodOptions} {
+		formReq := httptest.NewRequest(method, "/zero-limit", strings.NewReader("body="+payload))
+		formReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		formRec := httptest.NewRecorder()
+		engine.ServeHTTP(formRec, formReq)
+		if formRec.Code != http.StatusBadRequest || !strings.Contains(formRec.Body.String(), "http: POST too large") {
+			t.Fatalf("%s urlencoded 11MB: status = %d, body = %.200s, want 400 with http: POST too large", method, formRec.Code, formRec.Body.String())
+		}
 	}
 
 	jsonRec := serveJSONOn(t, engine, http.MethodPost, "/zero-limit", `{"body":"`+payload+`"}`)
@@ -3137,6 +3178,7 @@ type bindDiffCase struct {
 	contentType string
 	body        []byte
 	maxMemory   int64
+	keepRaw     bool
 }
 
 // refBindFileHeaderPtrType 由参考实现独立获取，避免依赖被测包的文件字段判定变量。
@@ -3280,7 +3322,7 @@ func refParseScalar(fieldValue reflect.Value, value string) bool {
 }
 
 // refBindRequest 用 stdlib 独立实现文档中的绑定流程：
-// 先按 query 绑定（GET/DELETE/HEAD 到此结束），其余方法按 Content-Type
+// 先按 query 绑定（GET/DELETE/HEAD 或 keepRaw 到此结束），其余方法按 Content-Type
 // 选择 JSON、urlencoded 或 multipart，后绑定者覆盖先绑定者。
 func refBindRequest(t *testing.T, tc bindDiffCase) (bindDiffReq, error) {
 	t.Helper()
@@ -3288,6 +3330,9 @@ func refBindRequest(t *testing.T, tc bindDiffCase) (bindDiffReq, error) {
 	// 与 net/url.Values.Query 一致：忽略解析错误，保留已解析部分
 	queryValues, _ := url.ParseQuery(tc.rawQuery)
 	refBindValues(reflect.ValueOf(&dst).Elem(), queryValues, nil)
+	if tc.keepRaw {
+		return dst, nil
+	}
 
 	switch tc.method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
@@ -3354,7 +3399,7 @@ func runBindDiff(t *testing.T, meta structMeta, tc bindDiffCase) (bindDiffReq, e
 		req.Header.Set("Content-Type", tc.contentType)
 	}
 	reqPtr := reflect.New(reflect.TypeOf(bindDiffReq{}))
-	err := bindRequestData(req, reqPtr, meta, tc.maxMemory, false)
+	err := bindRequestData(req, reqPtr, meta, tc.maxMemory, tc.keepRaw)
 	if req.MultipartForm != nil {
 		if cleanupErr := req.MultipartForm.RemoveAll(); cleanupErr != nil {
 			t.Fatalf("case %s: cleanup request multipart temp files: %v", tc.name, cleanupErr)
@@ -3404,6 +3449,9 @@ func buildBindDiffMultipart(t testing.TB, fields []bindDiffField, files []bindDi
 	t.Helper()
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
+	if err := writer.SetBoundary("zchttp-bind-diff-boundary"); err != nil {
+		t.Fatalf("set multipart boundary: %v", err)
+	}
 	for _, field := range fields {
 		if err := writer.WriteField(field.name, field.value); err != nil {
 			t.Fatalf("write multipart field %q: %v", field.name, err)
@@ -3424,8 +3472,9 @@ func buildBindDiffMultipart(t testing.TB, fields []bindDiffField, files []bindDi
 	return buf.Bytes(), writer.FormDataContentType()
 }
 
-// curatedBindDiffCases 覆盖文档中的关键绑定语义：方法分流、query/body 覆盖、
-// JSON null/显式零值/重复键/尾随值、form 尽力绑定、Content-Type 选择、multipart 文件。
+// curatedBindDiffCases 覆盖文档中的关键绑定语义：方法分流（含 OPTIONS/TRACE/CONNECT）、
+// query/body 覆盖、KeepRawBody、JSON null/显式零值/重复键/尾随值、form 尽力绑定、
+// Content-Type 选择、multipart 文件。
 func curatedBindDiffCases(t testing.TB) []bindDiffCase {
 	t.Helper()
 	multipartBody, multipartCT := buildBindDiffMultipart(t,
@@ -3444,6 +3493,10 @@ func curatedBindDiffCases(t testing.TB) []bindDiffCase {
 		{name: "get_body_ignored", method: http.MethodGet, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20},
 		{name: "delete_body_ignored", method: http.MethodDelete, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20},
 		{name: "head_body_ignored", method: http.MethodHead, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20},
+		{name: "options_form_merge", method: http.MethodOptions, rawQuery: "nick=q&page=1", contentType: "application/x-www-form-urlencoded", body: []byte("nick=body&page=2"), maxMemory: 32 << 20},
+		{name: "trace_json_body", method: http.MethodTrace, rawQuery: "nick=q", contentType: "application/json", body: []byte(`{"name":"body"}`), maxMemory: 32 << 20},
+		{name: "connect_form_merge", method: http.MethodConnect, rawQuery: "nick=q", contentType: "application/x-www-form-urlencoded", body: []byte("nick=body"), maxMemory: 32 << 20},
+		{name: "options_multipart", method: http.MethodOptions, rawQuery: "nick=q", contentType: multipartCT, body: multipartBody, maxMemory: 32 << 20},
 		{name: "post_json_partial_override", method: http.MethodPost, rawQuery: "nick=q&page=1&tags=q1&tags=q2&score=5&active=true", contentType: "application/json", body: []byte(`{"name":"body","page":0,"tags":null,"score":null}`), maxMemory: 32 << 20},
 		{name: "post_json_empty_body", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: nil, maxMemory: 32 << 20},
 		{name: "post_json_vertical_tab_body", method: http.MethodPost, rawQuery: "nick=q", contentType: "application/json", body: []byte("\v"), maxMemory: 32 << 20},
@@ -3459,6 +3512,9 @@ func curatedBindDiffCases(t testing.TB) []bindDiffCase {
 		{name: "post_form_invalid_keeps_query", method: http.MethodPost, rawQuery: "page=3&active=true", contentType: "application/x-www-form-urlencoded", body: []byte("page=abc&active=notabool"), maxMemory: 32 << 20},
 		{name: "post_form_malformed_escape", method: http.MethodPost, rawQuery: "", contentType: "application/x-www-form-urlencoded", body: []byte("page=%zz"), maxMemory: 32 << 20},
 		{name: "post_form_semicolon", method: http.MethodPost, rawQuery: "", contentType: "application/x-www-form-urlencoded", body: []byte("page=1;active=true"), maxMemory: 32 << 20},
+		{name: "post_json_keep_raw", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20, keepRaw: true},
+		{name: "post_form_keep_raw", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/x-www-form-urlencoded", body: []byte("nick=body&page=9"), maxMemory: 32 << 20, keepRaw: true},
+		{name: "options_form_keep_raw", method: http.MethodOptions, rawQuery: "nick=q&page=1", contentType: "application/x-www-form-urlencoded", body: []byte("nick=body&page=9"), maxMemory: 32 << 20, keepRaw: true},
 		{name: "post_form_charset", method: http.MethodPost, rawQuery: "page=1", contentType: "application/x-www-form-urlencoded; charset=UTF-8", body: []byte("nick=body&page=2"), maxMemory: 32 << 20},
 		{name: "post_unknown_ct_json", method: http.MethodPost, rawQuery: "nick=q", contentType: "text/plain", body: []byte(`{"name":"body"}`), maxMemory: 32 << 20},
 		{name: "post_empty_ct_json", method: http.MethodPost, rawQuery: "nick=q", contentType: "", body: []byte(`{"name":"body"}`), maxMemory: 32 << 20},
@@ -3610,6 +3666,9 @@ func refRandomMultipart(t *testing.T, rng *rand.Rand) ([]byte, string) {
 	t.Helper()
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
+	if err := writer.SetBoundary("zchttp-random-boundary"); err != nil {
+		t.Fatalf("set random multipart boundary: %v", err)
+	}
 	fieldCount := rng.Intn(6)
 	for i := 0; i < fieldCount; i++ {
 		key := refRandomKey(rng)
@@ -3662,14 +3721,11 @@ func refRandomUnknownContentType(rng *rand.Rand) string {
 	return []string{"text/plain", "application/octet-stream", "", "application/vnd.api+json"}[rng.Intn(4)]
 }
 
-// generateBindDiffRandomCases 生成随机请求：方法、query、Content-Type 与 body 相互独立，
+// generateBindDiffRandomCases 生成随机请求：方法、query、Content-Type、keepRaw 与 body 相互独立，
 // 覆盖 GET 带 body、未知/空 Content-Type 回退 JSON、form/multipart 解析错误等组合。
 func generateBindDiffRandomCases(t *testing.T, rng *rand.Rand, count int) []bindDiffCase {
 	t.Helper()
-	methods := []string{
-		http.MethodGet, http.MethodPost, http.MethodPut,
-		http.MethodPatch, http.MethodDelete, http.MethodHead,
-	}
+	methods := allHTTPMethods[:]
 	cases := make([]bindDiffCase, 0, count)
 	for i := 0; i < count; i++ {
 		method := methods[rng.Intn(len(methods))]
@@ -3704,6 +3760,7 @@ func generateBindDiffRandomCases(t *testing.T, rng *rand.Rand, count int) []bind
 			contentType: contentType,
 			body:        body,
 			maxMemory:   32 << 20,
+			keepRaw:     rng.Intn(6) == 0,
 		})
 	}
 	return cases
@@ -3736,41 +3793,31 @@ func TestBindStdlibDifferential(t *testing.T) {
 	})
 }
 
-// FuzzBindDifferential 用 stdlib 参考实现差分校验 query/form/JSON 绑定：
-// 固定方法、Content-Type、query 与 body 由 fuzzer 变异，逐次比较错误有无与绑定快照。
-// multipart 不纳入 fuzz 枚举（curated 用例已覆盖），避免任意 boundary 触发临时文件与磁盘 IO；
+// FuzzBindDifferential 用 stdlib 参考实现差分校验 query/form/JSON/multipart 绑定：
+// fuzzer 变异全部 HTTP 方法索引、原始 Content-Type（上限 1 KB）、query、body 与 keepRaw，
+// 逐次比较错误有无与绑定快照。Content-Type 不再是枚举，畸形媒体类型与 charset 变体
+// 可直接被探索；multipart 也纳入输入域——body 上限 64 KB 远低于 32 MB 内存阈值，
+// 不会落盘，runBindDiff 仍会清理可能产生的 MultipartForm。
+// 错误类别（Content-Type 解析错误 vs JSON 语法错误）不参与比较，仅比较错误有无。
 // body/query 上限 64 KB，保证单次执行足够快且无外部副作用。
 // 普通 go test 只运行 f.Add 种子；探索命令：
 //
 //	go test ./zchttp -run '^$' -fuzz '^FuzzBindDifferential$' -fuzztime=30s
 func FuzzBindDifferential(f *testing.F) {
 	meta := buildStructMeta(reflect.TypeOf(bindDiffReq{}))
-	methods := []string{
-		http.MethodGet, http.MethodPost, http.MethodPut,
-		http.MethodPatch, http.MethodDelete, http.MethodHead,
-	}
-	contentTypes := []string{
-		"application/json",
-		"application/json; charset=UTF-8",
-		"application/x-www-form-urlencoded",
-		"text/plain",
-		"",
-	}
+	methods := allHTTPMethods[:]
 	methodIndex := make(map[string]uint8, len(methods))
 	for i, method := range methods {
 		methodIndex[method] = uint8(i)
 	}
-	contentTypeIndex := make(map[string]uint8, len(contentTypes))
-	for i, contentType := range contentTypes {
-		contentTypeIndex[contentType] = uint8(i)
-	}
 
-	// 复用定向用例作为种子；multipart 用例的 Content-Type 不在枚举内，自动跳过
+	// 复用定向用例作为种子；Content-Type 为原始字符串，curated 用例全部可注入
 	type fuzzSeed struct {
 		method      uint8
-		contentType uint8
+		contentType string
 		query       string
 		body        string
+		keepRaw     bool
 	}
 	seenSeeds := make(map[fuzzSeed]bool)
 	for _, tc := range curatedBindDiffCases(f) {
@@ -3778,43 +3825,39 @@ func FuzzBindDifferential(f *testing.F) {
 		if !ok {
 			continue
 		}
-		contentType, ok := contentTypeIndex[tc.contentType]
-		if !ok {
-			continue
-		}
-		seed := fuzzSeed{method: method, contentType: contentType, query: tc.rawQuery, body: string(tc.body)}
+		seed := fuzzSeed{method: method, contentType: tc.contentType, query: tc.rawQuery, body: string(tc.body), keepRaw: tc.keepRaw}
 		if seenSeeds[seed] {
 			continue
 		}
 		seenSeeds[seed] = true
-		f.Add(seed.method, seed.contentType, seed.query, tc.body)
+		f.Add(seed.method, seed.contentType, seed.query, tc.body, seed.keepRaw)
+	}
+	// 补充畸形/未知 Content-Type 与固定 boundary multipart 的起点，避免解析分支缺少种子
+	for _, extra := range []struct {
+		contentType string
+		body        string
+	}{
+		{"application/json; charset", `{}`},
+		{"application/json; charset=UTF-32", `{"name":"x"}`},
+		{"application/x-www-form-urlencoded; charset", "nick=x"},
+		{"multipart/form-data; boundary=zfuzz", "--zfuzz\r\nContent-Disposition: form-data; name=\"nick\"\r\n\r\nbody\r\n--zfuzz--\r\n"},
+		{"", ""},
+	} {
+		f.Add(methodIndex[http.MethodPost], extra.contentType, "nick=q", []byte(extra.body), false)
 	}
 
-	f.Fuzz(func(t *testing.T, methodIdx, contentTypeIdx uint8, query string, body []byte) {
-		if len(query) > 64<<10 || len(body) > 64<<10 {
+	f.Fuzz(func(t *testing.T, methodIdx uint8, contentType, query string, body []byte, keepRaw bool) {
+		if len(query) > 64<<10 || len(body) > 64<<10 || len(contentType) > 1<<10 {
 			return
 		}
-		tc := bindDiffCase{
+		assertBindDiffCase(t, meta, bindDiffCase{
 			name:        "fuzz",
 			method:      methods[int(methodIdx)%len(methods)],
 			rawQuery:    query,
-			contentType: contentTypes[int(contentTypeIdx)%len(contentTypes)],
+			contentType: contentType,
 			body:        body,
 			maxMemory:   32 << 20,
-		}
-		want, wantErr := refBindRequest(t, tc)
-		got, gotErr := runBindDiff(t, meta, tc)
-		if (gotErr != nil) != (wantErr != nil) {
-			t.Fatalf("method=%s query=%q content-type=%q body=%q: implementation err=%v, reference err=%v",
-				tc.method, tc.rawQuery, tc.contentType, truncateBindDiffBody(body), gotErr, wantErr)
-		}
-		if wantErr != nil {
-			return
-		}
-		gotSnapshot, wantSnapshot := snapshotBindDiff(got), snapshotBindDiff(want)
-		if !reflect.DeepEqual(gotSnapshot, wantSnapshot) {
-			t.Fatalf("method=%s query=%q content-type=%q body=%q: implementation=%+v, reference=%+v",
-				tc.method, tc.rawQuery, tc.contentType, truncateBindDiffBody(body), gotSnapshot, wantSnapshot)
-		}
+			keepRaw:     keepRaw,
+		})
 	})
 }

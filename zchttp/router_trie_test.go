@@ -868,7 +868,7 @@ func refRequestPaths(rng *rand.Rand, routes []refRoute, randomCount int) []strin
 }
 
 // registerRefRoutes 注册参考路由，注册期 panic 视为生成器冲突模型与被测实现不一致。
-func registerRefRoutes(t *testing.T, routes []refRoute) *Router {
+func registerRefRoutes(t testing.TB, routes []refRoute) *Router {
 	t.Helper()
 	router := NewRouter()
 	defer func() {
@@ -978,29 +978,39 @@ func TestTrieLinearReferenceDifferential(t *testing.T) {
 	})
 }
 
+// assertNormalizePathContract 锁死 normalizePath 的对外契约：结果非空且以 "/" 开头、
+// 根路径以外无末尾 "/"、幂等、追加末尾 "/" 不改变结果。
+// fuzz 中原始路径必须在交给被测匹配前单独校验，否则归一化逻辑的回归会被
+// "两侧共用同一归一化结果"屏蔽。
+func assertNormalizePathContract(t *testing.T, raw, normalized string) {
+	t.Helper()
+	if normalized == "" || normalized[0] != '/' {
+		t.Fatalf("normalizePath(%q) = %q, want non-empty leading slash", raw, normalized)
+	}
+	if len(normalized) > 1 && normalized[len(normalized)-1] == '/' {
+		t.Fatalf("normalizePath(%q) = %q, want no trailing slash", raw, normalized)
+	}
+	if again := normalizePath(normalized); again != normalized {
+		t.Fatalf("normalizePath not idempotent for %q: %q -> %q", raw, normalized, again)
+	}
+	if withSlash := normalizePath(raw + "/"); withSlash != normalized {
+		t.Fatalf("normalizePath(%q) = %q, want trailing-slash equivalent %q", raw+"/", withSlash, normalized)
+	}
+}
+
 // FuzzRouterMatch 用线性参考匹配器差分校验基数树：fuzzer 变异路由表索引与请求路径，
 // 断言命中路由与捕获值一致，并拒绝参考实现的同优先级歧义。
+// 原始路径先校验 normalizePath 契约，再经归一化交给差分，使归一化逻辑本身也在 fuzz 覆盖内。
 // 路由表固定为 8 组定向用例（静态/参数/通配优先级、可选省略、回溯、根路径），
-// 路径先经 normalizePath 归一化；路径上限 64 KB，避免单次执行放大到不可控耗时。
+// 路径上限 64 KB，避免单次执行放大到不可控耗时。
 // 普通 go test 只运行 f.Add 种子；探索命令：
 //
 //	go test ./zchttp -run '^$' -fuzz '^FuzzRouterMatch$' -fuzztime=30s
 func FuzzRouterMatch(f *testing.F) {
 	tables := refCuratedRouteTables
 	routers := make([]*Router, len(tables))
-	registered := make([]map[*routeEntry]string, len(tables))
-	templates := make([][]string, len(tables))
 	for i, table := range tables {
-		router := NewRouter()
-		for _, route := range table.routes {
-			router.GET(route.path(), refMatchHandler)
-		}
-		routers[i] = router
-		registered[i] = make(map[*routeEntry]string, len(router.routes))
-		for _, record := range router.routes {
-			registered[i][record.entry] = record.path
-		}
-		templates[i] = refRouteTemplates(table.routes)
+		routers[i] = registerRefRoutes(f, table.routes)
 	}
 
 	pathSeeds := []string{
@@ -1020,25 +1030,37 @@ func FuzzRouterMatch(f *testing.F) {
 		}
 		index := int(tableIndex) % len(tables)
 		normalized := normalizePath(path)
-		entry, gotValues := routers[index].match(http.MethodGet, normalized)
-		wantRoute, wantValues, ambiguous := refMatch(tables[index].routes, normalized)
-		if ambiguous {
-			t.Fatalf("table=%d path=%q: reference matcher ambiguous", index, normalized)
+		assertNormalizePathContract(t, path, normalized)
+		assertTrieMatchesReference(t, routers[index], tables[index].routes, []string{normalized})
+	})
+}
+
+// FuzzRouterTableShapes 用 fuzz 种子确定性生成合法路由表，差分校验路由形状、注册与匹配：
+// 表由 generateRefRoutes 生成（保证无注册冲突），路径取 fuzz 输入与模板实例化集合；
+// 同时校验 normalizePath 契约。注册期 panic 由 registerRefRoutes 转为带路由表的失败。
+// 普通 go test 只运行 f.Add 种子；探索命令：
+//
+//	go test ./zchttp -run '^$' -fuzz '^FuzzRouterTableShapes$' -fuzztime=30s
+func FuzzRouterTableShapes(f *testing.F) {
+	for _, seed := range []int64{20261017, 20261018, 20261019, 20261020} {
+		for _, path := range []string{"/", "/a", "/a/b", "/a/b/c", "/users/v1/x"} {
+			f.Add(seed, path)
 		}
-		if wantRoute < 0 {
-			if entry != nil || len(gotValues) != 0 {
-				t.Fatalf("table=%d path=%q: trie hit %q values %v, reference miss",
-					index, normalized, registered[index][entry], gotValues)
-			}
+	}
+
+	f.Fuzz(func(t *testing.T, seed int64, path string) {
+		if len(path) > 64<<10 {
 			return
 		}
-		if entry == nil {
-			t.Fatalf("table=%d path=%q: trie miss, reference hit %q values %v",
-				index, normalized, templates[index][wantRoute], wantValues)
+		rng := rand.New(rand.NewSource(seed))
+		routes := generateRefRoutes(rng, 1+rng.Intn(7))
+		if len(routes) == 0 {
+			t.Fatalf("seed %d: generator produced no routes", seed)
 		}
-		if gotPath := registered[index][entry]; gotPath != templates[index][wantRoute] || !refSameValues(gotValues, wantValues) {
-			t.Fatalf("table=%d path=%q: trie %q values %v, reference %q values %v",
-				index, normalized, gotPath, gotValues, templates[index][wantRoute], wantValues)
-		}
+		router := registerRefRoutes(t, routes)
+		normalized := normalizePath(path)
+		assertNormalizePathContract(t, path, normalized)
+		paths := append([]string{normalized}, refRequestPaths(rng, routes, 0)...)
+		assertTrieMatchesReference(t, router, routes, paths)
 	})
 }
