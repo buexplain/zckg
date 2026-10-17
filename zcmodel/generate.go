@@ -23,7 +23,8 @@ import (
 //     避免产出无法编译或无法映射的代码；
 //  4. 生成 Entity（值类型字段）和 DO（any 类型字段）结构体及互转方法；
 //  5. 将生成代码写入 {OutputDir}/{文件名}.go（OutputDir 为空时报错），已存在的文件采用「骨架保持式合并」——
-//     顶层声明的排列结构不变，生成声明（Entity/DO 结构体、ToDO/ToEntity 方法）在原位替换，用户代码原位保留；
+//     顶层声明的排列结构不变，生成声明（Entity/DO 结构体、ToDO/ToEntity 方法）在原位替换，
+//     用户代码的内容与顺序原位保留（整个产物最终统一经 go/format 格式化）；
 //     落盘前对完整内容做 go/format 自校验，非法产物直接报错不写文件。
 func Generate(input Input) error {
 	// 校验数据库方言

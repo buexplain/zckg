@@ -111,6 +111,31 @@ func TestGenerate_JsonTagValueWithSpecialChars(t *testing.T) {
 	}
 }
 
+// TestGenerate_ExplicitJsonTagWithEmptyCase 锁定「显式优先」：全局 JsonTagValueCase 为空
+// （不自动生成 json tag）时，单列显式指定的 StructFieldInfo.JsonTagValue 仍会生成 json tag；
+// 未显式指定的列则完全不生成 json tag。
+func TestGenerate_ExplicitJsonTagWithEmptyCase(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := Generate(Input{
+		OutputDir: dir,
+		Dialect:   DialectMysql,
+		TableName: "user_info",
+		Columns: []*Column{
+			{Name: "id", Type: "bigint", StructFieldInfo: StructFieldInfo{JsonTagValue: "explicit"}},
+			{Name: "name", Type: "varchar(64)"},
+		},
+	}); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "user_info.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	got := string(content)
+	assertContains(t, got, `json:"explicit"`, "全局风格为空时显式 JsonTagValue 仍应生成 json tag")
+	assertNotContains(t, got, `json:"name"`, "未显式指定 JsonTagValue 的列不应自动生成 json tag")
+}
+
 // TestGenerate_InvalidJsonTagValueCase 验证 JsonTagValueCase 不在六种支持风格之内时的错误路径：
 // Generate 必须返回错误，且错误消息说明命名风格不受支持。
 func TestGenerate_InvalidJsonTagValueCase(t *testing.T) {

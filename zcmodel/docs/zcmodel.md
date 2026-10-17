@@ -12,7 +12,7 @@ zcmodel 是一个数据库模型代码生成模块：输入一张表的结构信
 
 - **三种方言**：内置 MySQL / PostgreSQL / SQLite 的列类型 → Go 类型映射表；
 - **命名自动转换**：任意风格的表名/列名（snake_case、camelCase、kebab-case 等）自动转为 Go 规范的 PascalCase，`id` 统一转为 `ID`；转换结果不是导出标识符（如中文列名）时报错，需显式指定名称；
-- **增量再生成（骨架保持式合并）**：目标文件已存在时，顶层声明的排列结构（有哪些声明、顺序、各自位置）原封不动，生成声明（Entity/DO 结构体、ToDO/ToEntity 方法）在各自原位替换为新内容，**用户自定义代码（含自定义方法、声明间的游离注释、`//go:generate` 等指令、行尾注释与文件尾注释）原样留在原位**，生成代码不再引用的 import 被移除——表结构变化时 git diff 只呈现生成区那几处变更；
+- **增量再生成（骨架保持式合并）**：目标文件已存在时，顶层声明的排列结构（有哪些声明、顺序、各自位置）原封不动，生成声明（Entity/DO 结构体、ToDO/ToEntity 方法）在各自原位替换为新内容，**用户自定义代码（含自定义方法、声明间的游离注释、`//go:generate` 等指令、行尾注释与文件尾注释）的内容与顺序原样保留在原位置**；整个产物最终经 gofmt 统一格式化（缩进、对齐、import 排序，声明间统一以一个空行分隔），因此首次再生成的 diff 可能同时包含用户区的格式类变更，之后保持稳定；生成代码不再引用的 import 被移除；
 - **tag 安全**：json、列映射、`ddl`、`description` 的 tag 值写入前经过转义净化，含反引号、换行、双引号的注释或列名不会破坏生成代码的语法；
 - **元数据快照**：可选的 `ddl` tag 呈现该列的类 DDL 列定义片段（类型 / 可空 / 默认值 / MySQL EXTRA），`primary_key` tag 标记主键列，`Input.Indexes` 渲染为结构体 doc 注释中的索引清单——使读模型文件的人与 AI 编码代理不必回查数据库即可看到表的面貌。元数据是**生成时刻的快照**，表结构变更后需重新生成才会刷新（不做运行时校验）。
 
@@ -132,7 +132,7 @@ func Generate(input Input) error
 | `FileName` | `string` | 输出文件名（不含 `.go` 扩展名）；为空时取 `TableName`。表名会触发 Go 文件名构建规则（如 `order_linux`、`user_test`、`_tmp`）时用它改名；结构体名仍由表名推导 |
 | `TableComment` | `string` | 表注释，生成到结构体注释中；为空时使用"表" |
 | `ColumnTagName` | `string` | 列映射 tag 的名称（如 `"column"`、`"db"`），与 zcdb 的列映射标签对应；为空时不生成列映射 tag，非空时须为合法 struct tag key |
-| `JsonTagValueCase` | `NameCase` | JSON tag 的命名风格；**空值表示不生成 json tag** |
+| `JsonTagValueCase` | `NameCase` | JSON tag 的命名风格；**空值表示不自动生成 json tag**（单列显式 `JsonTagValue` 仍会生成） |
 | `Columns` | `[]*Column` | 表的所有字段；为空时生成仅含空结构体与互转方法的文件；元素不得为 nil |
 | `Indexes` | `[]IndexInfo` | 表索引；为空时不生成结构体 doc 注释中的索引块 |
 
@@ -154,7 +154,7 @@ type StructFieldInfo struct {
     Name         string // 结构体字段名；留空则由列名自动推导（ToPascalCase）
     Type         string // 结构体字段类型；留空则由列类型自动映射（未命中兜底 string）
     Import       string // Type 对应的 import 路径（如 time.Time 需 "time"）；留空不引入包
-    JsonTagValue string // json tag 的值；留空时按 JsonTagValueCase 自动推导
+    JsonTagValue string // json tag 的值；非空时直接使用（JsonTagValueCase 为空也会生成）；留空时按 JsonTagValueCase 自动推导
 }
 
 type IndexInfo struct {
@@ -403,16 +403,16 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 
 ## 增量再生成与用户代码保护
 
-目标文件已存在时，`writeOrReplaceStruct` 采用「骨架保持式合并」重建文件：以原文件的顶层声明序列为骨架，合并时排列结构原封不动，只把生成声明在其原位替换为新内容。工作方式：
+目标文件已存在时，`writeOrReplaceStruct` 采用「骨架保持式合并」重建文件：以原文件的顶层声明序列为骨架，合并时排列结构原封不动，只把生成声明在其原位替换为新内容；用户声明的文本内容与顺序不变，但整个文件最终经 go/format 统一格式化（缩进、对齐、import 排序），槽位间统一以一个空行分隔。工作方式：
 
 1. **拆分生成代码**：把传入的生成代码拆成四个声明（Entity 结构体、ToDO、DO 结构体、ToEntity），供逐声明原位替换；某段为空表示不生成该声明（原文件中的旧槽位一并移除）；
 2. **AST 解析**整个现有文件（`parser.ParseComments`），解析失败则报错返回，绝不覆盖；
 3. **逐槽位重建骨架**（按原文件顶层声明的原始顺序）：
-   - 生成声明槽位（内部由 `isGeneratedTypeSpec` / `isGeneratedMethod` 判定，含值接收者版本）在原位替换为新内容；
-   - 用户声明（含 Entity/DO 上的自定义方法，指针/值接收者均识别）原样留在原位，**不再归位**到生成代码之后；
-   - **注释随声明原位保留**：每个声明的截取区间为「上一节点结束 → 本声明结束（含同行尾注释）」，声明之间的游离注释（含 `//go:generate` 等指令）留在原位；被移除的重复生成声明的游离注释顺延给下一个保留声明；只有被替换的生成声明自身区间内的注释（旧 doc、旧尾注释）随之丢弃；
-4. **type 声明块按 Spec 粒度处理**：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，用户类型（含各自注释）与块内不附着于任何 Spec 的游离注释原样保留；仅含一个生成 Spec 的声明以独立声明形态输出（不保留括号块）；
-5. **缺失生成声明的配对落点**：Entity 结构体↔ToDO、DO 结构体↔ToEntity 互为配对，结构体缺失补在其方法前、方法缺失补在其结构体后；两个都缺或都无配对时追加到最后一个生成声明之后（无任何生成声明时置于首个用户声明之前），标准顺序为 Entity 结构体 → ToDO → DO 结构体 → ToEntity；同类生成声明出现多份时（如用户手写的值接收者 ToDO 与生成的指针接收者 ToDO 共存），首个槽位原位替换、其余重复槽位移除；
+   - 生成声明槽位（内部由 `isGeneratedTypeSpec` / `isGeneratedMethod` 判定，含值接收者版本与括号包裹的接收者）在原位替换为新内容；
+   - 用户声明（含 Entity/DO 上的自定义方法，指针/值接收者均识别，含括号包裹的接收者）的内容与顺序保留在原位置，**不再归位**到生成代码之后（整体仍会经 gofmt 重新格式化）；
+   - **注释随声明原位保留**：每个声明的截取区间为「上一节点结束 → 本声明结束（含同行尾注释）」，声明之间的游离注释（含 `//go:generate` 等指令）内容保留在原位置；被移除的重复生成声明的游离注释顺延给下一个保留声明；只有被替换的生成声明自身区间内的注释（旧 doc、旧尾注释）随之丢弃；
+4. **type 声明块按 Spec 粒度处理**：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，用户类型（含各自注释）与块内不附着于任何 Spec 的游离注释内容与位置保留；仅含一个生成 Spec 的声明以独立声明形态输出（不保留括号块）；
+5. **缺失生成声明的配对落点**：Entity 结构体↔ToDO、DO 结构体↔ToEntity 互为配对，结构体缺失补在其方法前、方法缺失补在其结构体后；两个都缺或都无配对时追加到最后一个生成声明之后（无任何生成声明时置于首个用户声明之前），标准顺序为 Entity 结构体 → ToDO → DO 结构体 → ToEntity；同类生成声明出现多份时（如用户手写的值接收者 ToDO 与生成的指针接收者 ToDO 共存，或同一 type 块内重复的生成 Spec），首个槽位（块内为首个 Spec）原位替换、其余重复槽位（Spec）移除；
 6. **补齐与移除 import**：生成代码所需的包（如 `time`）若文件中缺失，自动补充并合并进原第一个 import 块（避免形成两个 import 块）；存量文件以**别名导入**（含 `_`、`.` 导入）所需包时不视为已存在，仍会补充默认导入（生成代码引用默认包名，两种导入可合法共存）。反向地，旧生成代码引用过、而新生成代码与保留的用户代码都不再引用的 import 会被移除（如删去最后一个时间列后的 `time`），块内导入全部移除时整个 import 声明一并移除；`_`、`.` 导入、`"C"` 以及路径末段无法确定包名的导入（如 `gopkg.in/yaml.v3`、主版本后缀 `/v2`）不做移除；
 7. **落盘保障**：全部处理成功后，对完整内容执行 `go/format.Source` 语法自校验，再经同目录临时文件 + rename 原子替换目标文件（见下方“落盘安全三重防线”）。
 
@@ -577,9 +577,9 @@ columns := []*zcmodel.Column{
 用户可以在生成文件中自由添加自定义方法，表结构变化后再次调用 `Generate`（骨架保持式合并）：
 
 - Entity/DO 结构体与 ToDO/ToEntity 被**替换**为最新版本，且各在**原位**替换——不搬动任何用户代码；
-- 自定义方法（如 `func (e *UserOrderEntity) Validate() error`，指针与值接收者均支持）**原样保留在原位置**，不再归位到对应结构体之后；把用户方法插在结构体与方法之间、或打散生成声明等排布都会被原样保持，因而 git diff 只呈现生成区那几处变更；
+- 自定义方法（如 `func (e *UserOrderEntity) Validate() error`，指针与值接收者均支持）的**内容与顺序保留在原位置**，不再归位到对应结构体之后；把用户方法插在结构体与方法之间、或打散生成声明等排布都会被保持。整个文件最终经 gofmt 统一格式化（声明间空行、import 排序等），因此首次再生成的 diff 可能同时包含格式变化，之后稳定；
 - 若新表结构引入了新的依赖包（如新增 datetime 列），`time` import 会被自动补上；反之依赖消失时（如删去最后一个时间列），不再被任何代码引用的 `time` import 会被自动移除，产物保持可编译；
-- 声明之间的注释（含 `//go:generate` 等指令）、同行尾注释与文件末尾的注释随用户代码原位保留。
+- 声明之间的注释（含 `//go:generate` 等指令）、同行尾注释与文件末尾的注释随用户代码保留在原位置（内容不变，缩进等格式随 gofmt 统一）。
 
 ## 注意事项
 
@@ -590,7 +590,7 @@ columns := []*zcmodel.Column{
 5. **SQLite 不支持字段注释**：SQLite 元数据中没有列注释，通过 zcdb Schema 读取时 `Comment` 恒为空，因此生成的 `description` tag 也恒为空；若手工构造 SQLite 方言的列并填写 `Comment`，仍会正常生成该 tag。
 6. **存量文件必须语法正确**：增量再生成依赖 `go/parser` 解析现有文件，若用户代码存在语法错误，`Generate` 报错返回且不会覆盖文件。
 7. **ToEntity 的类型断言语义**：DO 字段为 `any`，断言失败（值为 nil 或类型不符）时该字段被跳过，Entity 保留原值；不会返回错误。
-8. **json tag 可选**：`JsonTagValueCase` 传空串则不生成任何 json tag；单列也可通过显式指定 `StructFieldInfo.JsonTagValue` 覆盖全局风格。
+8. **json tag 可选**：`JsonTagValueCase` 传空串则不自动生成 json tag（未显式指定 `StructFieldInfo.JsonTagValue` 的列不生成）；单列可通过显式指定 `StructFieldInfo.JsonTagValue` 覆盖全局风格（全局风格为空时显式值同样生效）。
 9. **生成代码按名称识别**：增量再生成按名称匹配 Entity/DO 类型与 ToDO/ToEntity 方法，请勿在同一文件中定义与它们同名的其他类型，否则再生成时会被一并移除。
 10. **列名须能推导出合法标识符**：数字开头的列名（如 `2fa_code`）会报“不是合法的 Go 标识符”错误，请通过 `StructFieldInfo.Name` 显式指定合法字段名。字段名还必须是**导出标识符**（首字符为大写字母）：中文列名推导出的字段名虽是合法标识符，但未导出，反射与 json/db 映射都无法访问，因此会报错，需通过 `StructFieldInfo.Name` 指定导出名（tag 中仍保留中文列名）；显式指定 `_` 同样会被拒绝。字段名也不得为 `ToDO` / `ToEntity`（与生成方法同名，如列名 `to_entity`）。
 11. **`Nullable` 未知时刻意省略 NULL 标记**：手工构造 `Input` 且未设置 `Nullable` 时，`ddl` 片段只输出类型（如 `ddl:"varchar(255)"`）——缺省渲染 `NOT NULL` 会把可空列误标，故用 `*bool` 的 `nil` 表达「未知」并整段省略；需要完整的 NULL/NOT NULL 标记请显式设置（桥接 zcdb Schema 时该值恒已知）。
