@@ -503,3 +503,50 @@ func TestDiscard_Scan(t *testing.T) {
 		t.Errorf("discard.Scan(123) should return nil, got %v", err)
 	}
 }
+
+// TestNullSafeFieldScanNamedTypes 锁定命名 string/bool/int 类型的扫描转换：
+// 转换值必须先 Convert 到目标类型再 Set，否则 reflect.Set 会 panic（fuzz 发现）。
+func TestNullSafeFieldScanNamedTypes(t *testing.T) {
+	type status string
+	type flag bool
+	type amount int64
+
+	scan := func(targetType reflect.Type, src any) any {
+		t.Helper()
+		field := reflect.New(targetType).Elem()
+		if err := (&nullSafeField{field: field}).Scan(src); err != nil {
+			t.Fatalf("scan %v from %T: %v", targetType, src, err)
+		}
+		return field.Interface()
+	}
+
+	when := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		target reflect.Type
+		src    any
+		want   any
+	}{
+		{"named string from bytes", reflect.TypeOf(status("")), []byte("active"), status("active")},
+		{"named string from string", reflect.TypeOf(status("")), "done", status("done")},
+		{"named string from int", reflect.TypeOf(status("")), int64(42), status("42")},
+		{"named string from time", reflect.TypeOf(status("")), when, status(when.Format(time.RFC3339))},
+		{"named bool from int", reflect.TypeOf(flag(false)), int64(1), flag(true)},
+		{"named bool from string", reflect.TypeOf(flag(false)), "true", flag(true)},
+		{"named int from string", reflect.TypeOf(amount(0)), "7", amount(7)},
+		{"nil named string", reflect.TypeOf(status("")), nil, status("")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scan(tc.target, tc.src); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("scan = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+
+	ptrType := reflect.TypeOf((*status)(nil))
+	got := scan(ptrType, "ptr")
+	if got == nil || *got.(*status) != status("ptr") {
+		t.Fatalf("pointer named string scan = %#v", got)
+	}
+}

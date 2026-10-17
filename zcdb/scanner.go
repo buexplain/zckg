@@ -208,8 +208,13 @@ func (n *nullSafeField) Scan(src any) error {
 	// 类型转换
 	val := reflect.ValueOf(src)
 
-	// 辅助函数：将转换后的值设置到字段（处理指针间接）
+	// 辅助函数：将转换后的值设置到字段（处理指针间接）。
+	// 先把值 Convert 到目标字段的精确类型：命名 string/bool 等类型与内置类型
+	// 底层相同但类型不同，直接 Set 会触发 reflect.Set panic。
 	setFinalValue := func(converted reflect.Value) {
+		if converted.Type() != targetType {
+			converted = converted.Convert(targetType)
+		}
 		if isPtr {
 			newVal := reflect.New(targetType).Elem()
 			newVal.Set(converted)
