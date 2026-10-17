@@ -96,24 +96,28 @@ func GenerateOpenAPI(r *Router, info OpenAPIInfo) map[string]any {
 	})
 	for _, rec := range sortedRoutes {
 		// 参数路由的 {name}/{name?}/{name...} 段声明为 path 参数并从 query 排除；
-		// 静态路由无参数段，paramNames/optionalParams 为空集。
-		// OpenAPI 无 {name?}/{name...} 语法，二者转换为 {name} 形式并以 required:false 声明
-		// （通配尾段可零段命中，与可选参数同属"可省略"）
+		// 静态路由无参数段，paramNames/pathParamNotes 为空集。
+		// OpenAPI 无 {name?}/{name...} 语法，二者转换为 {name} 形式；
+		// OpenAPI 3.0 要求 path 参数必须 required:true，运行时可选/通配语义写入 description。
 		segments, perr := parseRoutePath(rec.path)
 		if perr != nil {
 			continue // 注册阶段已校验，防御性跳过
 		}
 		paramNames := make(map[string]bool)
-		optionalParams := make(map[string]bool)
+		pathParamNotes := make(map[string]string)
 		for _, seg := range segments {
-			if seg.isParam {
-				paramNames[seg.name] = true
-				if seg.optional || seg.catchAll {
-					optionalParams[seg.name] = true
-				}
+			if !seg.isParam {
+				continue
+			}
+			paramNames[seg.name] = true
+			switch {
+			case seg.optional:
+				pathParamNotes[seg.name] = "运行时可选：省略该段时路由仍可命中；OpenAPI 3.0 要求 path 参数必须声明为 required。"
+			case seg.catchAll:
+				pathParamNotes[seg.name] = "运行时为通配尾段：捕获剩余路径（可为空）；OpenAPI 3.0 要求 path 参数必须声明为 required。"
 			}
 		}
-		op := g.buildOperation(rec.method, rec.entry, paramNames, optionalParams)
+		op := g.buildOperation(rec.method, rec.entry, paramNames, pathParamNotes)
 		if op == nil {
 			continue
 		}
@@ -330,10 +334,10 @@ func (g *openAPIGenerator) walkDefaultsReachability(t reflect.Type, viaDefaults 
 // buildOperation 构造单个操作对象（parameters/requestBody/responses/tags/summary/deprecated）。
 // paramNames 为路径模板中的 {name}/{name?}/{name...} 参数名集合（无参数段的路由为空集）：所有方法均声明
 // path 参数（含被 ignore 的字段——path 声明受规范强制，见 buildPathParams），
-// GET/DELETE/HEAD 不再重复展示为 query；optionalParams 标记其中可选参数与通配尾段。
+// GET/DELETE/HEAD 不再重复展示为 query；pathParamNotes 为可选参数与通配尾段的运行时语义说明。
 // Req 嵌入 KeepRawBody 时与 GET 同样只绑定 query：其余方法的非路径字段输出为 query 参数，
 // requestBody 输出通用声明 {"content": {"*/*": {"schema": {}}}}（接受任意请求体、原样处理，不从字段推导）。
-func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, paramNames, optionalParams map[string]bool) map[string]any {
+func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, paramNames map[string]bool, pathParamNotes map[string]string) map[string]any {
 	// 使用注册阶段预计算的类型信息，避免重复反射
 	if entry.reqType == nil || entry.resType == nil {
 		return nil
@@ -365,7 +369,7 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, para
 
 	var params []any
 	if len(paramNames) > 0 {
-		params = append(params, g.buildPathParams(reqType, entry.reqMeta, paramNames, optionalParams)...)
+		params = append(params, g.buildPathParams(reqType, entry.reqMeta, paramNames, pathParamNotes)...)
 	}
 	switch method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
@@ -441,10 +445,11 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 // 被 ignore 的路径字段仍声明为 path 参数，只是不再出现在 body schema 与 query 中，
 // 从而避免生成"占位符无对应声明"的非法文档。
 // meta 为注册阶段预计算的 structMeta；paramNames 为路径模板中的参数名集合；
-// optionalParams 标记可选参数（{name?}）与通配尾段（{name...}），其 required 为 false，
-// 可选参数被省略或通配零段命中时保留字段 default 值或零值。
+// pathParamNotes 为可选参数（{name?}）与通配尾段（{name...}）的运行时语义说明。
+// OpenAPI 3.0 强制 path 参数 required:true，因此所有 path 参数一律输出 required:true，
+// 可省略语义只能通过 description 表达（生成文档仍可被规范校验器接受）。
 // 带 deprecated:"true" 的字段在 Parameter Object 顶层输出 deprecated: true。
-func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta, paramNames, optionalParams map[string]bool) []any {
+func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta, paramNames map[string]bool, pathParamNotes map[string]string) []any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
 	}
@@ -461,8 +466,11 @@ func (g *openAPIGenerator) buildPathParams(reqType reflect.Type, meta structMeta
 		param := map[string]any{
 			"name":     fm.name,
 			"in":       "path",
-			"required": !optionalParams[fm.name],
+			"required": true,
 			"schema":   g.typeToSchema(f.Type, f, 0, roleRequest),
+		}
+		if note := pathParamNotes[fm.name]; note != "" {
+			param["description"] = note
 		}
 		if isDeprecated(f) {
 			param["deprecated"] = true
@@ -946,10 +954,15 @@ func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructFiel
 				"items": map[string]any{"type": "string", "format": "binary"},
 			}, field, role)
 		}
-		return g.decorate(map[string]any{
+		schema := map[string]any{
 			"type":  "array",
 			"items": g.containerElementSchema(t.Elem(), field, depth, role),
-		}, field, role)
+		}
+		// nil slice 经 encoding/json 序列化为 null；固定数组没有 nil 形态，不加 nullable
+		if t.Kind() == reflect.Slice {
+			schema["nullable"] = true
+		}
+		return g.decorate(schema, field, role)
 	case reflect.Struct:
 		if role == roleResponse {
 			return g.decorate(g.registerResponseSchema(t), field, role)
@@ -960,6 +973,8 @@ func (g *openAPIGenerator) typeToSchema(t reflect.Type, field reflect.StructFiel
 		schema := map[string]any{
 			"type":                 "object",
 			"additionalProperties": valueSchema,
+			// nil map 经 encoding/json 序列化为 null
+			"nullable": true,
 		}
 		result := g.decorate(schema, field, role)
 		// 非 string key 无法在标准 OpenAPI 3.0 中表达，追加到 description 中

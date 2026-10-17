@@ -7,11 +7,16 @@ import (
 	"fmt"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/openapi3filter"
+	"github.com/getkin/kin-openapi/routers/legacy"
 )
 
 // oaCreateUserReq 覆盖 OpenAPIMeta 嵌入、required、default、指针等场景
@@ -2482,8 +2487,9 @@ func TestBuildQueryParamsSkipBranches(t *testing.T) {
 // ======== M1: 参数路由 OpenAPI 生成 ========
 
 // TestGenerateOpenAPI_ParamRoute 验证参数路由（必选 + 可选参数）被生成到 paths：
-// 路径模板转换为 OpenAPI 形式 {name}，参数声明为 in:path，
-// 必选参数 required:true，可选参数（{name?}）required:false，且路径参数不再作为 query 参数重复出现
+// 路径模板转换为 OpenAPI 形式 {name}，参数声明为 in:path；
+// OpenAPI 3.0 要求 path 参数必填，故必选与可选参数均 required:true，
+// 可选参数（{name?}）的运行时省略语义写入 description；路径参数不再作为 query 参数重复出现
 func TestGenerateOpenAPI_ParamRoute(t *testing.T) {
 	type oaParamUserReq struct {
 		ID int `json:"id"`
@@ -2541,17 +2547,22 @@ func TestGenerateOpenAPI_ParamRoute(t *testing.T) {
 	get2 := item2["get"].(map[string]any)
 	requiredBy := map[string]bool{}
 	inBy := map[string]any{}
+	descriptionBy := map[string]string{}
 	for _, p := range get2["parameters"].([]any) {
 		pm := p.(map[string]any)
 		name, _ := pm["name"].(string)
 		inBy[name] = pm["in"]
 		requiredBy[name], _ = pm["required"].(bool)
+		descriptionBy[name], _ = pm["description"].(string)
 	}
 	if requiredBy["post_id"] != true {
 		t.Errorf("post_id.required = %v, want true", requiredBy["post_id"])
 	}
-	if requiredBy["comment_id"] != false {
-		t.Errorf("comment_id.required = %v, want false (optional)", requiredBy["comment_id"])
+	if requiredBy["comment_id"] != true {
+		t.Errorf("comment_id.required = %v, want true (OpenAPI 3.0 requires all path params)", requiredBy["comment_id"])
+	}
+	if !strings.Contains(descriptionBy["comment_id"], "运行时可选") {
+		t.Errorf("comment_id.description = %q, want runtime-optional note", descriptionBy["comment_id"])
 	}
 	// 路径参数不应同时出现在 query 中
 	if inBy["post_id"] != "path" || inBy["comment_id"] != "path" {
@@ -3839,17 +3850,17 @@ type oaCatchAllReq struct {
 }
 
 // TestOpenAPICatchAllPathParam 验证通配段的 OpenAPI 呈现：路径模板 {name...} 转为 {name}（paths 中不残留 "..."），
-// 通配参数以 in=path、required=false 声明（与可选参数同属既有规范兼容限制），
-// 前置必选参数仍为 required=true；根路径通配 /{rest...} 转为 /{rest}。
+// 通配参数以 in=path、required=true 声明（OpenAPI 3.0 要求 path 参数必填），
+// 运行时通配语义写入 description；前置必选参数同为 required=true；根路径通配 /{rest...} 转为 /{rest}。
 func TestOpenAPICatchAllPathParam(t *testing.T) {
 	cases := []struct {
 		route    string
 		template string
 		required map[string]bool
 	}{
-		{"/proxy/{rest...}", "/proxy/{rest}", map[string]bool{"rest": false}},
-		{"/a/{x}/{rest...}", "/a/{x}/{rest}", map[string]bool{"x": true, "rest": false}},
-		{"/{rest...}", "/{rest}", map[string]bool{"rest": false}},
+		{"/proxy/{rest...}", "/proxy/{rest}", map[string]bool{"rest": true}},
+		{"/a/{x}/{rest...}", "/a/{x}/{rest}", map[string]bool{"x": true, "rest": true}},
+		{"/{rest...}", "/{rest}", map[string]bool{"rest": true}},
 	}
 	for _, c := range cases {
 		t.Run(c.route, func(t *testing.T) {
@@ -3875,6 +3886,10 @@ func TestOpenAPICatchAllPathParam(t *testing.T) {
 				if got, _ := pm["required"].(bool); got != wantRequired {
 					t.Errorf("%s.required = %v, want %v", name, got, wantRequired)
 				}
+			}
+			rest := findParam(t, params, "rest")
+			if description, _ := rest["description"].(string); !strings.Contains(description, "通配尾段") {
+				t.Errorf("rest.description = %q, want catch-all note", description)
 			}
 		})
 	}
@@ -4470,4 +4485,309 @@ func TestGenerateOpenAPI_JSONNamedEmbedRequired(t *testing.T) {
 	if rec := serveRequest(t, r, http.MethodPost, "/emb-optional", "{}"); rec.Code != http.StatusOK {
 		t.Fatalf("emb-optional: expected 200 (default satisfies), got %d; body=%s", rec.Code, rec.Body.String())
 	}
+}
+
+// ======== 外部规范校验（kin-openapi） ========
+
+type oaExternalAddr struct {
+	City string `json:"city" example:"Hangzhou"`
+}
+
+type oaExternalReq struct {
+	OpenAPIMeta `tags:"External" summary:"外部校验" description:"参数路由与 query"`
+	ID          int       `json:"id" example:"1"`
+	Q           string    `json:"q" default:"all"`
+	At          time.Time `json:"at" time_format:"unix"`
+}
+
+type oaExternalRestReq struct {
+	OpenAPIMeta `tags:"External" summary:"剩余路径"`
+	Rest        string `json:"rest"`
+}
+
+type oaExternalCreateReq struct {
+	OpenAPIMeta `tags:"External" summary:"创建"`
+	Name        string            `json:"name" nonzero:"true"`
+	Addr        oaExternalAddr    `json:"addr"`
+	Ref         *oaExternalAddr   `json:"ref"`
+	Tags        []string          `json:"tags"`
+	Meta        map[string]string `json:"meta"`
+}
+
+type oaExternalFileReq struct {
+	OpenAPIMeta `tags:"External" summary:"上传"`
+	Title       string                `json:"title"`
+	File        *multipart.FileHeader `json:"file"`
+}
+
+type oaExternalRes struct {
+	ID        int               `json:"id"`
+	Name      string            `json:"name"`
+	CreatedAt time.Time         `json:"created_at"`
+	Addr      *oaExternalAddr   `json:"addr"`
+	Items     []oaExternalAddr  `json:"items"`
+	Meta      map[string]string `json:"meta"`
+}
+
+type oaExternalWrapper struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data"`
+}
+
+func oaExternalFixtureRes() oaExternalRes {
+	return oaExternalRes{
+		ID:        42,
+		Name:      "alice",
+		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		Addr:      &oaExternalAddr{City: "Hangzhou"},
+		Items:     []oaExternalAddr{{City: "Shanghai"}},
+		Meta:      map[string]string{"k": "v"},
+	}
+}
+
+func buildExternalValidatorRouter() *Router {
+	handler := func(_ context.Context, _ oaExternalReq) (oaExternalRes, error) {
+		return oaExternalFixtureRes(), nil
+	}
+	r := NewRouter()
+	r.GET("/ext/{id}", func(_ context.Context, req oaExternalReq) (oaExternalRes, error) {
+		res := oaExternalFixtureRes()
+		res.ID = req.ID
+		return res, nil
+	})
+	r.GET("/ext/optional/{id?}", handler)
+	r.GET("/ext/files/{rest...}", func(_ context.Context, _ oaExternalRestReq) (oaExternalRes, error) {
+		return oaExternalFixtureRes(), nil
+	})
+	r.GET("/ext/nil-collections", func(_ context.Context, _ oaExternalRestReq) (oaExternalRes, error) {
+		return oaExternalRes{ID: 1, Name: "nil", CreatedAt: time.Unix(1700000000, 0).UTC()}, nil
+	})
+	r.GET("/{rest...}", func(_ context.Context, _ oaExternalRestReq) (oaExternalRes, error) {
+		return oaExternalFixtureRes(), nil
+	})
+	r.POST("/ext", func(_ context.Context, _ oaExternalCreateReq) (oaExternalRes, error) {
+		return oaExternalFixtureRes(), nil
+	})
+	r.POST("/ext/upload", func(_ context.Context, _ oaExternalFileReq) (oaExternalRes, error) {
+		return oaExternalFixtureRes(), nil
+	})
+	r.DELETE("/ext/{id}", handler)
+	return r
+}
+
+// loadGeneratedOpenAPI 序列化生成文档并用 kin-openapi 加载、执行完整规范校验。
+func loadGeneratedOpenAPI(t *testing.T, doc map[string]any) *openapi3.T {
+	t.Helper()
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal generated document: %v", err)
+	}
+	parsed, err := openapi3.NewLoader().LoadFromData(raw)
+	if err != nil {
+		t.Fatalf("kin-openapi load: %v", err)
+	}
+	if err := parsed.Validate(context.Background()); err != nil {
+		t.Fatalf("kin-openapi validate: %v", err)
+	}
+	return parsed
+}
+
+// TestGenerateOpenAPI_ExternalValidator 用 kin-openapi 作为外部规范 oracle：
+// 将 GenerateOpenAPI 产物序列化后加载并执行完整规范校验，覆盖默认/自定义响应包装、
+// 必选与可选 path 参数、通配尾段、query、JSON/multipart 请求体、嵌套/指针/map/时间/文件 schema。
+// 该测试只校验文档本身符合 OpenAPI 3.0；运行时流量一致性见 TestOpenAPI_ContractTrafficConformance。
+func TestGenerateOpenAPI_ExternalValidator(t *testing.T) {
+	cases := []struct {
+		name    string
+		wrapper any
+	}{
+		{name: "default_wrapper", wrapper: nil},
+		{name: "custom_wrapper", wrapper: oaExternalWrapper{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := buildExternalValidatorRouter()
+			parsed := loadGeneratedOpenAPI(t, GenerateOpenAPI(router, OpenAPIInfo{
+				Title:           "External Validator",
+				Description:     "kin-openapi conformance",
+				Version:         "1.0.0",
+				ResponseWrapper: tc.wrapper,
+			}))
+			if parsed.OpenAPI != "3.0.3" {
+				t.Fatalf("openapi version = %q, want 3.0.3", parsed.OpenAPI)
+			}
+		})
+	}
+}
+
+type oaContractExchange struct {
+	name        string
+	method      string
+	target      string
+	contentType string
+	body        []byte
+}
+
+// TestOpenAPI_ContractTrafficConformance 用生成的 OpenAPI 文档校验真实请求与响应流量：
+// 请求经 HttpEngine 执行后，分别用 openapi3filter 校验请求参数/请求体与响应状态/响应体，
+// 覆盖 path/query、JSON、multipart 文件、通配尾段与默认响应包装。
+func TestOpenAPI_ContractTrafficConformance(t *testing.T) {
+	router := buildExternalValidatorRouter()
+	doc := loadGeneratedOpenAPI(t, GenerateOpenAPI(router, OpenAPIInfo{
+		Title:   "Contract Traffic",
+		Version: "1.0.0",
+	}))
+	specRouter, err := legacy.NewRouter(doc)
+	if err != nil {
+		t.Fatalf("create OpenAPI router: %v", err)
+	}
+
+	var multipartBody bytes.Buffer
+	writer := multipart.NewWriter(&multipartBody)
+	if err := writer.WriteField("title", "contract"); err != nil {
+		t.Fatalf("write multipart field: %v", err)
+	}
+	part, err := writer.CreateFormFile("file", "contract.txt")
+	if err != nil {
+		t.Fatalf("create multipart file: %v", err)
+	}
+	if _, err := part.Write([]byte("hello")); err != nil {
+		t.Fatalf("write multipart file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	engine := NewEngine()
+	engine.Router = router
+	cases := []oaContractExchange{
+		{name: "get_path_query", method: http.MethodGet, target: "/ext/42?q=all&at=1700000000"},
+		{name: "get_optional_present", method: http.MethodGet, target: "/ext/optional/7"},
+		{name: "get_catchall_single_segment", method: http.MethodGet, target: "/ext/files/a.txt"},
+		{name: "get_nil_collections", method: http.MethodGet, target: "/ext/nil-collections"},
+		{name: "get_root_catchall", method: http.MethodGet, target: "/elsewhere"},
+		{
+			name:        "post_json",
+			method:      http.MethodPost,
+			target:      "/ext",
+			contentType: "application/json",
+			body:        []byte(`{"name":"alice","addr":{"city":"Hangzhou"},"ref":{"city":"Shanghai"},"tags":["a"],"meta":{"k":"v"}}`),
+		},
+		{
+			name:        "post_json_minimal",
+			method:      http.MethodPost,
+			target:      "/ext",
+			contentType: "application/json",
+			body:        []byte(`{"name":"alice"}`),
+		},
+		{
+			name:        "post_multipart_file",
+			method:      http.MethodPost,
+			target:      "/ext/upload",
+			contentType: writer.FormDataContentType(),
+			body:        multipartBody.Bytes(),
+		},
+		{name: "delete", method: http.MethodDelete, target: "/ext/42"},
+	}
+
+	options := &openapi3filter.Options{IncludeResponseStatus: true, MultiError: true}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			newRequest := func() *http.Request {
+				req := httptest.NewRequest(tc.method, tc.target, bytes.NewReader(tc.body))
+				if tc.contentType != "" {
+					req.Header.Set("Content-Type", tc.contentType)
+				}
+				return req
+			}
+
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, newRequest())
+			if rec.Code != http.StatusOK {
+				t.Fatalf("runtime status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+
+			request := newRequest()
+			route, pathParams, err := specRouter.FindRoute(request)
+			if err != nil {
+				t.Fatalf("spec route not found: %v", err)
+			}
+			requestInput := &openapi3filter.RequestValidationInput{
+				Request:    request,
+				PathParams: pathParams,
+				Route:      route,
+				Options:    options,
+			}
+			if err := openapi3filter.ValidateRequest(context.Background(), requestInput); err != nil {
+				t.Fatalf("request violates generated contract: %v", err)
+			}
+			responseInput := (&openapi3filter.ResponseValidationInput{
+				RequestValidationInput: requestInput,
+				Status:                 rec.Code,
+				Header:                 rec.Header(),
+				Options:                options,
+			}).SetBodyBytes(rec.Body.Bytes())
+			if err := openapi3filter.ValidateResponse(context.Background(), responseInput); err != nil {
+				t.Fatalf("response violates generated contract: %v", err)
+			}
+		})
+	}
+}
+
+// TestOpenAPI_ContractValidatorRejectsMismatch 验证契约校验器本身可失败：
+// 缺少 nonzero 必填字段的请求、与响应 schema 类型不符的响应都必须被拒绝，
+// 避免正向流量用例在同源谬误下全部绿灯。
+func TestOpenAPI_ContractValidatorRejectsMismatch(t *testing.T) {
+	router := buildExternalValidatorRouter()
+	doc := loadGeneratedOpenAPI(t, GenerateOpenAPI(router, OpenAPIInfo{
+		Title:   "Contract Negative",
+		Version: "1.0.0",
+	}))
+	specRouter, err := legacy.NewRouter(doc)
+	if err != nil {
+		t.Fatalf("create OpenAPI router: %v", err)
+	}
+	options := &openapi3filter.Options{IncludeResponseStatus: true, MultiError: true}
+
+	t.Run("request_missing_required_field", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodPost, "/ext", strings.NewReader(`{}`))
+		request.Header.Set("Content-Type", "application/json")
+		route, pathParams, err := specRouter.FindRoute(request)
+		if err != nil {
+			t.Fatalf("spec route not found: %v", err)
+		}
+		err = openapi3filter.ValidateRequest(context.Background(), &openapi3filter.RequestValidationInput{
+			Request:    request,
+			PathParams: pathParams,
+			Route:      route,
+			Options:    options,
+		})
+		if err == nil {
+			t.Fatal("expected missing required field to be rejected")
+		}
+	})
+
+	t.Run("response_type_mismatch", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/ext/42?q=all&at=1700000000", nil)
+		route, pathParams, err := specRouter.FindRoute(request)
+		if err != nil {
+			t.Fatalf("spec route not found: %v", err)
+		}
+		requestInput := &openapi3filter.RequestValidationInput{
+			Request:    request,
+			PathParams: pathParams,
+			Route:      route,
+			Options:    options,
+		}
+		responseInput := (&openapi3filter.ResponseValidationInput{
+			RequestValidationInput: requestInput,
+			Status:                 http.StatusOK,
+			Header:                 http.Header{"Content-Type": []string{"application/json"}},
+			Options:                options,
+		}).SetBodyBytes([]byte(`{"data":{"id":"not-an-integer"},"code":0,"message":"success"}`))
+		if err := openapi3filter.ValidateResponse(context.Background(), responseInput); err == nil {
+			t.Fatal("expected response type mismatch to be rejected")
+		}
+	})
 }

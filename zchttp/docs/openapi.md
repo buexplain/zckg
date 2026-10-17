@@ -175,10 +175,10 @@ Req 字段在 OpenAPI schema 中是否标记为 `required`，按以下规则判�
 | `float32`                   | `{type: number, format: float}`                                                                        |
 | `float64`                   | `{type: number, format: double}`                                                                       |
 | `time.Time`                 | 请求 schema：`{type: string, format: date-time}`；若 `time_format` 为 `unix*` 则为 `{type: integer, format: int64}`（指针与切片的元素同样按该标签展开）。响应 schema 恒为 `{type: string, format: date-time}` |
-| 切片/数组                       | `{type: array, items: ...}`，元素递归推断（`time.Time` 元素复用容器字段的 `time_format`）                                                        |
+| 切片/数组                       | `{type: array, items: ...}`，元素递归推断（`time.Time` 元素复用容器字段的 `time_format`）；切片额外输出 `nullable: true`（nil slice 序列化为 `null`），固定数组不输出 |
 | 结构体                         | 注册到 `components/schemas` 并以 `$ref` 引用；同名结构体去重且支持递归嵌套循环引用检测                                             |
 | 指针                          | 被指向类型为 `$ref` 时包裹 `{nullable: true, allOf: [$ref]}`；否则在被指向类型上加 `nullable: true`                        |
-| `map[K]V`                   | `{type: object, additionalProperties: <V 的 schema>}`；非 string key 在 description 中注明 `key type: <kind>` |
+| `map[K]V`                   | `{type: object, additionalProperties: <V 的 schema>, nullable: true}`（nil map 序列化为 `null`）；非 string key 在 description 中注明 `key type: <kind>` |
 | `*multipart.FileHeader`     | `{type: string, format: binary}`                                                                       |
 | `[]*multipart.FileHeader`   | `{type: array, items: {type: string, format: binary}}`                                                 |
 
@@ -187,14 +187,18 @@ Req 字段在 OpenAPI schema 中是否标记为 `required`，按以下规则判�
 
 map 的 value 类型通过 `t.Elem()` 递归推断：
 
-- `map[string]string` → `{"type":"object","additionalProperties":{"type":"string"}}`
-- `map[string]int` → `{"type":"object","additionalProperties":{"type":"integer","format":"int64"}}`
+- `map[string]string` → `{"type":"object","additionalProperties":{"type":"string"},"nullable":true}`
+- `map[string]int` → `{"type":"object","additionalProperties":{"type":"integer","format":"int64"},"nullable":true}`
 - `map[string]*SomeStruct` →
-  `{"type":"object","additionalProperties":{"nullable":true,"allOf":[{"$ref":"#/components/schemas/SomeStruct"}]}}`
+  `{"type":"object","additionalProperties":{"nullable":true,"allOf":[{"$ref":"#/components/schemas/SomeStruct"}]},"nullable":true}`
 - `map[string][]int` →
-  `{"type":"object","additionalProperties":{"type":"array","items":{"type":"integer","format":"int64"}}}`
-- `map[int]string` → `{"type":"object","additionalProperties":{"type":"string"},"description":"key type: int"}`（非
+  `{"type":"object","additionalProperties":{"type":"array","items":{"type":"integer","format":"int64"},"nullable":true},"nullable":true}`
+- `map[int]string` → `{"type":"object","additionalProperties":{"type":"string"},"nullable":true,"description":"key type: int"}`（非
   string key 在 description 注明）
+
+### nil 切片 / nil map 的 nullable 语义
+
+`encoding/json` 将 nil slice 与 nil map 序列化为 `null`，而非 `[]` / `{}`。因此切片（不含固定数组）与 map 字段一律输出 `nullable: true`，使响应中的 `null` 与请求体中的 `null` 都能通过契约校验，并与运行时反序列化结果（nil）一致。切片/map 的元素不会继承该标记；固定数组永远序列化为 JSON 数组，故不标记 nullable。
 
 ### 指针类型 nullable 处理
 
@@ -217,7 +221,7 @@ map 的 value 类型通过 `t.Elem()` 递归推断：
 - **GET / DELETE / HEAD**：请求字段生成为 `query` 参数（`in: query`）。**仅扁平字段**（标量、切片、指针标量、`time.Time`）参与生成：命名 struct（`time.Time` 除外）、`map` 与文件字段被跳过——query 绑定仅处理扁平字段，展示无法绑定的参数会误导 API 使用者。
 - **其余方法**：请求字段生成为 `requestBody`；含文件字段（`*multipart.FileHeader` 或 `[]*multipart.FileHeader`，含**嵌入结构体**中的文件字段）时使用 `multipart/form-data`，否则 `application/json`。`requestBody.required` 通过默认 Req 模板推导：生成器以注册期默认值作为初始状态，排除 path 字段后执行内建 `nonzero` 校验；校验失败时为 `true`，否则为 `false`。因此全可选 Req、仅含有效默认值的 Req，以及只由 path 参数满足必填要求的 Req 均不强制 body；含无默认值 `nonzero:"true"` body 字段的 Req 强制 body。任意自定义 `Validate()` 无法静态推导，不参与此判定。该推导以 OpenAPI 展示的 body 作为非路径字段的规范输入位置，不考虑运行时“先绑定 query、再绑定 body”的兼容能力；因此扁平 nonzero 字段即使可仅由 query 满足，文档仍可能要求 requestBody，生成契约有意比运行时可接受输入更严格。
 - **嵌入 `zchttp.KeepRawBody` 的 Req（POST / PUT / PATCH 等）**：与请求阶段“只绑定 query 与路径参数”的语义一致，非路径字段按 GET 规则生成为 `query` 参数，`requestBody` 输出通用声明 `{"content": {"*/*": {"schema": {}}}}`（表达“接受任意请求体，原样处理”，不从 Req 字段推导 schema，`components.schemas` 中也不出现 Req 与 `KeepRawBody`），且不标记为 required；GET / DELETE / HEAD 上嵌入时输出与未嵌入一致。
-- **参数路由**（如 `/users/{id}`）：所有 HTTP 方法均将 `{name}` 对应的字段声明为 path 参数（`in: path`，`required: true`）——**不受 `ignore` 影响**：OpenAPI 要求每个模板占位符都有对应声明，缺失即产生非法文档；GET / DELETE / HEAD 不再重复声明为 query，其余方法仍保留既有 body 字段（其中 `ignore:"true"` 的字段仍从 body schema 排除）。可选参数 `{name?}` 与通配尾段 `{name...}` 分别转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` / `...` 语法），路径模板中不再出现 `?` 与 `...`，二者均输出 `in: path`、`required: false`（通配尾段可零段命中，如 `/dify/{rest...}` 收到 `/dify`）；OpenAPI 3.0 要求 path 参数必填，此表示违反规范，属既有的兼容性限制。客户端生成器填充通配参数时通常把 `/` 编码为 `%2F`，引擎按解码后的 `r.URL.Path` 匹配，仍命中同一路由。
+- **参数路由**（如 `/users/{id}`）：所有 HTTP 方法均将 `{name}` 对应的字段声明为 path 参数（`in: path`，`required: true`）——**不受 `ignore` 影响**：OpenAPI 要求每个模板占位符都有对应声明，缺失即产生非法文档；GET / DELETE / HEAD 不再重复声明为 query，其余方法仍保留既有 body 字段（其中 `ignore:"true"` 的字段仍从 body schema 排除）。可选参数 `{name?}` 与通配尾段 `{name...}` 分别转换为 OpenAPI 的 `{name}` 形式（OpenAPI 无 `?` / `...` 语法），路径模板中不再出现 `?` 与 `...`。**OpenAPI 3.0 强制 path 参数 `required: true`**，因此二者同样输出 `required: true`，运行时“可省略 / 可零段命中 / 可捕获多段”的语义写入该参数的 `description`（OpenAPI 3.0 无法表达可选 path 参数与多段通配，这是规范表达能力限制而非文档非法）。客户端生成器填充通配参数时通常把 `/` 编码为 `%2F`，引擎按解码后的 `r.URL.Path` 匹配，仍命中同一路由。
 - **响应**：统一包装为 `Response{data, code, message}` 结构，包装层 schema 名称为 `Response_<Type>`，其 `data` 指向响应数据 schema `<Type>Response`（响应角色不读请求侧约束标签，故与请求同名类型的 schema 内容不同，见 [字段级标签](#字段级标签)）；成功时统一返回 `200`（与 `HttpEngine` 默认响应行为一致）。`OpenAPIInfo.ResponseWrapper` 为 nil 时使用默认包装；非 nil 时必须是 struct 或 struct 指针，所有参与输出的导出字段必须声明非空 `json` 名（或用 `json:"-"` 排除），并且必须恰有一个导出的 interface kind 字段（包括 `interface{}`/`any` 或命名接口）作为 data 占位符。该占位符会替换为实际 Res schema，其余字段按自身类型生成；未导出字段被忽略。配置为非 struct、缺少或含多个占位符、或者导出字段缺少有效 `json` 名时，`GenerateOpenAPI` 会 panic 并给出配置错误，而不会静默回退默认包装。
 
 > 输出确定性：生成前对 method 与 path 排序，多次生成的输出字节级一致（schema 序号归属稳定），快照测试/增量 diff 友好。
