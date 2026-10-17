@@ -106,10 +106,10 @@ func FuzzBuilderCompile(f *testing.F) {
 					shape, table, column, operator, value, results[0].name, baseArgs, result.name, result.args)
 			}
 			if result.name == "PostgreSQL" {
-				assertFuzzSequentialPlaceholders(t, result.name, result.sql, dialects[i].syntax, len(result.args))
+				assertSequentialPlaceholders(t, result.name, result.sql, dialects[i].syntax, len(result.args))
 				continue
 			}
-			if got := fuzzRawCodePlaceholderCount(result.sql, dialects[i].syntax, result.name); got != len(result.args) {
+			if got := codePlaceholderCount(result.sql, dialects[i].syntax, result.name); got != len(result.args) {
 				t.Fatalf("dialect=%s shape=%d sql=%q: %d placeholder(s), %d arg(s)", result.name, shape, result.sql, got, len(result.args))
 			}
 		}
@@ -159,9 +159,9 @@ func runFuzzTerminal(builder *Builder, shape uint8, column string) (string, []an
 	}
 }
 
-// assertFuzzSequentialPlaceholders 断言 PostgreSQL 产物代码区的 $N 严格按 1..argCount 顺序出现。
+// assertSequentialPlaceholders 断言 PostgreSQL 产物代码区的 $N 严格按 1..argCount 顺序出现。
 // Builder 生成的参数顺序必须与 SQL 占位符顺序一致，重复、跳号或越界都会在这里暴露。
-func assertFuzzSequentialPlaceholders(t *testing.T, dialect, sqlStr string, syntax sqlScanSyntax, argCount int) {
+func assertSequentialPlaceholders(t *testing.T, dialect, sqlStr string, syntax sqlScanSyntax, argCount int) {
 	t.Helper()
 	expected := 1
 	for _, segment := range splitSQLCode(sqlStr, syntax) {
@@ -271,10 +271,10 @@ func FuzzBuilderSubqueryCompile(f *testing.F) {
 					shape, variant, table, column, operator, value, results[0].name, baseArgs, result.name, result.args)
 			}
 			if result.name == "PostgreSQL" {
-				assertFuzzSequentialPlaceholders(t, result.name, result.sql, dialects[i].syntax, len(result.args))
+				assertSequentialPlaceholders(t, result.name, result.sql, dialects[i].syntax, len(result.args))
 				continue
 			}
-			if got := fuzzRawCodePlaceholderCount(result.sql, dialects[i].syntax, result.name); got != len(result.args) {
+			if got := codePlaceholderCount(result.sql, dialects[i].syntax, result.name); got != len(result.args) {
 				t.Fatalf("dialect=%s shape=%d sql=%q: %d placeholder(s), %d arg(s)", result.name, shape, result.sql, got, len(result.args))
 			}
 		}

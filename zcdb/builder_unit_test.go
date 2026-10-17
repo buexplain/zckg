@@ -3442,6 +3442,101 @@ func TestNewApi_ToDeleteJoin(t *testing.T) {
 	}
 }
 
+// TestBuilder_UpdateDeleteJoinBindingOrder 锁定 Update/DeleteJoin/Increment 在
+// "JoinOn(带值) + JoinSub(带派生表绑定与 ON 值)" 混合场景下的 args 顺序：
+// MySQL 为 JOIN → SET → WHERE；PG/SQLite 为 SET → FROM(派生表) → ON → WHERE。
+// 该场景对应历史上的 PG/SQLite 参数错位缺陷，编号顺序与绑定数组顺序必须一致。
+func TestBuilder_UpdateDeleteJoinBindingOrder(t *testing.T) {
+	type updateData struct {
+		Name   string `db:"name"`
+		Status string `db:"status"`
+	}
+	buildChain := func(g Grammar) *Builder {
+		sub := newTestBuilder(g, nil).Table("orders").Select("user_id").Where("amount", ">", 100)
+		return newTestBuilder(g, nil).Table("users").
+			JoinOn("profiles", func(j *JoinBuilder) {
+				j.On("profiles.user_id", "=", "users.id").Where("profiles.active", "=", 99)
+			}).
+			JoinSub(sub, "o", func(j *JoinBuilder) {
+				j.On("o.user_id", "=", "users.id").Where("o.score", ">", 50)
+			}).
+			Where("users.status", "=", "active")
+	}
+	cases := []struct {
+		name          string
+		grammar       Grammar
+		syntax        sqlScanSyntax
+		wantUpdateSQL string
+		wantUpdate    []any
+		wantDelete    []any
+		wantIncrement []any
+	}{
+		{
+			name:    "MySQL",
+			grammar: NewMySQLGrammar(),
+			syntax:  mysqlScanSyntax,
+			wantUpdateSQL: "UPDATE `users` INNER JOIN `profiles` ON `profiles`.`user_id` = `users`.`id` AND `profiles`.`active` = ? " +
+				"INNER JOIN (SELECT `user_id` FROM `orders` WHERE `amount` > ?) AS `o` ON `o`.`user_id` = `users`.`id` AND `o`.`score` > ? " +
+				"SET `name` = ?, `status` = ? WHERE `users`.`status` = ?",
+			wantUpdate:    []any{99, 100, 50, "updated", "vip", "active"},
+			wantDelete:    []any{99, 100, 50, "active"},
+			wantIncrement: []any{99, 100, 50, 1, "active"},
+		},
+		{
+			name:    "PostgreSQL",
+			grammar: NewPostgresGrammar(),
+			syntax:  pgScanSyntax,
+			wantUpdateSQL: `UPDATE "users" SET "name" = $1, "status" = $2 FROM "profiles", (SELECT "user_id" FROM "orders" WHERE "amount" > $3) AS "o" ` +
+				`WHERE "profiles"."user_id" = "users"."id" AND "profiles"."active" = $4 AND "o"."user_id" = "users"."id" AND "o"."score" > $5 AND "users"."status" = $6`,
+			wantUpdate:    []any{"updated", "vip", 100, 99, 50, "active"},
+			wantDelete:    []any{100, 99, 50, "active"},
+			wantIncrement: []any{1, 100, 99, 50, "active"},
+		},
+		{
+			name:    "SQLite",
+			grammar: NewSQLiteGrammar(),
+			syntax:  sqliteScanSyntax,
+			wantUpdateSQL: `UPDATE "users" SET "name" = ?, "status" = ? FROM "profiles", (SELECT "user_id" FROM "orders" WHERE "amount" > ?) AS "o" ` +
+				`WHERE "profiles"."user_id" = "users"."id" AND "profiles"."active" = ? AND "o"."user_id" = "users"."id" AND "o"."score" > ? AND "users"."status" = ?`,
+			wantUpdate:    []any{"updated", "vip", 100, 99, 50, "active"},
+			wantDelete:    []any{99, 100, 50, "active"},
+			wantIncrement: []any{1, 100, 99, 50, "active"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlStr, args, err := buildChain(tc.grammar).ToUpdate(updateData{Name: "updated", Status: "vip"})
+			assertNoError(t, err)
+			assertSQL(t, tc.wantUpdateSQL, sqlStr)
+			assertArgs(t, tc.wantUpdate, args)
+			assertCompilerPlaceholderInvariant(t, tc.name, tc.syntax, sqlStr, len(args))
+
+			sqlStr, args, err = buildChain(tc.grammar).ToDeleteJoin()
+			assertNoError(t, err)
+			assertArgs(t, tc.wantDelete, args)
+			assertCompilerPlaceholderInvariant(t, tc.name, tc.syntax, sqlStr, len(args))
+
+			sqlStr, args, err = buildChain(tc.grammar).ToIncrement([]string{"age"}, []any{1})
+			assertNoError(t, err)
+			assertArgs(t, tc.wantIncrement, args)
+			assertCompilerPlaceholderInvariant(t, tc.name, tc.syntax, sqlStr, len(args))
+		})
+	}
+}
+
+// assertCompilerPlaceholderInvariant 校验编译产物占位符与 args 数量一致：
+// PG 要求 $N 严格按 1..N 顺序，MySQL/SQLite 要求代码区 ? 数量等于 args 数量。
+func assertCompilerPlaceholderInvariant(t *testing.T, dialect string, syntax sqlScanSyntax, sqlStr string, argCount int) {
+	t.Helper()
+	if dialect == "PostgreSQL" {
+		assertSequentialPlaceholders(t, dialect, sqlStr, syntax, argCount)
+		return
+	}
+	if got := codePlaceholderCount(sqlStr, syntax, dialect); got != argCount {
+		t.Fatalf("dialect=%s sql=%q: %d placeholder(s), %d arg(s)", dialect, sqlStr, got, argCount)
+	}
+}
+
 // TestNewApi_WhereShorthandInvalid 验证 Where 三参形式的非法运算符错误。
 func TestNewApi_WhereShorthandInvalid(t *testing.T) {
 	g := NewMySQLGrammar()

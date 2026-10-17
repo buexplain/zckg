@@ -458,7 +458,7 @@ func FuzzCompileRaw(f *testing.F) {
 		if err != nil {
 			t.Fatalf("dialect=%s sql=%q args=%d: want success, got %v", d.name, sqlStr, count, err)
 		}
-		if remaining := fuzzRawCodePlaceholderCount(out, d.syntax, d.name); remaining != 0 {
+		if remaining := codePlaceholderCount(out, d.syntax, d.name); remaining != 0 {
 			t.Fatalf("dialect=%s sql=%q args=%d: %d placeholder(s) left in code region: %q",
 				d.name, sqlStr, count, remaining, out)
 		}
@@ -492,12 +492,12 @@ func fuzzRawPlaceholdersMatch(sqlStr string, syntax sqlScanSyntax, dialect strin
 		}
 		return maxIndex == argCount
 	}
-	return fuzzRawCodePlaceholderCount(sqlStr, syntax, dialect) == argCount
+	return codePlaceholderCount(sqlStr, syntax, dialect) == argCount
 }
 
-// fuzzRawCodePlaceholderCount 统计代码区中的占位符数量：PG 为 $N 引用次数，
+// codePlaceholderCount 统计代码区中的占位符数量：PG 为 $N 引用次数，
 // MySQL/SQLite 为 ? 数量；非代码区一律不计。
-func fuzzRawCodePlaceholderCount(sqlStr string, syntax sqlScanSyntax, dialect string) int {
+func codePlaceholderCount(sqlStr string, syntax sqlScanSyntax, dialect string) int {
 	count := 0
 	for _, segment := range splitSQLCode(sqlStr, syntax) {
 		if !segment.code {
