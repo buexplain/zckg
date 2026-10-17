@@ -3,6 +3,7 @@ package zchttp
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -437,5 +438,542 @@ func TestTrieParamRejectsEmptySegment(t *testing.T) {
 	assertTrieMatches(t, withCatchAll, []trieMatchCase{
 		{"empty segment falls to catch-all", "/c//b", "caRest", []string{"/b"}},
 		{"non-empty segment prefers param", "/c/1/b", "caParam", []string{"1"}},
+	})
+}
+
+// ======== 线性参考匹配器差分测试 ========
+
+// refSegKind 是参考实现独立定义的段类型，与被测基数树无共享代码。
+type refSegKind int
+
+const (
+	refStaticSeg refSegKind = iota
+	refParamSeg
+	refOptionalSeg
+	refCatchAllSeg
+)
+
+// refSegment 是参考路由的一段：静态段用 text 表示字面量，参数段用 text 表示参数名。
+type refSegment struct {
+	kind refSegKind
+	text string
+}
+
+// refRoute 用段列表描述一条路由，不经过被测实现的 parseRoutePath。
+type refRoute struct {
+	segments []refSegment
+}
+
+func refStatic(text string) refSegment   { return refSegment{kind: refStaticSeg, text: text} }
+func refParam(name string) refSegment    { return refSegment{kind: refParamSeg, text: name} }
+func refOptional(name string) refSegment { return refSegment{kind: refOptionalSeg, text: name} }
+func refCatchAll(name string) refSegment { return refSegment{kind: refCatchAllSeg, text: name} }
+
+// path 将参考路由渲染为可交给被测 Router 注册的路径模板。
+func (r refRoute) path() string {
+	if len(r.segments) == 0 {
+		return "/"
+	}
+	parts := make([]string, len(r.segments))
+	for i, seg := range r.segments {
+		switch seg.kind {
+		case refStaticSeg:
+			parts[i] = seg.text
+		case refParamSeg:
+			parts[i] = "{" + seg.text + "}"
+		case refOptionalSeg:
+			parts[i] = "{" + seg.text + "?}"
+		case refCatchAllSeg:
+			parts[i] = "{" + seg.text + "...}"
+		}
+	}
+	return "/" + strings.Join(parts, "/")
+}
+
+// refMatchReq 覆盖随机路由可能用到的全部参数名，保证生成的路由都能通过注册期字段校验。
+type refMatchReq struct {
+	ID   string `json:"id"`
+	X    string `json:"x"`
+	Y    string `json:"y"`
+	Z    string `json:"z"`
+	Name string `json:"name"`
+	Rest string `json:"rest"`
+}
+type refMatchRes struct{}
+
+func refMatchHandler(_ context.Context, _ refMatchReq) (refMatchRes, error) {
+	return refMatchRes{}, nil
+}
+
+// refRoutesConflict 独立判定两条参考路由在注册期是否会冲突：
+// 静态段与参数/通配槽可共存；同位置通配名不一致或重复终点冲突；
+// 同位置参数名或可选性不一致冲突；一方是另一方前缀时可共存。
+func refRoutesConflict(a, b refRoute) bool {
+	for i := 0; i < len(a.segments) && i < len(b.segments); i++ {
+		x, y := a.segments[i], b.segments[i]
+		switch {
+		case x.kind == refStaticSeg && y.kind == refStaticSeg:
+			if x.text != y.text {
+				return false
+			}
+		case x.kind == refStaticSeg || y.kind == refStaticSeg:
+			return false
+		case x.kind == refCatchAllSeg && y.kind == refCatchAllSeg:
+			return true
+		case x.kind == refCatchAllSeg || y.kind == refCatchAllSeg:
+			return false
+		default:
+			if x.text != y.text || (x.kind == refOptionalSeg) != (y.kind == refOptionalSeg) {
+				return true
+			}
+		}
+	}
+	return len(a.segments) == len(b.segments)
+}
+
+// 参考匹配器为每个决策位置打分，按字典序取最高分，等价于基数树的
+// 静态 > 参数 > 通配、路径耗尽时终点 > 可选省略 > 通配零段。
+const (
+	refRankStatic   = 3
+	refRankParam    = 2
+	refRankOmit     = 2
+	refRankCatchAll = 1
+	refRankTerminal = 3
+)
+
+// match 在单条参考路由上确定性匹配已切分的请求路径，
+// 返回捕获值与决策分数序列；不匹配返回 ok=false。
+func (r refRoute) match(pathSegs []string) (values []string, ranks []int, ok bool) {
+	ranks = make([]int, 0, len(r.segments)+1)
+	i := 0
+	for _, seg := range r.segments {
+		switch seg.kind {
+		case refStaticSeg:
+			if i >= len(pathSegs) || pathSegs[i] != seg.text {
+				return nil, nil, false
+			}
+			ranks = append(ranks, refRankStatic)
+			i++
+		case refParamSeg, refOptionalSeg:
+			if i == len(pathSegs) {
+				// 可选参数只能位于末尾（路由语法保证），路径恰在此处耗尽时走省略分支
+				if seg.kind != refOptionalSeg {
+					return nil, nil, false
+				}
+				ranks = append(ranks, refRankOmit)
+				continue
+			}
+			if pathSegs[i] == "" {
+				return nil, nil, false
+			}
+			values = append(values, pathSegs[i])
+			ranks = append(ranks, refRankParam)
+			i++
+		case refCatchAllSeg:
+			if i < len(pathSegs) {
+				values = append(values, strings.Join(pathSegs[i:], "/"))
+			}
+			ranks = append(ranks, refRankCatchAll)
+			i = len(pathSegs)
+		}
+	}
+	if i != len(pathSegs) {
+		return nil, nil, false
+	}
+	ranks = append(ranks, refRankTerminal)
+	return values, ranks, true
+}
+
+// refSplitPath 按 match 的输入契约切分请求路径：根路径无段，其余去掉一个前导 "/"。
+func refSplitPath(path string) []string {
+	if path == "" || path == "/" {
+		return nil
+	}
+	return strings.Split(strings.TrimPrefix(path, "/"), "/")
+}
+
+// compareRefRanks 按字典序比较决策分数序列。
+func compareRefRanks(a, b []int) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] == b[i] {
+			continue
+		}
+		if a[i] < b[i] {
+			return -1
+		}
+		return 1
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	default:
+		return 0
+	}
+}
+
+// refMatch 线性扫描全部参考路由，返回优先级最高的命中路由下标与捕获值；
+// route 为 -1 表示未命中，ambiguous 表示两条候选的优先级完全相同时出现歧义。
+func refMatch(routes []refRoute, path string) (route int, values []string, ambiguous bool) {
+	pathSegs := refSplitPath(path)
+	route = -1
+	var bestRanks []int
+	for idx := range routes {
+		candidateValues, candidateRanks, ok := routes[idx].match(pathSegs)
+		if !ok {
+			continue
+		}
+		if route == -1 {
+			route, values, bestRanks = idx, candidateValues, candidateRanks
+			ambiguous = false
+			continue
+		}
+		switch compareRefRanks(candidateRanks, bestRanks) {
+		case 1:
+			route, values, bestRanks = idx, candidateValues, candidateRanks
+			ambiguous = false
+		case 0:
+			ambiguous = true
+		}
+	}
+	return route, values, ambiguous
+}
+
+var (
+	refStaticWords = []string{"a", "b", "c", "u", "v1", "users", "x"}
+	refParamNames  = []string{"id", "x", "y", "z", "name"}
+)
+
+// refPickParamName 从未占用的参数名中随机挑选，名字耗尽时返回空串。
+func refPickParamName(rng *rand.Rand, used map[string]bool) string {
+	start := rng.Intn(len(refParamNames))
+	for i := 0; i < len(refParamNames); i++ {
+		name := refParamNames[(start+i)%len(refParamNames)]
+		if !used[name] {
+			return name
+		}
+	}
+	return ""
+}
+
+// generateRefRoutes 生成指定数量的互不冲突随机路由，供差分测试使用。
+func generateRefRoutes(rng *rand.Rand, want int) []refRoute {
+	routes := make([]refRoute, 0, want)
+	for attempts := 0; len(routes) < want && attempts < want*100; attempts++ {
+		depth := rng.Intn(5)
+		segments := make([]refSegment, 0, depth+1)
+		used := make(map[string]bool, depth+1)
+		for i := 0; i < depth; i++ {
+			if rng.Intn(10) < 3 {
+				name := refPickParamName(rng, used)
+				if name == "" {
+					segments = append(segments, refStatic(refStaticWords[rng.Intn(len(refStaticWords))]))
+					continue
+				}
+				used[name] = true
+				segments = append(segments, refParam(name))
+				continue
+			}
+			segments = append(segments, refStatic(refStaticWords[rng.Intn(len(refStaticWords))]))
+		}
+		switch rng.Intn(6) {
+		case 0:
+			if name := refPickParamName(rng, used); name != "" {
+				segments = append(segments, refOptional(name))
+			}
+		case 1:
+			segments = append(segments, refCatchAll("rest"))
+		}
+		candidate := refRoute{segments: segments}
+		conflict := false
+		for _, existing := range routes {
+			if refRoutesConflict(candidate, existing) {
+				conflict = true
+				break
+			}
+		}
+		if conflict {
+			continue
+		}
+		routes = append(routes, candidate)
+	}
+	return routes
+}
+
+// refCuratedRouteTables 覆盖文档中锁死的优先级组合，作为随机生成之外的定向差分输入。
+var refCuratedRouteTables = []struct {
+	name   string
+	routes []refRoute
+}{
+	{
+		name: "static_param_catchall",
+		routes: []refRoute{
+			{[]refSegment{refStatic("a"), refStatic("s")}},
+			{[]refSegment{refStatic("a"), refParam("x")}},
+			{[]refSegment{refStatic("a"), refCatchAll("rest")}},
+			{[]refSegment{refStatic("b"), refParam("x"), refStatic("z")}},
+			{[]refSegment{refStatic("b"), refCatchAll("rest")}},
+			{[]refSegment{refStatic("c")}},
+			{[]refSegment{refStatic("c"), refCatchAll("rest")}},
+		},
+	},
+	{
+		name: "cross_level_static_priority",
+		routes: []refRoute{
+			{[]refSegment{refStatic("a"), refParam("x")}},
+			{[]refSegment{refStatic("a"), refStatic("b"), refCatchAll("rest")}},
+		},
+	},
+	{
+		name: "optional_and_catchall",
+		routes: []refRoute{
+			{[]refSegment{refStatic("a"), refOptional("x")}},
+			{[]refSegment{refStatic("a"), refCatchAll("rest")}},
+		},
+	},
+	{
+		name: "backtrack_to_param",
+		routes: []refRoute{
+			{[]refSegment{refStatic("a"), refParam("x"), refStatic("b")}},
+			{[]refSegment{refStatic("a"), refStatic("static"), refStatic("c")}},
+		},
+	},
+	{
+		name: "root_variants",
+		routes: []refRoute{
+			{},
+			{[]refSegment{refOptional("x")}},
+			{[]refSegment{refCatchAll("rest")}},
+		},
+	},
+	{
+		name: "exact_beats_optional",
+		routes: []refRoute{
+			{[]refSegment{refStatic("posts"), refParam("id"), refStatic("comments"), refOptional("name")}},
+			{[]refSegment{refStatic("posts"), refParam("id"), refStatic("comments")}},
+		},
+	},
+	{
+		name: "static_deep_and_catchall",
+		routes: []refRoute{
+			{[]refSegment{refStatic("api"), refParam("id"), refStatic("detail")}},
+			{[]refSegment{refStatic("api"), refStatic("users"), refCatchAll("rest")}},
+			{[]refSegment{refStatic("api"), refStatic("users"), refStatic("me")}},
+		},
+	},
+	{
+		name: "catchall_after_param",
+		routes: []refRoute{
+			{[]refSegment{refStatic("o"), refParam("x"), refCatchAll("rest")}},
+			{[]refSegment{refStatic("o"), refParam("x"), refStatic("fixed")}},
+			{[]refSegment{refStatic("o"), refParam("x")}},
+		},
+	},
+}
+
+// refAddPath 将具体段列表还原为请求路径并交给 add 去重收集。
+func refAddPath(add func(string), parts []string) {
+	if len(parts) == 0 {
+		add("/")
+		return
+	}
+	add("/" + strings.Join(parts, "/"))
+}
+
+// refAlphabet 收集参考路由中的静态字面量并追加一个诱饵，供穷举路径使用。
+func refAlphabet(routes []refRoute) []string {
+	seen := make(map[string]bool)
+	alphabet := make([]string, 0, 8)
+	for _, route := range routes {
+		for _, seg := range route.segments {
+			if seg.kind == refStaticSeg && !seen[seg.text] {
+				seen[seg.text] = true
+				alphabet = append(alphabet, seg.text)
+			}
+		}
+	}
+	return append(alphabet, "q")
+}
+
+// refExhaustivePaths 生成深度不超过 maxDepth 的全部路径，并为每个路径追加
+// 内部空段变体（末段保持非空，以遵守 normalizePath 后的输入契约）。
+func refExhaustivePaths(alphabet []string, maxDepth int) []string {
+	paths := []string{"/"}
+	var walk func(parts []string)
+	walk = func(parts []string) {
+		if len(parts) == maxDepth {
+			return
+		}
+		for _, word := range alphabet {
+			next := append(append([]string(nil), parts...), word)
+			refAddPath(func(p string) { paths = append(paths, p) }, next)
+			for i := 0; i < len(next)-1; i++ {
+				variant := append([]string(nil), next...)
+				variant[i] = ""
+				refAddPath(func(p string) { paths = append(paths, p) }, variant)
+			}
+			walk(next)
+		}
+	}
+	walk(nil)
+	return paths
+}
+
+// refRequestPaths 由路由模板实例化出命中路径与逐段前缀（覆盖可选省略、通配零段），
+// 再补充随机路径（含内部空段），使每条路由与不命中分支都有机会被比较。
+func refRequestPaths(rng *rand.Rand, routes []refRoute, randomCount int) []string {
+	paths := make([]string, 0, len(routes)*4+randomCount+1)
+	seen := make(map[string]bool)
+	add := func(path string) {
+		if !seen[path] {
+			seen[path] = true
+			paths = append(paths, path)
+		}
+	}
+	for _, route := range routes {
+		concrete := make([]string, 0, len(route.segments)+2)
+		refAddPath(add, concrete)
+		for i, seg := range route.segments {
+			switch seg.kind {
+			case refStaticSeg:
+				concrete = append(concrete, seg.text)
+			case refParamSeg, refOptionalSeg:
+				concrete = append(concrete, fmt.Sprintf("v%d", i))
+			case refCatchAllSeg:
+				concrete = append(concrete, fmt.Sprintf("c%d", i))
+				refAddPath(add, concrete)
+				concrete = append(concrete, "d")
+			}
+			refAddPath(add, concrete)
+		}
+	}
+	words := []string{"a", "b", "c", "u", "v1", "users", "x", "y", "z", "id", "other", "d"}
+	for i := 0; i < randomCount; i++ {
+		depth := rng.Intn(6)
+		parts := make([]string, depth)
+		for j := range parts {
+			if rng.Intn(8) == 0 {
+				parts[j] = ""
+			} else {
+				parts[j] = words[rng.Intn(len(words))]
+			}
+		}
+		if depth > 0 && parts[depth-1] == "" {
+			parts[depth-1] = "z"
+		}
+		refAddPath(add, parts)
+	}
+	return paths
+}
+
+// registerRefRoutes 注册参考路由，注册期 panic 视为生成器冲突模型与被测实现不一致。
+func registerRefRoutes(t *testing.T, routes []refRoute) *Router {
+	t.Helper()
+	router := NewRouter()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("generated route table failed to register: %v; routes %v", r, refRouteTemplates(routes))
+		}
+	}()
+	for _, route := range routes {
+		router.GET(route.path(), refMatchHandler)
+	}
+	return router
+}
+
+func refRouteTemplates(routes []refRoute) []string {
+	templates := make([]string, len(routes))
+	for i, route := range routes {
+		templates[i] = route.path()
+	}
+	return templates
+}
+
+// refSameValues 比较捕获值，nil 与空切片视为等价（均表示未捕获参数）。
+func refSameValues(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// assertTrieMatchesReference 对每条路径比较基数树匹配与线性参考匹配的路由及捕获值。
+func assertTrieMatchesReference(t *testing.T, router *Router, routes []refRoute, paths []string) {
+	t.Helper()
+	registered := make(map[*routeEntry]string, len(router.routes))
+	for _, record := range router.routes {
+		if _, exists := registered[record.entry]; exists {
+			t.Fatalf("route entry reused by %q", record.path)
+		}
+		registered[record.entry] = record.path
+	}
+	templates := refRouteTemplates(routes)
+	for _, path := range paths {
+		entry, gotValues := router.match(http.MethodGet, path)
+		wantRoute, wantValues, ambiguous := refMatch(routes, path)
+		if ambiguous {
+			t.Fatalf("path %q: reference matcher ambiguous; routes %v", path, templates)
+		}
+		if wantRoute < 0 {
+			if entry != nil {
+				t.Fatalf("path %q: trie hit %q, reference miss; routes %v", path, registered[entry], templates)
+			}
+			if len(gotValues) != 0 {
+				t.Fatalf("path %q: trie miss returned values %q; routes %v", path, gotValues, templates)
+			}
+			continue
+		}
+		if entry == nil {
+			t.Fatalf("path %q: trie miss, reference hit %q values %q; routes %v", path, templates[wantRoute], wantValues, templates)
+		}
+		if gotPath := registered[entry]; gotPath != templates[wantRoute] {
+			t.Fatalf("path %q: trie hit %q, reference hit %q; routes %v", path, gotPath, templates[wantRoute], templates)
+		}
+		if !refSameValues(gotValues, wantValues) {
+			t.Fatalf("path %q: trie captured %q, reference captured %q (route %q); routes %v",
+				path, gotValues, wantValues, templates[wantRoute], templates)
+		}
+	}
+}
+
+// TestTrieLinearReferenceDifferential 用独立实现的线性参考匹配器对基数树做差分校验：
+// 定向表覆盖文档锁死的静态/参数/通配优先级、可选省略与零段命中；
+// 随机表覆盖组合爆炸的路由形状与请求路径（含内部空段），逐条比较命中路由与捕获值。
+// 参考实现按决策位置打分取字典序最高分，与被测基数树不共享匹配或解析代码。
+func TestTrieLinearReferenceDifferential(t *testing.T) {
+	t.Run("curated", func(t *testing.T) {
+		for _, table := range refCuratedRouteTables {
+			t.Run(table.name, func(t *testing.T) {
+				router := registerRefRoutes(t, table.routes)
+				paths := refExhaustivePaths(refAlphabet(table.routes), 4)
+				assertTrieMatchesReference(t, router, table.routes, paths)
+			})
+		}
+	})
+
+	t.Run("random", func(t *testing.T) {
+		const (
+			trials   = 120
+			baseSeed = int64(20261017)
+		)
+		for trial := 0; trial < trials; trial++ {
+			seed := baseSeed + int64(trial)
+			rng := rand.New(rand.NewSource(seed))
+			routes := generateRefRoutes(rng, 1+rng.Intn(7))
+			if len(routes) == 0 {
+				t.Fatalf("trial %d (seed %d): generator produced no routes", trial, seed)
+			}
+			router := registerRefRoutes(t, routes)
+			paths := refRequestPaths(rng, routes, 80)
+			t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
+				assertTrieMatchesReference(t, router, routes, paths)
+			})
+		}
 	})
 }
