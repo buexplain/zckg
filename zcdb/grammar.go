@@ -36,7 +36,8 @@ type Grammar interface {
 	CompileDeleteJoin(b *Builder) string
 	// CompileTruncate 编译 TRUNCATE 语句
 	CompileTruncate(b *Builder) string
-	// CompileRaw 把一条带 ? 占位符的原始 SQL 与绑定参数内联成一条**可直接执行**的完整 SQL：
+	// CompileRaw 把一条带方言占位符的原始 SQL（MySQL/SQLite 为 ?，PostgreSQL 为 $N）
+	// 与绑定参数内联成一条**可直接执行**的完整 SQL：
 	// 产物不含占位符、也不需要参数，用于手工执行、日志留档或交给其它组件。
 	//
 	// 安全警示：产物把参数值写成了 SQL 文本，等于放弃占位符绑定这一注入防线。

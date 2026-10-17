@@ -1339,10 +1339,10 @@ func TestSQLiteInteg_NewApi_DeleteJoin(t *testing.T) {
 		t.Errorf("DeleteJoin join-only affected: expected 1, got %d", affected)
 	}
 
-	// 无 join 无 where：保护机制拒绝
+	// 无 join 无 where：DeleteJoin 自身的参数错误优先返回
 	_, err = db.Builder().Table("users").DeleteJoin(ctx)
-	if !errors.Is(err, ErrDeleteWithoutWhere) {
-		t.Errorf("expected ErrDeleteWithoutWhere, got %v", err)
+	if !errors.Is(err, ErrDeleteJoinNoJoin) {
+		t.Errorf("expected ErrDeleteJoinNoJoin, got %v", err)
 	}
 
 	// Force 绕过保护但无 join：ErrDeleteJoinNoJoin

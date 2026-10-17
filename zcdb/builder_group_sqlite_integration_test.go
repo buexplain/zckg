@@ -131,9 +131,9 @@ func TestSQLiteInteg_HavingNotBetween(t *testing.T) {
 }
 
 // TestSQLiteInteg_CountWithGroupBy 验证 GROUP BY 下的 Count 行为。
-// 当前行为（BUG）：生成 SELECT COUNT(*) FROM orders GROUP BY user_id，
-// 返回每组一行的计数，Count 只取第一行（user_id=1 的 2），与"记录总数"语义不符。
-// 期望行为：返回分组数量（4）。
+// 回归背景：修复前生成 SELECT COUNT(*) FROM orders GROUP BY user_id，
+// 返回每组一行的计数，Count 只取第一行，与"记录总数"语义不符；
+// 本用例锁死包裹子查询计数（返回分组数量 4）。
 func TestSQLiteInteg_CountWithGroupBy(t *testing.T) {
 	db := openSQLiteTestDB(t)
 	setupSQLiteOrdersTable(t, db)

@@ -52,7 +52,9 @@ func (b *Builder) Limit(n int) *Builder {
 	return b
 }
 
-// Offset 设置查询结果偏移量（编译为 OFFSET n，n<=0 时不输出）。
+// Offset 设置查询结果偏移量。n<=0 时不输出；n>0 且未设置 Limit 时，
+// MySQL 自动补 LIMIT 18446744073709551615、SQLite 自动补 LIMIT -1（两方言要求 OFFSET
+// 与 LIMIT 同时出现），PostgreSQL 直接输出 OFFSET。
 //
 //	sql, _, _ := db.Builder().Table("users").Limit(10).Offset(20).ToSelect()
 //	// SQL: SELECT * FROM `users` LIMIT 10 OFFSET 20

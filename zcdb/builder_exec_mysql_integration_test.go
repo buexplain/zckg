@@ -1295,10 +1295,10 @@ func TestMySQLInteg_NewApi_DeleteJoin(t *testing.T) {
 		t.Errorf("users after DeleteJoin: expected 2, got %d", count)
 	}
 
-	// 保护机制
+	// 无 join 无 where：DeleteJoin 自身的参数错误优先返回
 	_, err = db.Builder().Table("users").DeleteJoin(context.Background())
-	if !errors.Is(err, ErrDeleteWithoutWhere) {
-		t.Errorf("expected ErrDeleteWithoutWhere, got %v", err)
+	if !errors.Is(err, ErrDeleteJoinNoJoin) {
+		t.Errorf("expected ErrDeleteJoinNoJoin, got %v", err)
 	}
 }
 

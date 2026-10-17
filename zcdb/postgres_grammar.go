@@ -10,7 +10,7 @@ import (
 //   - 参数占位符使用 $1, $2, $3 ...
 //   - 共享锁使用 FOR SHARE
 //   - DELETE/UPDATE 不支持 ORDER BY 和 LIMIT
-//   - INSERT 支持 RETURNING 子句
+//   - 数据库支持 RETURNING，但本 Grammar 暂不生成该子句（需要时使用原始 SQL）
 type PostgresGrammar struct {
 	paramCount int // 编译期间的参数计数器（每次编译入口重置）
 }
@@ -765,7 +765,9 @@ func (g *PostgresGrammar) compileJoin(join JoinClause) string {
 
 	result := joinType + " " + tablePart
 	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
-		result += " ON " + g.compileJoinConditions(join.Conditions)
+		if condSQL := g.compileJoinConditions(join.Conditions); condSQL != "" {
+			result += " ON " + condSQL
+		}
 	}
 	return result
 }
@@ -846,7 +848,7 @@ func (g *PostgresGrammar) compileJoinConditions(conditions []JoinCondition) stri
 				}
 			}
 		}
-		if clause == "" {
+		if strings.TrimSpace(clause) == "" {
 			continue
 		}
 		// 同 compileWheres：以 parts 是否为空判定首条有效条件，避免悬挂连接词

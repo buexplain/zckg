@@ -336,12 +336,26 @@ func (g *MySQLGrammar) CompileUpsert(b *Builder, columns []string, rows [][]any,
 	}
 
 	// ON DUPLICATE KEY UPDATE 部分
-	// updateColumns 为空（全部插入列均为 uniqueBy）时退化为 no-op 自赋值，等价冲突时不更新
+	// updateColumns 为空（全部插入列均为 uniqueBy）时退化为 no-op 自赋值，
+	// 但必须引用真实插入列：优先取同时出现在插入列中的 uniqueBy 列，否则退回首列。
 	if len(updateColumns) == 0 {
-		if len(uniqueBy) > 0 {
-			updateColumns = uniqueBy[:1]
-		} else {
-			updateColumns = columns[:1]
+		selected := ""
+		for _, candidate := range uniqueBy {
+			for _, col := range columns {
+				if col == candidate {
+					selected = col
+					break
+				}
+			}
+			if selected != "" {
+				break
+			}
+		}
+		if selected == "" && len(columns) > 0 {
+			selected = columns[0]
+		}
+		if selected != "" {
+			updateColumns = []string{selected}
 		}
 	}
 	sql.WriteString(" ON DUPLICATE KEY UPDATE ")
@@ -723,7 +737,9 @@ func (g *MySQLGrammar) compileJoin(join JoinClause) string {
 
 	result := joinType + " " + tablePart
 	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
-		result += " ON " + g.compileJoinConditions(join.Conditions)
+		if condSQL := g.compileJoinConditions(join.Conditions); condSQL != "" {
+			result += " ON " + condSQL
+		}
 	}
 	return result
 }
@@ -803,9 +819,10 @@ func (g *MySQLGrammar) compileJoinConditions(conditions []JoinCondition) string 
 				}
 			}
 		}
-		if clause == "" {
+		if strings.TrimSpace(clause) == "" {
 			continue
 		}
+
 		// 同 compileWheres：以 parts 是否为空判定首条有效条件，避免悬挂连接词
 		if len(parts) == 0 {
 			parts = append(parts, clause)

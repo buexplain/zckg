@@ -8,6 +8,7 @@ package zcdb
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 )
 
@@ -48,6 +49,11 @@ func (b *Builder) Insert(ctx context.Context, data any) (int64, error) {
 //	id, err := db.Builder().Table("users").InsertGetId(ctx, &user)
 //	// SQL: INSERT INTO `users` (`name`, `age`) VALUES (?, ?)
 func (b *Builder) InsertGetId(ctx context.Context, data any) (int64, error) {
+	// 仅支持单个结构体/结构体指针：非空切片会插入多行，LastInsertId 语义不明确，直接拒绝；
+	// 空切片仍交给 ToInsert 统一返回 ErrEmptyData。
+	if v := reflect.ValueOf(data); v.IsValid() && v.Kind() == reflect.Slice && v.Len() > 0 {
+		return 0, ErrInvalidStruct
+	}
 	// 先做数据校验与编译（参数错误优先于方言限制返回）
 	sqlStr, args, err := b.ToInsert(data)
 	if err != nil {
@@ -314,6 +320,10 @@ func (b *Builder) DeleteJoin(ctx context.Context) (int64, error) {
 	if err := b.validateWriteBuilder(); err != nil {
 		return 0, err
 	}
+	// 无 JOIN 是 DeleteJoin 自身的参数错误，优先于无 WHERE 保护返回
+	if len(b.joins) == 0 {
+		return 0, ErrDeleteJoinNoJoin
+	}
 	// 破坏性操作保护：DeleteJoin 真实编译 JOIN，带条件的 JOIN 计为有效限定
 	if !b.force && !b.hasEffectiveWhere() && !b.hasEffectiveJoin() {
 		return 0, ErrDeleteWithoutWhere
@@ -444,12 +454,50 @@ func orTruth(a, b whereTruth) whereTruth {
 	return truthFalse
 }
 
-// hasEffectiveJoin 判断是否存在带条件的 JOIN。
-// Update 系列与 DeleteJoin 会真实编译 JOIN，其 ON 条件同样限定操作范围，
-// 视为有效限定条件；无条件 JOIN 会产生笛卡尔积，不视为限定。普通 Delete 不编译 JOIN，不使用本判定。
+// hasEffectiveJoin 判断是否存在编译后能产生实际限定条件的 JOIN（含任意深度的嵌套 join 组）。
+// Update 系列与 DeleteJoin 会真实编译 JOIN，其 ON 条件同样限定操作范围，视为有效限定；
+// 无条件 JOIN 产生笛卡尔积，不视为限定。空 Raw（含纯空白）编译时不产生任何条件，不能计入；
+// 空列表 NOT IN 编译为 1 = 1，同样不收窄范围。普通 Delete 不编译 JOIN，不使用本判定。
 func (b *Builder) hasEffectiveJoin() bool {
-	for _, j := range b.joins {
-		if len(j.Conditions) > 0 {
+	return hasEffectiveJoinClauses(b.joins)
+}
+
+// hasEffectiveJoinClauses 递归检查 join 列表，任意层级存在有效 ON 条件即返回 true。
+func hasEffectiveJoinClauses(joins []JoinClause) bool {
+	for _, j := range joins {
+		if hasEffectiveJoinConditions(j.Conditions) || hasEffectiveJoinClauses(j.Joins) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasEffectiveJoinConditions 判断 ON 条件列表是否至少有一条编译后能收窄范围。
+// 判定与 collectJoinConditionBindings/各 Grammar 的 compileJoinConditions 对齐：
+// 空 Raw 不产生 SQL；空 NOT IN 产生 1 = 1（恒真）；嵌套组递归判断。
+func hasEffectiveJoinConditions(conditions []JoinCondition) bool {
+	for _, c := range conditions {
+		switch c.Type {
+		case "raw":
+			if strings.TrimSpace(c.SQL) != "" {
+				return true
+			}
+		case "in":
+			// 空列表 IN 编译为 0 = 1（恒假，仍能限定）；空列表 NOT IN 为 1 = 1（恒真，不限定了）
+			if len(c.Values) == 0 && c.Not {
+				continue
+			}
+			return true
+		case "nested":
+			if c.Nested != nil &&
+				(hasEffectiveJoinConditions(c.Nested.Conditions) || hasEffectiveJoinClauses(c.Nested.Joins)) {
+				return true
+			}
+		case "inSub", "exists", "subValue":
+			if c.Sub != nil {
+				return true
+			}
+		case "column", "value", "null":
 			return true
 		}
 	}

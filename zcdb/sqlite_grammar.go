@@ -13,7 +13,7 @@ import (
 //   - 没有 TRUNCATE，用 DELETE FROM 代替
 //   - 不支持锁（FOR UPDATE / LOCK IN SHARE MODE 返回 ErrSQLiteLockNotSupported）
 //   - UPDATE 不生成 JOIN、ORDER BY、LIMIT（多表更新用 FROM 子句，SQLite 3.33+）
-//   - DELETE 不生成 ORDER BY 和 LIMIT（除非编译时启用）
+//   - DELETE 不生成 ORDER BY 和 LIMIT
 //   - 随机排序使用 RANDOM()
 type SQLiteGrammar struct{}
 
@@ -712,7 +712,9 @@ func (g *SQLiteGrammar) compileJoin(join JoinClause) string {
 
 	result := joinType + " " + tablePart
 	if join.Type != JoinTypeCross && len(join.Conditions) > 0 {
-		result += " ON " + g.compileJoinConditions(join.Conditions)
+		if condSQL := g.compileJoinConditions(join.Conditions); condSQL != "" {
+			result += " ON " + condSQL
+		}
 	}
 	return result
 }
@@ -792,7 +794,7 @@ func (g *SQLiteGrammar) compileJoinConditions(conditions []JoinCondition) string
 				}
 			}
 		}
-		if clause == "" {
+		if strings.TrimSpace(clause) == "" {
 			continue
 		}
 		// 同 compileWheres：以 parts 是否为空判定首条有效条件，避免悬挂连接词

@@ -62,7 +62,8 @@ func parseStruct(t reflect.Type, tagName string) *structInfo {
 
 // collectStructFields 按「外层优先」顺序展开结构体字段（含匿名嵌入结构体）。
 // 采用广度优先遍历：浅层字段先于深层（嵌入）字段处理，同层内按声明顺序；
-// 遇到已出现的列名直接跳过（浅层遮蔽深层，对齐 encoding/json 语义）。
+// 遇到已出现的列名直接跳过（浅层遮蔽深层；同深度冲突保留先声明者，与
+// encoding/json 的冲突丢弃语义不同）。
 // 返回去重后的字段序列，供扫描映射与 Insert/Update 数据提取共用。
 func collectStructFields(t reflect.Type, tagName string) []structField {
 	type pending struct {

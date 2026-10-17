@@ -1424,8 +1424,8 @@ func TestBuilder_WhereInExpression(t *testing.T) {
 }
 
 // TestBug_HavingWithExpression 验证 Having/OrHaving 传入 Expression 时直接内嵌 SQL。
-// 当前行为（BUG）：compileHavings 的 basic 分支固定生成占位符，
-// Expression 被当作绑定参数传入驱动导致执行失败。
+// 回归背景：修复前 compileHavings 的 basic 分支固定生成占位符，Expression 被当作
+// 绑定参数传入驱动导致执行失败；本用例锁死内嵌行为。
 func TestBug_HavingWithExpression(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1452,7 +1452,8 @@ func TestBug_HavingWithExpression(t *testing.T) {
 }
 
 // TestBug_RawWithExpressionBindings 验证 WhereRaw/HavingRaw/Join.Raw 的绑定参数中含 Expression 时直接内嵌。
-// 当前行为（BUG）：raw SQL 原样输出（含 ?），Expression 被当作绑定参数传入驱动导致执行失败。
+// 回归背景：修复前 raw SQL 原样输出（含 ?），Expression 被当作绑定参数传入驱动导致执行失败；
+// 本用例锁死内嵌行为与空绑定参数。
 func TestBug_RawWithExpressionBindings(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1496,7 +1497,8 @@ func TestBug_RawWithExpressionBindings(t *testing.T) {
 }
 
 // TestBug_ToCountWithDistinct 验证 Distinct + Count 的去重计数。
-// 当前行为（BUG）：生成 SELECT DISTINCT COUNT(*)，DISTINCT 对聚合结果无效，返回总行数。
+// 回归背景：修复前生成 SELECT DISTINCT COUNT(*)，DISTINCT 对聚合结果无效，返回总行数；
+// 本用例锁死包裹子查询计数。
 func TestBug_ToCountWithDistinct(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1523,7 +1525,8 @@ func TestBug_ToCountWithDistinct(t *testing.T) {
 }
 
 // TestBug_OffsetWithoutLimit 验证仅 Offset 无 Limit 时各方言生成合法 SQL。
-// 当前行为（BUG）：MySQL/SQLite 直接输出 OFFSET n（无 LIMIT），数据库报语法错误。
+// 回归背景：修复前 MySQL/SQLite 直接输出 OFFSET n（无 LIMIT），数据库报语法错误；
+// 本用例锁死隐式 LIMIT 行为。
 func TestBug_OffsetWithoutLimit(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1548,8 +1551,8 @@ func TestBug_OffsetWithoutLimit(t *testing.T) {
 }
 
 // TestBug_CloneHavingsBindings 验证 Clone 后 havings 的 Bindings 相互独立。
-// 当前行为（BUG）：Clone 只复制 havings 切片，Bindings 数组仍共享，
-// 修改克隆会影响原 Builder（并发复用不安全）。
+// 回归背景：修复前 Clone 只复制 havings 切片，Bindings 数组仍共享，
+// 修改克隆会影响原 Builder（并发复用不安全）；本用例锁死深拷贝。
 func TestBug_CloneHavingsBindings(t *testing.T) {
 	b := newTestBuilder(NewMySQLGrammar(), nil).
 		Table("users").
@@ -1565,7 +1568,7 @@ func TestBug_CloneHavingsBindings(t *testing.T) {
 
 // TestBug_InsertUpdateNilPointer 验证 Insert/Update 传入 nil 结构体指针时
 // 返回 ErrInvalidStruct 而非 panic。
-// 当前行为（BUG）：extractInsertData/extractUpdateData 对 nil 指针执行
+// 回归背景：修复前 extractInsertData/extractUpdateData 对 nil 指针执行
 // v.Elem() 后 v.Type() 直接 panic（reflect: call of Type on zero Value）。
 func TestBug_InsertUpdateNilPointer(t *testing.T) {
 	type User struct {
@@ -1600,8 +1603,8 @@ func TestBug_InsertUpdateNilPointer(t *testing.T) {
 }
 
 // TestBug_ScanNumericToString 验证数值扫描到 string 字段时转换为数字字符串。
-// 当前行为（BUG）：int64 123 经 ConvertibleTo 分支 Convert 为 string，
-// 得到字符码 "{" 而不是 "123"。
+// 回归背景：修复前 int64 123 经 ConvertibleTo 分支 Convert 为 string，
+// 得到字符码 "{" 而不是 "123"；本用例锁死数字字符串格式化。
 func TestBug_ScanNumericToString(t *testing.T) {
 	var s string
 	n := nullSafeField{field: reflect.ValueOf(&s).Elem()}
@@ -1614,7 +1617,7 @@ func TestBug_ScanNumericToString(t *testing.T) {
 }
 
 // TestBug_ScanByteSliceToIntSlice 验证 []byte 扫描到非字节切片目标（如 []int）时不 panic。
-// 当前行为（BUG）：reflect.Copy 元素类型不匹配直接 panic。
+// 回归背景：修复前 reflect.Copy 元素类型不匹配直接 panic；本用例锁死 JSON 反序列化路径。
 func TestBug_ScanByteSliceToIntSlice(t *testing.T) {
 	var arr []int
 	n := nullSafeField{field: reflect.ValueOf(&arr).Elem()}
@@ -1701,6 +1704,150 @@ func TestBug_HasEffectiveWhere(t *testing.T) {
 	})
 	if !b.hasEffectiveJoin() {
 		t.Error("join with on condition should be effective")
+	}
+}
+
+// TestBug_HasEffectiveJoin 验证有效 JOIN 判定：空 Raw/空 NOT IN 不计入，
+// 正常 ON、空 IN（0 = 1）与任意层级嵌套 join 组的 ON 计入。
+func TestBug_HasEffectiveJoin(t *testing.T) {
+	g := NewMySQLGrammar()
+	tests := []struct {
+		name  string
+		build func() *Builder
+		want  bool
+	}{
+		{"空 Raw ON 不计入", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.Raw("")
+			})
+		}, false},
+		{"纯空白 Raw ON 不计入", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.Raw("   ")
+			})
+		}, false},
+		{"正常 ON 计入", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.On("orders.user_id", "=", "users.id")
+			})
+		}, true},
+		{"空列表 NOT IN（1 = 1）不计入", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.WhereNotIn("orders.id", []any{})
+			})
+		}, false},
+		{"空列表 IN（0 = 1）计入", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.WhereIn("orders.id", []any{})
+			})
+		}, true},
+		{"仅嵌套 join 组带 ON 计入", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.JoinOn("items", func(q *JoinBuilder) {
+					q.On("items.order_id", "=", "orders.id")
+				})
+			})
+		}, true},
+		{"嵌套组条件为空不计入", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.JoinOn("items", func(q *JoinBuilder) {})
+			})
+		}, false},
+		{"JoinSub 无回调不计入", func() *Builder {
+			sub := newTestBuilder(g, nil).Table("logs").Select("user_id")
+			return newTestBuilder(g, nil).Table("users").JoinSub(sub, "l", nil)
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.build().hasEffectiveJoin(); got != tt.want {
+				t.Errorf("hasEffectiveJoin()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBug_EmptyJoinOnNoDanglingOn 验证空 Raw ON 不生成悬挂的 " ON "。
+// 该形态经保护机制拒绝执行；此处仅锁死编译层不再产出非法拼接。
+func TestBug_EmptyJoinOnNoDanglingOn(t *testing.T) {
+	tests := []struct {
+		name     string
+		grammar  Grammar
+		expected string
+	}{
+		{"mysql", NewMySQLGrammar(), "SELECT * FROM `users` INNER JOIN `orders`"},
+		{"postgres", NewPostgresGrammar(), `SELECT * FROM "users" INNER JOIN "orders"`},
+		{"sqlite", NewSQLiteGrammar(), `SELECT * FROM "users" INNER JOIN "orders"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, _, err := newTestBuilder(tt.grammar, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.Raw("")
+			}).ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, tt.expected, sql)
+		})
+	}
+}
+
+// TestBug_DeleteJoinNoJoinPrecedence 验证 DeleteJoin 无 JOIN 时优先返回 ErrDeleteJoinNoJoin，
+// 即使同时缺少 WHERE（此前会先被 ErrDeleteWithoutWhere 遮蔽）。
+func TestBug_DeleteJoinNoJoinPrecedence(t *testing.T) {
+	g := NewMySQLGrammar()
+	if _, err := newTestBuilder(g, nil).Table("users").DeleteJoin(context.Background()); !errors.Is(err, ErrDeleteJoinNoJoin) {
+		t.Errorf("无 JOIN 无 WHERE 应返回 ErrDeleteJoinNoJoin, got %v", err)
+	}
+	if _, err := newTestBuilder(g, nil).Table("users").Where("id", "=", 1).DeleteJoin(context.Background()); !errors.Is(err, ErrDeleteJoinNoJoin) {
+		t.Errorf("无 JOIN 有 WHERE 应返回 ErrDeleteJoinNoJoin, got %v", err)
+	}
+}
+
+// TestBug_InsertGetIdRejectsSlice 验证 InsertGetId 拒绝切片（LastInsertId 对多行无明确语义）。
+func TestBug_InsertGetIdRejectsSlice(t *testing.T) {
+	type row struct {
+		Name string `db:"name"`
+	}
+	_, err := newTestBuilder(NewMySQLGrammar(), nil).Table("users").
+		InsertGetId(context.Background(), []row{{Name: "a"}, {Name: "b"}})
+	if !errors.Is(err, ErrInvalidStruct) {
+		t.Errorf("InsertGetId 传入切片应返回 ErrInvalidStruct, got %v", err)
+	}
+}
+
+// TestBug_OperatorInjection_JoinShorthand 验证 Join/LeftJoin/RightJoin/CrossJoinOn
+// 与 JoinBuilder.CrossJoinOn 的运算符同样走白名单校验。
+func TestBug_OperatorInjection_JoinShorthand(t *testing.T) {
+	g := NewMySQLGrammar()
+	invalid := "= 1; DROP TABLE users; --"
+	tests := []struct {
+		name  string
+		build func() *Builder
+	}{
+		{"Join", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").Join("orders", "users.id", invalid, "orders.user_id")
+		}},
+		{"LeftJoin", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").LeftJoin("orders", "users.id", invalid, "orders.user_id")
+		}},
+		{"RightJoin", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").RightJoin("orders", "users.id", invalid, "orders.user_id")
+		}},
+		{"CrossJoinOn", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").CrossJoinOn("orders", "users.id", invalid, "orders.user_id")
+		}},
+		{"JoinBuilder_CrossJoinOn", func() *Builder {
+			return newTestBuilder(g, nil).Table("users").JoinOn("orders", func(j *JoinBuilder) {
+				j.On("orders.user_id", "=", "users.id").
+					CrossJoinOn("colors", "colors.id", invalid, "orders.id")
+			})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := tt.build().ToSelect(); !errors.Is(err, ErrInvalidOperator) {
+				t.Errorf("恶意运算符应返回 ErrInvalidOperator, got %v", err)
+			}
+		})
 	}
 }
 
@@ -2707,6 +2854,24 @@ func assertInsertUsingColumnMismatch(t *testing.T, g Grammar) {
 		sub.Table("users")
 	}); err != nil {
 		t.Errorf("ToInsertUsing 默认列: unexpected error %v", err)
+	}
+	// SelectRaw 的非通配列同样参与静态计数
+	if err := checkUsing([]string{"name", "age"}, func(sub *Builder) {
+		sub.Table("users").SelectRaw("name")
+	}); !errors.Is(err, ErrInsertUsingColumnMismatch) {
+		t.Errorf("ToInsertUsing SelectRaw 列数不一致: expected ErrInsertUsingColumnMismatch, got %v", err)
+	}
+	// SelectRaw 含通配符（如 COUNT(*)）→ 无法静态判定，不报错
+	if err := checkUsing([]string{"name"}, func(sub *Builder) {
+		sub.Table("users").SelectRaw("COUNT(*)")
+	}); err != nil {
+		t.Errorf("ToInsertUsing SelectRaw 通配符: unexpected error %v", err)
+	}
+	// SelectSub 同样参与静态计数
+	if err := checkUsing([]string{"name", "age"}, func(sub *Builder) {
+		sub.Table("users").SelectSub(newTestBuilder(g, nil).Table("t").Select("id"), "x")
+	}); !errors.Is(err, ErrInsertUsingColumnMismatch) {
+		t.Errorf("ToInsertUsing SelectSub 列数不一致: expected ErrInsertUsingColumnMismatch, got %v", err)
 	}
 	// ToInsertOrIgnoreUsing 同样校验
 	b := newTestBuilder(g, nil).Table("archive")

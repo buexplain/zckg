@@ -498,7 +498,7 @@ func crossDialectCommentErrors(t *testing.T, open commentDAOOpener) {
 		}, ErrDeleteWithoutWhere},
 		{"DeleteJoin", func(dao *DBDao) (int64, error) {
 			return dao.Builder().Table(table).Comment("not:authorization").DeleteJoin(ctx)
-		}, ErrDeleteWithoutWhere},
+		}, ErrDeleteJoinNoJoin},
 		{"Increment", func(dao *DBDao) (int64, error) {
 			return dao.Builder().Table(table).Comment("not:authorization").Increment(ctx, "num", 1)
 		}, ErrUpdateWithoutWhere},

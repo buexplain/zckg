@@ -13,6 +13,10 @@ package zcdb
 //	    Join("orders", "users.id", "=", "orders.user_id").ToSelect()
 //	// SQL: SELECT `users`.`name`, `orders`.`amount` FROM `users` INNER JOIN `orders` ON `users`.`id` = `orders`.`user_id`
 func (b *Builder) Join(table, first, op, second string) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.joins = append(b.joins, JoinClause{
 		Type:  JoinTypeInner,
 		Table: table,
@@ -33,6 +37,10 @@ func (b *Builder) Join(table, first, op, second string) *Builder {
 //	    LeftJoin("orders", "users.id", "=", "orders.user_id").ToSelect()
 //	// SQL: SELECT `users`.`name`, `orders`.`amount` FROM `users` LEFT JOIN `orders` ON `users`.`id` = `orders`.`user_id`
 func (b *Builder) LeftJoin(table, first, op, second string) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.joins = append(b.joins, JoinClause{
 		Type:  JoinTypeLeft,
 		Table: table,
@@ -54,6 +62,10 @@ func (b *Builder) LeftJoin(table, first, op, second string) *Builder {
 //	    RightJoin("orders", "users.id", "=", "orders.user_id").ToSelect()
 //	// SQL: SELECT `users`.`name`, `orders`.`amount` FROM `users` RIGHT JOIN `orders` ON `users`.`id` = `orders`.`user_id`
 func (b *Builder) RightJoin(table, first, op, second string) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.joins = append(b.joins, JoinClause{
 		Type:  JoinTypeRight,
 		Table: table,
@@ -90,6 +102,10 @@ func (b *Builder) CrossJoin(table string) *Builder {
 //	// MySQL SQL: SELECT * FROM `users` CROSS JOIN `colors` ON `colors`.`id` = `users`.`id`
 //	// PG SQL:    SELECT * FROM "users" INNER JOIN "colors" ON "colors"."id" = "users"."id"
 func (b *Builder) CrossJoinOn(table, first, op, second string) *Builder {
+	if err := validateOperator(op); err != nil {
+		b.err = err
+		return b
+	}
 	b.joins = append(b.joins, JoinClause{
 		Type:  JoinTypeCrossOn,
 		Table: table,
@@ -524,6 +540,10 @@ func (j *JoinBuilder) JoinOn(table string, callback func(*JoinBuilder)) *JoinBui
 //	j.On("orders.user_id", "=", "users.id").CrossJoinOn("coupons", "coupons.id", "=", "orders.coupon_id")
 //	// MySQL SQL: ... INNER JOIN (`orders` CROSS JOIN `coupons` ON `coupons`.`id` = `orders`.`coupon_id`) ON `orders`.`user_id` = `users`.`id`
 func (j *JoinBuilder) CrossJoinOn(table, first, op, second string) *JoinBuilder {
+	if err := validateOperator(op); err != nil {
+		j.err = err
+		return j
+	}
 	j.Joins = append(j.Joins, JoinClause{
 		Type:  JoinTypeCrossOn,
 		Table: table,

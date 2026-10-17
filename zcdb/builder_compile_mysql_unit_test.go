@@ -53,6 +53,19 @@ func TestMySQLCompile_UpsertEmptyUpdateColumnsElse(t *testing.T) {
 	}
 }
 
+// TestMySQLCompile_UpsertFallbackUsesInsertedColumn 验证退化自赋值只引用真实插入列：
+// uniqueBy 含额外列且位于首位时，仍应选择同时存在于插入列中的 email，而非 tenant。
+func TestMySQLCompile_UpsertFallbackUsesInsertedColumn(t *testing.T) {
+	type onlyEmail struct {
+		Email string `db:"email"`
+	}
+	sql, args, err := newTestBuilder(NewMySQLGrammar(), nil).Table("users").
+		ToUpsert(onlyEmail{Email: "a@t.com"}, []string{"tenant", "email"}, nil)
+	assertNoError(t, err)
+	assertSQL(t, "INSERT INTO `users` (`email`) VALUES (?) ON DUPLICATE KEY UPDATE `email` = VALUES(`email`)", sql)
+	assertArgs(t, []any{"a@t.com"}, args)
+}
+
 // TestMySQLCompile_InsertOrIgnoreMultiRowAndExpression 覆盖 MySQL 方言
 // CompileInsertOrIgnore 的多行分隔符与 Expression 内联分支。
 func TestMySQLCompile_InsertOrIgnoreMultiRowAndExpression(t *testing.T) {

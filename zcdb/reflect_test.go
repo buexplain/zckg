@@ -190,8 +190,8 @@ func TestParseStruct_CacheHit(t *testing.T) {
 }
 
 // TestParseStruct_EmbeddedPtrStruct 验证嵌入指针结构体（*struct 匿名嵌入）字段展开。
-// 当前行为（BUG）：嵌入条件限制为值类型结构体，*Base 不会被展开，
-// 而是被当作普通字段（列名变为 base）。
+// 回归背景：修复前嵌入条件限制为值类型结构体，*Base 不会被展开，
+// 而是被当作普通字段（列名变为 base）；本用例锁死嵌入指针展开。
 func TestParseStruct_EmbeddedPtrStruct(t *testing.T) {
 	type Base struct {
 		ID   int    `db:"id"`
@@ -228,7 +228,8 @@ func TestParseStruct_EmbeddedPtrStruct(t *testing.T) {
 }
 
 // TestParseStruct_EmbeddedShadowOuterWins 验证同名列的嵌入展开为「外层优先」：
-// 外层字段遮蔽嵌入层同名字段，与声明顺序无关（对齐 encoding/json 语义）。
+// 外层字段遮蔽嵌入层同名字段，与声明顺序无关（同深度冲突的取舍见
+// TestParseStruct_EmbeddedSameDepthFirstDeclared）。
 func TestParseStruct_EmbeddedShadowOuterWins(t *testing.T) {
 	type Base struct {
 		Name string `db:"name"`
@@ -267,6 +268,32 @@ func TestParseStruct_EmbeddedShadowOuterWins(t *testing.T) {
 				t.Errorf("expected index %v, got %v", tc.want, info.Fields[0].Index)
 			}
 		})
+	}
+}
+
+// TestParseStruct_EmbeddedSameDepthFirstDeclared 验证同深度两个匿名嵌入结构体存在同名列时，
+// 取声明顺序靠前的字段（与 encoding/json 的冲突丢弃语义不同，文档已按此收窄）。
+func TestParseStruct_EmbeddedSameDepthFirstDeclared(t *testing.T) {
+	type A struct {
+		Name string `db:"name"`
+	}
+	type B struct {
+		Name string `db:"name"`
+	}
+	type C struct {
+		A
+		B
+	}
+
+	info := parseStruct(reflect.TypeOf(C{}), "")
+	if info == nil {
+		t.Fatal("parseStruct returned nil")
+	}
+	if len(info.Fields) != 1 {
+		t.Fatalf("expected 1 deduped field, got %d: %+v", len(info.Fields), info.Fields)
+	}
+	if info.Fields[0].Column != "name" || !reflect.DeepEqual(info.Fields[0].Index, []int{0, 0}) {
+		t.Errorf("同深度冲突应取先声明的 A.Name（index [0 0]），got %+v", info.Fields[0])
 	}
 }
 
