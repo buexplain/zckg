@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -3046,4 +3049,687 @@ func TestBindMultipartValueOverMemoryLimit(t *testing.T) {
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "multipart: message too large") {
 		t.Fatalf("expected 400 multipart: message too large, got %d; body=%.200s", rec.Code, rec.Body.String())
 	}
+}
+
+// ======== stdlib 差分测试：query/form/JSON/multipart 绑定 ========
+
+// bindDiffNested 是 JSON 嵌套字段，query/form 绑定应跳过整个结构体。
+type bindDiffNested struct {
+	Key string `json:"key"`
+	Num int    `json:"num"`
+}
+
+// bindDiffReq 是差分测试用的 Req：覆盖 form/json 绑定名差异、标量、切片、指针、
+// 嵌套结构体、map、忽略字段与上传文件。字段保持扁平，避免把匿名嵌入展开语义
+// 混入本次差分（该语义由既有测试覆盖）。
+type bindDiffReq struct {
+	Nick     string                  `json:"name" form:"nick"`
+	Page     int                     `json:"page"`
+	Active   bool                    `json:"active"`
+	Ratio    float64                 `json:"ratio"`
+	Tags     []string                `json:"tags"`
+	Nums     []int                   `json:"nums"`
+	Score    *int                    `json:"score"`
+	Ignored  string                  `json:"-"`
+	Nested   bindDiffNested          `json:"nested"`
+	Extra    map[string]string       `json:"extra"`
+	FormOnly string                  `form:"fo"`
+	File     *multipart.FileHeader   `json:"file"`
+	Files    []*multipart.FileHeader `json:"files"`
+}
+
+type bindDiffFileSnapshot struct {
+	Filename string
+	Size     int64
+}
+
+// bindDiffSnapshot 把 Req 转成可比较快照，避免直接比较两个 parser 产生的文件头指针。
+type bindDiffSnapshot struct {
+	Nick     string
+	Page     int
+	Active   bool
+	Ratio    float64
+	Tags     []string
+	Nums     []int
+	Score    *int
+	Ignored  string
+	Nested   bindDiffNested
+	Extra    map[string]string
+	FormOnly string
+	File     *bindDiffFileSnapshot
+	Files    []bindDiffFileSnapshot
+}
+
+func snapshotBindDiff(req bindDiffReq) bindDiffSnapshot {
+	snapshot := bindDiffSnapshot{
+		Nick:     req.Nick,
+		Page:     req.Page,
+		Active:   req.Active,
+		Ratio:    req.Ratio,
+		Tags:     req.Tags,
+		Nums:     req.Nums,
+		Ignored:  req.Ignored,
+		Nested:   req.Nested,
+		Extra:    req.Extra,
+		FormOnly: req.FormOnly,
+	}
+	if req.Score != nil {
+		value := *req.Score
+		snapshot.Score = &value
+	}
+	if req.File != nil {
+		snapshot.File = &bindDiffFileSnapshot{Filename: req.File.Filename, Size: req.File.Size}
+	}
+	for _, file := range req.Files {
+		if file == nil {
+			snapshot.Files = append(snapshot.Files, bindDiffFileSnapshot{})
+			continue
+		}
+		snapshot.Files = append(snapshot.Files, bindDiffFileSnapshot{Filename: file.Filename, Size: file.Size})
+	}
+	return snapshot
+}
+
+type bindDiffCase struct {
+	name        string
+	method      string
+	rawQuery    string
+	contentType string
+	body        []byte
+	maxMemory   int64
+}
+
+// refBindFileHeaderPtrType 由参考实现独立获取，避免依赖被测包的文件字段判定变量。
+var refBindFileHeaderPtrType = reflect.TypeOf((*multipart.FileHeader)(nil))
+
+// refBindFieldName 独立实现文档约定的绑定名解析：form > json > 字段名。
+func refBindFieldName(field reflect.StructField) string {
+	if tag := field.Tag.Get("form"); tag != "" {
+		if name := refBindTagName(tag); name != "" {
+			return name
+		}
+	}
+	if tag := field.Tag.Get("json"); tag != "" {
+		if name := refBindTagName(tag); name != "" {
+			return name
+		}
+	}
+	return field.Name
+}
+
+func refBindTagName(tag string) string {
+	if idx := strings.IndexByte(tag, ','); idx >= 0 {
+		tag = tag[:idx]
+	}
+	return tag
+}
+
+// refBindValues 用反射按绑定名把 values/files 写入结构体：
+// 文件字段优先于普通值、标量取首值且不去空白、切片逐值去空白后整体提交、
+// 转换失败保持字段原值（尽力绑定）。仅处理扁平结构体字段。
+func refBindValues(dst reflect.Value, values map[string][]string, files map[string][]*multipart.FileHeader) {
+	typ := dst.Type()
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.PkgPath != "" {
+			continue
+		}
+		name := refBindFieldName(field)
+		if name == "" || name == "-" {
+			continue
+		}
+		fieldValue := dst.Field(i)
+		if !fieldValue.CanSet() {
+			continue
+		}
+		switch {
+		case field.Type == refBindFileHeaderPtrType:
+			if headers := files[name]; len(headers) > 0 {
+				fieldValue.Set(reflect.ValueOf(headers[0]))
+			}
+			continue
+		case field.Type.Kind() == reflect.Slice && field.Type.Elem() == refBindFileHeaderPtrType:
+			if headers := files[name]; len(headers) > 0 {
+				fieldValue.Set(reflect.ValueOf(headers))
+			}
+			continue
+		}
+		fieldValues, ok := values[name]
+		if !ok || len(fieldValues) == 0 {
+			continue
+		}
+		refBindFieldValue(fieldValue, fieldValues)
+	}
+}
+
+func refBindFieldValue(fieldValue reflect.Value, values []string) {
+	if fieldValue.Kind() == reflect.Slice {
+		if !refIsScalarType(fieldValue.Type().Elem()) {
+			return
+		}
+		parsed := reflect.MakeSlice(fieldValue.Type(), len(values), len(values))
+		for i, value := range values {
+			if !refParseScalar(parsed.Index(i), strings.TrimSpace(value)) {
+				return
+			}
+		}
+		fieldValue.Set(parsed)
+		return
+	}
+	refParseScalar(fieldValue, values[0])
+}
+
+func refIsScalarType(t reflect.Type) bool {
+	for depth := 0; t.Kind() == reflect.Ptr; depth++ {
+		if depth >= maxPtrDerefDepth {
+			return false
+		}
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
+// refParseScalar 先用 stdlib 转换到临时值，成功后才写入目标；失败保持原值。
+func refParseScalar(fieldValue reflect.Value, value string) bool {
+	if fieldValue.Kind() == reflect.Ptr {
+		parsed := reflect.New(fieldValue.Type().Elem())
+		if !refParseScalar(parsed.Elem(), value) {
+			return false
+		}
+		fieldValue.Set(parsed)
+		return true
+	}
+	switch fieldValue.Kind() {
+	case reflect.String:
+		fieldValue.SetString(value)
+	case reflect.Bool:
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return false
+		}
+		fieldValue.SetBool(parsed)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		parsed, err := strconv.ParseInt(value, 10, fieldValue.Type().Bits())
+		if err != nil {
+			return false
+		}
+		fieldValue.SetInt(parsed)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		parsed, err := strconv.ParseUint(value, 10, fieldValue.Type().Bits())
+		if err != nil {
+			return false
+		}
+		fieldValue.SetUint(parsed)
+	case reflect.Float32, reflect.Float64:
+		parsed, err := strconv.ParseFloat(value, fieldValue.Type().Bits())
+		if err != nil {
+			return false
+		}
+		fieldValue.SetFloat(parsed)
+	default:
+		return false
+	}
+	return true
+}
+
+// refBindRequest 用 stdlib 独立实现文档中的绑定流程：
+// 先按 query 绑定（GET/DELETE/HEAD 到此结束），其余方法按 Content-Type
+// 选择 JSON、urlencoded 或 multipart，后绑定者覆盖先绑定者。
+func refBindRequest(t *testing.T, tc bindDiffCase) (bindDiffReq, error) {
+	t.Helper()
+	var dst bindDiffReq
+	// 与 net/url.Values.Query 一致：忽略解析错误，保留已解析部分
+	queryValues, _ := url.ParseQuery(tc.rawQuery)
+	refBindValues(reflect.ValueOf(&dst).Elem(), queryValues, nil)
+
+	switch tc.method {
+	case http.MethodGet, http.MethodDelete, http.MethodHead:
+		return dst, nil
+	}
+
+	mediaType := ""
+	var params map[string]string
+	if tc.contentType != "" {
+		parsedType, parsedParams, err := mime.ParseMediaType(tc.contentType)
+		if err != nil {
+			return dst, err
+		}
+		mediaType, params = parsedType, parsedParams
+	}
+
+	switch mediaType {
+	case "application/x-www-form-urlencoded":
+		bodyValues, err := url.ParseQuery(string(tc.body))
+		if err != nil {
+			return dst, err
+		}
+		// ParseForm 同时解析 URL query；body 成功但 query 非法时仍返回 query 错误
+		if _, queryErr := url.ParseQuery(tc.rawQuery); queryErr != nil {
+			return dst, queryErr
+		}
+		refBindValues(reflect.ValueOf(&dst).Elem(), bodyValues, nil)
+	case "multipart/form-data":
+		boundary := params["boundary"]
+		if boundary == "" {
+			return dst, fmt.Errorf("no multipart boundary parameter")
+		}
+		form, err := multipart.NewReader(bytes.NewReader(tc.body), boundary).ReadForm(tc.maxMemory)
+		if err != nil {
+			return dst, err
+		}
+		refBindValues(reflect.ValueOf(&dst).Elem(), form.Value, form.File)
+		if cleanupErr := form.RemoveAll(); cleanupErr != nil {
+			t.Fatalf("case %s: cleanup reference multipart temp files: %v", tc.name, cleanupErr)
+		}
+		// ParseMultipartForm 内部先执行 ParseForm，query 非法时在 multipart 解析成功后返回该错误
+		if _, queryErr := url.ParseQuery(tc.rawQuery); queryErr != nil {
+			return dst, queryErr
+		}
+	default:
+		// 空 Content-Type 与未知 Content-Type 均回退 JSON；空白请求体视为无 body
+		if len(bytes.TrimSpace(tc.body)) == 0 {
+			return dst, nil
+		}
+		if err := json.Unmarshal(tc.body, &dst); err != nil {
+			return dst, err
+		}
+	}
+	return dst, nil
+}
+
+// runBindDiff 走被测 bindRequestData，并在返回前清理 multipart 可能产生的临时文件。
+func runBindDiff(t *testing.T, meta structMeta, tc bindDiffCase) (bindDiffReq, error) {
+	t.Helper()
+	req := httptest.NewRequest(tc.method, "/bind-diff", bytes.NewReader(tc.body))
+	req.URL.RawQuery = tc.rawQuery
+	if tc.contentType != "" {
+		req.Header.Set("Content-Type", tc.contentType)
+	}
+	reqPtr := reflect.New(reflect.TypeOf(bindDiffReq{}))
+	err := bindRequestData(req, reqPtr, meta, tc.maxMemory, false)
+	if req.MultipartForm != nil {
+		if cleanupErr := req.MultipartForm.RemoveAll(); cleanupErr != nil {
+			t.Fatalf("case %s: cleanup request multipart temp files: %v", tc.name, cleanupErr)
+		}
+	}
+	return reqPtr.Elem().Interface().(bindDiffReq), err
+}
+
+func truncateBindDiffBody(body []byte) string {
+	const limit = 256
+	if len(body) > limit {
+		return string(body[:limit]) + "..."
+	}
+	return string(body)
+}
+
+// assertBindDiffCase 同时执行 stdlib 参考流程与被测绑定，比较错误有无与最终字段值。
+func assertBindDiffCase(t *testing.T, meta structMeta, tc bindDiffCase) {
+	t.Helper()
+	want, wantErr := refBindRequest(t, tc)
+	got, gotErr := runBindDiff(t, meta, tc)
+	detail := fmt.Sprintf("method=%s query=%q content-type=%q body=%q", tc.method, tc.rawQuery, tc.contentType, truncateBindDiffBody(tc.body))
+	if (gotErr != nil) != (wantErr != nil) {
+		t.Fatalf("%s: error mismatch\n implementation err: %v\n stdlib reference err: %v\n %s", tc.name, gotErr, wantErr, detail)
+	}
+	if wantErr != nil {
+		return
+	}
+	gotSnapshot, wantSnapshot := snapshotBindDiff(got), snapshotBindDiff(want)
+	if !reflect.DeepEqual(gotSnapshot, wantSnapshot) {
+		t.Fatalf("%s: binding mismatch\n implementation: %+v\n stdlib reference: %+v\n %s", tc.name, gotSnapshot, wantSnapshot, detail)
+	}
+}
+
+type bindDiffField struct {
+	name  string
+	value string
+}
+
+type bindDiffFile struct {
+	field   string
+	name    string
+	content string
+}
+
+func buildBindDiffMultipart(t *testing.T, fields []bindDiffField, files []bindDiffFile) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	for _, field := range fields {
+		if err := writer.WriteField(field.name, field.value); err != nil {
+			t.Fatalf("write multipart field %q: %v", field.name, err)
+		}
+	}
+	for _, file := range files {
+		part, err := writer.CreateFormFile(file.field, file.name)
+		if err != nil {
+			t.Fatalf("create multipart file %q: %v", file.field, err)
+		}
+		if _, err := part.Write([]byte(file.content)); err != nil {
+			t.Fatalf("write multipart file %q: %v", file.field, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	return buf.Bytes(), writer.FormDataContentType()
+}
+
+// curatedBindDiffCases 覆盖文档中的关键绑定语义：方法分流、query/body 覆盖、
+// JSON null/显式零值/重复键/尾随值、form 尽力绑定、Content-Type 选择、multipart 文件。
+func curatedBindDiffCases(t *testing.T) []bindDiffCase {
+	t.Helper()
+	multipartBody, multipartCT := buildBindDiffMultipart(t,
+		[]bindDiffField{{"nick", "body"}, {"page", "2"}, {"tags", "f1"}, {"tags", "f2"}},
+		[]bindDiffFile{
+			{field: "file", name: "a.txt", content: "hello"},
+			{field: "files", name: "b.txt", content: "bb"},
+			{field: "files", name: "c.txt", content: "ccc"},
+		})
+	smallMemoryBody, smallMemoryCT := buildBindDiffMultipart(t, nil,
+		[]bindDiffFile{{field: "file", name: "big.bin", content: strings.Repeat("x", 64)}})
+	truncatedMultipart := append([]byte(nil), multipartBody...)
+	truncatedMultipart = truncatedMultipart[:len(truncatedMultipart)/2]
+
+	return []bindDiffCase{
+		{name: "get_body_ignored", method: http.MethodGet, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20},
+		{name: "delete_body_ignored", method: http.MethodDelete, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20},
+		{name: "head_body_ignored", method: http.MethodHead, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20},
+		{name: "post_json_partial_override", method: http.MethodPost, rawQuery: "nick=q&page=1&tags=q1&tags=q2&score=5&active=true", contentType: "application/json", body: []byte(`{"name":"body","page":0,"tags":null,"score":null}`), maxMemory: 32 << 20},
+		{name: "post_json_empty_body", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: nil, maxMemory: 32 << 20},
+		{name: "post_json_empty_object", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{}`), maxMemory: 32 << 20},
+		{name: "post_json_top_level_null", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`null`), maxMemory: 32 << 20},
+		{name: "post_json_trailing_value", method: http.MethodPost, rawQuery: "nick=q", contentType: "application/json", body: []byte(`{"name":"a"}{"name":"b"}`), maxMemory: 32 << 20},
+		{name: "post_json_malformed", method: http.MethodPost, rawQuery: "nick=q", contentType: "application/json", body: []byte(`{"name":`), maxMemory: 32 << 20},
+		{name: "post_json_duplicate_key", method: http.MethodPost, rawQuery: "nick=q", contentType: "application/json", body: []byte(`{"name":"a","name":"b"}`), maxMemory: 32 << 20},
+		{name: "post_json_case_insensitive", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"NAME":"b","PAGE":7}`), maxMemory: 32 << 20},
+		{name: "post_json_wrong_type", method: http.MethodPost, rawQuery: "page=1", contentType: "application/json", body: []byte(`{"page":"abc"}`), maxMemory: 32 << 20},
+		{name: "post_json_nested_and_map", method: http.MethodPost, rawQuery: "nick=q&fo=q", contentType: "application/json", body: []byte(`{"nested":{"key":"k","num":3},"extra":{"a":"b"},"FormOnly":"x"}`), maxMemory: 32 << 20},
+		{name: "post_form_partial_override", method: http.MethodPost, rawQuery: "nick=q&page=1&tags=q1&tags=q2", contentType: "application/x-www-form-urlencoded", body: []byte("nick=body&page=0&tags=f1&tags=f2"), maxMemory: 32 << 20},
+		{name: "post_form_invalid_keeps_query", method: http.MethodPost, rawQuery: "page=3&active=true", contentType: "application/x-www-form-urlencoded", body: []byte("page=abc&active=notabool"), maxMemory: 32 << 20},
+		{name: "post_form_malformed_escape", method: http.MethodPost, rawQuery: "", contentType: "application/x-www-form-urlencoded", body: []byte("page=%zz"), maxMemory: 32 << 20},
+		{name: "post_form_semicolon", method: http.MethodPost, rawQuery: "", contentType: "application/x-www-form-urlencoded", body: []byte("page=1;active=true"), maxMemory: 32 << 20},
+		{name: "post_form_charset", method: http.MethodPost, rawQuery: "page=1", contentType: "application/x-www-form-urlencoded; charset=UTF-8", body: []byte("nick=body&page=2"), maxMemory: 32 << 20},
+		{name: "post_unknown_ct_json", method: http.MethodPost, rawQuery: "nick=q", contentType: "text/plain", body: []byte(`{"name":"body"}`), maxMemory: 32 << 20},
+		{name: "post_empty_ct_json", method: http.MethodPost, rawQuery: "nick=q", contentType: "", body: []byte(`{"name":"body"}`), maxMemory: 32 << 20},
+		{name: "post_unknown_ct_empty_body", method: http.MethodPost, rawQuery: "nick=q", contentType: "text/plain", body: nil, maxMemory: 32 << 20},
+		{name: "post_malformed_ct", method: http.MethodPost, rawQuery: "nick=q", contentType: "application/json; charset", body: []byte(`{}`), maxMemory: 32 << 20},
+		{name: "post_multipart_fields_and_files", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: multipartCT, body: multipartBody, maxMemory: 32 << 20},
+		{name: "post_multipart_truncated", method: http.MethodPost, rawQuery: "nick=q", contentType: multipartCT, body: truncatedMultipart, maxMemory: 32 << 20},
+		{name: "post_multipart_no_boundary", method: http.MethodPost, rawQuery: "nick=q", contentType: "multipart/form-data", body: multipartBody, maxMemory: 32 << 20},
+		{name: "post_multipart_small_memory", method: http.MethodPost, rawQuery: "", contentType: smallMemoryCT, body: smallMemoryBody, maxMemory: 1},
+		{name: "query_malformed_escape_ignored", method: http.MethodGet, rawQuery: "nick=q&bad=%zz", contentType: "", body: nil, maxMemory: 32 << 20},
+		{name: "slice_invalid_element_keeps_nil", method: http.MethodGet, rawQuery: "nums=1&nums=bad", contentType: "", body: nil, maxMemory: 32 << 20},
+		{name: "slice_trims_elements", method: http.MethodGet, rawQuery: "tags=%20a%20&tags=b", contentType: "", body: nil, maxMemory: 32 << 20},
+		{name: "scalar_not_trimmed", method: http.MethodGet, rawQuery: "nick=%20q%20", contentType: "", body: nil, maxMemory: 32 << 20},
+	}
+}
+
+var bindDiffKeys = []string{"nick", "name", "page", "active", "ratio", "tags", "nums", "score", "fo", "unknown", "nested", "extra", "file", "files", "-"}
+
+func refRandomKey(rng *rand.Rand) string {
+	return bindDiffKeys[rng.Intn(len(bindDiffKeys))]
+}
+
+func refRandomValue(rng *rand.Rand, key string) string {
+	switch key {
+	case "page", "score":
+		return []string{"0", "1", "-7", "42", "abc", "+3", " 42 "}[rng.Intn(7)]
+	case "active":
+		return []string{"true", "false", "TRUE", "1", "0", "yes", ""}[rng.Intn(7)]
+	case "ratio":
+		return []string{"0", "1.5", "-0.25", "1e3", "abc", ""}[rng.Intn(6)]
+	case "nums":
+		return []string{"0", "1", "-2", "bad", " 3 "}[rng.Intn(5)]
+	case "tags":
+		return []string{"", " a ", "b", "中文", "x,y"}[rng.Intn(5)]
+	default:
+		return []string{"", "v", " body ", "中文", "-", "x/y"}[rng.Intn(6)]
+	}
+}
+
+func refRandomQuery(rng *rand.Rand) string {
+	if rng.Intn(5) == 0 {
+		return ""
+	}
+	values := url.Values{}
+	fieldCount := rng.Intn(6)
+	for i := 0; i < fieldCount; i++ {
+		key := refRandomKey(rng)
+		for j := 0; j < 1+rng.Intn(3); j++ {
+			values.Add(key, refRandomValue(rng, key))
+		}
+	}
+	query := values.Encode()
+	if rng.Intn(20) == 0 {
+		if query != "" {
+			query += "&"
+		}
+		query += "bad=%zz"
+	}
+	return query
+}
+
+func refRandomJSONBody(t *testing.T, rng *rand.Rand) []byte {
+	t.Helper()
+	switch rng.Intn(14) {
+	case 0:
+		return nil
+	case 1:
+		return []byte("   ")
+	case 2:
+		return []byte("null")
+	case 3:
+		return []byte(`{"name":"a"}{"name":"b"}`)
+	case 4:
+		return []byte(`{"page":`)
+	case 5:
+		return []byte(`{"name":"a"} trailing`)
+	}
+
+	object := make(map[string]any)
+	keys := []string{"name", "nick", "page", "active", "ratio", "tags", "nums", "score", "nested", "extra", "FormOnly", "unknown"}
+	fieldCount := rng.Intn(6)
+	for i := 0; i < fieldCount; i++ {
+		key := keys[rng.Intn(len(keys))]
+		switch key {
+		case "name", "nick", "FormOnly", "unknown":
+			object[key] = []string{"", "v", " body ", "中文"}[rng.Intn(4)]
+		case "page":
+			object[key] = []any{0, 1, -7, 42, 3.5}[rng.Intn(5)]
+		case "active":
+			object[key] = rng.Intn(2) == 0
+		case "ratio":
+			object[key] = []any{0, 1.5, -0.25, 1e3}[rng.Intn(4)]
+		case "tags":
+			switch rng.Intn(6) {
+			case 0:
+				object[key] = nil
+			case 1:
+				object[key] = []any{1, 2}
+			default:
+				object[key] = []string{"", "a", " b ", "中文"}
+			}
+		case "nums":
+			switch rng.Intn(6) {
+			case 0:
+				object[key] = nil
+			case 1:
+				object[key] = []any{"bad"}
+			default:
+				object[key] = []any{0, 1, -2}
+			}
+		case "score":
+			if rng.Intn(4) == 0 {
+				object[key] = nil
+			} else {
+				object[key] = rng.Intn(100)
+			}
+		case "nested":
+			object[key] = map[string]any{"key": "k", "num": rng.Intn(10)}
+		case "extra":
+			object[key] = map[string]string{"a": "b"}
+		}
+	}
+	body, err := json.Marshal(object)
+	if err != nil {
+		t.Fatalf("marshal random JSON body: %v", err)
+	}
+	return body
+}
+
+func refRandomFormBody(rng *rand.Rand) []byte {
+	switch rng.Intn(14) {
+	case 0:
+		return []byte("page=%zz")
+	case 1:
+		return []byte("page=1;active=true")
+	}
+	values := url.Values{}
+	fieldCount := rng.Intn(6)
+	for i := 0; i < fieldCount; i++ {
+		key := refRandomKey(rng)
+		for j := 0; j < 1+rng.Intn(3); j++ {
+			values.Add(key, refRandomValue(rng, key))
+		}
+	}
+	return []byte(values.Encode())
+}
+
+func refRandomMultipart(t *testing.T, rng *rand.Rand) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	fieldCount := rng.Intn(6)
+	for i := 0; i < fieldCount; i++ {
+		key := refRandomKey(rng)
+		if err := writer.WriteField(key, refRandomValue(rng, key)); err != nil {
+			t.Fatalf("write random multipart field %q: %v", key, err)
+		}
+	}
+	fileCount := rng.Intn(3)
+	for i := 0; i < fileCount; i++ {
+		part, err := writer.CreateFormFile("file", fmt.Sprintf("f%d.txt", i))
+		if err != nil {
+			t.Fatalf("create random multipart file: %v", err)
+		}
+		if _, err := part.Write([]byte(strings.Repeat("x", 1+rng.Intn(32)))); err != nil {
+			t.Fatalf("write random multipart file: %v", err)
+		}
+	}
+	filesCount := rng.Intn(3)
+	for i := 0; i < filesCount; i++ {
+		part, err := writer.CreateFormFile("files", fmt.Sprintf("g%d.txt", i))
+		if err != nil {
+			t.Fatalf("create random multipart files element: %v", err)
+		}
+		if _, err := part.Write([]byte(strings.Repeat("y", 1+rng.Intn(32)))); err != nil {
+			t.Fatalf("write random multipart files element: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close random multipart writer: %v", err)
+	}
+	body := buf.Bytes()
+	if rng.Intn(10) == 0 && len(body) > 2 {
+		body = body[:len(body)/2]
+	}
+	return body, writer.FormDataContentType()
+}
+
+func refRandomJSONContentType(rng *rand.Rand) string {
+	return []string{
+		"application/json",
+		"application/json; charset=UTF-8",
+		"Application/JSON",
+		"application/problem+json",
+		"",
+		"application/json; charset",
+	}[rng.Intn(6)]
+}
+
+func refRandomUnknownContentType(rng *rand.Rand) string {
+	return []string{"text/plain", "application/octet-stream", "", "application/vnd.api+json"}[rng.Intn(4)]
+}
+
+// generateBindDiffRandomCases 生成随机请求：方法、query、Content-Type 与 body 相互独立，
+// 覆盖 GET 带 body、未知/空 Content-Type 回退 JSON、form/multipart 解析错误等组合。
+func generateBindDiffRandomCases(t *testing.T, rng *rand.Rand, count int) []bindDiffCase {
+	t.Helper()
+	methods := []string{
+		http.MethodGet, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodHead,
+	}
+	cases := make([]bindDiffCase, 0, count)
+	for i := 0; i < count; i++ {
+		method := methods[rng.Intn(len(methods))]
+		rawQuery := refRandomQuery(rng)
+		var body []byte
+		contentType := ""
+		switch rng.Intn(8) {
+		case 0, 1:
+			body = refRandomJSONBody(t, rng)
+			contentType = refRandomJSONContentType(rng)
+		case 2, 6:
+			body = refRandomFormBody(rng)
+			contentType = "application/x-www-form-urlencoded"
+			if rng.Intn(3) == 0 {
+				contentType += "; charset=UTF-8"
+			}
+		case 3:
+			body, contentType = refRandomMultipart(t, rng)
+		case 4:
+			body = refRandomJSONBody(t, rng)
+			contentType = refRandomUnknownContentType(rng)
+		case 5:
+			body = nil
+		default:
+			body = []byte("not-json")
+			contentType = "application/json"
+		}
+		cases = append(cases, bindDiffCase{
+			name:        fmt.Sprintf("random_%03d", i),
+			method:      method,
+			rawQuery:    rawQuery,
+			contentType: contentType,
+			body:        body,
+			maxMemory:   32 << 20,
+		})
+	}
+	return cases
+}
+
+// TestBindStdlibDifferential 用 stdlib 解析结果作为 oracle 校验 query/form/JSON/multipart 绑定：
+// 参考流程独立实现 form > json > 字段名映射、标量取首值、切片整组提交、失败保持原值、
+// body 覆盖 query、GET/DELETE/HEAD 忽略 body、未知 Content-Type 回退 JSON。
+// 定向用例覆盖文档锁死的边界；随机用例覆盖方法 × Content-Type × body 组合。
+func TestBindStdlibDifferential(t *testing.T) {
+	meta := buildStructMeta(reflect.TypeOf(bindDiffReq{}))
+	t.Run("curated", func(t *testing.T) {
+		for _, tc := range curatedBindDiffCases(t) {
+			t.Run(tc.name, func(t *testing.T) {
+				assertBindDiffCase(t, meta, tc)
+			})
+		}
+	})
+	t.Run("random", func(t *testing.T) {
+		const (
+			seed  = int64(20261017)
+			count = 150
+		)
+		rng := rand.New(rand.NewSource(seed))
+		for _, tc := range generateBindDiffRandomCases(t, rng, count) {
+			t.Run(tc.name, func(t *testing.T) {
+				assertBindDiffCase(t, meta, tc)
+			})
+		}
+	})
 }
