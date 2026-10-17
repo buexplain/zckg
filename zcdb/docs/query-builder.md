@@ -170,7 +170,7 @@ sql, args, _ = db.Builder().Table("users").WhereValueBetween(25, "min_age", "max
 // args: [25]
 ```
 
-以上每个方法均有对应的 `Or` 前缀变体：`OrWhereNotBetween`、`OrWhereBetweenColumns`、`OrWhereNotBetweenColumns`、`OrWhereValueBetween`。
+以上每个方法均有对应的 `Or` 前缀变体：`OrWhereBetween`、`OrWhereNotBetween`、`OrWhereBetweenColumns`、`OrWhereNotBetweenColumns`、`OrWhereValueBetween`。
 
 ### WhereRaw / OrWhereRaw
 
@@ -489,6 +489,8 @@ sql, _, _ = db.Builder().Table("users").InRandomOrder().ToSelect()
 ### Limit / Offset / ForPage
 
 `n <= 0` 时不输出对应子句；`ForPage(page, perPage)` 中 page 从 1 开始（< 1 时修正为 1），`perPage <= 0` 时 limit/offset 均 <= 0，等同不分页：
+
+仅设置 `Offset(n)`（n > 0）而未设置 `Limit` 时，MySQL 自动补 `LIMIT 18446744073709551615`、SQLite 自动补 `LIMIT -1`（两方言要求 OFFSET 必须与 LIMIT 同时出现）；PostgreSQL 直接输出 `OFFSET n`。
 
 ```go
 sql, _, _ := db.Builder().Table("users").Limit(10).Offset(20).ToSelect()

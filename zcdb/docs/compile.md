@@ -206,13 +206,19 @@ sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).
 
 ## 原始 SQL 内联编译（CompileRaw）
 
-需要把一条带 `?` 的原始 SQL 与参数合成**一条完整 SQL**（不含占位符、不需要参数）时用 `Grammar.CompileRaw`——典型场景是手工执行、日志留档、贴给 DBA 复核。Grammar 实例经 `db.Grammar()` 取得：
+需要把一条带占位符的原始 SQL 与参数合成**一条完整 SQL**（不含占位符、不需要参数）时用 `Grammar.CompileRaw`——典型场景是手工执行、日志留档、贴给 DBA 复核。占位符形态随方言而定：MySQL/SQLite 用 `?`，PostgreSQL 用 `$N`。Grammar 实例经 `db.Grammar()` 取得：
 
 ```go
+// MySQL / SQLite：? 占位符
 sqlStr, err := db.Grammar().CompileRaw(
 	"UPDATE `users` SET `name` = ?, `updated_at` = ? WHERE `id` = ?",
 	[]any{"张三", zcdb.NewExpression("NOW()"), 7})
-// MySQL：      UPDATE `users` SET `name` = '张三', `updated_at` = NOW() WHERE `id` = 7
+// MySQL： UPDATE `users` SET `name` = '张三', `updated_at` = NOW() WHERE `id` = 7
+
+// PostgreSQL：$N 占位符（`?` 在 PostgreSQL 里是 jsonb 键存在操作符等运算符，不参与占位符识别）
+sqlStr, err = db.Grammar().CompileRaw(
+	`UPDATE "users" SET "name" = $1, "updated_at" = $2 WHERE "id" = $3`,
+	[]any{"张三", zcdb.NewExpression("NOW()"), 7})
 // PostgreSQL： UPDATE "users" SET "name" = '张三', "updated_at" = NOW() WHERE "id" = 7
 // 产物无需参数即可执行：db.Exec(ctx, sqlStr)
 ```
@@ -244,6 +250,6 @@ complete, err := db.Grammar().CompileRaw(sqlStr, args)
 
 - 占位符与参数按出现顺序一一对应，数量不一致返回 `ErrRawPlaceholderMismatch`（消息含两侧实际数量），失败时产物为空串；
 - 占位符形态与方言自身一致：MySQL/SQLite 认 `?`、产物保持 `?`；PostgreSQL 认 `$N`——按编号取参数内联，编号须落在 `1..参数个数` 内且最大编号等于参数个数（同 `lib/pq` 与引擎的契约，允许重复引用同一编号、允许区间内未被引用的参数）。`?` 在 PostgreSQL 里是 jsonb 键存在操作符等运算符，故**一律按普通字符处理**、不参与占位符识别；
-- **只识别代码区**：字符串字面量（`'...'`、MySQL 的 `"..."`）、引号标识符（`` `...` ``）、行注释（`--`，MySQL 另有 `#`）、块注释与 PostgreSQL 美元引用（`$$...$$` / `$tag$...$tag$`）里的 `?` / `$N` 都是字面内容、原样保留——`name LIKE '%?%'` 不会被改写。这条判定与引擎一致，由集成测试 [sql_scan_engine_parity_integration_test.go](../sql_scan_engine_parity_integration_test.go) 逐构造比对「扫描器计数 vs 引擎要求参数个数」锁死。MySQL 字符串里的反斜杠按默认转义模式处理（`NO_BACKSLASH_ESCAPES` 未覆盖），PostgreSQL 的 `E'...'` 按转义字符串处理；未覆盖的语法（SQLite 的 `[...]` 标识符、MySQL 的 `/*! */` 可执行注释、PostgreSQL 的 `U&'...'`）见 sqlScan.go；
+- **只识别代码区**：字符串字面量（`'...'`、MySQL 的 `"..."`）、引号标识符（`` `...` ``）、行注释（`--`，MySQL 另有 `#`）、块注释与 PostgreSQL 美元引用（`$$...$$` / `$tag$...$tag$`）里的 `?` / `$N` 都是字面内容、原样保留——`name LIKE '%?%'` 不会被改写。这条判定与引擎一致，由集成测试 [cross_dialect_integration_test.go](../cross_dialect_integration_test.go)（`crossDialectTestScanEngineParity`，三方言入口见 `cross_dialect_{mysql,postgres,sqlite}_integration_test.go`）逐构造比对「扫描器计数 vs 引擎要求参数个数」锁死。MySQL 字符串里的反斜杠按默认转义模式处理（`NO_BACKSLASH_ESCAPES` 未覆盖），PostgreSQL 的 `E'...'` 按转义字符串处理；未覆盖的语法（SQLite 的 `[...]` 标识符、MySQL 的 `/*! */` 可执行注释、PostgreSQL 的 `U&'...'`）见 sqlScan.go；
 - MySQL/SQLite 的连续 `??` 按**两个占位符**计；注意裸 `??` 在引擎侧本就是语法错误（只有 PostgreSQL 的 `?` 是运算符），写成 `??` 属于误用形态——PostgreSQL 下 `?` 是普通字符，jsonb 键存在操作符直接写 `?` 即可；
 - 不追加 DAO 默认注释；内联不产生 `$N` 占位符、也不触碰 Grammar 的编译期计数器，可并发调用。

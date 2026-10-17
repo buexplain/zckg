@@ -114,10 +114,10 @@ affected, err := db.Builder().Table("users_archive").
 // MySQL SQL: INSERT IGNORE INTO `users_archive` (`name`, `age`) SELECT `name`, `age` FROM `users`
 ```
 
-**列数校验**：子查询通过 `Select`/`AddSelect` 显式指定列且不含通配符（`*`）时，
+**列数校验**：子查询通过 `Select`/`AddSelect`/`SelectRaw`/`SelectSub` 指定列，且所有列值都不含通配符 `*` 时，
 `ToInsertUsing`/`ToInsertOrIgnoreUsing` 会在编译期校验目标列数与子查询列数一致，
 不一致返回哨兵错误 `ErrInsertUsingColumnMismatch`；无法静态判定列数的场景
-（如 `SELECT *` 或未显式指定列）不做编译期校验，列数一致性由数据库在运行时校验。
+（如 `SELECT *`、`t.*`、`COUNT(*)` 或未显式指定列）不做编译期校验，列数一致性由数据库在运行时校验。
 
 ## Update
 
@@ -223,7 +223,8 @@ SQLite 特殊处理：`DELETE FROM` 不会重置 AUTOINCREMENT 序列，`Truncat
 "有效限定"的判定规则：
 
 - WHERE 条件整体能静态收窄范围：按 SQL 优先级（AND 先于 OR）把条件归约为恒真/恒假/依赖行数据，只有"依赖行数据"或"恒假"计为有效。空嵌套回调与空 `WhereRaw` 编译时被跳过，不计入；空列表 `WhereNotIn`（编译为 `1 = 1`）以及子查询无有效条件的 `WhereExists`/`WhereNotExists` 不按行收窄，计为恒真，因此 `WhereNotIn("id", []any{})` 单独使用或普通条件与空 `WhereNotIn` 形成的 OR 恒真组合都会被拒绝；空列表 `WhereIn`（`0 = 1`）计为恒假，放行但不影响任何行；
-- 或存在**带 ON 条件**的 JOIN（无条件 JOIN 产生笛卡尔积，不视为限定）。该规则只适用于 `Update`/`Increment`/`Decrement`/`DeleteJoin`，它们会真实编译 JOIN。
+- **非空 `WhereRaw` 不做内容归约**：包括 `WhereRaw("1 = 1")` 在内的任意非空原始条件一律视为"依赖行数据"并计为有效限定，这是刻意保留的逃生口。确需全表操作时仍建议显式调用 `Force()`，便于代码审查与检索；
+- 或存在带 ON 条件的 JOIN（无条件 JOIN 产生笛卡尔积，不视为限定）。该规则只适用于 `Update`/`Increment`/`Decrement`/`DeleteJoin`，它们会真实编译 JOIN；空 `Raw`（含纯空白）不产生 ON 条件，不计入，嵌套 join 组中的有效 ON 条件同样计入。
 
 普通 `Delete` / `ToDelete` 不编译 JOIN：只要 Builder 带有 JOIN 就返回 `ErrDeleteWithJoin`（`Force()` 也不放行），避免 JOIN 限定被静默丢弃后变成全表删除；按关联删除请使用 `DeleteJoin`。
 

@@ -72,7 +72,7 @@ defer db.Close()
 
 `db.Pool()` 返回 DAO 持有的底层连接池，供调用方直接管理生命周期（`AddSlave`/`Ping`/`Close`）或获取 `*sql.DB`；`db.Close()` 即委托给该池的 `Close`。
 
-`db.Grammar()` 返回 DAO 按 `dialect` 推导出的 SQL 编译器（`MySQLGrammar`/`PostgresGrammar`/`SQLiteGrammar`），供在 Builder 之外自行编译 SQL：独立生成 SQL 文本、拼装自定义子查询，或把带 `?` 的原始 SQL 与参数内联成一条完整可执行 SQL（`CompileRaw`，见[编译](compile.md)）。返回值与 DAO 内部是**同一实例**，只读使用：内置三方言实现均无对外可写状态（MySQL/SQLite 无字段，PostgreSQL 的参数计数器只在单次编译的克隆副本上累加），因此调用它不会改变 DAO 后续编译与执行行为，并发调用也安全。与 Builder 编译路径的差别是：直接调用 Grammar 不追加 DAO 默认注释。
+`db.Grammar()` 返回 DAO 按 `dialect` 推导出的 SQL 编译器（`MySQLGrammar`/`PostgresGrammar`/`SQLiteGrammar`），供在 Builder 之外自行编译 SQL：独立生成 SQL 文本、拼装自定义子查询，或把带方言占位符（MySQL/SQLite 为 `?`、PostgreSQL 为 `$N`）的原始 SQL 与参数内联成一条完整可执行 SQL（`CompileRaw`，见[编译](compile.md)）。返回值与 DAO 内部是**同一实例**，只读使用：内置三方言实现均无对外可写状态（MySQL/SQLite 无字段，PostgreSQL 的参数计数器只在单次编译的克隆副本上累加），因此调用它不会改变 DAO 后续编译与执行行为，并发调用也安全。与 Builder 编译路径的差别是：直接调用 Grammar 不追加 DAO 默认注释。
 
 ## 自定义列映射标签
 
