@@ -3333,8 +3333,9 @@ func refBindRequest(t *testing.T, tc bindDiffCase) (bindDiffReq, error) {
 			return dst, queryErr
 		}
 	default:
-		// 空 Content-Type 与未知 Content-Type 均回退 JSON；空白请求体视为无 body
-		if len(bytes.TrimSpace(tc.body)) == 0 {
+		// 空 Content-Type 与未知 Content-Type 均回退 JSON；仅 JSON 空白（空格/Tab/CR/LF）
+		// 视为无 body——encoding/json 不把 \v、\f 等 Unicode 空白当作空白。
+		if len(bytes.Trim(tc.body, " \t\r\n")) == 0 {
 			return dst, nil
 		}
 		if err := json.Unmarshal(tc.body, &dst); err != nil {
@@ -3399,7 +3400,7 @@ type bindDiffFile struct {
 	content string
 }
 
-func buildBindDiffMultipart(t *testing.T, fields []bindDiffField, files []bindDiffFile) ([]byte, string) {
+func buildBindDiffMultipart(t testing.TB, fields []bindDiffField, files []bindDiffFile) ([]byte, string) {
 	t.Helper()
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -3425,7 +3426,7 @@ func buildBindDiffMultipart(t *testing.T, fields []bindDiffField, files []bindDi
 
 // curatedBindDiffCases 覆盖文档中的关键绑定语义：方法分流、query/body 覆盖、
 // JSON null/显式零值/重复键/尾随值、form 尽力绑定、Content-Type 选择、multipart 文件。
-func curatedBindDiffCases(t *testing.T) []bindDiffCase {
+func curatedBindDiffCases(t testing.TB) []bindDiffCase {
 	t.Helper()
 	multipartBody, multipartCT := buildBindDiffMultipart(t,
 		[]bindDiffField{{"nick", "body"}, {"page", "2"}, {"tags", "f1"}, {"tags", "f2"}},
@@ -3445,6 +3446,7 @@ func curatedBindDiffCases(t *testing.T) []bindDiffCase {
 		{name: "head_body_ignored", method: http.MethodHead, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20},
 		{name: "post_json_partial_override", method: http.MethodPost, rawQuery: "nick=q&page=1&tags=q1&tags=q2&score=5&active=true", contentType: "application/json", body: []byte(`{"name":"body","page":0,"tags":null,"score":null}`), maxMemory: 32 << 20},
 		{name: "post_json_empty_body", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: nil, maxMemory: 32 << 20},
+		{name: "post_json_vertical_tab_body", method: http.MethodPost, rawQuery: "nick=q", contentType: "application/json", body: []byte("\v"), maxMemory: 32 << 20},
 		{name: "post_json_empty_object", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{}`), maxMemory: 32 << 20},
 		{name: "post_json_top_level_null", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`null`), maxMemory: 32 << 20},
 		{name: "post_json_trailing_value", method: http.MethodPost, rawQuery: "nick=q", contentType: "application/json", body: []byte(`{"name":"a"}{"name":"b"}`), maxMemory: 32 << 20},
@@ -3730,6 +3732,89 @@ func TestBindStdlibDifferential(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				assertBindDiffCase(t, meta, tc)
 			})
+		}
+	})
+}
+
+// FuzzBindDifferential 用 stdlib 参考实现差分校验 query/form/JSON 绑定：
+// 固定方法、Content-Type、query 与 body 由 fuzzer 变异，逐次比较错误有无与绑定快照。
+// multipart 不纳入 fuzz 枚举（curated 用例已覆盖），避免任意 boundary 触发临时文件与磁盘 IO；
+// body/query 上限 64 KB，保证单次执行足够快且无外部副作用。
+// 普通 go test 只运行 f.Add 种子；探索命令：
+//
+//	go test ./zchttp -run '^$' -fuzz '^FuzzBindDifferential$' -fuzztime=30s
+func FuzzBindDifferential(f *testing.F) {
+	meta := buildStructMeta(reflect.TypeOf(bindDiffReq{}))
+	methods := []string{
+		http.MethodGet, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodHead,
+	}
+	contentTypes := []string{
+		"application/json",
+		"application/json; charset=UTF-8",
+		"application/x-www-form-urlencoded",
+		"text/plain",
+		"",
+	}
+	methodIndex := make(map[string]uint8, len(methods))
+	for i, method := range methods {
+		methodIndex[method] = uint8(i)
+	}
+	contentTypeIndex := make(map[string]uint8, len(contentTypes))
+	for i, contentType := range contentTypes {
+		contentTypeIndex[contentType] = uint8(i)
+	}
+
+	// 复用定向用例作为种子；multipart 用例的 Content-Type 不在枚举内，自动跳过
+	type fuzzSeed struct {
+		method      uint8
+		contentType uint8
+		query       string
+		body        string
+	}
+	seenSeeds := make(map[fuzzSeed]bool)
+	for _, tc := range curatedBindDiffCases(f) {
+		method, ok := methodIndex[tc.method]
+		if !ok {
+			continue
+		}
+		contentType, ok := contentTypeIndex[tc.contentType]
+		if !ok {
+			continue
+		}
+		seed := fuzzSeed{method: method, contentType: contentType, query: tc.rawQuery, body: string(tc.body)}
+		if seenSeeds[seed] {
+			continue
+		}
+		seenSeeds[seed] = true
+		f.Add(seed.method, seed.contentType, seed.query, tc.body)
+	}
+
+	f.Fuzz(func(t *testing.T, methodIdx, contentTypeIdx uint8, query string, body []byte) {
+		if len(query) > 64<<10 || len(body) > 64<<10 {
+			return
+		}
+		tc := bindDiffCase{
+			name:        "fuzz",
+			method:      methods[int(methodIdx)%len(methods)],
+			rawQuery:    query,
+			contentType: contentTypes[int(contentTypeIdx)%len(contentTypes)],
+			body:        body,
+			maxMemory:   32 << 20,
+		}
+		want, wantErr := refBindRequest(t, tc)
+		got, gotErr := runBindDiff(t, meta, tc)
+		if (gotErr != nil) != (wantErr != nil) {
+			t.Fatalf("method=%s query=%q content-type=%q body=%q: implementation err=%v, reference err=%v",
+				tc.method, tc.rawQuery, tc.contentType, truncateBindDiffBody(body), gotErr, wantErr)
+		}
+		if wantErr != nil {
+			return
+		}
+		gotSnapshot, wantSnapshot := snapshotBindDiff(got), snapshotBindDiff(want)
+		if !reflect.DeepEqual(gotSnapshot, wantSnapshot) {
+			t.Fatalf("method=%s query=%q content-type=%q body=%q: implementation=%+v, reference=%+v",
+				tc.method, tc.rawQuery, tc.contentType, truncateBindDiffBody(body), gotSnapshot, wantSnapshot)
 		}
 	})
 }
