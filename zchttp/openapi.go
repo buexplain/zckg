@@ -391,7 +391,8 @@ func (g *openAPIGenerator) buildOperation(method string, entry *routeEntry, para
 // buildQueryParams 为 GET/DELETE/HEAD 生成 query 参数列表。
 // meta 为注册阶段预计算的 structMeta，直接使用其字段名和 nonzero+default 判定，避免重复反射遍历。
 // paramNames 为路径参数名集合：绑定到路径参数的字段不作为 query 参数展示。
-// 跳过非扁平字段（Map 与命名 struct）：query 绑定仅处理扁平字段，展示会误导 API 使用者；
+// 仅保留 query 绑定实际可写入的类型（标量、标量指针与标量切片），跳过数组、map、
+// 嵌套结构体、多层容器与指针包裹的容器；展示无法绑定的参数会误导 API 使用者；
 // 文件字段一并跳过（GET 无 multipart）。
 // 带 deprecated:"true" 的字段在 Parameter Object 顶层输出 deprecated: true。
 func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMeta, paramNames map[string]bool) []any {
@@ -418,12 +419,8 @@ func (g *openAPIGenerator) buildQueryParams(reqType reflect.Type, meta structMet
 		if fm.isFile || fm.isFileSlice {
 			continue // 文件字段无法经 query 绑定（GET 无 multipart）
 		}
-		ft := f.Type
-		if ft.Kind() == reflect.Ptr {
-			ft = ft.Elem()
-		}
-		if ft.Kind() == reflect.Map || (ft.Kind() == reflect.Struct && ft != timeType) {
-			continue // 非扁平字段：query 绑定仅处理扁平字段
+		if !isQueryBindableType(f.Type) {
+			continue // 仅标量与标量切片可绑定；数组/容器/嵌套结构体展示会误导调用方
 		}
 		param := map[string]any{
 			"name":     fm.name,
@@ -685,11 +682,21 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta,
 
 	// required 仅请求角色输出：nonzero 是请求侧的运行时校验约束，响应无对应语义。
 	// 以 nonzero 校验实际覆盖的字段（按索引路径对齐）为准。
+	//
+	// requiredEmbedPrefixes 记录“扁平化路径上存在无法由默认值满足的 nonzero 字段”的匿名嵌入
+	// 索引前缀。带 json 名的匿名嵌入在 JSON schema 中是嵌套对象：客户端省略整个对象时，
+	// 运行时的扁平校验仍会检查其子字段（匿名嵌入没有父字段判零环节），因此父级必须把
+	// 该嵌入属性声明为 required，否则生成的文档允许省略、运行期却返回 400。
 	requiredAt := map[string]bool{}
+	requiredEmbedPrefixes := map[string]bool{}
 	if role == roleRequest {
 		for _, fm := range meta.fields {
-			if fm.name != "" && fm.name != "-" && fm.nonzero && !fm.hasDefault {
-				requiredAt[fmt.Sprint(fm.indices)] = true
+			if fm.name == "" || fm.name == "-" || !fm.nonzero || fm.hasDefault {
+				continue
+			}
+			requiredAt[fmt.Sprint(fm.indices)] = true
+			for n := 1; n < len(fm.indices); n++ {
+				requiredEmbedPrefixes[fmt.Sprint(fm.indices[:n])] = true
 			}
 		}
 	}
@@ -717,6 +724,8 @@ func (g *openAPIGenerator) registerStructSchema(t reflect.Type, meta structMeta,
 			}
 			props[jf.name] = g.typeToSchema(jf.field.Type, jf.field, 0, role)
 			if requiredAt[fmt.Sprint(jf.index)] {
+				required = append(required, jf.name)
+			} else if jf.field.Anonymous && isStructLike(jf.field.Type) && requiredEmbedPrefixes[fmt.Sprint(jf.index)] {
 				required = append(required, jf.name)
 			}
 		}

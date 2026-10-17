@@ -217,3 +217,28 @@ func TestDocReview_ContainerMatrixAndOpenAPIDisplay(t *testing.T) {
 		t.Errorf("响应包装层 Response_drResWithTags 缺失")
 	}
 }
+
+// DOC-08：仅设置 Content-Type（不写响应）不会让默认响应回调跳过，
+// 默认 JSON 会覆盖该响应头（与 http-engine-callback.md 第五节 written 判定一致）。
+func TestDocReview_ContentTypeOnlyDoesNotSkip(t *testing.T) {
+	type ctReq struct{}
+	type ctRes struct {
+		OK bool `json:"ok"`
+	}
+
+	e := NewEngine()
+	e.Router.GET("/doc-ct-only", func(ctx context.Context, _ ctReq) (ctRes, error) {
+		w, _ := ResponseWriterFromContext(ctx)
+		w.Header().Set("Content-Type", "text/plain")
+		return ctRes{OK: true}, nil
+	})
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/doc-ct-only", nil))
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json (default handler overwrites)", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("default JSON response should be written, got %s", rec.Body.String())
+	}
+}

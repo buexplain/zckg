@@ -222,9 +222,14 @@ func setFileField(fieldValue reflect.Value, headers []*multipart.FileHeader) boo
 	return false
 }
 
-// setFieldValue 将字符串值列表写入字段：切片字段绑定全部值，标量字段绑定第一个值
+// setFieldValue 将字符串值列表写入字段：切片字段绑定全部值，标量字段绑定第一个值。
+// 切片元素必须是 setScalar 可写入的标量（或其指针）：元素为结构体、数组、多层切片等
+// 不支持的类型时直接跳过，保持字段绑定前值，避免写入同长度的全零元素。
 func setFieldValue(fieldValue reflect.Value, values []string, timeFormat string, loc *time.Location) error {
 	if fieldValue.Kind() == reflect.Slice {
+		if !isScalarType(fieldValue.Type().Elem()) {
+			return nil
+		}
 		slice := reflect.MakeSlice(fieldValue.Type(), len(values), len(values))
 		for i, v := range values {
 			v = strings.TrimSpace(v)
@@ -325,6 +330,16 @@ func isScalarType(t reflect.Type) bool {
 		return true
 	}
 	return false
+}
+
+// isQueryBindableType 判定字段能否被 query/form 扁平绑定写入：标量（含任意层指针）
+// 或元素为标量的切片。数组、map、结构体、多层切片与指针包裹的容器均不可绑定，
+// 供 OpenAPI 生成过滤 query 参数，避免展示运行时不会写入的字段。
+func isQueryBindableType(t reflect.Type) bool {
+	if isScalarType(t) {
+		return true
+	}
+	return t.Kind() == reflect.Slice && isScalarType(t.Elem())
 }
 
 // setTime 将字符串解析为 time.Time：

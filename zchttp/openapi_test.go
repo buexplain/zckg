@@ -4344,3 +4344,130 @@ func TestGenerateOpenAPI_ResInertTagsIgnored(t *testing.T) {
 		t.Errorf("响应侧时间应恒为 date-time: got %v", changed)
 	}
 }
+
+// TestGenerateOpenAPI_DefaultSkipsPointerToSlice 锁死 default 支持范围：
+// *[]T 等“指针包裹容器”不支持 default——schema 不展示 default；
+// 同时 nonzero 字段仍推断为 required（与运行期未填充而校验失败一致）。
+func TestGenerateOpenAPI_DefaultSkipsPointerToSlice(t *testing.T) {
+	type oaPtrSliceDefaultReq struct {
+		V *[]int `json:"v" default:"1,2"`
+		N *[]int `json:"n" nonzero:"true" default:"1,2"`
+	}
+	type oaPtrSliceDefaultRes struct{}
+
+	r := NewRouter()
+	r.POST("/ptr-slice-default", func(_ context.Context, _ oaPtrSliceDefaultReq) (oaPtrSliceDefaultRes, error) {
+		return oaPtrSliceDefaultRes{}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	obj := schemas["oaPtrSliceDefaultReq"].(map[string]any)
+	props := obj["properties"].(map[string]any)
+	if _, has := props["v"].(map[string]any)["default"]; has {
+		t.Fatalf("*[]int default must not be displayed: %v", props["v"])
+	}
+	if _, has := props["n"].(map[string]any)["default"]; has {
+		t.Fatalf("*[]int + nonzero default must not be displayed: %v", props["n"])
+	}
+	if !reflect.DeepEqual(obj["required"], []any{"n"}) {
+		t.Fatalf("required = %v, want [n]", obj["required"])
+	}
+}
+
+// TestGenerateOpenAPI_QuerySkipsNonBindableContainers 锁死 GET query 参数过滤：
+// 仅标量、标量指针与标量切片参与生成；数组、指针包裹容器、多层切片与 []Struct
+// 在运行时不会被绑定，不能出现在文档中。
+func TestGenerateOpenAPI_QuerySkipsNonBindableContainers(t *testing.T) {
+	type oaQInner struct {
+		A string `json:"a"`
+	}
+	type oaQueryFilterReq struct {
+		Items     []oaQInner `json:"items"`
+		Arr       [2]int     `json:"arr"`
+		PtrSlice  *[]int     `json:"ptrSlice"`
+		PtrArr    *[2]int    `json:"ptrArr"`
+		Multi     [][]int    `json:"multi"`
+		Slice     []int      `json:"slice"`
+		At        time.Time  `json:"at" time_format:"unix"`
+		PtrScalar *int       `json:"ptrScalar"`
+	}
+	type oaQueryFilterRes struct{}
+
+	r := NewRouter()
+	r.GET("/query-filter", func(_ context.Context, _ oaQueryFilterReq) (oaQueryFilterRes, error) {
+		return oaQueryFilterRes{}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	op := doc["paths"].(map[string]any)["/query-filter"].(map[string]any)["get"].(map[string]any)
+	names := map[string]bool{}
+	for _, p := range op["parameters"].([]any) {
+		names[p.(map[string]any)["name"].(string)] = true
+	}
+	for _, want := range []string{"slice", "at", "ptrScalar"} {
+		if !names[want] {
+			t.Errorf("bindable query param %q missing, got: %v", want, names)
+		}
+	}
+	for _, bad := range []string{"items", "arr", "ptrSlice", "ptrArr", "multi"} {
+		if names[bad] {
+			t.Errorf("non-bindable query param %q must be skipped, got: %v", bad, names)
+		}
+	}
+}
+
+// TestGenerateOpenAPI_JSONNamedEmbedRequired 锁死带 json 名匿名嵌入的 required 推断：
+// 扁平化 nonzero 子字段无法由默认值满足时，父级必须把该嵌入属性声明为 required
+// （运行期省略整个嵌入对象仍会执行扁平校验）；有 default 可满足时保持可选。
+func TestGenerateOpenAPI_JSONNamedEmbedRequired(t *testing.T) {
+	type OaEmbReqBase struct {
+		Name string `json:"name" nonzero:"true"`
+	}
+	type OaEmbDefaultBase struct {
+		Name string `json:"name" nonzero:"true" default:"x"`
+	}
+	type oaEmbRequiredReq struct {
+		OaEmbReqBase `json:"base"`
+	}
+	type oaEmbOptionalReq struct {
+		OaEmbDefaultBase `json:"base"`
+	}
+	type oaEmbPtrReq struct {
+		*OaEmbReqBase `json:"base"`
+	}
+	type oaEmbWrap struct {
+		OaEmbReqBase `json:"base"`
+	}
+	type oaEmbNestedReq struct {
+		oaEmbWrap
+	}
+	type oaEmbRes struct{}
+
+	r := NewRouter()
+	r.POST("/emb-required", func(_ context.Context, _ oaEmbRequiredReq) (oaEmbRes, error) { return oaEmbRes{}, nil })
+	r.POST("/emb-optional", func(_ context.Context, _ oaEmbOptionalReq) (oaEmbRes, error) { return oaEmbRes{}, nil })
+	r.POST("/emb-ptr", func(_ context.Context, _ oaEmbPtrReq) (oaEmbRes, error) { return oaEmbRes{}, nil })
+	r.POST("/emb-nested", func(_ context.Context, _ oaEmbNestedReq) (oaEmbRes, error) { return oaEmbRes{}, nil })
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "t", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	for _, name := range []string{"oaEmbRequiredReq", "oaEmbPtrReq", "oaEmbNestedReq"} {
+		obj := schemas[name].(map[string]any)
+		if !reflect.DeepEqual(obj["required"], []any{"base"}) {
+			t.Errorf("%s required = %v, want [base]", name, obj["required"])
+		}
+	}
+	if _, has := schemas["oaEmbOptionalReq"].(map[string]any)["required"]; has {
+		t.Errorf("嵌入子字段可由 default 满足时不应标记 required: %v", schemas["oaEmbOptionalReq"])
+	}
+
+	// 文档与运行期一致：省略嵌入对象在 required 场景返回 400，在 default 场景返回 200。
+	if rec := serveRequest(t, r, http.MethodPost, "/emb-required", "{}"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("emb-required: expected 400, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := serveRequest(t, r, http.MethodPost, "/emb-nested", "{}"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("emb-nested: expected 400, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := serveRequest(t, r, http.MethodPost, "/emb-optional", "{}"); rec.Code != http.StatusOK {
+		t.Fatalf("emb-optional: expected 200 (default satisfies), got %d; body=%s", rec.Code, rec.Body.String())
+	}
+}

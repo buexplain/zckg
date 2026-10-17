@@ -508,12 +508,17 @@ func hasRequestPhaseDefaults(t reflect.Type, visiting map[reflect.Type]bool) boo
 	return false
 }
 
-// isDefaultSupported 判定字段类型是否支持 default 标签：仅标量类型、标量的指针及其切片支持（Slice/Ptr 递归判定）
+// isDefaultSupported 判定字段类型是否支持 default 标签：标量、标量的任意层指针，
+// 以及元素为标量（或标量指针）的切片。
+// 指向容器（如 *[]int）或容器的容器（如 [][]int、[]*[]int）不支持：
+// applyDefaults 的 setFieldValue 不会展开这些形态，误判为支持会导致
+// “注册/OpenAPI 宣称有默认值、运行时永不填充”。
 func isDefaultSupported(t reflect.Type) bool {
 	return isDefaultSupportedDepth(t, 0)
 }
 
 // isDefaultSupportedDepth 带深度上限的递归实现，
+// Ptr/Slice 只允许解引用到标量链（可含多层指针），不允许再遇到 Slice/Array/Map；
 // 防自引用命名类型（如 type S []S）无限递归，超限视为不支持
 func isDefaultSupportedDepth(t reflect.Type, depth int) bool {
 	if depth >= maxPtrDerefDepth {
@@ -526,7 +531,26 @@ func isDefaultSupportedDepth(t reflect.Type, depth int) bool {
 		reflect.Float32, reflect.Float64:
 		return true
 	case reflect.Slice, reflect.Ptr:
-		return isDefaultSupportedDepth(t.Elem(), depth+1)
+		return isScalarOrPtrToScalar(t.Elem(), depth+1)
+	default:
+		return false
+	}
+}
+
+// isScalarOrPtrToScalar 判定 t 是否为标量或指向标量的指针链（允许任意层指针）。
+// 用作 default 支持的 Ptr/Slice 元素判定：元素不允许再是容器。
+func isScalarOrPtrToScalar(t reflect.Type, depth int) bool {
+	if depth >= maxPtrDerefDepth {
+		return false
+	}
+	switch t.Kind() {
+	case reflect.String, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
+	case reflect.Ptr:
+		return isScalarOrPtrToScalar(t.Elem(), depth+1)
 	default:
 		return false
 	}

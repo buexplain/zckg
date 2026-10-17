@@ -2883,3 +2883,167 @@ func TestBindPathParams_TimeTagOnPointerAndSlice(t *testing.T) {
 		t.Error("[]time.Time 不应被判定为标量类型")
 	}
 }
+
+// TestSetFieldValue_UnsupportedContainerKeepsOriginal 锁死尽力绑定语义：
+// 切片元素为结构体/多层容器时不写回全零元素，指针包裹的容器不会被 setScalar 写入。
+func TestSetFieldValue_UnsupportedContainerKeepsOriginal(t *testing.T) {
+	type item struct{ X int }
+	type holder struct {
+		Items    []item
+		Multi    [][]int
+		PtrSlice *[]int
+	}
+	d := holder{Items: []item{{X: 7}}}
+	v := reflect.ValueOf(&d).Elem()
+
+	if err := setFieldValue(v.Field(0), []string{"x"}, "", nil); err != nil {
+		t.Fatalf("[]struct: unexpected error: %v", err)
+	}
+	if len(d.Items) != 1 || d.Items[0].X != 7 {
+		t.Fatalf("[]struct must keep original value, got %v", d.Items)
+	}
+
+	if err := setFieldValue(v.Field(1), []string{"1", "2"}, "", nil); err != nil {
+		t.Fatalf("[][]int: unexpected error: %v", err)
+	}
+	if d.Multi != nil {
+		t.Fatalf("[][]int must keep nil, got %v", d.Multi)
+	}
+
+	if err := setFieldValue(v.Field(2), []string{"1"}, "", nil); err != nil {
+		t.Fatalf("*[]int: unexpected error: %v", err)
+	}
+	if d.PtrSlice != nil {
+		t.Fatalf("*[]int must keep nil, got %v", *d.PtrSlice)
+	}
+}
+
+// TestBindValues_QuerySkipsUnsupportedContainers 锁死 GET query 的运行时行为：
+// []Struct、数组、指针包裹容器与多层切片保持绑定前值，只有标量切片正常绑定。
+func TestBindValues_QuerySkipsUnsupportedContainers(t *testing.T) {
+	type inner struct {
+		A string `json:"a"`
+	}
+	type req struct {
+		Items    []inner       `json:"items"`
+		Arr      [2]int        `json:"arr"`
+		PtrSlice *[]int        `json:"ptrSlice"`
+		Multi    [][]time.Time `json:"multi" time_format:"unix"`
+		OK       []int         `json:"ok"`
+	}
+	type res struct {
+		ItemsNil bool   `json:"itemsNil"`
+		Arr      [2]int `json:"arr"`
+		PtrNil   bool   `json:"ptrNil"`
+		MultiNil bool   `json:"multiNil"`
+		OK       []int  `json:"ok"`
+	}
+
+	router := NewRouter()
+	router.GET("/containers", func(_ context.Context, q req) (res, error) {
+		return res{ItemsNil: q.Items == nil, Arr: q.Arr, PtrNil: q.PtrSlice == nil, MultiNil: q.Multi == nil, OK: q.OK}, nil
+	})
+
+	rec := serveRequest(t, router, http.MethodGet,
+		"/containers?items=x&arr=1&arr=2&ptrSlice=3&multi=1600000000&ok=1&ok=2", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+	var out res
+	decodeData(t, rec, &out)
+	if !out.ItemsNil {
+		t.Fatal("[]struct query must not be written")
+	}
+	if out.Arr != [2]int{} {
+		t.Fatalf("array query must keep zero value, got %v", out.Arr)
+	}
+	if !out.PtrNil {
+		t.Fatal("*[]int query must keep nil")
+	}
+	if !out.MultiNil {
+		t.Fatal("[][]time.Time query must keep nil")
+	}
+	if !reflect.DeepEqual(out.OK, []int{1, 2}) {
+		t.Fatalf("scalar slice should bind, got %v", out.OK)
+	}
+}
+
+// TestJSONNamedEmbedFlatKeyIgnored 锁死带 json 名匿名嵌入的绑定语义：
+// query/form 扁平绑定；JSON 只认嵌套对象，父级扁平键被 encoding/json 忽略。
+func TestJSONNamedEmbedFlatKeyIgnored(t *testing.T) {
+	type namedBase struct {
+		Name string `json:"name" form:"name"`
+	}
+	type req struct {
+		namedBase `json:"base"`
+	}
+	type res struct {
+		Name string `json:"name"`
+	}
+
+	router := NewRouter()
+	h := func(_ context.Context, q req) (res, error) { return res{Name: q.Name}, nil }
+	router.GET("/named-embed", h)
+	router.POST("/named-embed", h)
+
+	rec := serveRequest(t, router, http.MethodGet, "/named-embed?name=q", "")
+	var out res
+	decodeData(t, rec, &out)
+	if out.Name != "q" {
+		t.Fatalf("query should bind flat name, got %q", out.Name)
+	}
+
+	rec = serveRequest(t, router, http.MethodPost, "/named-embed", `{"name":"flat"}`)
+	decodeData(t, rec, &out)
+	if out.Name != "" {
+		t.Fatalf("flat JSON key must be ignored for json-named embed, got %q", out.Name)
+	}
+
+	rec = serveRequest(t, router, http.MethodPost, "/named-embed", `{"base":{"name":"nested"}}`)
+	decodeData(t, rec, &out)
+	if out.Name != "nested" {
+		t.Fatalf("nested JSON object should bind, got %q", out.Name)
+	}
+}
+
+// TestBindMultipartValueOverMemoryLimit 锁死 multipart 非文件值的预算：
+// 只有文件部分可落盘；非文件值超过 MultipartFormMaxMemory + 10MB 时绑定失败返回 400。
+func TestBindMultipartValueOverMemoryLimit(t *testing.T) {
+	type req struct {
+		Blob string `form:"blob"`
+	}
+	type res struct {
+		Len int `json:"len"`
+	}
+
+	router := NewRouter()
+	router.POST("/upload-value", func(_ context.Context, q req) (res, error) {
+		return res{Len: len(q.Blob)}, nil
+	})
+	engine := NewEngine()
+	engine.Router = router
+	engine.MaxBodyBytes = 0
+	engine.MultipartFormMaxMemory = 1 << 10
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormField("blob")
+	if err != nil {
+		t.Fatalf("CreateFormField: %v", err)
+	}
+	payload := strings.Repeat("z", 11<<20)
+	if _, err := fw.Write([]byte(payload)); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	httpReq := httptest.NewRequest(http.MethodPost, "/upload-value", &buf)
+	httpReq.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httpReq)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "multipart: message too large") {
+		t.Fatalf("expected 400 multipart: message too large, got %d; body=%.200s", rec.Code, rec.Body.String())
+	}
+}
