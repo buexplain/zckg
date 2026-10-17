@@ -29,11 +29,8 @@ zcmodel/
 ├── columnTypeToGoType.go   # 列类型归一化与方言类型映射表
 ├── *_test.go               # 单元测试与集成测试（集成测试对接真实 MySQL/PostgreSQL/SQLite）
 └── docs/
-    ├── zcmodel.md          # 本文档
-    └── fuzz-testing.md     # 模糊测试计划与执行说明
+    └── zcmodel.md          # 本文档
 ```
-
-模糊测试的目标设计、种子来源、oracle 与执行命令见 [fuzz-testing.md](fuzz-testing.md)。
 
 ## 生成流程
 
