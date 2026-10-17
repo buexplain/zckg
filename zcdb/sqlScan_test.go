@@ -79,3 +79,65 @@ func TestSplitSQLCode(t *testing.T) {
 		})
 	}
 }
+
+// FuzzSplitSQLCode 用不变量 fuzz 校验 SQL 代码区扫描器：fuzzer 变异方言索引与 SQL 文本，
+// 断言片段拼接等于原文、每个非代码段长度与 nonCodeLen 一致、无空段、无相邻代码段、结果确定。
+// 相邻非代码段是合法形态（如 /**/ 紧邻未闭合引号，二者之间没有代码区）。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcdb -run '^$' -fuzz '^FuzzSplitSQLCode$' -fuzztime=30s
+func FuzzSplitSQLCode(f *testing.F) {
+	syntaxes := []sqlScanSyntax{mysqlScanSyntax, pgScanSyntax, sqliteScanSyntax}
+	seeds := []string{
+		"", "SELECT ?", "a'?'b", "'a''b'", `'a\'b'`, `"a\"b"`, "`a?b`c",
+		"a -- ?\nb", "a--?b", "a # ?", "a/* ? */b", "a/* /* ? */ */b",
+		"a $tag$ ? $1 $tag$ b", "a $$ ? $$ b", "a $1 b", `a E'\'' b`,
+		`a 'E\' b`, "a 'b", "a /* b", "'a' x", "a $tag b", "a $tag$ b",
+		"?''?", "/**/\"", "''''", "$$", "$tag$", "--", "#", "/*", "*/", "`", `"`, "'",
+		"\x00'?'", "中文'?'", strings.Repeat("'", 8),
+	}
+	for i := range syntaxes {
+		for _, seed := range seeds {
+			f.Add(uint8(i), seed)
+		}
+	}
+	f.Fuzz(func(t *testing.T, dialectIndex uint8, sqlStr string) {
+		if len(sqlStr) > 64<<10 {
+			return
+		}
+		syntax := syntaxes[int(dialectIndex)%len(syntaxes)]
+		segments := splitSQLCode(sqlStr, syntax)
+		var joined strings.Builder
+		offset := 0
+		for i, segment := range segments {
+			if segment.text == "" {
+				t.Fatalf("dialect=%d sql=%q: empty segment at %d", dialectIndex, sqlStr, i)
+			}
+			if i > 0 && segments[i-1].code && segment.code {
+				t.Fatalf("dialect=%d sql=%q: adjacent code segments at %d", dialectIndex, sqlStr, i)
+			}
+			if !segment.code {
+				if got := nonCodeLen(sqlStr, offset, syntax); got != len(segment.text) {
+					t.Fatalf("dialect=%d sql=%q: nonCodeLen at %d = %d, segment len = %d",
+						dialectIndex, sqlStr, offset, got, len(segment.text))
+				}
+			}
+			joined.WriteString(segment.text)
+			offset += len(segment.text)
+		}
+		if joined.String() != sqlStr {
+			t.Fatalf("dialect=%d sql=%q: joined segments = %q", dialectIndex, sqlStr, joined.String())
+		}
+		again := splitSQLCode(sqlStr, syntax)
+		if len(again) != len(segments) {
+			t.Fatalf("dialect=%d sql=%q: segment count differs on second run: %d vs %d",
+				dialectIndex, sqlStr, len(again), len(segments))
+		}
+		for i := range segments {
+			if again[i] != segments[i] {
+				t.Fatalf("dialect=%d sql=%q: segment %d differs on second run: %+v vs %+v",
+					dialectIndex, sqlStr, i, again[i], segments[i])
+			}
+		}
+	})
+}

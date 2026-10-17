@@ -1,7 +1,7 @@
 // 本文件为「参数值内联」（rawLiteral.go）与 CompileRaw 的编译层单元测试：
 // 覆盖占位符形态识别（字符串/引号标识符/注释/美元引用）、编号模式校验、
-// 不支持类型与 NaN/Inf 报错、占位符数量校验；文件中的 rawTestTime 与命名字节/标量类型
-// 供本包单元层与集成层用例共用。
+// 不支持类型与 NaN/Inf 报错、占位符数量校验，并包含 CompileRaw 的 fuzz 不变量与计数模型；
+// 文件中的 rawTestTime 与命名字节/标量类型供本包单元层与集成层用例共用。
 // 仅验证编译结果，不依赖数据库连接、不执行 SQL；用例不经过 Builder，因此不涉及 DAO 默认注释。
 // 「值内联后被数据库认可」的可执行验证在 cross_dialect_integration_test.go
 // （crossDialectTestCompileRawLiterals / crossDialectTestScanEngineParity），
@@ -13,6 +13,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -396,4 +397,122 @@ func TestGrammar_CompileRaw_NamedNilByteSlice(t *testing.T) {
 	if gotSQL != "SELECT NULL" {
 		t.Errorf("命名字节切片的 nil 值应写成 NULL：got %q", gotSQL)
 	}
+}
+
+// FuzzCompileRaw 用独立占位符计数模型 fuzz 校验 CompileRaw：
+// fuzzer 变异方言、SQL 与参数个数，模型先算出应成功还是 ErrRawPlaceholderMismatch；
+// 成功时再扫描产物代码区，断言占位符已全部内联（字符串/注释/引号标识符/美元引用内的不算）。
+// 参数含 ?、$1、引号、反斜杠、数值、bool、字节与时间，验证内联文本不会破坏后续扫描。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcdb -run '^$' -fuzz '^FuzzCompileRaw$' -fuzztime=30s
+func FuzzCompileRaw(f *testing.F) {
+	type dialect struct {
+		name    string
+		grammar Grammar
+		syntax  sqlScanSyntax
+	}
+	dialects := []dialect{
+		{"MySQL", NewMySQLGrammar(), mysqlScanSyntax},
+		{"PostgreSQL", NewPostgresGrammar(), pgScanSyntax},
+		{"SQLite", NewSQLiteGrammar(), sqliteScanSyntax},
+	}
+	args := []any{
+		"plain",
+		"q? $1 ' \\ \n",
+		int64(-7),
+		2.5,
+		true,
+		[]byte{0x00, 0x01, 0xff},
+		rawTestTime,
+	}
+	seeds := []string{
+		"", "SELECT ?", "SELECT '?'", "SELECT $$ $1 $$",
+		"SELECT /* ? */ 1", "SELECT 'a''?b'", "SELECT ? + ?",
+		"SELECT $1", "SELECT $2, $1, $2", "SELECT $0", "??", "`?`", `"?"`,
+		`E'\'' ?`, "-- ?\n?", "/* ? */ ?", "$tag$ $1 $tag$ ?",
+	}
+	for i := range dialects {
+		for _, seed := range seeds {
+			for argCount := uint8(0); argCount <= 3; argCount++ {
+				f.Add(uint8(i), seed, argCount)
+			}
+		}
+	}
+	f.Fuzz(func(t *testing.T, dialectIndex uint8, sqlStr string, argCount uint8) {
+		if len(sqlStr) > 64<<10 {
+			return
+		}
+		d := dialects[int(dialectIndex)%len(dialects)]
+		count := int(argCount) % (len(args) + 1)
+		fuzzArgs := args[:count]
+		wantOK := fuzzRawPlaceholdersMatch(sqlStr, d.syntax, d.name, count)
+		out, err := d.grammar.CompileRaw(sqlStr, fuzzArgs)
+		if !wantOK {
+			if !errors.Is(err, ErrRawPlaceholderMismatch) {
+				t.Fatalf("dialect=%s sql=%q args=%d: want placeholder mismatch, got err=%v out=%q",
+					d.name, sqlStr, count, err, out)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("dialect=%s sql=%q args=%d: want success, got %v", d.name, sqlStr, count, err)
+		}
+		if remaining := fuzzRawCodePlaceholderCount(out, d.syntax, d.name); remaining != 0 {
+			t.Fatalf("dialect=%s sql=%q args=%d: %d placeholder(s) left in code region: %q",
+				d.name, sqlStr, count, remaining, out)
+		}
+	})
+}
+
+// fuzzRawPlaceholdersMatch 独立计算 CompileRaw 是否应成功：
+// PostgreSQL 的每个 $N 必须在 1..argCount 内且最大编号等于 argCount；
+// MySQL/SQLite 的代码区 ? 数量必须等于 argCount。
+func fuzzRawPlaceholdersMatch(sqlStr string, syntax sqlScanSyntax, dialect string, argCount int) bool {
+	if dialect == "PostgreSQL" {
+		maxIndex := 0
+		for _, segment := range splitSQLCode(sqlStr, syntax) {
+			if !segment.code {
+				continue
+			}
+			for i := 0; i < len(segment.text); i++ {
+				digits := numberedDigits(segment.text, i)
+				if digits == 0 {
+					continue
+				}
+				index, err := strconv.Atoi(segment.text[i+1 : i+1+digits])
+				if err != nil || index < 1 || index > argCount {
+					return false
+				}
+				if index > maxIndex {
+					maxIndex = index
+				}
+				i += digits
+			}
+		}
+		return maxIndex == argCount
+	}
+	return fuzzRawCodePlaceholderCount(sqlStr, syntax, dialect) == argCount
+}
+
+// fuzzRawCodePlaceholderCount 统计代码区中的占位符数量：PG 为 $N 引用次数，
+// MySQL/SQLite 为 ? 数量；非代码区一律不计。
+func fuzzRawCodePlaceholderCount(sqlStr string, syntax sqlScanSyntax, dialect string) int {
+	count := 0
+	for _, segment := range splitSQLCode(sqlStr, syntax) {
+		if !segment.code {
+			continue
+		}
+		if dialect == "PostgreSQL" {
+			for i := 0; i < len(segment.text); i++ {
+				if digits := numberedDigits(segment.text, i); digits > 0 {
+					count++
+					i += digits
+				}
+			}
+			continue
+		}
+		count += strings.Count(segment.text, "?")
+	}
+	return count
 }

@@ -143,6 +143,49 @@ func TestNormalizeSQLComment(t *testing.T) {
 	}
 }
 
+// FuzzNormalizeSQLComment 用不变量 fuzz 校验注释规范化：任意输入（含非法 UTF-8、控制字符、
+// 超长文本）的输出必须是合法 UTF-8、≤255 rune、首尾无空白、不含 * / \ 与控制字符，且幂等。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcdb -run '^$' -fuzz '^FuzzNormalizeSQLComment$' -fuzztime=30s
+func FuzzNormalizeSQLComment(f *testing.F) {
+	for _, seed := range []string{
+		"", " \t\r\n ", "*\x00\r\n", "/", `\`, "*//*\\", " app:user-service ",
+		"普通中文 trace:? $1", "**// + 41 -- ", "a /* b", "a\x00b\r\nc", "a\tb\x1bc",
+		"a\xffb", "a\xe4\xb8", "*/ + 41 --", "a */ */ /* b", "/*! + 41 */",
+		"/*+ test */", "svc:api 'name' \"value\"; ? $1", "svc:/api/v1/trace",
+		`C:\svc\api`, "a\\nb", "  a  b  ", "\u3000a\u00a0b\u3000",
+		"a\u2028b\u2029c\u200bd", strings.Repeat("a", 256), strings.Repeat("中", 256),
+		strings.Repeat("a", 254) + "\xffb", strings.Repeat("a", 254) + " b",
+		"\x00\x01\x02", "中文*/\\\x00",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, text string) {
+		if len(text) > 64<<10 {
+			return
+		}
+		got := normalizeSQLComment(text)
+		if !utf8.ValidString(got) {
+			t.Fatalf("input=%q: output is invalid UTF-8: %q", text, got)
+		}
+		if count := utf8.RuneCountInString(got); count > maxSQLCommentRunes {
+			t.Fatalf("input=%q: output has %d runes, max %d", text, count, maxSQLCommentRunes)
+		}
+		if strings.TrimSpace(got) != got {
+			t.Fatalf("input=%q: output not trimmed: %q", text, got)
+		}
+		for _, r := range got {
+			if r == '*' || r == '/' || r == '\\' || unicode.IsControl(r) {
+				t.Fatalf("input=%q: output contains forbidden rune %U: %q", text, r, got)
+			}
+		}
+		if again := normalizeSQLComment(got); again != got {
+			t.Fatalf("input=%q: not idempotent: %q -> %q", text, got, again)
+		}
+	})
+}
+
 // TestBuilder_CommentLifecycle 验证默认复制、覆盖清空、反复编译及 DAO/Builder 隔离。
 func TestBuilder_CommentLifecycle(t *testing.T) {
 	dao, err := NewDBDao(&Pool{}, "mysql", nil, "custom", " app:one ")
