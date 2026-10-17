@@ -115,6 +115,65 @@ func truncateForLog(s string) string {
 	return s[:max] + fmt.Sprintf("\n...(内容已截断，共 %d 字节)", len(s))
 }
 
+// decodeFuzzColumns 把 fuzz 的列规格解码为 []*Column：'|' 分隔列，';' 分隔
+// 列名/类型/注释，最多 16 列；列名、类型、注释各自截断到 1KB，控制单输入规模。
+// "nil" 块表示 nil 列，用于覆盖 Generate 的 nil 列错误分支。
+func decodeFuzzColumns(spec string) []*Column {
+	if spec == "" {
+		return nil
+	}
+	chunks := strings.Split(spec, "|")
+	if len(chunks) > 16 {
+		chunks = chunks[:16]
+	}
+	columns := make([]*Column, 0, len(chunks))
+	for _, chunk := range chunks {
+		if chunk == "nil" {
+			columns = append(columns, nil)
+			continue
+		}
+		parts := strings.SplitN(chunk, ";", 3)
+		column := &Column{}
+		if len(parts) > 0 {
+			column.Name = truncateFuzzItem(parts[0])
+		}
+		if len(parts) > 1 {
+			column.Type = truncateFuzzItem(parts[1])
+		}
+		if len(parts) > 2 {
+			column.Comment = truncateFuzzItem(parts[2])
+		}
+		columns = append(columns, column)
+	}
+	return columns
+}
+
+// truncateFuzzItem 将单个列字段限制在 1KB 内，避免随机输入放大文件 I/O 与类型检查耗时。
+func truncateFuzzItem(s string) string {
+	const max = 1 << 10
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
+}
+
+// assertFuzzNoTempFiles 断言目录内没有原子写入遗留的临时文件；目录不存在视为通过。
+func assertFuzzNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("read output dir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp") {
+			t.Fatalf("temporary file left behind: %s", entry.Name())
+		}
+	}
+}
+
 // assertContains 断言 got 包含 want，失败时输出缺失片段与截断后的实际内容。
 // desc 说明被断言的语义，用于区分同一测试内的多处断言。
 // 断言失败按 Errorf 处理（不中断），需要中断的前置条件请直接使用 t.Fatalf。

@@ -29,8 +29,11 @@ zcmodel/
 ├── columnTypeToGoType.go   # 列类型归一化与方言类型映射表
 ├── *_test.go               # 单元测试与集成测试（集成测试对接真实 MySQL/PostgreSQL/SQLite）
 └── docs/
-    └── zcmodel.md          # 本文档
+    ├── zcmodel.md          # 本文档
+    └── fuzz-testing.md     # 模糊测试计划与执行说明
 ```
+
+模糊测试的目标设计、种子来源、oracle 与执行命令见 [fuzz-testing.md](fuzz-testing.md)。
 
 ## 生成流程
 
@@ -42,13 +45,13 @@ zcmodel/
       ① 校验 Dialect
                                  │
       ② 校验表名（防路径穿越与非法标识符）
-         ├─ 拒绝空名、"." / ".."、路径分隔符（/、\）与 Windows 非法字符（<>:"|?*）
+         ├─ 拒绝空名、非 UTF-8、"." / ".."、路径分隔符（/、\）与 Windows 非法字符（<>:"|?*）
          ├─ 首字符须为 ASCII 字母或下划线
          └─ 推导出的结构体名前缀（ToPascalCase(TableName)）须为导出 Go 标识符
             （拒绝 public.users、user$x、_2fa、_用户 等）
                                  │
       ③ 确定输出文件名（Input.FileName，空则取 TableName）
-         ├─ 显式 FileName：拒绝 "." / ".."、路径分隔符、Windows 非法字符与 .go 扩展名
+         ├─ 显式 FileName：拒绝非 UTF-8、"." / ".."、路径分隔符、Windows 非法字符与 .go 扩展名
          └─ 拒绝触发 Go 文件名构建规则的名字（_ 或 . 开头、_test 后缀、_GOOS / _GOARCH 后缀）
                                  │
       ④ 校验 ColumnTagName（非空时须为合法 struct tag key）
@@ -98,11 +101,13 @@ func Generate(input Input) error
 | `不支持的数据库方言: xxx` | `Dialect` 不是 mysql / postgres / sqlite |
 | `表名为空` | `TableName` 为空字符串 |
 | `表名非法: xxx` | `TableName` 为 `.` 或 `..` |
+| `表名不是合法的 UTF-8: xxx` | `TableName` 含非法 UTF-8 字节（Windows 会替换为 U+FFFD，导致落盘路径与期望不一致） |
 | `表名包含非法字符: xxx` | `TableName` 含路径分隔符（`/`、`\`）或 Windows 非法文件名字符（`< > : " | ? *`） |
 | `表名首字符必须为 ASCII 字母或下划线: xxx` | `TableName` 首字符为数字或非 ASCII 字符（如中文表名），会推导出无法编译的结构体名 |
 | `表名 xxx 推导出的结构体名前缀 xxx 不是合法的导出 Go 标识符` | 首字符合法但 `ToPascalCase(TableName)` 不是导出标识符：含 `.`（如 schema 限定名 `public.users`）、含 `$`（如 `user$x`）、下划线后接数字（`_2fa` → `2fa`）或中文（`_用户` → `用户`，未导出） |
 | `表名 xxx 用作文件名 xxx.go 会触发 Go 文件名规则（原因），请通过 Input.FileName 指定文件名` | `FileName` 为空且表名会触发 Go 文件名构建规则：`_` 开头（被 go 工具忽略）、`_test` 后缀（成为测试文件）、`_GOOS` / `_GOARCH` / `_GOOS_GOARCH` 后缀（如 `order_linux`，成为平台构建约束）。以 `.` 开头的表名在此前已被「表名首字符」校验拒绝，不进入本分支 |
 | `文件名非法: xxx` | 显式 `FileName` 为 `.` 或 `..` |
+| `文件名不是合法的 UTF-8: xxx` | 显式 `FileName` 含非法 UTF-8 字节 |
 | `文件名包含非法字符: xxx` | 显式 `FileName` 含路径分隔符或 Windows 非法文件名字符 |
 | `文件名不应包含 .go 扩展名: xxx` | 显式 `FileName` 以 `.go` 结尾（扩展名由生成器追加） |
 | `文件名 xxx.go 会触发 Go 文件名规则（原因）` | 显式 `FileName` 触发上述 Go 文件名构建规则 |
@@ -584,7 +589,7 @@ columns := []*zcmodel.Column{
 ## 注意事项
 
 1. **输出目录名即包名（仅新建文件）**：新建生成文件时，`OutputDir` 绝对路径的最后一级目录名被用作 `package` 名（相对路径 `.` 解析为当前目录的实际名称），请保证它是合法的 Go 包名（如 `model`），位于根目录等无法推导时回退为 `main`；`OutputDir` 不得为空（返回「输出目录为空」）；存量文件再生成时尊重原 package 声明，不受目录名影响。
-2. **表名与文件名经主动校验**：输出文件名默认为 `{TableName}.go`（不做大小写转换），可用 `Input.FileName` 覆盖；`Generate` 会主动校验——拒绝空表名、`.` / `..`、路径分隔符与 Windows 非法文件名字符，首字符必须为 ASCII 字母或下划线，且表名经 `ToPascalCase` 推导出的结构体名前缀必须是合法的导出 Go 标识符（拒绝 `public.users`、`_2fa` 等）；文件名还不得触发 Go 文件名规则（`_` / `.` 开头被 go 工具忽略、`_test` 后缀被当作测试文件、`_linux` / `_amd64` 等后缀被当作平台构建约束），表名触发时请通过 `FileName` 另行指定。非法时返回明确错误（而非依赖操作系统或编译器报错）。
+2. **表名与文件名经主动校验**：输出文件名默认为 `{TableName}.go`（不做大小写转换），可用 `Input.FileName` 覆盖；`Generate` 会主动校验——拒绝空表名、非 UTF-8、`.` / `..`、路径分隔符与 Windows 非法文件名字符，首字符必须为 ASCII 字母或下划线，且表名经 `ToPascalCase` 推导出的结构体名前缀必须是合法的导出 Go 标识符（拒绝 `public.users`、`_2fa` 等）；文件名还不得触发 Go 文件名规则（`_` / `.` 开头被 go 工具忽略、`_test` 后缀被当作测试文件、`_linux` / `_amd64` 等后缀被当作平台构建约束），表名触发时请通过 `FileName` 另行指定。非法时返回明确错误（而非依赖操作系统或编译器报错）。
 3. **未知列类型兜底为 string**：映射表未覆盖的列类型（如 PG 的自定义类型）默认映射为 `string`，避免生成非法代码；需要精确类型时请显式指定 `StructFieldInfo.Type` 与 `Import`。
 4. **MySQL 的 BOOL 实际是 TINYINT(1)**：从真实 MySQL 读到的 BOOL/BOOLEAN 列，其存储类型为 `tinyint`，映射结果为 `int` 而非 `bool`。
 5. **SQLite 不支持字段注释**：SQLite 元数据中没有列注释，通过 zcdb Schema 读取时 `Comment` 恒为空，因此生成的 `description` tag 也恒为空；若手工构造 SQLite 方言的列并填写 `Comment`，仍会正常生成该 tag。

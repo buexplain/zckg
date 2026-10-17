@@ -170,5 +170,7 @@ func normalizeColumnType(dialect Dialect, colType string) string {
 		t = strings.ReplaceAll(t, "\"", "")
 		t = strings.ReplaceAll(t, "'", "")
 	}
-	return t
+	// 方言修饰移除可能重新产生连续空格（如去掉引号/修饰符），末尾再次压缩，
+	// 保证归一化幂等并能命中映射表的单空格键。
+	return strings.Join(strings.Fields(t), " ")
 }

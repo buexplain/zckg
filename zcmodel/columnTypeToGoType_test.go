@@ -1,6 +1,10 @@
 package zcmodel
 
-import "testing"
+import (
+	"go/parser"
+	"strings"
+	"testing"
+)
 
 // TestNormalizeColumnType 验证列类型归一化的三方言代表规则：
 // 去除长度/精度与枚举值列表、MySQL 的 unsigned/zerofill 修饰、
@@ -47,6 +51,7 @@ func TestNormalizeColumnType(t *testing.T) {
 		{name: "SQLite native character 带长度", dialect: DialectSqlite, colType: "NATIVE CHARACTER(70)", want: "native character"},
 		{name: "SQLite bigint 带长度", dialect: DialectSqlite, colType: "BIGINT(20)", want: "bigint"},
 		{name: "SQLite 带引号类型名", dialect: DialectSqlite, colType: `"text"`, want: "text"},
+		{name: "SQLite 去引号后压缩空白", dialect: DialectSqlite, colType: `0 0 " 000`, want: "0 0 000"},
 		{name: "SQLite clob", dialect: DialectSqlite, colType: "CLOB", want: "clob"},
 
 		// 边界情况
@@ -144,4 +149,185 @@ func TestFormatStructFieldType(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fuzzColumnTypeRef 是独立于实现的期望：原始输入 → 归一化结果 → Go 类型。
+// 该表按方言手工维护，与定向用例的期望同源；实现中的 normalizeColumnType 或
+// makeColumnTypeToGoTypeMap 发生语义回归时由 fuzz 直接发现，而不是用实现自证。
+type fuzzColumnTypeRef struct {
+	normalized string
+	want       string
+}
+
+// fuzzColumnTypeRefs 返回三方言的独立期望表：包含全部映射键与带长度/修饰符/时区/引号的代表输入。
+// 每次返回全新 map，避免测试之间共享可变数据。
+func fuzzColumnTypeRefs() map[Dialect]map[string]fuzzColumnTypeRef {
+	return map[Dialect]map[string]fuzzColumnTypeRef{
+		DialectMysql: {
+			"tinyint": {"tinyint", "int"}, "smallint": {"smallint", "int"},
+			"mediumint": {"mediumint", "int"}, "int": {"int", "int"},
+			"integer": {"integer", "int"}, "bigint": {"bigint", "int64"},
+			"year": {"year", "int"}, "float": {"float", "float64"},
+			"double": {"double", "float64"}, "decimal": {"decimal", "float64"},
+			"numeric": {"numeric", "float64"}, "bool": {"bool", "bool"},
+			"boolean": {"boolean", "bool"}, "char": {"char", "string"},
+			"varchar": {"varchar", "string"}, "tinytext": {"tinytext", "string"},
+			"text": {"text", "string"}, "mediumtext": {"mediumtext", "string"},
+			"longtext": {"longtext", "string"}, "enum": {"enum", "string"},
+			"set": {"set", "string"}, "json": {"json", "string"},
+			"date": {"date", "time.Time"}, "time": {"time", "time.Time"},
+			"datetime": {"datetime", "time.Time"}, "timestamp": {"timestamp", "time.Time"},
+			"binary": {"binary", "[]byte"}, "varbinary": {"varbinary", "[]byte"},
+			"tinyblob": {"tinyblob", "[]byte"}, "blob": {"blob", "[]byte"},
+			"mediumblob": {"mediumblob", "[]byte"}, "longblob": {"longblob", "[]byte"},
+
+			"VARCHAR(255)":        {"varchar", "string"},
+			"bigint(20) unsigned": {"bigint", "int64"},
+			"int unsigned":        {"int", "int"},
+			"float zerofill":      {"float", "float64"},
+			"decimal(10,2)":       {"decimal", "float64"},
+			"ENUM('a','b')":       {"enum", "string"},
+			"  datetime  ":        {"datetime", "time.Time"},
+			"BLOB":                {"blob", "[]byte"},
+			"unknown_type":        {"unknown_type", ""},
+			"a)bi":                {"abi", ""},
+			"a(b(c":               {"a", ""},
+		},
+		DialectPostgres: {
+			"smallint": {"smallint", "int"}, "int2": {"int2", "int"},
+			"integer": {"integer", "int"}, "int": {"int", "int"},
+			"int4": {"int4", "int"}, "bigint": {"bigint", "int64"},
+			"int8": {"int8", "int64"}, "smallserial": {"smallserial", "int"},
+			"serial": {"serial", "int"}, "bigserial": {"bigserial", "int64"},
+			"real": {"real", "float64"}, "float4": {"float4", "float64"},
+			"double precision": {"double precision", "float64"}, "float8": {"float8", "float64"},
+			"numeric": {"numeric", "float64"}, "decimal": {"decimal", "float64"},
+			"money": {"money", "string"}, "boolean": {"boolean", "bool"},
+			"bool": {"bool", "bool"}, "character varying": {"character varying", "string"},
+			"varchar": {"varchar", "string"}, "character": {"character", "string"},
+			"char": {"char", "string"}, "bpchar": {"bpchar", "string"},
+			"text": {"text", "string"}, "uuid": {"uuid", "string"},
+			"json": {"json", "string"}, "jsonb": {"jsonb", "string"},
+			"inet": {"inet", "string"}, "interval": {"interval", "string"},
+			"date": {"date", "time.Time"}, "time": {"time", "time.Time"},
+			"timetz": {"timetz", "time.Time"}, "timestamp": {"timestamp", "time.Time"},
+			"timestamptz": {"timestamptz", "time.Time"}, "bytea": {"bytea", "[]byte"},
+
+			"character varying(255)":      {"character varying", "string"},
+			"CHARACTER VARYING(255)":      {"character varying", "string"},
+			"timestamp with time zone":    {"timestamptz", "time.Time"},
+			"timestamp(6) with time zone": {"timestamptz", "time.Time"},
+			"time without time zone":      {"time", "time.Time"},
+			"unknown_type":                {"unknown_type", ""},
+		},
+		DialectSqlite: {
+			"tinyint": {"tinyint", "int"}, "smallint": {"smallint", "int"},
+			"mediumint": {"mediumint", "int"}, "int": {"int", "int"},
+			"integer": {"integer", "int"}, "bigint": {"bigint", "int64"},
+			"int2": {"int2", "int"}, "int8": {"int8", "int64"},
+			"unsigned big int": {"unsigned big int", "int64"}, "real": {"real", "float64"},
+			"double": {"double", "float64"}, "double precision": {"double precision", "float64"},
+			"float": {"float", "float64"}, "numeric": {"numeric", "float64"},
+			"decimal": {"decimal", "float64"}, "boolean": {"boolean", "bool"},
+			"bool": {"bool", "bool"}, "character": {"character", "string"},
+			"varchar": {"varchar", "string"}, "varying character": {"varying character", "string"},
+			"nchar": {"nchar", "string"}, "native character": {"native character", "string"},
+			"nvarchar": {"nvarchar", "string"}, "text": {"text", "string"},
+			"clob": {"clob", "string"}, "blob": {"blob", "[]byte"},
+			"date": {"date", "time.Time"}, "datetime": {"datetime", "time.Time"},
+			"timestamp": {"timestamp", "time.Time"}, "json": {"json", "string"},
+
+			"VARCHAR(255)":          {"varchar", "string"},
+			`"text"`:                {"text", "string"},
+			`0 0 " 000`:             {"0 0 000", ""},
+			"UNSIGNED BIG INT":      {"unsigned big int", "int64"},
+			"VARYING CHARACTER(10)": {"varying character", "string"},
+			"NATIVE CHARACTER(70)":  {"native character", "string"},
+			"unknown_type":          {"unknown_type", ""},
+		},
+	}
+}
+
+// FuzzColumnTypeToGoType 校验归一化与映射的确定性、幂等性和独立期望表覆盖：
+// 任意类型字符串归一化后不得含括号/首尾空白、保持小写，二次归一化不变；
+// 命中独立期望表的输入必须得到精确的归一化结果与 Go 类型；
+// 映射结果还必须等于方言映射表对归一化键的查询，且输出类型可被 parser.ParseExpr 接受。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcmodel -run '^$' -fuzz '^FuzzColumnTypeToGoType$' -fuzztime=30s
+func FuzzColumnTypeToGoType(f *testing.F) {
+	dialects := []Dialect{DialectMysql, DialectPostgres, DialectSqlite, Dialect("oracle")}
+	// validTypes 是映射允许输出的 Go 类型集合；新增映射目标类型时需同步维护。
+	validTypes := map[string]bool{
+		"int": true, "int64": true, "float64": true, "bool": true,
+		"string": true, "time.Time": true, "[]byte": true,
+	}
+	refs := fuzzColumnTypeRefs()
+	seeds := []string{
+		"", "VARCHAR(255)", "bigint(20) unsigned", "int unsigned", "float zerofill",
+		"decimal(10,2)", "ENUM('a','b')", "  datetime  ", "text",
+		"character varying(255)", "timestamp with time zone", "timestamp(6) with time zone",
+		"time without time zone", "double precision", "bytea", `"text"`,
+		"UNSIGNED BIG INT", "VARYING CHARACTER(10)", "unknown_type", "a)bi", "a(b(c",
+	}
+	for i, dialect := range dialects {
+		for _, seed := range seeds {
+			f.Add(uint8(i), seed)
+		}
+		// 独立期望表中的全部输入（含全部映射键与代表修饰形式）作为种子。
+		for input := range refs[dialect] {
+			f.Add(uint8(i), input)
+			f.Add(uint8(i), strings.ToUpper(input)+"(10)")
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, dialectIndex uint8, colType string) {
+		if len(colType) > 256 {
+			return
+		}
+		dialect := dialects[int(dialectIndex)%len(dialects)]
+		normalized := normalizeColumnType(dialect, colType)
+		if again := normalizeColumnType(dialect, normalized); again != normalized {
+			t.Fatalf("dialect=%s type=%q: normalize not idempotent: %q -> %q", dialect, colType, normalized, again)
+		}
+		if normalized != strings.ToLower(normalized) {
+			t.Fatalf("dialect=%s type=%q: normalized not lowercase: %q", dialect, colType, normalized)
+		}
+		if strings.Join(strings.Fields(normalized), " ") != normalized {
+			t.Fatalf("dialect=%s type=%q: normalized whitespace not collapsed: %q", dialect, colType, normalized)
+		}
+		if strings.ContainsAny(normalized, "()") {
+			t.Fatalf("dialect=%s type=%q: normalized still contains parentheses: %q", dialect, colType, normalized)
+		}
+
+		got := formatStructFieldType(dialect, colType)
+		if again := formatStructFieldType(dialect, colType); again != got {
+			t.Fatalf("dialect=%s type=%q: formatStructFieldType not deterministic: %q -> %q", dialect, colType, got, again)
+		}
+		// 与实现同构的映射查询只作为附加一致性检查；语义正确性由下面的独立期望表保证。
+		mapping := makeColumnTypeToGoTypeMap(dialect)
+		want := ""
+		if mapping != nil {
+			want = mapping[normalized]
+		}
+		if got != want {
+			t.Fatalf("dialect=%s type=%q normalized=%q: got %q, want %q", dialect, colType, normalized, got, want)
+		}
+		if ref, ok := refs[dialect][colType]; ok {
+			if normalized != ref.normalized {
+				t.Fatalf("dialect=%s type=%q: normalized=%q, want %q", dialect, colType, normalized, ref.normalized)
+			}
+			if got != ref.want {
+				t.Fatalf("dialect=%s type=%q: type=%q, want %q", dialect, colType, got, ref.want)
+			}
+		}
+		if got != "" {
+			if _, err := parser.ParseExpr(got); err != nil {
+				t.Fatalf("dialect=%s type=%q: result %q is not a parsable Go type expression: %v", dialect, colType, got, err)
+			}
+			if !validTypes[got] {
+				t.Fatalf("dialect=%s type=%q: unexpected Go type %q", dialect, colType, got)
+			}
+		}
+	})
 }

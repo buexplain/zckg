@@ -1,15 +1,18 @@
 package zcmodel
 
 import (
+	"bytes"
 	"go/ast"
 	"go/format"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -2059,4 +2062,719 @@ func TestWriteOrReplaceStruct_DropAndDedupeGeneratedDecls(t *testing.T) {
 		assertNotContains(t, got, "type (", "全部为前序重复的生成块应整块移除")
 		typeCheckGoSource(t, got)
 	})
+}
+
+// fuzzExtraFragmentExpectations 是独立于 ddLExtraParts 的字面量期望：满足白名单的 EXTRA
+// 必须按固定顺序与固定大小写输出，精度仅保留纯数字，未命中白名单的标记不得出现。
+func fuzzExtraFragmentExpectations() map[string]string {
+	return map[string]string{
+		"":                                 "",
+		"auto_increment":                   "AUTO_INCREMENT",
+		"AUTO_INCREMENT DEFAULT_GENERATED": "AUTO_INCREMENT",
+		"on update CURRENT_TIMESTAMP(3)":   "ON UPDATE CURRENT_TIMESTAMP(3)",
+		"on update CURRENT_TIMESTAMP(x)":   "ON UPDATE CURRENT_TIMESTAMP",
+		"virtual generated":                "VIRTUAL GENERATED",
+		"stored generated":                 "STORED GENERATED",
+		"auto_increment virtual generated stored generated": "AUTO_INCREMENT VIRTUAL GENERATED STORED GENERATED",
+		"on update current_timestamp default_generated":     "ON UPDATE CURRENT_TIMESTAMP",
+		"default_generated": "",
+	}
+}
+
+// FuzzAssembleDDLFragment 校验类 DDL 片段与 tag 净化：
+// 独立参考模型推导 NULL/NOT NULL、DEFAULT（空串为 ”）与 EXTRA 白名单/顺序/精度；
+// EXTRA 另用独立字面量期望表锚定白名单语义；再经 buildStruct + go/parser +
+// reflect.StructTag 验证 tag 值完整还原（反引号按约定替换为单引号）。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcmodel -run '^$' -fuzz '^FuzzAssembleDDLFragment$' -fuzztime=30s
+func FuzzAssembleDDLFragment(f *testing.F) {
+	type seed struct {
+		colType     string
+		defaultText string
+		extra       string
+		comment     string
+		nullableIdx uint8
+		defaultSet  bool
+	}
+	seeds := []seed{
+		{"text", "", "", "", 0, false},
+		{"varchar(255)", "", "", "用户名", 2, false},
+		{"enum('pending','paid')", "", "auto_increment", "", 1, false},
+		{"decimal(10,2)", "0.00", "", "", 2, true},
+		{"datetime", "", "on update CURRENT_TIMESTAMP(3)", "", 0, false},
+		{"int", "", "auto_increment DEFAULT_GENERATED virtual generated", "", 2, false},
+		{"text", "", "", "a`b\nc\"d\\e", 0, false},
+		{"text", "", "", "", 1, false},
+		{"text", "", "", "", 2, false},
+	}
+	for _, s := range seeds {
+		f.Add(s.colType, s.defaultText, s.extra, s.comment, s.nullableIdx, s.defaultSet)
+	}
+	extraRefs := fuzzExtraFragmentExpectations()
+	for extra := range extraRefs {
+		f.Add("text", "", extra, "", uint8(0), false)
+	}
+
+	f.Fuzz(func(t *testing.T, colType, defaultText, extra, comment string, nullableIdx uint8, defaultSet bool) {
+		if len(colType) > 1<<10 || len(defaultText) > 1<<10 || len(extra) > 1<<10 || len(comment) > 1<<10 {
+			return
+		}
+		var nullable *bool
+		switch nullableIdx % 3 {
+		case 1:
+			value := true
+			nullable = &value
+		case 2:
+			value := false
+			nullable = &value
+		}
+		var defaultPtr *string
+		if defaultSet {
+			value := defaultText
+			defaultPtr = &value
+		}
+		column := Column{
+			Name:            "col",
+			Type:            colType,
+			Comment:         comment,
+			Nullable:        nullable,
+			Default:         defaultPtr,
+			Extra:           extra,
+			StructFieldInfo: StructFieldInfo{Name: "F", Type: "string"},
+		}
+
+		got := assembleDDLFragment(column)
+		if wantExtra, ok := extraRefs[extra]; ok {
+			wantFragment := strings.TrimSpace("v " + wantExtra)
+			if refGot := assembleDDLFragment(Column{Type: "v", Extra: extra}); refGot != wantFragment {
+				t.Fatalf("extra=%q: assembleDDLFragment=%q, want %q", extra, refGot, wantFragment)
+			}
+		}
+		if want := fuzzExpectedDDLFragment(column); got != want {
+			t.Fatalf("type=%q nullable=%v default=%v extra=%q\ngot:  %q\nwant: %q", colType, nullable, defaultSet, extra, got, want)
+		}
+		if again := assembleDDLFragment(column); again != got {
+			t.Fatalf("assembleDDLFragment not deterministic: %q -> %q", got, again)
+		}
+
+		source := "package model\n" + buildStruct("TEntity", []Column{column}, false, "", "db", nil)
+		file, err := parser.ParseFile(token.NewFileSet(), "", source, parser.AllErrors)
+		if err != nil {
+			t.Fatalf("generated struct syntax error: %v\n%s", err, source)
+		}
+		tag := reflect.StructTag(fieldTagOf(file, "F"))
+		// buildStruct 仅在 Column.Type 非空时输出 ddl tag；Type 为空属手工构造边界。
+		if colType != "" {
+			wantTag := strings.ReplaceAll(got, "`", "'")
+			if value, ok := tag.Lookup("ddl"); !ok || value != wantTag {
+				t.Fatalf("ddl tag round-trip: got (%q,%v), want %q\nfragment=%q", value, ok, wantTag, got)
+			}
+		}
+		if comment != "" {
+			wantComment := strings.ReplaceAll(comment, "`", "'")
+			if value, ok := tag.Lookup("description"); !ok || value != wantComment {
+				t.Fatalf("description tag round-trip: got (%q,%v), want %q", value, ok, wantComment)
+			}
+		}
+	})
+}
+
+// fuzzExpectedDDLFragment 独立实现 assembleDDLFragment 的文档规则。
+func fuzzExpectedDDLFragment(col Column) string {
+	parts := []string{col.Type}
+	if col.Nullable != nil {
+		if *col.Nullable {
+			parts = append(parts, "NULL")
+		} else {
+			parts = append(parts, "NOT NULL")
+		}
+	}
+	if col.Default != nil {
+		value := *col.Default
+		if value == "" {
+			value = "''"
+		}
+		parts = append(parts, "DEFAULT "+value)
+	}
+	parts = append(parts, fuzzExpectedDDLExtra(col.Extra)...)
+	return strings.Join(parts, " ")
+}
+
+func fuzzExpectedDDLExtra(extra string) []string {
+	if extra == "" {
+		return nil
+	}
+	lower := strings.ToLower(extra)
+	order := []struct {
+		marker    string
+		output    string
+		precision bool
+	}{
+		{"auto_increment", "AUTO_INCREMENT", false},
+		{"on update current_timestamp", "ON UPDATE CURRENT_TIMESTAMP", true},
+		{"virtual generated", "VIRTUAL GENERATED", false},
+		{"stored generated", "STORED GENERATED", false},
+	}
+	var parts []string
+	for _, item := range order {
+		idx := strings.Index(lower, item.marker)
+		if idx < 0 {
+			continue
+		}
+		out := item.output
+		if item.precision {
+			rest := lower[idx+len(item.marker):]
+			if strings.HasPrefix(rest, "(") {
+				if end := strings.IndexByte(rest, ')'); end >= 2 {
+					digits := rest[1:end]
+					allDigits := true
+					for _, r := range digits {
+						if r < '0' || r > '9' {
+							allDigits = false
+							break
+						}
+					}
+					if allDigits {
+						out += rest[:end+1]
+					}
+				}
+			}
+		}
+		parts = append(parts, out)
+	}
+	return parts
+}
+
+// fuzzExistingSource 按 layoutIdx/variant 位组合构造语法合法的既有 Go 源码：
+// layoutIdx 控制 build tag、用户声明（const/var/func/type/方法/type 块）与 //go:generate；
+// variant bit0 构造旧生成声明（Entity 带 time.Time），bit1 用别名 t "time" 引用，
+// bit2 追加 _ "embed" 与 . "strings" import。
+func fuzzExistingSource(layoutIdx, variant uint8) string {
+	var b strings.Builder
+	if layoutIdx&1 != 0 {
+		b.WriteString("//go:build !ignore\n\n")
+	}
+	b.WriteString("package model\n\n")
+	hasOld := variant&1 != 0
+	aliasTime := variant&2 != 0
+	if hasOld {
+		if aliasTime {
+			b.WriteString("import t \"time\"\n\n")
+		} else {
+			b.WriteString("import \"time\"\n\n")
+		}
+	}
+	if variant&4 != 0 {
+		b.WriteString("import (\n\t_ \"embed\"\n\t. \"strings\"\n)\n\n")
+	}
+	if layoutIdx&2 != 0 {
+		b.WriteString("//go:generate echo user\n\n")
+	}
+	if layoutIdx&4 != 0 {
+		b.WriteString("// user const comment\nconst UserConst = 1\n\n")
+	}
+	if layoutIdx&8 != 0 {
+		b.WriteString("var UserVar = 2 // user var trailing\n\n")
+	}
+	if layoutIdx&16 != 0 {
+		b.WriteString("func UserFunc() int { return UserVar }\n\n")
+	}
+	if layoutIdx&32 != 0 {
+		b.WriteString("// user type comment\ntype UserType struct{ X int }\n\n")
+	}
+	if layoutIdx&64 != 0 {
+		b.WriteString("func (u UserType) String() string { return \"x\" }\n\n")
+	}
+	if layoutIdx&128 != 0 {
+		b.WriteString("type (\n\tKeepOne struct{ A int }\n\tUserEntity struct{ ID string }\n\tKeepTwo struct{ B int }\n)\n\n")
+	}
+	if hasOld {
+		timeType := "time.Time"
+		if aliasTime {
+			timeType = "t.Time"
+		}
+		b.WriteString("type UserEntity struct {\n\tID int\n\tCreatedAt " + timeType + "\n}\n\n")
+		b.WriteString("func (e *UserEntity) ToDO() { _ = e }\n\n")
+		b.WriteString("type UserDO struct {\n\tID any\n\tCreatedAt any\n}\n\n")
+		b.WriteString("func (d *UserDO) ToEntity() { _ = d }\n\n")
+	}
+	return b.String()
+}
+
+// fuzzNewGeneratedCode 构造待合并的新生成代码：
+// variant bit3 表示 Entity 含 time.Time 字段（需要 time import），bit4 表示 ToDO 使用值接收者。
+func fuzzNewGeneratedCode(variant uint8) (entityCode, doCode string, neededImports []string) {
+	withTime := variant&8 != 0
+	valueReceiver := variant&16 != 0
+
+	var eb strings.Builder
+	eb.WriteString("type UserEntity struct {\n\tID int\n")
+	if withTime {
+		eb.WriteString("\tCreatedAt time.Time\n")
+	}
+	eb.WriteString("}\n\n")
+	receiver := "e *UserEntity"
+	if valueReceiver {
+		receiver = "e UserEntity"
+	}
+	eb.WriteString("func (" + receiver + ") ToDO() { _ = e }")
+
+	var db strings.Builder
+	db.WriteString("type UserDO struct {\n\tID any\n")
+	if withTime {
+		db.WriteString("\tCreatedAt any\n")
+	}
+	db.WriteString("}\n\nfunc (d *UserDO) ToEntity() { _ = d }")
+	if withTime {
+		neededImports = []string{"time"}
+	}
+	return eb.String(), db.String(), neededImports
+}
+
+// FuzzWriteOrReplaceStruct 校验增量 AST 合并：
+// 输入为既有 Go 源码（raw 或按位组合的合法骨架）、生成代码变体（time 字段/值接收者）
+// 与 import 形态（默认/别名/blank/dot）。成功产物必须可解析且 gofmt 稳定；
+// 用户顶层声明文本、顺序与游离注释保留；Entity/DO/ToDO/ToEntity 各恰一份；
+// 生成代码需要的 import 存在且不重复，旧生成代码独占的 import 被移除，blank/dot 不被误删；
+// 连续两次生成字节一致。失败（既有文件语法错误）时原文件逐字节不变且无临时文件。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcmodel -run '^$' -fuzz '^FuzzWriteOrReplaceStruct$' -fuzztime=30s
+func FuzzWriteOrReplaceStruct(f *testing.F) {
+	type seed struct {
+		existing string
+		layout   uint8
+		variant  uint8
+	}
+	seeds := []seed{
+		{"", 0, 128},
+		{"  \n", 0, 128},
+		{"package model\n\nvar FuzzSentinel = 1\n", 0, 128},
+		{`package model
+
+import "fmt"
+
+// user-marker
+//go:generate echo user
+
+type UserEntity struct {
+	ID string
+}
+
+func (e *UserEntity) ToDO() { _ = e }
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() { _ = d }
+
+type UserType struct{ X int }
+
+func (u UserType) String() string { return fmt.Sprint(u.X) }
+`, 0, 128},
+		{"package model\n\ntype (\n\tUserEntity struct{ ID string }\n\tUserType struct{ X int }\n)\n", 0, 128},
+		{"package model\n\nconst UserConst = 1\n\nvar UserVar = 2\n", 0, 128},
+		{"package model\n\ntype UserEntity struct {", 0, 128},
+		{"package model\n\nfunc broken( {", 0, 128},
+		{"package model\r\n\r\ntype UserType struct{ X int }\r\n", 0, 128},
+		// 结构化模式：覆盖用户声明、旧生成声明、别名/blank/dot import 与 time 字段组合。
+		{"", 1 | 4 | 8 | 16 | 32 | 64 | 128, 1 | 2 | 4},
+		{"", 2 | 8 | 16 | 32, 1 | 4 | 8},
+		{"", 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128, 1 | 8 | 16},
+		{"", 1 | 4 | 8 | 16 | 32, 1 | 2 | 4 | 8},
+		{"", 4 | 16, 4 | 8 | 16},
+	}
+	for _, s := range seeds {
+		f.Add(s.existing, s.layout, s.variant)
+	}
+
+	f.Fuzz(func(t *testing.T, existing string, layoutIdx, variant uint8) {
+		if len(existing) > 8<<10 {
+			return
+		}
+		rawMode := variant&128 != 0
+		initial := existing
+		if !rawMode {
+			initial = fuzzExistingSource(layoutIdx, variant)
+		}
+		if len(initial) > 8<<10 {
+			return
+		}
+		// 以 gofmt 后的源码作为文本比较基线；失败则按损坏输入处理，交给合并错误路径。
+		initialFormatted := false
+		if formatted, err := format.Source([]byte(initial)); err == nil {
+			initial = string(formatted)
+			initialFormatted = true
+		}
+		entityCode, doCode, neededImports := fuzzNewGeneratedCode(variant)
+
+		outputDir := filepath.Join(t.TempDir(), "model")
+		if err := os.MkdirAll(outputDir, 0o755); err != nil {
+			t.Fatalf("mkdir output: %v", err)
+		}
+		target := filepath.Join(outputDir, "user.go")
+		if initial != "" {
+			if err := os.WriteFile(target, []byte(initial), 0o644); err != nil {
+				t.Fatalf("write initial file: %v", err)
+			}
+		}
+
+		err := writeOrReplaceStruct(target, "UserEntity", entityCode, "UserDO", doCode, neededImports)
+		if err != nil {
+			if initial != "" {
+				after, readErr := os.ReadFile(target)
+				if readErr != nil {
+					t.Fatalf("read file after failed merge: %v", readErr)
+				}
+				if string(after) != initial {
+					t.Fatalf("failed merge modified existing file:\nbefore: %q\nafter:  %q\nerr: %v", initial, after, err)
+				}
+			} else if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+				t.Fatalf("failed merge created target file")
+			}
+			assertFuzzNoTempFiles(t, outputDir)
+			return
+		}
+
+		content, readErr := os.ReadFile(target)
+		if readErr != nil {
+			t.Fatalf("read merged file: %v", readErr)
+		}
+		fset := token.NewFileSet()
+		file, parseErr := parser.ParseFile(fset, target, content, parser.ParseComments|parser.AllErrors)
+		if parseErr != nil {
+			t.Fatalf("merged file syntax error: %v\n%s", parseErr, content)
+		}
+		formatted, formatErr := format.Source(content)
+		if formatErr != nil {
+			t.Fatalf("merged file format error: %v", formatErr)
+		}
+		if !bytes.Equal(formatted, content) {
+			t.Fatalf("merged file is not gofmt-stable")
+		}
+
+		entity, do, toDO, toEntity := fuzzGeneratedDeclCounts(file)
+		if entity != 1 || do != 1 || toDO != 1 || toEntity != 1 {
+			t.Fatalf("generated declaration counts = entity:%d do:%d ToDO:%d ToEntity:%d, want 1 each\n%s", entity, do, toDO, toEntity, content)
+		}
+		if strings.Contains(initial, "//go:generate") && !strings.Contains(string(content), "//go:generate echo user") {
+			t.Fatalf("//go:generate directive was not preserved\n%s", content)
+		}
+
+		var initialImports []fuzzImportSpec
+		if initialFormatted && strings.TrimSpace(initial) != "" {
+			initFset := token.NewFileSet()
+			initFile, initErr := parser.ParseFile(initFset, target, initial, parser.ParseComments|parser.AllErrors)
+			if initErr != nil {
+				t.Fatalf("initial formatted source does not parse: %v\n%s", initErr, initial)
+			}
+			wantDecls := fuzzUserDeclTexts(t, initFile, "UserEntity", "UserDO")
+			gotDecls := fuzzUserDeclTexts(t, file, "UserEntity", "UserDO")
+			if !reflect.DeepEqual(wantDecls, gotDecls) {
+				t.Fatalf("user declarations changed\nwant: %v\ngot:  %v\n%s", wantDecls, gotDecls, content)
+			}
+			for _, comment := range fuzzFreeComments(t, initFset, initFile, []byte(initial), "UserEntity", "UserDO") {
+				if !bytes.Contains(content, []byte(comment)) {
+					t.Fatalf("free-floating comment was dropped: %q\n%s", comment, content)
+				}
+			}
+			initialImports = fuzzImportSpecs(t, initFile)
+		}
+
+		outImports := fuzzImportSpecs(t, file)
+		timeNeeded := variant&8 != 0
+		if timeNeeded {
+			defaultTime := 0
+			for _, imp := range outImports {
+				if imp.path == "time" && imp.name == "" {
+					defaultTime++
+				}
+			}
+			if defaultTime == 0 {
+				t.Fatalf("generated code needs time but no default time import exists")
+			}
+			if !rawMode && defaultTime != 1 {
+				t.Fatalf("default time import count = %d, want 1", defaultTime)
+			}
+		}
+		// 结构化模式下用户代码不引用 time：旧生成代码独占的 time import 必须被移除。
+		if !timeNeeded && !rawMode && variant&1 != 0 {
+			for _, imp := range outImports {
+				if imp.path == "time" {
+					t.Fatalf("old generated time import was not removed: %+v", imp)
+				}
+			}
+		}
+		// 旧生成代码使用别名 t "time"：新代码仍需要 time 时别名保留；不再需要时别名移除。
+		if !rawMode && variant&1 != 0 && variant&2 != 0 {
+			hasAlias := fuzzHasImport(outImports, "time", "t")
+			if timeNeeded && !hasAlias {
+				t.Fatalf("alias time import was removed while generated code still needs time")
+			}
+			if !timeNeeded && hasAlias {
+				t.Fatalf("old generated alias time import was not removed")
+			}
+		}
+		for _, imp := range initialImports {
+			switch {
+			case imp.name == "_" || imp.name == ".":
+				if !fuzzHasImport(outImports, imp.path, imp.name) {
+					t.Fatalf("named import %q %q was removed", imp.name, imp.path)
+				}
+			case imp.name == "" && imp.path != "time":
+				if !fuzzHasImport(outImports, imp.path, "") {
+					t.Fatalf("user import %q was removed", imp.path)
+				}
+			}
+		}
+
+		if err := writeOrReplaceStruct(target, "UserEntity", entityCode, "UserDO", doCode, neededImports); err != nil {
+			t.Fatalf("second merge failed: %v", err)
+		}
+		second, readErr := os.ReadFile(target)
+		if readErr != nil {
+			t.Fatalf("read second merged file: %v", readErr)
+		}
+		if !bytes.Equal(content, second) {
+			t.Fatalf("merge is not idempotent")
+		}
+		assertFuzzNoTempFiles(t, outputDir)
+	})
+}
+
+type fuzzImportSpec struct {
+	path string
+	name string
+}
+
+// fuzzImportSpecs 提取文件中的全部 import（path + 局部名，默认导入名为空串）。
+func fuzzImportSpecs(t *testing.T, file *ast.File) []fuzzImportSpec {
+	t.Helper()
+	specs := make([]fuzzImportSpec, 0, len(file.Imports))
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("import path %q is not quoted: %v", spec.Path.Value, err)
+		}
+		name := ""
+		if spec.Name != nil {
+			name = spec.Name.Name
+		}
+		specs = append(specs, fuzzImportSpec{path: path, name: name})
+	}
+	return specs
+}
+
+func fuzzHasImport(specs []fuzzImportSpec, path, name string) bool {
+	for _, spec := range specs {
+		if spec.path == path && spec.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+type fuzzDeclText struct {
+	key  string
+	text string
+}
+
+// fuzzUserDeclTexts 提取非生成顶层声明的规范打印文本：类型（含块内 TypeSpec）、var/const、
+// 函数与方法；生成声明（Entity/DO 与 ToDO/ToEntity）排除。返回顺序即源码顺序。
+// 使用 go/printer 规范打印而非原始源码片段：go/format 会按块内最长名称重新对齐，
+// 原始空白不应成为断言目标；声明内容、顺序与注释由本函数和 fuzzFreeComments 共同锁死。
+func fuzzUserDeclTexts(t *testing.T, file *ast.File, entityName, doName string) []fuzzDeclText {
+	t.Helper()
+	var out []fuzzDeclText
+	typeCount := make(map[string]int)
+	valueCount := make(map[string]int)
+	funcCount := make(map[string]int)
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			if d.Tok == token.IMPORT {
+				continue
+			}
+			if d.Tok == token.TYPE {
+				for _, spec := range d.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok || ts.Name.Name == entityName || ts.Name.Name == doName {
+						continue
+					}
+					key := "type:" + ts.Name.Name + "#" + strconv.Itoa(typeCount[ts.Name.Name])
+					typeCount[ts.Name.Name]++
+					out = append(out, fuzzDeclText{key: key, text: fuzzNodeString(t, ts)})
+				}
+				continue
+			}
+			names := make([]string, 0)
+			for _, spec := range d.Specs {
+				if vs, ok := spec.(*ast.ValueSpec); ok {
+					for _, name := range vs.Names {
+						names = append(names, name.Name)
+					}
+				}
+			}
+			key := d.Tok.String() + ":" + strings.Join(names, ",") + "#" + strconv.Itoa(valueCount[d.Tok.String()])
+			valueCount[d.Tok.String()]++
+			out = append(out, fuzzDeclText{key: key, text: fuzzNodeString(t, d)})
+		case *ast.FuncDecl:
+			if fuzzIsGeneratedMethod(d, entityName, doName) {
+				continue
+			}
+			name := d.Name.Name
+			if recv := fuzzReceiverTypeName(d); recv != "" {
+				name = recv + "." + name
+			}
+			key := "func:" + name + "#" + strconv.Itoa(funcCount[name])
+			funcCount[name]++
+			out = append(out, fuzzDeclText{key: key, text: fuzzNodeString(t, d)})
+		}
+	}
+	return out
+}
+
+// fuzzNodeString 用 go/printer 规范打印 AST 节点，消除 gofmt 对齐/缩进差异。
+func fuzzNodeString(t *testing.T, node any) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, token.NewFileSet(), node); err != nil {
+		t.Fatalf("print declaration: %v", err)
+	}
+	return buf.String()
+}
+
+type fuzzSpan struct {
+	from int
+	to   int
+}
+
+// fuzzFreeComments 返回不附着于生成声明的注释组原文（含 //go:generate 与游离注释）。
+func fuzzFreeComments(t *testing.T, fset *token.FileSet, file *ast.File, src []byte, entityName, doName string) []string {
+	t.Helper()
+	spans := fuzzGeneratedSpans(t, fset, file, entityName, doName)
+	tf := fset.File(file.Pos())
+	off := func(pos token.Pos) int { return tf.Offset(pos) }
+	var out []string
+	for _, cg := range file.Comments {
+		from, to := off(cg.Pos()), off(cg.End())
+		generated := false
+		for _, span := range spans {
+			if from >= span.from && to <= span.to {
+				generated = true
+				break
+			}
+		}
+		if generated {
+			continue
+		}
+		out = append(out, string(src[from:to]))
+	}
+	return out
+}
+
+func fuzzGeneratedSpans(t *testing.T, fset *token.FileSet, file *ast.File, entityName, doName string) []fuzzSpan {
+	t.Helper()
+	tf := fset.File(file.Pos())
+	off := func(pos token.Pos) int { return tf.Offset(pos) }
+	var spans []fuzzSpan
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			if d.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range d.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || (ts.Name.Name != entityName && ts.Name.Name != doName) {
+					continue
+				}
+				from := ts.Pos()
+				if ts.Doc != nil {
+					from = ts.Doc.Pos()
+				}
+				to := ts.End()
+				if ts.Comment != nil {
+					to = ts.Comment.End()
+				}
+				spans = append(spans, fuzzSpan{from: off(from), to: off(to)})
+			}
+		case *ast.FuncDecl:
+			if !fuzzIsGeneratedMethod(d, entityName, doName) {
+				continue
+			}
+			from := d.Pos()
+			if d.Doc != nil {
+				from = d.Doc.Pos()
+			}
+			spans = append(spans, fuzzSpan{from: off(from), to: off(d.End())})
+		}
+	}
+	return spans
+}
+
+func fuzzIsGeneratedMethod(decl *ast.FuncDecl, entityName, doName string) bool {
+	receiver := fuzzReceiverTypeName(decl)
+	return (receiver == entityName && decl.Name.Name == "ToDO") ||
+		(receiver == doName && decl.Name.Name == "ToEntity")
+}
+
+func fuzzGeneratedDeclCounts(file *ast.File) (entity, do, toDO, toEntity int) {
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				switch typeSpec.Name.Name {
+				case "UserEntity":
+					entity++
+				case "UserDO":
+					do++
+				}
+			}
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				continue
+			}
+			receiver := fuzzReceiverTypeName(d)
+			if (receiver == "UserEntity" && d.Name.Name == "ToDO") || (receiver == "UserDO" && d.Name.Name == "ToEntity") {
+				if d.Name.Name == "ToDO" {
+					toDO++
+				} else {
+					toEntity++
+				}
+			}
+		}
+	}
+	return entity, do, toDO, toEntity
+}
+
+func fuzzReceiverTypeName(decl *ast.FuncDecl) string {
+	if decl.Recv == nil || len(decl.Recv.List) == 0 {
+		return ""
+	}
+	expr := decl.Recv.List[0].Type
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		expr = paren.X
+	}
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	default:
+		return ""
+	}
 }

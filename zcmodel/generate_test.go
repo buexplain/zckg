@@ -1,9 +1,12 @@
 package zcmodel
 
 import (
+	"bytes"
 	"fmt"
+	"go/ast"
 	"go/format"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -564,6 +567,42 @@ func TestGenerate_InvalidFileName(t *testing.T) {
 			}
 			if after := snapshotFiles(t, base); !reflect.DeepEqual(after, before) {
 				t.Errorf("FileName=%q 生成产生了文件\nbefore: %v\nafter:  %v", tt.fileName, before, after)
+			}
+		})
+	}
+}
+
+// TestGenerate_InvalidUTF8Name 验证表名/文件名不是合法 UTF-8 时前置报错且不产生文件：
+// Windows 会把非法字节替换为 U+FFFD，若放行会导致落盘文件名与调用方期望路径不一致。
+func TestGenerate_InvalidUTF8Name(t *testing.T) {
+	base := t.TempDir()
+	tests := []struct {
+		name      string
+		tableName string
+		fileName  string
+		wantErr   string
+	}{
+		{"表名非法 UTF-8", "user\x8e", "", "表名不是合法的 UTF-8"},
+		{"显式文件名非法 UTF-8", "user", "user\x8e", "文件名不是合法的 UTF-8"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := snapshotFiles(t, base)
+			err := Generate(Input{
+				OutputDir: filepath.Join(base, "model"),
+				Dialect:   DialectMysql,
+				TableName: tt.tableName,
+				FileName:  tt.fileName,
+				Columns:   []*Column{{Name: "id", Type: "bigint"}},
+			})
+			if err == nil {
+				t.Fatalf("tableName=%q fileName=%q 期望返回错误，实际为 nil", tt.tableName, tt.fileName)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("错误信息应包含 %q，实际: %v", tt.wantErr, err)
+			}
+			if after := snapshotFiles(t, base); !reflect.DeepEqual(after, before) {
+				t.Errorf("非法 UTF-8 名称生成了文件\nbefore: %v\nafter:  %v", before, after)
 			}
 		})
 	}
@@ -1326,4 +1365,359 @@ func TestIsPathWithinDir_RelError(t *testing.T) {
 	if isPathWithinDir(relDir, absPath) {
 		t.Fatal("相对目录与绝对路径混用时 Rel 报错，应返回 false")
 	}
+}
+
+// FuzzGenerate 覆盖 Generate 的端到端路径与失败原子性：
+// 输入表/文件名/tag/注释/列规格（列名、类型、注释以 ';' 分隔，'|' 分列，最多 16 列，单项 ≤1KB）；
+// 成功时断言产物确实写入唯一目标文件、Entity/DO 声明与字段名/类型/tag 与输入一致、
+// 可解析/格式化、二次生成字节一致；失败时既有哨兵文件逐字节不变、路径解析失败时
+// 不创建输出目录且无临时文件。编译级类型检查按内容哈希抽样执行（约 1/16），
+// 完整类型检查由定向用例覆盖。
+// 普通 go test 只运行种子；探索命令：
+//
+//	go test ./zcmodel -run '^$' -fuzz '^FuzzGenerate$' -fuzztime=30s
+func FuzzGenerate(f *testing.F) {
+	type seed struct {
+		dialectIdx   uint8
+		table        string
+		fileName     string
+		columnTag    string
+		tableComment string
+		columns      string
+		flags        uint8
+	}
+	seeds := []seed{
+		{0, "users", "", "db", "用户表", "id;bigint(20);主键|user_name;varchar(64);用户名", 0},
+		{1, "users", "", "db", "", "id;bigint;PK|created_at;timestamp with time zone;", 1 | 8},
+		{2, "users", "users_model", "db", "用户", "id;INTEGER;|name;TEXT;", 2 | 4},
+		{0, "user_info", "", "column", "注释含`反引号`\n换行", "id;int;|name;text;", 0},
+		{0, "", "users", "db", "", "id;int;", 0},
+		{0, "../escape", "users", "db", "", "id;int;", 0},
+		{0, "public.users", "users", "db", "", "id;int;", 0},
+		{0, "2fa", "", "db", "", "id;int;", 0},
+		{0, "users", "x_test", "db", "", "id;int;", 0},
+		{0, "users", "", "bad tag", "", "id;int;", 0},
+		{0, "users", "", "db", "", "id;int;|id;text;", 0},
+		{0, "users", "", "db", "", "nil", 0},
+		{0, "users", "", "db", "", "", 0},
+		{0, "users", "", "db", "", "id;int;", 64},
+		{0, "users", "", "db", "", "id;unknown_type;", 0},
+		{0, "users", "", "db", "", "id;int;", 32},
+		{255, "users", "", "db", "", "id;int;", 0},
+	}
+	for _, s := range seeds {
+		f.Add(s.dialectIdx, s.table, s.fileName, s.columnTag, s.tableComment, s.columns, s.flags)
+	}
+
+	f.Fuzz(func(t *testing.T, dialectIdx uint8, table, fileName, columnTag, tableComment, columnsSpec string, flags uint8) {
+		if len(table) > 1<<10 || len(fileName) > 1<<10 || len(columnTag) > 1<<10 ||
+			len(tableComment) > 1<<10 || len(columnsSpec) > 4<<10 {
+			return
+		}
+		dialects := []Dialect{DialectMysql, DialectPostgres, DialectSqlite}
+		dialect := dialects[int(dialectIdx)%len(dialects)]
+		if dialectIdx == 255 {
+			// 未知方言只保留一个明确入口，避免随机输入中 1/4 永远落在错误分支。
+			dialect = Dialect("oracle")
+		}
+		columns := decodeFuzzColumns(columnsSpec)
+		for i, column := range columns {
+			if column == nil {
+				continue
+			}
+			if flags&2 != 0 {
+				column.Nullable = boolPtr(i%2 == 0)
+			}
+			if flags&4 != 0 {
+				column.Default = strPtr("")
+			}
+			if i == 0 && flags&8 != 0 {
+				column.PrimaryKey = true
+			}
+			if i == 0 && flags&16 != 0 {
+				column.Extra = "auto_increment"
+			}
+		}
+		input := Input{
+			OutputDir:     filepath.Join(t.TempDir(), "model"),
+			Database:      "fuzz_db",
+			Dialect:       dialect,
+			TableName:     table,
+			FileName:      fileName,
+			TableComment:  tableComment,
+			ColumnTagName: columnTag,
+			Columns:       columns,
+		}
+		if flags&1 != 0 {
+			input.JsonTagValueCase = NameCaseLowerCamel
+		}
+		if flags&64 != 0 {
+			input.JsonTagValueCase = NameCase("invalid")
+		}
+		if flags&32 != 0 {
+			input.Indexes = []IndexInfo{{Name: "idx_fuzz", Columns: []string{"id"}}}
+		}
+
+		resolved, resolveErr := resolveFileName(fileName, table)
+		sentinel := []byte("package model\n\nvar FuzzSentinel = 1\n")
+		target := ""
+		couldCreateDir := resolveErr == nil && resolved != ""
+		if couldCreateDir {
+			candidate := filepath.Join(input.OutputDir, resolved+".go")
+			if isPathWithinDir(input.OutputDir, candidate) {
+				if err := os.MkdirAll(input.OutputDir, 0o755); err != nil {
+					t.Fatalf("mkdir output: %v", err)
+				}
+				// 平台不允许的文件名（如控制字符）无法预写哨兵；跳过预写，
+				// 由 Generate 自身的校验/写入路径返回错误。
+				if err := os.WriteFile(candidate, sentinel, 0o644); err == nil {
+					target = candidate
+				}
+			}
+		}
+
+		err := Generate(input)
+		if err != nil {
+			if target != "" {
+				after, readErr := os.ReadFile(target)
+				if readErr != nil {
+					t.Fatalf("read target after failed Generate: %v", readErr)
+				}
+				if !bytes.Equal(after, sentinel) {
+					t.Fatalf("failed Generate modified target:\nbefore: %q\nafter:  %q\nerr: %v", sentinel, after, err)
+				}
+			}
+			// 路径解析失败时 Generate 在 MkdirAll 之前返回，输出目录不得被创建。
+			if !couldCreateDir {
+				if _, statErr := os.Stat(input.OutputDir); !os.IsNotExist(statErr) {
+					t.Fatalf("Generate failed (%v) but created output directory %s", err, input.OutputDir)
+				}
+			}
+			assertFuzzNoTempFiles(t, input.OutputDir)
+			return
+		}
+		if resolveErr != nil {
+			t.Fatalf("resolveFileName failed (%v) but Generate succeeded", resolveErr)
+		}
+		if target == "" {
+			t.Fatalf("Generate succeeded without a resolved target (table=%q file=%q)", table, fileName)
+		}
+		content, readErr := os.ReadFile(target)
+		if readErr != nil {
+			t.Fatalf("read generated file: %v", readErr)
+		}
+		if bytes.Equal(content, sentinel) {
+			t.Fatalf("Generate succeeded but did not rewrite target %s", target)
+		}
+		if !bytes.Contains(content, []byte("FuzzSentinel")) {
+			t.Fatalf("user sentinel var was lost during regeneration")
+		}
+		// 目标文件必须恰好是 resolved+".go"：防止生成器写错路径或额外落盘其他文件时误判成功。
+		entries, readDirErr := os.ReadDir(input.OutputDir)
+		if readDirErr != nil {
+			t.Fatalf("read output dir: %v", readDirErr)
+		}
+		var goFiles []string
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			if strings.HasSuffix(entry.Name(), ".go") {
+				goFiles = append(goFiles, entry.Name())
+			}
+		}
+		wantFile := resolved + ".go"
+		if len(goFiles) != 1 || goFiles[0] != wantFile {
+			t.Fatalf("generated file set = %v, want [%s]", goFiles, wantFile)
+		}
+		file, parseErr := parser.ParseFile(token.NewFileSet(), target, content, parser.AllErrors)
+		if parseErr != nil {
+			t.Fatalf("generated file syntax error: %v\n%s", parseErr, content)
+		}
+		formatted, formatErr := format.Source(content)
+		if formatErr != nil {
+			t.Fatalf("generated file format error: %v", formatErr)
+		}
+		if !bytes.Equal(formatted, content) {
+			t.Fatalf("generated file is not gofmt-stable")
+		}
+		// 编译级检查较慢，按内容哈希抽样；完整类型检查由定向用例覆盖。
+		if fuzzShouldTypeCheck(content) {
+			typeCheckGoSource(t, string(content))
+		}
+		assertFuzzNoTempFiles(t, input.OutputDir)
+
+		expected := make([]*Column, len(columns))
+		for i, column := range columns {
+			if column == nil {
+				t.Fatalf("Generate succeeded with nil column at index %d", i)
+			}
+			expected[i] = column
+		}
+		baseName := ToPascalCase(table)
+		fuzzAssertGeneratedStruct(t, file, baseName+"Entity", expected, false, input.Dialect, columnTag, input.JsonTagValueCase)
+		fuzzAssertGeneratedStruct(t, file, baseName+"DO", expected, true, input.Dialect, columnTag, input.JsonTagValueCase)
+		if flags&32 != 0 && !bytes.Contains(content, []byte("idx_fuzz")) {
+			t.Fatalf("index comment idx_fuzz missing from generated file")
+		}
+
+		if err := Generate(input); err != nil {
+			t.Fatalf("second Generate failed: %v", err)
+		}
+		second, readErr := os.ReadFile(target)
+		if readErr != nil {
+			t.Fatalf("read regenerated file: %v", readErr)
+		}
+		if !bytes.Equal(content, second) {
+			t.Fatalf("Generate is not idempotent for target %s", target)
+		}
+	})
+}
+
+// fuzzShouldTypeCheck 用内容哈希决定是否做编译级检查：约 1/16 的成功输入执行，
+// 使 fuzz 保持可观的执行速率，同时仍能发现系统性生成代码错误。
+func fuzzShouldTypeCheck(src []byte) bool {
+	var sum uint32
+	for _, b := range src {
+		sum = sum*31 + uint32(b)
+	}
+	return sum%16 == 0
+}
+
+// fuzzAssertGeneratedStruct 校验生成的 Entity/DO 结构体：字段数量、顺序、名称、类型与 tag
+// 必须与输入列一致；tag 经 reflect.StructTag 语义读取，反引号按 sanitizeTagValue 约定替换为单引号。
+func fuzzAssertGeneratedStruct(t *testing.T, file *ast.File, name string, columns []*Column, do bool, dialect Dialect, columnTag string, jsonCase NameCase) {
+	t.Helper()
+	st := fuzzFindGeneratedStruct(t, file, name)
+	if st.Fields == nil {
+		t.Fatalf("%s has nil field list", name)
+	}
+	fields := st.Fields.List
+	if len(fields) != len(columns) {
+		t.Fatalf("%s field count = %d, want %d", name, len(fields), len(columns))
+	}
+	seen := make(map[string]bool, len(fields))
+	for i, field := range fields {
+		column := columns[i]
+		if len(field.Names) != 1 {
+			t.Fatalf("%s field %d has %d names, want 1", name, i, len(field.Names))
+		}
+		fieldName := field.Names[0].Name
+		if want := ToPascalCase(column.Name); fieldName != want {
+			t.Fatalf("%s field %d name = %q, want %q", name, i, fieldName, want)
+		}
+		if !token.IsExported(fieldName) {
+			t.Fatalf("%s field %q is not exported", name, fieldName)
+		}
+		if fieldName == "ToDO" || fieldName == "ToEntity" {
+			t.Fatalf("%s field %q conflicts with a generated method", name, fieldName)
+		}
+		if seen[fieldName] {
+			t.Fatalf("%s contains duplicate field %q", name, fieldName)
+		}
+		seen[fieldName] = true
+
+		wantType := "any"
+		if !do {
+			wantType = formatStructFieldType(dialect, column.Type)
+			if wantType == "" {
+				wantType = "string"
+			}
+		}
+		if gotType := fuzzExprString(t, field.Type); gotType != wantType {
+			t.Fatalf("%s field %q type = %q, want %q", name, fieldName, gotType, wantType)
+		}
+
+		tag := reflect.StructTag("")
+		if field.Tag != nil {
+			tag = reflect.StructTag(strings.Trim(field.Tag.Value, "`"))
+		}
+		if columnTag != "" {
+			want := strings.ReplaceAll(column.Name, "`", "'")
+			got, ok := tag.Lookup(columnTag)
+			if want == "" {
+				if ok {
+					t.Fatalf("%s field %q unexpectedly has tag %q=%q", name, fieldName, columnTag, got)
+				}
+			} else if !ok || got != want {
+				t.Fatalf("%s field %q tag %q = (%q,%v), want %q", name, fieldName, columnTag, got, ok, want)
+			}
+		}
+		if jsonCase != "" {
+			want := strings.ReplaceAll(formatJSONTag(column.Name, jsonCase), "`", "'")
+			got, ok := tag.Lookup("json")
+			if want == "" {
+				if ok {
+					t.Fatalf("%s field %q unexpectedly has empty json tag", name, fieldName)
+				}
+			} else if !ok || got != want {
+				t.Fatalf("%s field %q json tag = (%q,%v), want %q", name, fieldName, got, ok, want)
+			}
+		} else if _, ok := tag.Lookup("json"); ok {
+			t.Fatalf("%s field %q unexpectedly has json tag", name, fieldName)
+		}
+		if column.PrimaryKey {
+			if got, ok := tag.Lookup("primary_key"); !ok || got != "true" {
+				t.Fatalf("%s field %q primary_key tag = (%q,%v), want true", name, fieldName, got, ok)
+			}
+		} else if _, ok := tag.Lookup("primary_key"); ok {
+			t.Fatalf("%s field %q unexpectedly has primary_key tag", name, fieldName)
+		}
+		if column.Type != "" {
+			want := strings.ReplaceAll(assembleDDLFragment(*column), "`", "'")
+			if got, ok := tag.Lookup("ddl"); !ok || got != want {
+				t.Fatalf("%s field %q ddl tag = (%q,%v), want %q", name, fieldName, got, ok, want)
+			}
+		} else if _, ok := tag.Lookup("ddl"); ok {
+			t.Fatalf("%s field %q unexpectedly has ddl tag", name, fieldName)
+		}
+		if column.Comment != "" {
+			want := strings.ReplaceAll(column.Comment, "`", "'")
+			if got, ok := tag.Lookup("description"); !ok || got != want {
+				t.Fatalf("%s field %q description tag = (%q,%v), want %q", name, fieldName, got, ok, want)
+			}
+		} else if _, ok := tag.Lookup("description"); ok {
+			t.Fatalf("%s field %q unexpectedly has description tag", name, fieldName)
+		}
+	}
+}
+
+// fuzzFindGeneratedStruct 在解析后的文件中查找指定名称的结构体声明，缺失或重复均视为失败。
+func fuzzFindGeneratedStruct(t *testing.T, file *ast.File, name string) *ast.StructType {
+	t.Helper()
+	var found *ast.StructType
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != name {
+				continue
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				t.Fatalf("type %s is not a struct", name)
+			}
+			if found != nil {
+				t.Fatalf("duplicate type %s", name)
+			}
+			found = st
+		}
+	}
+	if found == nil {
+		t.Fatalf("missing generated type %s", name)
+	}
+	return found
+}
+
+// fuzzExprString 将 AST 类型表达式渲染为规范字符串，用于与期望 Go 类型比较。
+func fuzzExprString(t *testing.T, expr ast.Expr) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, token.NewFileSet(), expr); err != nil {
+		t.Fatalf("print field type: %v", err)
+	}
+	return buf.String()
 }

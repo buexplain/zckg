@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Generate 根据表信息和列定义生成 Entity 结构体、DO 结构体及两者的互转方法（ToDO/ToEntity），
@@ -164,12 +165,15 @@ func Generate(input Input) error {
 }
 
 // validateTableName 校验表名可直接安全用作文件名：
-// 不得为空、不得为 "." / ".."、不得含路径分隔符（/、\）与 Windows 非法文件名字符（<>:"|?*），
+// 必须是合法 UTF-8；不得为空、不得为 "." / ".."、不得含路径分隔符（/、\）与 Windows 非法文件名字符（<>:"|?*），
 // 且首字符须为 ASCII 字母或下划线——表名将推导结构体名，非 ASCII（如中文）或数字开头
 // 会推导出无法编译的标识符，前置报错给出明确根因。
 func validateTableName(name string) error {
 	if name == "" {
 		return errors.New("表名为空")
+	}
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("表名不是合法的 UTF-8: %q", name)
 	}
 	if name == "." || name == ".." {
 		return fmt.Errorf("表名非法: %s", name)
@@ -186,15 +190,21 @@ func validateTableName(name string) error {
 }
 
 // resolveFileName 确定输出文件名（不含 .go）：name 为空时取表名，否则使用调用方显式指定的 name。
-// 显式指定的文件名同样拒绝 "." / ".."、路径分隔符、Windows 非法文件名字符与多余的 .go 扩展名；
-// 无论来源，文件名触发 Go 文件名构建规则（见 goFileNameConflict）时报错，
-// 来源为表名时提示通过 Input.FileName 改名。
+// 表名与显式文件名都必须是合法 UTF-8；显式文件名同样拒绝 "." / ".."、路径分隔符、
+// Windows 非法文件名字符与多余的 .go 扩展名；无论来源，文件名触发 Go 文件名构建规则
+// （见 goFileNameConflict）时报错，来源为表名时提示通过 Input.FileName 改名。
 func resolveFileName(name, tableName string) (string, error) {
 	if name == "" {
+		if !utf8.ValidString(tableName) {
+			return "", fmt.Errorf("表名不是合法的 UTF-8: %q", tableName)
+		}
 		if reason := goFileNameConflict(tableName); reason != "" {
 			return "", fmt.Errorf("表名 %s 用作文件名 %s.go 会触发 Go 文件名规则（%s），请通过 Input.FileName 指定文件名", tableName, tableName, reason)
 		}
 		return tableName, nil
+	}
+	if !utf8.ValidString(name) {
+		return "", fmt.Errorf("文件名不是合法的 UTF-8: %q", name)
 	}
 	if name == "." || name == ".." {
 		return "", fmt.Errorf("文件名非法: %s", name)
