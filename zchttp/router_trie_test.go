@@ -977,3 +977,68 @@ func TestTrieLinearReferenceDifferential(t *testing.T) {
 		}
 	})
 }
+
+// FuzzRouterMatch 用线性参考匹配器差分校验基数树：fuzzer 变异路由表索引与请求路径，
+// 断言命中路由与捕获值一致，并拒绝参考实现的同优先级歧义。
+// 路由表固定为 8 组定向用例（静态/参数/通配优先级、可选省略、回溯、根路径），
+// 路径先经 normalizePath 归一化；路径上限 64 KB，避免单次执行放大到不可控耗时。
+// 普通 go test 只运行 f.Add 种子；探索命令：
+//
+//	go test ./zchttp -run '^$' -fuzz '^FuzzRouterMatch$' -fuzztime=30s
+func FuzzRouterMatch(f *testing.F) {
+	tables := refCuratedRouteTables
+	routers := make([]*Router, len(tables))
+	registered := make([]map[*routeEntry]string, len(tables))
+	templates := make([][]string, len(tables))
+	for i, table := range tables {
+		router := NewRouter()
+		for _, route := range table.routes {
+			router.GET(route.path(), refMatchHandler)
+		}
+		routers[i] = router
+		registered[i] = make(map[*routeEntry]string, len(router.routes))
+		for _, record := range router.routes {
+			registered[i][record.entry] = record.path
+		}
+		templates[i] = refRouteTemplates(table.routes)
+	}
+
+	pathSeeds := []string{
+		"", "/", "/a", "/a/s", "/a/1", "/a/1/2", "/a//b", "/a/s/t",
+		"/a/b", "/a/b/c", "/a/b/c/d", "/posts/1/comments", "/posts/1/comments/2",
+		"/optional/7", "/elsewhere", "//b", "/static/c",
+	}
+	for i := range tables {
+		for _, seed := range pathSeeds {
+			f.Add(uint8(i), seed)
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, tableIndex uint8, path string) {
+		if len(path) > 64<<10 {
+			return
+		}
+		index := int(tableIndex) % len(tables)
+		normalized := normalizePath(path)
+		entry, gotValues := routers[index].match(http.MethodGet, normalized)
+		wantRoute, wantValues, ambiguous := refMatch(tables[index].routes, normalized)
+		if ambiguous {
+			t.Fatalf("table=%d path=%q: reference matcher ambiguous", index, normalized)
+		}
+		if wantRoute < 0 {
+			if entry != nil || len(gotValues) != 0 {
+				t.Fatalf("table=%d path=%q: trie hit %q values %v, reference miss",
+					index, normalized, registered[index][entry], gotValues)
+			}
+			return
+		}
+		if entry == nil {
+			t.Fatalf("table=%d path=%q: trie miss, reference hit %q values %v",
+				index, normalized, templates[index][wantRoute], wantValues)
+		}
+		if gotPath := registered[index][entry]; gotPath != templates[index][wantRoute] || !refSameValues(gotValues, wantValues) {
+			t.Fatalf("table=%d path=%q: trie %q values %v, reference %q values %v",
+				index, normalized, gotPath, gotValues, templates[index][wantRoute], wantValues)
+		}
+	})
+}
