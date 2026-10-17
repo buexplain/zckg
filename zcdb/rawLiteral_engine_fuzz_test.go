@@ -21,8 +21,8 @@ type fuzzRawNamedString string
 type fuzzRawNamedBytes []byte
 
 // FuzzRawLiteralSQLiteRoundTrip 校验 SQLite 字面量内联的往返一致性：
-// 0 nil、1 string、2 []byte、3 int64、4 uint64、5 float64、6 bool、7 time.Time、
-// 8 非空指针（预期错误）、9 nil 指针、10 命名 string、11 命名 []byte。
+// 0 nil、1 string、2 []byte、3 int64、4 uint64、5 float64（NaN/Inf 走错误路径）、
+// 6 bool、7 time.Time、8 非空指针（预期错误）、9 nil 指针、10 命名 string、11 命名 []byte。
 // 普通 go test 只运行种子；探索命令：
 //
 //	go test ./zcdb -run '^$' -fuzz '^FuzzRawLiteralSQLiteRoundTrip$' -fuzztime=30s
@@ -31,7 +31,11 @@ func FuzzRawLiteralSQLiteRoundTrip(f *testing.F) {
 	if err != nil {
 		f.Fatalf("open sqlite: %v", err)
 	}
-	f.Cleanup(func() { _ = db.Close() })
+	f.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			f.Errorf("close sqlite: %v", err)
+		}
+	})
 
 	seeds := []struct {
 		kind uint8
@@ -50,6 +54,9 @@ func FuzzRawLiteralSQLiteRoundTrip(f *testing.F) {
 		{5, "", 0, 0, 1.5, false},
 		{6, "", 0, 0, 0, true},
 		{7, "", 1700000000, 0, 0, false},
+		{5, "", 0, 0, math.NaN(), false},
+		{5, "", 0, 0, math.Inf(1), false},
+		{5, "", 0, 0, math.Inf(-1), false},
 		{8, "ptr", 0, 0, 0, false},
 		{9, "", 0, 0, 0, false},
 		{10, "named", 0, 0, 0, false},
@@ -60,7 +67,8 @@ func FuzzRawLiteralSQLiteRoundTrip(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, kind uint8, text string, i int64, u uint64, fv float64, b bool) {
-		if len(text) > 4<<10 || math.IsNaN(fv) || math.IsInf(fv, 0) || u > math.MaxInt64 {
+		if len(text) > 4<<10 || u > math.MaxInt64 {
+			// SQLite 无法表示超过 int64 的无符号整数，超出范围不属于该方言的往返范围。
 			return
 		}
 		var value any
@@ -100,6 +108,14 @@ func FuzzRawLiteralSQLiteRoundTrip(f *testing.F) {
 		}
 
 		literal, err := inlineRawLiteral(value, sqliteRawLiteralStyle, 1)
+		// NaN/Inf 没有 SQL 字面量表示，必须与不支持类型一样返回 ErrRawValueNotInlinable；
+		// 不能静默跳过，否则该文档化错误路径只剩确定性用例覆盖。
+		if kind%12 == 5 && (math.IsNaN(fv) || math.IsInf(fv, 0)) {
+			if !errors.Is(err, ErrRawValueNotInlinable) {
+				t.Fatalf("non-finite float %v literal err = %v, want ErrRawValueNotInlinable", fv, err)
+			}
+			return
+		}
 		if kind%12 == 8 {
 			if !errors.Is(err, ErrRawValueNotInlinable) {
 				t.Fatalf("non-nil pointer literal err = %v, want ErrRawValueNotInlinable", err)

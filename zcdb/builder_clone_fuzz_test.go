@@ -26,13 +26,14 @@ func cloneFuzzCompile(builder *Builder) cloneFuzzOutput {
 
 func assertCloneFuzzEqual(t *testing.T, stage string, want, got cloneFuzzOutput) {
 	t.Helper()
-	if (want.err != nil) != (got.err != nil) || want.sql != got.sql || !reflect.DeepEqual(want.args, got.args) {
+	if !fuzzSameError(want.err, got.err) || want.sql != got.sql || !reflect.DeepEqual(want.args, got.args) {
 		t.Fatalf("%s differs:\nwant (%q,%v,%v)\ngot  (%q,%v,%v)", stage, want.sql, want.args, want.err, got.sql, got.args, got.err)
 	}
 }
 
 // FuzzBuilderClone 校验 Clone 深拷贝语义：原对象与 Clone 编译结果一致、Clone 可链式再克隆、
-// 修改 Clone 不影响原对象且反向亦然；shape=7 构造 TableSub 自引用，Clone 必须快速返回
+// 修改 Clone 不影响原对象且反向亦然；Force/Primary 不进入 SQL，需直接比较副本字段，
+// 锁子句则经编译产物间接验证；shape=7 构造 TableSub 自引用，Clone 必须快速返回
 // 携带 ErrCyclicQuery 的副本。普通 go test 只运行种子；探索命令：
 //
 //	go test ./zcdb -run '^$' -fuzz '^FuzzBuilderClone$' -fuzztime=30s
@@ -82,6 +83,12 @@ func FuzzBuilderClone(f *testing.F) {
 			baseline := cloneFuzzCompile(original)
 
 			clone := original.Clone()
+			// Force/Primary 只影响执行保护与连接路由，不改变 ToSelect 产物；
+			// 若只比较编译结果，Clone 丢失这两个标记不会被发现，故直接断言副本字段。
+			if clone.force != original.force || clone.usePrimary != original.usePrimary || clone.lockClause != original.lockClause {
+				t.Fatalf("dialect=%s: Clone lost execution flags: force %v->%v, primary %v->%v, lock %q->%q",
+					dialect.name, original.force, clone.force, original.usePrimary, clone.usePrimary, original.lockClause, clone.lockClause)
+			}
 			assertCloneFuzzEqual(t, dialect.name+" original/clone", baseline, cloneFuzzCompile(clone))
 			assertCloneFuzzEqual(t, dialect.name+" clone/clone-of-clone", cloneFuzzCompile(clone), cloneFuzzCompile(clone.Clone()))
 
@@ -113,20 +120,22 @@ func FuzzBuilderClone(f *testing.F) {
 	})
 }
 
-// buildCloneFuzzBuilder 构造覆盖 Clone 全部复制分支的 Builder：
+// buildCloneFuzzBuilder 构造覆盖 Clone 全部复制分支的 Builder。
+// 先经 newTestBuilder 注入统一测试注释，再以 fuzz 输入覆盖 Comment：
+// 注释本身就是本目标的 fuzz 维度，属于注释专项例外（不要求保留 testComment）。
 // FROM/SELECT 子查询（共享同一子 Builder，形成菱形引用）、JoinOn + JoinSub、
 // 嵌套 WHERE/HAVING、WhereIn/WhereRaw/GroupByRaw/HavingRaw、Order/Limit/Offset、
 // UNION、Comment 与 Force/Primary/Lock 标记。shape=7 构造自引用环。
 func buildCloneFuzzBuilder(g Grammar, shape uint8, table, column, operator, value, comment string, limit, offset uint16, flags uint8) *Builder {
 	if shape == 7 {
-		builder := NewBuilder(g, nil).Table("cycle")
+		builder := newTestBuilder(g, nil).Table("cycle")
 		builder.TableSub(builder, "self")
 		return builder
 	}
-	sharedSub := NewBuilder(g, nil).Table("orders").Select("user_id").Where("amount", ">", value)
-	unionSub := NewBuilder(g, nil).Table("admins").Select(column).Where(column, ">", value)
+	sharedSub := newTestBuilder(g, nil).Table("orders").Select("user_id").Where("amount", ">", value)
+	unionSub := newTestBuilder(g, nil).Table("admins").Select(column).Where(column, ">", value)
 
-	builder := NewBuilder(g, nil)
+	builder := newTestBuilder(g, nil)
 	if shape%2 == 1 {
 		builder.TableSub(sharedSub, "base")
 	} else {

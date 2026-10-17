@@ -25,7 +25,7 @@ const crossDialectMissingTable = "cross_dialect_missing_table_xyz"
 
 const integrationSQLComment = "app:comment"
 
-type commentDAOOpener func(*testing.T, string, SlowSQLCallback) *DBDao
+type commentDAOOpener func(testing.TB, string, SlowSQLCallback) *DBDao
 
 type commentSQLCall struct {
 	sql  string

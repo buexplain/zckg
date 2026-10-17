@@ -46,7 +46,11 @@ func FuzzIdentifierWrapping(f *testing.F) {
 	if err != nil {
 		f.Fatalf("open sqlite: %v", err)
 	}
-	f.Cleanup(func() { _ = db.Close() })
+	f.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			f.Errorf("close sqlite: %v", err)
+		}
+	})
 
 	f.Fuzz(func(t *testing.T, dialectIndex, kind uint8, identifier string) {
 		if len(identifier) > 4<<10 || strings.ContainsRune(identifier, 0) ||

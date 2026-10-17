@@ -74,26 +74,13 @@ func FuzzUpsertInsertUsingMatrix(f *testing.F) {
 			if cSet {
 				inserted = append(inserted, "c")
 			}
-			effectiveUpdate := updateColumns
-			if len(effectiveUpdate) == 0 {
-				excluded := make(map[string]bool, len(uniqueBy))
-				for _, col := range uniqueBy {
-					excluded[col] = true
-				}
-				for _, col := range inserted {
-					if !excluded[col] {
-						effectiveUpdate = append(effectiveUpdate, col)
-					}
-				}
-			}
-
 			var successArgs []any
 			successName := ""
 			for _, dialect := range dialects {
-				builder := NewBuilder(dialect.grammar, nil).Table("t")
+				builder := newTestBuilder(dialect.grammar, nil).Table("t")
 				sql1, args1, err1 := builder.ToUpsert(row, uniqueBy, updateColumns)
 				sql2, args2, err2 := builder.ToUpsert(row, uniqueBy, updateColumns)
-				if (err1 != nil) != (err2 != nil) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
+				if !fuzzSameError(err1, err2) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
 					t.Fatalf("dialect=%s upsert repeated compile differs:\n(%q,%v,%v)\n(%q,%v,%v)",
 						dialect.name, sql1, args1, err1, sql2, args2, err2)
 				}
@@ -116,14 +103,8 @@ func FuzzUpsertInsertUsingMatrix(f *testing.F) {
 					t.Fatalf("dialect=%s upsert args=%v, want %v", dialect.name, args1, wantArgs)
 				}
 				fuzzAssertPlaceholders(t, dialect, sql1, len(args1))
-				if len(effectiveUpdate) == 0 {
-					if dialect.name == "MySQL" && !strings.Contains(sql1, "ON DUPLICATE KEY UPDATE") {
-						t.Fatalf("MySQL upsert all-conflict SQL=%q, want ON DUPLICATE KEY UPDATE", sql1)
-					}
-					if dialect.name != "MySQL" && !strings.Contains(sql1, "DO NOTHING") {
-						t.Fatalf("%s upsert all-conflict SQL=%q, want DO NOTHING", dialect.name, sql1)
-					}
-				}
+				wantUpdate := fuzzExpectedUpdateColumns(dialect.name, uniqueBy, updateColumns, inserted)
+				fuzzAssertUpsertUpdateClause(t, dialect, sql1, uniqueBy, wantUpdate)
 				if successName == "" {
 					successName, successArgs = dialect.name, args1
 				} else if !reflect.DeepEqual(successArgs, args1) {
@@ -138,7 +119,7 @@ func FuzzUpsertInsertUsingMatrix(f *testing.F) {
 		successArgs := []any(nil)
 		successName := ""
 		for _, dialect := range dialects {
-			builder := NewBuilder(dialect.grammar, nil).Table("archive")
+			builder := newTestBuilder(dialect.grammar, nil).Table("archive")
 			run := func() (string, []any, error) {
 				callback := func(sub *Builder) {
 					sub.Table("src").Select("a", "b").Where("x", "=", value)
@@ -150,7 +131,7 @@ func FuzzUpsertInsertUsingMatrix(f *testing.F) {
 			}
 			sql1, args1, err1 := run()
 			sql2, args2, err2 := run()
-			if (err1 != nil) != (err2 != nil) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
+			if !fuzzSameError(err1, err2) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
 				t.Fatalf("dialect=%s insertUsing repeated compile differs", dialect.name)
 			}
 			if wantErr {
@@ -194,6 +175,90 @@ func fuzzUpsertOptions(flags uint8) (uniqueBy, updateColumns []string) {
 		updateColumns = []string{"c"}
 	}
 	return uniqueBy, updateColumns
+}
+
+// fuzzExpectedUpdateColumns 独立推导冲突时实际更新的列：
+// 显式 updateColumns 原样使用；为空时先展开为「插入列 - uniqueBy」（ToUpsert 的统一规则）；
+// 展开后仍为空时 PG/SQLite 退化为 DO NOTHING，MySQL 按 Grammar 规则选第一个同时出现在
+// uniqueBy 与插入列中的列，都不匹配时回退插入首列，做 no-op 自赋值。
+func fuzzExpectedUpdateColumns(dialectName string, uniqueBy, updateColumns, inserted []string) []string {
+	expected := updateColumns
+	if len(expected) == 0 {
+		excluded := make(map[string]bool, len(uniqueBy))
+		for _, col := range uniqueBy {
+			excluded[col] = true
+		}
+		for _, col := range inserted {
+			if !excluded[col] {
+				expected = append(expected, col)
+			}
+		}
+	}
+	if len(expected) > 0 || dialectName != "MySQL" {
+		return expected
+	}
+	for _, candidate := range uniqueBy {
+		for _, col := range inserted {
+			if col == candidate {
+				return []string{col}
+			}
+		}
+	}
+	if len(inserted) > 0 {
+		return []string{inserted[0]}
+	}
+	return nil
+}
+
+// fuzzAssertUpsertUpdateClause 按方言断言冲突目标与更新子句的列集合/顺序：
+// PG/SQLite 校验 ON CONFLICT 目标列，以及 DO NOTHING 或 DO UPDATE SET 的 EXCLUDED 引用；
+// MySQL 校验 ON DUPLICATE KEY UPDATE 的 VALUES() 自引用。
+func fuzzAssertUpsertUpdateClause(t *testing.T, dialect builderFuzzDialect, sqlStr string, uniqueBy, updateColumns []string) {
+	t.Helper()
+	if dialect.name == "MySQL" {
+		want := "ON DUPLICATE KEY UPDATE "
+		for i, col := range updateColumns {
+			if i > 0 {
+				want += ", "
+			}
+			wrapped := dialect.grammar.WrapColumn(col)
+			want += wrapped + " = VALUES(" + wrapped + ")"
+		}
+		if !strings.Contains(sqlStr, want) {
+			t.Fatalf("MySQL upsert SQL=%q, want update clause %q", sqlStr, want)
+		}
+		return
+	}
+
+	wantConflict := "ON CONFLICT ("
+	for i, col := range uniqueBy {
+		if i > 0 {
+			wantConflict += ", "
+		}
+		wantConflict += dialect.grammar.WrapColumn(col)
+	}
+	wantConflict += ")"
+	if !strings.Contains(sqlStr, wantConflict) {
+		t.Fatalf("%s upsert SQL=%q, want conflict target %q", dialect.name, sqlStr, wantConflict)
+	}
+
+	if len(updateColumns) == 0 {
+		if !strings.Contains(sqlStr, "DO NOTHING") {
+			t.Fatalf("%s upsert all-conflict SQL=%q, want DO NOTHING", dialect.name, sqlStr)
+		}
+		return
+	}
+	wantUpdate := "DO UPDATE SET "
+	for i, col := range updateColumns {
+		if i > 0 {
+			wantUpdate += ", "
+		}
+		wrapped := dialect.grammar.WrapColumn(col)
+		wantUpdate += wrapped + " = EXCLUDED." + wrapped
+	}
+	if !strings.Contains(sqlStr, wantUpdate) {
+		t.Fatalf("%s upsert SQL=%q, want update clause %q", dialect.name, sqlStr, wantUpdate)
+	}
 }
 
 func fuzzInsertUsingColumns(flags uint8) []string {

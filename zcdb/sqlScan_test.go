@@ -81,8 +81,9 @@ func TestSplitSQLCode(t *testing.T) {
 }
 
 // FuzzSplitSQLCode 用不变量 fuzz 校验 SQL 代码区扫描器：fuzzer 变异方言索引与 SQL 文本，
-// 断言片段拼接等于原文、每个非代码段长度与 nonCodeLen 一致、无空段、无相邻代码段、结果确定。
-// 相邻非代码段是合法形态（如 /**/ 紧邻未闭合引号，二者之间没有代码区）。
+// 断言片段拼接等于原文、无空段、无相邻代码段、结果确定。
+// 非代码段的边界语义由 TestSplitSQLCode 的精确期望锁定；这里不再用 nonCodeLen 自证片段长度，
+// 避免 oracle 与被测实现同源。相邻非代码段是合法形态（如 /**/ 紧邻未闭合引号，二者之间没有代码区）。
 // 普通 go test 只运行种子；探索命令：
 //
 //	go test ./zcdb -run '^$' -fuzz '^FuzzSplitSQLCode$' -fuzztime=30s
@@ -108,7 +109,6 @@ func FuzzSplitSQLCode(f *testing.F) {
 		syntax := syntaxes[int(dialectIndex)%len(syntaxes)]
 		segments := splitSQLCode(sqlStr, syntax)
 		var joined strings.Builder
-		offset := 0
 		for i, segment := range segments {
 			if segment.text == "" {
 				t.Fatalf("dialect=%d sql=%q: empty segment at %d", dialectIndex, sqlStr, i)
@@ -116,14 +116,7 @@ func FuzzSplitSQLCode(f *testing.F) {
 			if i > 0 && segments[i-1].code && segment.code {
 				t.Fatalf("dialect=%d sql=%q: adjacent code segments at %d", dialectIndex, sqlStr, i)
 			}
-			if !segment.code {
-				if got := nonCodeLen(sqlStr, offset, syntax); got != len(segment.text) {
-					t.Fatalf("dialect=%d sql=%q: nonCodeLen at %d = %d, segment len = %d",
-						dialectIndex, sqlStr, offset, got, len(segment.text))
-				}
-			}
 			joined.WriteString(segment.text)
-			offset += len(segment.text)
 		}
 		if joined.String() != sqlStr {
 			t.Fatalf("dialect=%d sql=%q: joined segments = %q", dialectIndex, sqlStr, joined.String())

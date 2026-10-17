@@ -140,6 +140,7 @@ func main() {
 | [mutate.md](mutate.md) | 写操作：Insert/Upsert/Update/Increment/Delete/DeleteJoin/Truncate 与安全防护 |
 | [compile.md](compile.md) | ToXxx 纯编译系列、原始 SQL 内联编译（CompileRaw）与 Expression 原始表达式 |
 | [schema.md](schema.md) | Schema 元数据查询（表列表、字段信息） |
+| [fuzz-testing.md](fuzz-testing.md) | 模糊测试目标清单、oracle 策略、执行命令与已知边界 |
 
 ## 错误变量速查
 

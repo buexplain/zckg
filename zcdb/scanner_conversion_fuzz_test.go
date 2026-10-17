@@ -83,6 +83,10 @@ func FuzzNullSafeFieldScan(f *testing.F) {
 		{5, "", 0, 0, 1.5, false},
 		{6, "", 0, 0, 0, true},
 		{7, "", 1700000000, 0, 0, false},
+		// 字符串浮点特殊值：NaN 不能直接用 == / DeepEqual 比较，必须走 NaN-aware 断言。
+		{2, "NaN", 0, 0, 0, false},
+		{2, "Inf", 0, 0, 0, false},
+		{2, "-Inf", 0, 0, 0, false},
 	}
 	for targetIndex := range fuzzScanTargetTypes {
 		for _, seed := range seedValues {
@@ -91,7 +95,7 @@ func FuzzNullSafeFieldScan(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, targetIndex, sourceKind uint8, text string, i int64, u uint64, fv float64, b bool) {
-		if len(text) > 4<<10 || math.IsNaN(fv) || math.IsInf(fv, 0) {
+		if len(text) > 4<<10 {
 			return
 		}
 		targetType := fuzzScanTargetTypes[int(targetIndex)%len(fuzzScanTargetTypes)]
@@ -128,7 +132,7 @@ func FuzzNullSafeFieldScan(f *testing.F) {
 			}
 			return
 		}
-		if !reflect.DeepEqual(field.Interface(), want.Interface()) {
+		if !fuzzScanValuesEqual(field, want) {
 			t.Fatalf("target=%v src=%T(%v): got %#v, want %#v", targetType, src, src, field.Interface(), want.Interface())
 		}
 	})
@@ -254,4 +258,24 @@ func fuzzScanUnmarshalJSON(value []byte, target reflect.Type) (reflect.Value, er
 		return reflect.Zero(target), ErrScanConvert
 	}
 	return dst.Elem(), nil
+}
+
+// fuzzScanValuesEqual 比较实现与参考模型的转换结果。NaN 与自身不相等，
+// 直接使用 reflect.DeepEqual 会把正确的 NaN 转换误报为失败；目标类型矩阵中
+// 只有浮点标量（含未来可能新增的浮点指针）会产生 NaN，因此单独处理。
+func fuzzScanValuesEqual(got, want reflect.Value) bool {
+	if got.Kind() == reflect.Ptr || want.Kind() == reflect.Ptr {
+		if got.Kind() != want.Kind() || got.IsNil() != want.IsNil() {
+			return false
+		}
+		if got.IsNil() {
+			return true
+		}
+		return fuzzScanValuesEqual(got.Elem(), want.Elem())
+	}
+	if got.Kind() == reflect.Float32 || got.Kind() == reflect.Float64 {
+		g, w := got.Float(), want.Float()
+		return g == w || math.IsNaN(g) && math.IsNaN(w)
+	}
+	return reflect.DeepEqual(got.Interface(), want.Interface())
 }

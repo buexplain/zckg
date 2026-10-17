@@ -15,7 +15,7 @@ import (
 // DSN: host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres。
 // 外部数据库不可达时 Skip，成功建连后的错误均失败。
 // docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
-func openPgCommentDAO(t *testing.T, comment string, callback SlowSQLCallback) *DBDao {
+func openPgCommentDAO(t testing.TB, comment string, callback SlowSQLCallback) *DBDao {
 	t.Helper()
 	const dsn = "host=127.0.0.1 port=5432 user=postgres password=root sslmode=disable dbname=postgres"
 	pool, err := NewPool(PoolConfig{DriverName: "postgres", DSN: dsn, MaxOpenConns: 1})

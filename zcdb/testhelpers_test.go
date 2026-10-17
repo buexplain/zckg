@@ -93,7 +93,7 @@ func scanRawRow(t *testing.T, rows *sql.Rows) ([]string, bool) {
 // driverValueText 把驱动返回值归一为可比文本：NULL → "NULL"、[]byte/string → 原字符串
 // （字节按原始字节比对）、int64 → 十进制、float64 → 最短表示、bool → "true"/"false"。
 // 其它类型视为未覆盖并直接失败，避免出现"悄悄比较不到"的假绿。
-func driverValueText(t *testing.T, value any) string {
+func driverValueText(t testing.TB, value any) string {
 	t.Helper()
 	switch v := value.(type) {
 	case nil:

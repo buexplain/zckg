@@ -7,6 +7,7 @@
 package zcdb
 
 import (
+	"errors"
 	"reflect"
 	"strconv"
 	"strings"
@@ -82,7 +83,7 @@ func FuzzBuilderCompile(f *testing.F) {
 			builder := buildFuzzBuilder(dialect.grammar, shape, table, column, operator, value, distinct, limit, offset)
 			sql1, args1, err1 := runFuzzTerminal(builder, shape, column)
 			sql2, args2, err2 := runFuzzTerminal(builder, shape, column)
-			if (err1 != nil) != (err2 != nil) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
+			if !fuzzSameError(err1, err2) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
 				t.Fatalf("dialect=%s shape=%d table=%q column=%q op=%q value=%q: repeated compile differs:\n(%q,%v,%v)\n(%q,%v,%v)",
 					dialect.name, shape, table, column, operator, value, sql1, args1, err1, sql2, args2, err2)
 			}
@@ -91,8 +92,8 @@ func FuzzBuilderCompile(f *testing.F) {
 
 		allErr := results[0].err != nil
 		for _, result := range results[1:] {
-			if (result.err != nil) != allErr {
-				t.Fatalf("shape=%d table=%q column=%q op=%q value=%q: error presence differs across dialects: %+v", shape, table, column, operator, value, results)
+			if !fuzzSameError(result.err, results[0].err) {
+				t.Fatalf("shape=%d table=%q column=%q op=%q value=%q: error differs across dialects: %+v", shape, table, column, operator, value, results)
 			}
 		}
 		if allErr {
@@ -117,7 +118,7 @@ func FuzzBuilderCompile(f *testing.F) {
 }
 
 func buildFuzzBuilder(g Grammar, shape uint8, table, column, operator, value string, distinct bool, limit, offset uint16) *Builder {
-	builder := NewBuilder(g, nil).Table(table)
+	builder := newTestBuilder(g, nil).Table(table)
 	switch shape {
 	case 0, 1, 5, 6, 7:
 		builder.Select(column).Where(column, operator, value)
@@ -246,7 +247,7 @@ func FuzzBuilderSubqueryCompile(f *testing.F) {
 			builder := buildSubqueryFuzzBuilder(dialect.grammar, shape, variant, table, column, operator, value)
 			sql1, args1, err1 := runSubqueryFuzzTerminal(builder, shape, variant, column, value)
 			sql2, args2, err2 := runSubqueryFuzzTerminal(builder, shape, variant, column, value)
-			if (err1 != nil) != (err2 != nil) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
+			if !fuzzSameError(err1, err2) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
 				t.Fatalf("dialect=%s shape=%d variant=%v table=%q column=%q op=%q value=%q: repeated compile differs:\n(%q,%v,%v)\n(%q,%v,%v)",
 					dialect.name, shape, variant, table, column, operator, value, sql1, args1, err1, sql2, args2, err2)
 			}
@@ -255,8 +256,8 @@ func FuzzBuilderSubqueryCompile(f *testing.F) {
 
 		allErr := results[0].err != nil
 		for _, result := range results[1:] {
-			if (result.err != nil) != allErr {
-				t.Fatalf("shape=%d variant=%v table=%q column=%q op=%q value=%q: error presence differs across dialects: %+v",
+			if !fuzzSameError(result.err, results[0].err) {
+				t.Fatalf("shape=%d variant=%v table=%q column=%q op=%q value=%q: error differs across dialects: %+v",
 					shape, variant, table, column, operator, value, results)
 			}
 		}
@@ -285,18 +286,18 @@ func FuzzBuilderSubqueryCompile(f *testing.F) {
 // 外层 where 使用 fuzzer 提供的运算符/值，便于单独观察外层错误与参数收集。
 func buildSubqueryFuzzBuilder(g Grammar, shape uint8, variant bool, table, column, operator, value string) *Builder {
 	sub := func() *Builder {
-		return NewBuilder(g, nil).Table("source").Select(column).Where(column, ">", value)
+		return newTestBuilder(g, nil).Table("source").Select(column).Where(column, ">", value)
 	}
 	subCallback := func(q *Builder) {
 		q.Table("source").Select(column).Where(column, ">", value)
 	}
 	switch shape {
 	case 0:
-		return NewBuilder(g, nil).TableSub(sub(), "s").Select(column).Where(column, operator, value)
+		return newTestBuilder(g, nil).TableSub(sub(), "s").Select(column).Where(column, operator, value)
 	case 1:
-		return NewBuilder(g, nil).Table(table).Select(column).SelectSub(sub(), "s").Where(column, operator, value)
+		return newTestBuilder(g, nil).Table(table).Select(column).SelectSub(sub(), "s").Where(column, operator, value)
 	case 2:
-		builder := NewBuilder(g, nil).Table(table).Select(column)
+		builder := newTestBuilder(g, nil).Table(table).Select(column)
 		if variant {
 			builder.WhereNotInSub(column, subCallback)
 		} else {
@@ -304,7 +305,7 @@ func buildSubqueryFuzzBuilder(g Grammar, shape uint8, variant bool, table, colum
 		}
 		return builder.Where(column, operator, value)
 	case 3:
-		builder := NewBuilder(g, nil).Table(table).Select(column)
+		builder := newTestBuilder(g, nil).Table(table).Select(column)
 		if variant {
 			builder.OrWhereSub(column, operator, subCallback)
 		} else {
@@ -312,7 +313,7 @@ func buildSubqueryFuzzBuilder(g Grammar, shape uint8, variant bool, table, colum
 		}
 		return builder.Where(column, operator, value)
 	case 4:
-		builder := NewBuilder(g, nil).Table(table).Select(column)
+		builder := newTestBuilder(g, nil).Table(table).Select(column)
 		if variant {
 			builder.WhereNotExists(subCallback)
 		} else {
@@ -320,7 +321,7 @@ func buildSubqueryFuzzBuilder(g Grammar, shape uint8, variant bool, table, colum
 		}
 		return builder.Where(column, operator, value)
 	case 5:
-		builder := NewBuilder(g, nil).Table(table).Select(column)
+		builder := newTestBuilder(g, nil).Table(table).Select(column)
 		callback := func(j *JoinBuilder) {
 			j.On("s.user_id", "=", "users.id").Where("s.score", ">", value)
 		}
@@ -331,8 +332,8 @@ func buildSubqueryFuzzBuilder(g Grammar, shape uint8, variant bool, table, colum
 		}
 		return builder.Where(column, operator, value)
 	case 6:
-		union := NewBuilder(g, nil).Table("admins").Select(column).Where(column, ">", value)
-		builder := NewBuilder(g, nil).Table(table).Select(column).Where(column, operator, value)
+		union := newTestBuilder(g, nil).Table("admins").Select(column).Where(column, ">", value)
+		builder := newTestBuilder(g, nil).Table(table).Select(column).Where(column, operator, value)
 		if variant {
 			builder.UnionAll(union)
 		} else {
@@ -340,29 +341,29 @@ func buildSubqueryFuzzBuilder(g Grammar, shape uint8, variant bool, table, colum
 		}
 		return builder
 	case 7, 11:
-		return NewBuilder(g, nil).Table(table)
+		return newTestBuilder(g, nil).Table(table)
 	case 8:
-		inner := NewBuilder(g, nil).Table("deep").Select(column).Where(column, ">", value)
-		middle := NewBuilder(g, nil).Table("source").Select(column).
+		inner := newTestBuilder(g, nil).Table("deep").Select(column).Where(column, ">", value)
+		middle := newTestBuilder(g, nil).Table("source").Select(column).
 			TableSub(inner, "d").
 			Where(column, ">", value)
-		return NewBuilder(g, nil).TableSub(middle, "m").Select(column).Where(column, operator, value)
+		return newTestBuilder(g, nil).TableSub(middle, "m").Select(column).Where(column, operator, value)
 	case 9:
-		nested := NewBuilder(g, nil).Table("source").Select(column).
+		nested := newTestBuilder(g, nil).Table("source").Select(column).
 			WhereInSub(column, func(q *Builder) {
 				q.Table("dept").Select(column).Where(column, ">", value)
 			}).
 			Where(column, ">", value)
-		return NewBuilder(g, nil).Table(table).Select(column).SelectSub(nested, "s").Where(column, operator, value)
+		return newTestBuilder(g, nil).Table(table).Select(column).SelectSub(nested, "s").Where(column, operator, value)
 	case 10:
-		nested := NewBuilder(g, nil).Table("source").Select(column).
+		nested := newTestBuilder(g, nil).Table("source").Select(column).
 			WhereSub(column, ">", func(q *Builder) {
 				q.Table("stats").Select(column).Where(column, ">", value)
 			}).
 			Where(column, ">", value)
-		return NewBuilder(g, nil).Table(table).Select(column).WhereExists(nested).Where(column, operator, value)
+		return newTestBuilder(g, nil).Table(table).Select(column).WhereExists(nested).Where(column, operator, value)
 	default:
-		return NewBuilder(g, nil).Table(table).Select(column)
+		return newTestBuilder(g, nil).Table(table).Select(column)
 	}
 }
 
@@ -378,7 +379,7 @@ func runSubqueryFuzzTerminal(builder *Builder, shape uint8, variant bool, column
 		return builder.ToInsertUsing([]string{column}, simpleSub)
 	case 11:
 		sub := func(q *Builder) {
-			joined := NewBuilder(builder.grammar, nil).Table("joined").Select(column).Where(column, ">", value)
+			joined := newTestBuilder(builder.grammar, nil).Table("joined").Select(column).Where(column, ">", value)
 			q.Table("source").Select(column).
 				JoinSub(joined, "j", func(jb *JoinBuilder) {
 					jb.On("j.uid", "=", "source.uid").Where("j.score", ">", value)
@@ -444,7 +445,7 @@ func FuzzBuilderDeleteJoinCompile(f *testing.F) {
 			builder := buildDeleteJoinFuzzBuilder(dialect.grammar, shape, variant, table, column, operator, value)
 			sql1, args1, err1 := runDeleteJoinFuzzTerminal(builder, shape)
 			sql2, args2, err2 := runDeleteJoinFuzzTerminal(builder, shape)
-			if (err1 != nil) != (err2 != nil) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
+			if !fuzzSameError(err1, err2) || sql1 != sql2 || !reflect.DeepEqual(args1, args2) {
 				t.Fatalf("dialect=%s shape=%d variant=%v table=%q column=%q op=%q value=%q: repeated compile differs:\n(%q,%v,%v)\n(%q,%v,%v)",
 					dialect.name, shape, variant, table, column, operator, value, sql1, args1, err1, sql2, args2, err2)
 			}
@@ -453,12 +454,21 @@ func FuzzBuilderDeleteJoinCompile(f *testing.F) {
 
 		allErr := results[0].err != nil
 		for _, result := range results[1:] {
-			if (result.err != nil) != allErr {
-				t.Fatalf("shape=%d variant=%v table=%q column=%q op=%q value=%q: error presence differs across dialects: %+v",
+			if !fuzzSameError(result.err, results[0].err) {
+				t.Fatalf("shape=%d variant=%v table=%q column=%q op=%q value=%q: error differs across dialects: %+v",
 					shape, variant, table, column, operator, value, results)
 			}
 		}
 		if allErr {
+			// shape 5 使用固定合法表名/条件构造「带 JOIN 的 Delete」，
+			// 错误必须来自 JOIN 守卫本身，而不是空表名或非法运算符。
+			if shape == 5 {
+				for _, result := range results {
+					if !errors.Is(result.err, ErrDeleteWithJoin) {
+						t.Fatalf("dialect=%s shape=5 err=%v, want ErrDeleteWithJoin", result.name, result.err)
+					}
+				}
+			}
 			return
 		}
 
@@ -483,14 +493,14 @@ func FuzzBuilderDeleteJoinCompile(f *testing.F) {
 // 便于同时覆盖派生表、ON 条件与外层 WHERE 三处绑定位置。
 func buildDeleteJoinFuzzBuilder(g Grammar, shape uint8, variant bool, table, column, operator, value string) *Builder {
 	sub := func() *Builder {
-		return NewBuilder(g, nil).Table("orders").Select("user_id").Where("amount", ">", value)
+		return newTestBuilder(g, nil).Table("orders").Select("user_id").Where("amount", ">", value)
 	}
 	on := func(j *JoinBuilder) {
 		j.On("o.user_id", "=", "users.id").Where("o.score", ">", value)
 	}
 	switch shape {
 	case 0:
-		builder := NewBuilder(g, nil).Table(table).Select("id")
+		builder := newTestBuilder(g, nil).Table(table).Select("id")
 		if variant {
 			builder.LeftJoinSub(sub(), "o", on)
 		} else {
@@ -498,31 +508,31 @@ func buildDeleteJoinFuzzBuilder(g Grammar, shape uint8, variant bool, table, col
 		}
 		return builder.Where(column, operator, value)
 	case 1:
-		return NewBuilder(g, nil).Table(table).Select("id").
+		return newTestBuilder(g, nil).Table(table).Select("id").
 			JoinOn("profiles", func(j *JoinBuilder) {
 				j.On("profiles.user_id", "=", "users.id").Where("profiles.active", "=", value)
 			}).
 			JoinSub(sub(), "o", on).
 			Where(column, operator, value)
 	case 2:
-		second := NewBuilder(g, nil).Table("items").Select("user_id").Where("qty", ">", "fallback")
-		return NewBuilder(g, nil).Table(table).Select("id").
+		second := newTestBuilder(g, nil).Table("items").Select("user_id").Where("qty", ">", "fallback")
+		return newTestBuilder(g, nil).Table(table).Select("id").
 			JoinSub(sub(), "o", on).
 			JoinSub(second, "i", func(j *JoinBuilder) {
 				j.On("i.user_id", "=", "users.id").Where("i.qty", ">", value)
 			}).
 			Where(column, operator, value)
 	case 3:
-		return NewBuilder(g, nil).Table(table).Select("id").JoinSub(sub(), "o", on)
+		return newTestBuilder(g, nil).Table(table).Select("id").JoinSub(sub(), "o", on)
 	case 4:
-		nested := NewBuilder(g, nil).Table("orders").Select("user_id").
+		nested := newTestBuilder(g, nil).Table("orders").Select("user_id").
 			WhereInSub("user_id", func(q *Builder) {
 				q.Table("profiles").Select("user_id").Where("active", "=", value)
 			}).
 			Where("amount", ">", value)
-		return NewBuilder(g, nil).Table(table).Select("id").JoinSub(nested, "o", on).Where(column, operator, value)
-	default: // shape 5：带 JOIN 调用 ToDelete，预期 ErrDeleteWithJoin
-		return NewBuilder(g, nil).Table(table).Select("id").JoinSub(sub(), "o", on).Where(column, operator, value)
+		return newTestBuilder(g, nil).Table(table).Select("id").JoinSub(nested, "o", on).Where(column, operator, value)
+	default: // shape 5：固定合法表名/条件，保证错误只来自 JOIN 守卫（ErrDeleteWithJoin）
+		return newTestBuilder(g, nil).Table("users").Select("id").JoinSub(sub(), "o", on).Where("status", "=", "active")
 	}
 }
 
@@ -531,4 +541,17 @@ func runDeleteJoinFuzzTerminal(builder *Builder, shape uint8) (string, []any, er
 		return builder.ToDelete()
 	}
 	return builder.ToDeleteJoin()
+}
+
+// fuzzSameError 比较两次编译或跨方言编译的错误：存在性之外还要求错误文本一致。
+// Builder 层校验错误与方言无关，因此跨方言使用同一断言；若未来出现方言特有错误，
+// 应改为按哨兵 errors.Is 比较并在注释中说明。
+func fuzzSameError(a, b error) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil {
+		return true
+	}
+	return a.Error() == b.Error()
 }

@@ -78,12 +78,12 @@ func FuzzInsertUpdateData(f *testing.F) {
 			columns, rows, err := extractInsertData(input, "db")
 			assertFuzzExtractResult(t, "insert", kind, wantCols, wantRows, wantErr, columns, rows, err)
 			if wantErr != nil {
-				if _, _, compileErr := NewBuilder(NewMySQLGrammar(), nil).Table("t").ToInsert(input); !errors.Is(compileErr, wantErr) {
+				if _, _, compileErr := newTestBuilder(NewMySQLGrammar(), nil).Table("t").ToInsert(input); !errors.Is(compileErr, wantErr) {
 					t.Fatalf("insert kind=%d: compile error = %v, want %v", kind, compileErr, wantErr)
 				}
 				return
 			}
-			sqlStr, args, compileErr := NewBuilder(NewMySQLGrammar(), nil).Table("t").ToInsert(input)
+			sqlStr, args, compileErr := newTestBuilder(NewMySQLGrammar(), nil).Table("t").ToInsert(input)
 			assertNoError(t, compileErr)
 			if got := codePlaceholderCount(sqlStr, mysqlScanSyntax, "MySQL"); got != len(args) {
 				t.Fatalf("insert kind=%d sql=%q: %d placeholder(s), %d arg(s)", kind, sqlStr, got, len(args))
@@ -102,12 +102,12 @@ func FuzzInsertUpdateData(f *testing.F) {
 		columns, values, err := extractUpdateData(input, "db")
 		assertFuzzExtractResult(t, "update", kind, wantCols, [][]any{wantValues}, wantErr, columns, [][]any{values}, err)
 		if wantErr != nil {
-			if _, _, compileErr := NewBuilder(NewMySQLGrammar(), nil).Table("t").ToUpdate(input); !errors.Is(compileErr, wantErr) {
+			if _, _, compileErr := newTestBuilder(NewMySQLGrammar(), nil).Table("t").ToUpdate(input); !errors.Is(compileErr, wantErr) {
 				t.Fatalf("update kind=%d: compile error = %v, want %v", kind, compileErr, wantErr)
 			}
 			return
 		}
-		sqlStr, args, compileErr := NewBuilder(NewMySQLGrammar(), nil).Table("t").ToUpdate(input)
+		sqlStr, args, compileErr := newTestBuilder(NewMySQLGrammar(), nil).Table("t").ToUpdate(input)
 		assertNoError(t, compileErr)
 		if got := codePlaceholderCount(sqlStr, mysqlScanSyntax, "MySQL"); got != len(args) {
 			t.Fatalf("update kind=%d sql=%q: %d placeholder(s), %d arg(s)", kind, sqlStr, got, len(args))

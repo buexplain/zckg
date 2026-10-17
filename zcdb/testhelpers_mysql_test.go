@@ -18,7 +18,7 @@ const mysqlTestMasterDSN = "root:root@tcp(127.0.0.1:3306)/?charset=utf8mb4&parse
 // openMySQLCommentDAO 独立建连，不清理既有基线表；主从池连接同一测试库，供路由观测。
 // 默认探测 DSN 为 mysqlTestMasterDSN，不可达时 Skip；建连后的 DDL/构造错误均失败。
 // docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
-func openMySQLCommentDAO(t *testing.T, comment string, callback SlowSQLCallback) *DBDao {
+func openMySQLCommentDAO(t testing.TB, comment string, callback SlowSQLCallback) *DBDao {
 	t.Helper()
 	probe, err := NewPool(PoolConfig{DriverName: "mysql", DSN: mysqlTestMasterDSN})
 	if err != nil {

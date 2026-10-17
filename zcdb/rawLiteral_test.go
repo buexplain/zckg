@@ -399,10 +399,12 @@ func TestGrammar_CompileRaw_NamedNilByteSlice(t *testing.T) {
 	}
 }
 
-// FuzzCompileRaw 用独立占位符计数模型 fuzz 校验 CompileRaw：
-// fuzzer 变异方言、SQL 与参数个数，模型先算出应成功还是 ErrRawPlaceholderMismatch；
+// FuzzCompileRaw 用占位符计数模型 fuzz 校验 CompileRaw：
+// fuzzer 变异方言、SQL、参数个数与首个字符串参数，模型先算出应成功还是 ErrRawPlaceholderMismatch；
+// 计数模型与被测实现共用 sqlScan 扫描器，因此它验证的是编译语义而非扫描器本身
+// （扫描器边界由 TestSplitSQLCode 与 FuzzSplitSQLCode 覆盖）；
 // 成功时再扫描产物代码区，断言占位符已全部内联（字符串/注释/引号标识符/美元引用内的不算）。
-// 参数含 ?、$1、引号、反斜杠、数值、bool、字节与时间，验证内联文本不会破坏后续扫描。
+// 其余参数固定为含 ?、$1、引号、反斜杠、数值、bool、字节与时间，验证内联文本不会破坏后续扫描。
 // 普通 go test 只运行种子；探索命令：
 //
 //	go test ./zcdb -run '^$' -fuzz '^FuzzCompileRaw$' -fuzztime=30s
@@ -417,14 +419,16 @@ func FuzzCompileRaw(f *testing.F) {
 		{"PostgreSQL", NewPostgresGrammar(), pgScanSyntax},
 		{"SQLite", NewSQLiteGrammar(), sqliteScanSyntax},
 	}
-	args := []any{
-		"plain",
-		"q? $1 ' \\ \n",
-		int64(-7),
-		2.5,
-		true,
-		[]byte{0x00, 0x01, 0xff},
-		rawTestTime,
+	argPool := func(text string) []any {
+		return []any{
+			text,
+			"q? $1 ' \\ \n",
+			int64(-7),
+			2.5,
+			true,
+			[]byte{0x00, 0x01, 0xff},
+			rawTestTime,
+		}
 	}
 	seeds := []string{
 		"", "SELECT ?", "SELECT '?'", "SELECT $$ $1 $$",
@@ -434,16 +438,19 @@ func FuzzCompileRaw(f *testing.F) {
 	}
 	for i := range dialects {
 		for _, seed := range seeds {
-			for argCount := uint8(0); argCount <= 3; argCount++ {
-				f.Add(uint8(i), seed, argCount)
+			for _, argText := range []string{"plain", "a'b\\c? $1"} {
+				for argCount := uint8(0); argCount <= 3; argCount++ {
+					f.Add(uint8(i), seed, argText, argCount)
+				}
 			}
 		}
 	}
-	f.Fuzz(func(t *testing.T, dialectIndex uint8, sqlStr string, argCount uint8) {
-		if len(sqlStr) > 64<<10 {
+	f.Fuzz(func(t *testing.T, dialectIndex uint8, sqlStr, argText string, argCount uint8) {
+		if len(sqlStr) > 64<<10 || len(argText) > 4<<10 {
 			return
 		}
 		d := dialects[int(dialectIndex)%len(dialects)]
+		args := argPool(argText)
 		count := int(argCount) % (len(args) + 1)
 		fuzzArgs := args[:count]
 		wantOK := fuzzRawPlaceholdersMatch(sqlStr, d.syntax, d.name, count)
@@ -465,9 +472,11 @@ func FuzzCompileRaw(f *testing.F) {
 	})
 }
 
-// fuzzRawPlaceholdersMatch 独立计算 CompileRaw 是否应成功：
+// fuzzRawPlaceholdersMatch 计算 CompileRaw 是否应成功：
 // PostgreSQL 的每个 $N 必须在 1..argCount 内且最大编号等于 argCount；
 // MySQL/SQLite 的代码区 ? 数量必须等于 argCount。
+// 注意：这里复用被测的 splitSQLCode/numberedDigits，属于同源计数模型，
+// 不能用来证明扫描器本身正确。
 func fuzzRawPlaceholdersMatch(sqlStr string, syntax sqlScanSyntax, dialect string, argCount int) bool {
 	if dialect == "PostgreSQL" {
 		maxIndex := 0
@@ -497,6 +506,7 @@ func fuzzRawPlaceholdersMatch(sqlStr string, syntax sqlScanSyntax, dialect strin
 
 // codePlaceholderCount 统计代码区中的占位符数量：PG 为 $N 引用次数，
 // MySQL/SQLite 为 ? 数量；非代码区一律不计。
+// 与 splitSQLCode 同源：用于验证编译产物，不作为扫描器的独立 oracle。
 func codePlaceholderCount(sqlStr string, syntax sqlScanSyntax, dialect string) int {
 	count := 0
 	for _, segment := range splitSQLCode(sqlStr, syntax) {

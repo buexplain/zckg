@@ -1,6 +1,8 @@
 // 本文件为 ScanStruct 的 SQLite 往返 fuzz：
 // 以内存 SQLite 驱动的返回类型为 oracle，覆盖 TEXT/INTEGER/REAL/BLOB/NULL、
-// 单行/多行/指针切片、未匹配列与空结果。纯 Go 驱动，无外部数据库依赖。
+// 单行/多行/指针切片、未匹配列、空结果与 NULL/空 BLOB 区分。纯 Go 驱动，无外部数据库依赖。
+// 注意：modernc SQLite 对 NULL 与空 BLOB 扫描到 []byte 都返回 nil，
+// 因此 NULL/空 BLOB 的区分由 *[]byte 字段（shape=5）单独验证。
 
 package zcdb
 
@@ -26,8 +28,13 @@ type fuzzScanNullRow struct {
 	N string `db:"nullable"`
 }
 
+type fuzzScanBlobPtrRow struct {
+	B *[]byte `db:"b"`
+}
+
 // FuzzScanRoundTrip 校验 SQLite 写入后 ScanStruct 的往返与 NULL/列映射语义：
-// shape=0 单结构体、1 []结构体、2 []*结构体、3 NULL→string 零值、4 空结果。
+// shape=0 单结构体、1 []结构体、2 []*结构体、3 NULL→string 零值、4 空结果、
+// 5 *[]byte 区分 NULL 与空 BLOB。
 // 普通 go test 只运行种子；探索命令：
 //
 //	go test ./zcdb -run '^$' -fuzz '^FuzzScanRoundTrip$' -fuzztime=30s
@@ -37,7 +44,11 @@ func FuzzScanRoundTrip(f *testing.F) {
 		f.Fatalf("open sqlite: %v", err)
 	}
 	db.SetMaxOpenConns(1)
-	f.Cleanup(func() { _ = db.Close() })
+	f.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			f.Errorf("close sqlite: %v", err)
+		}
+	})
 	if _, err := db.Exec(`CREATE TABLE fuzz_scan (
 		id INTEGER PRIMARY KEY,
 		s TEXT, i INTEGER, r REAL, b BLOB, nullable TEXT, extra TEXT
@@ -60,6 +71,10 @@ func FuzzScanRoundTrip(f *testing.F) {
 		{3, "x", 1, 2.5, []byte("y"), false, ""},
 		{3, "x", 1, 2.5, []byte("y"), true, "n"},
 		{4, "x", 1, 2.5, []byte("y"), true, "n"},
+		// shape=5：分别锁定 NULL BLOB 与空 BLOB 经 *[]byte 的区分。
+		{5, "x", 1, 2.5, nil, true, "n"},
+		{5, "x", 1, 2.5, []byte{}, true, "n"},
+		{5, "x", 1, 2.5, []byte("y"), true, "n"},
 	}
 	for _, seed := range seeds {
 		f.Add(seed.shape, seed.s, seed.i, seed.r, seed.b, seed.nullableSet, seed.nullable)
@@ -69,7 +84,7 @@ func FuzzScanRoundTrip(f *testing.F) {
 		if len(s) > 4<<10 || len(b) > 4<<10 || len(nullable) > 4<<10 || math.IsNaN(r) || math.IsInf(r, 0) {
 			return
 		}
-		shape %= 5
+		shape %= 6
 		if _, err := db.Exec(`DELETE FROM fuzz_scan`); err != nil {
 			t.Fatalf("delete: %v", err)
 		}
@@ -94,7 +109,7 @@ func FuzzScanRoundTrip(f *testing.F) {
 		switch shape {
 		case 0:
 			insert(1)
-			rows, err := db.Query(`SELECT s, i, r, b, nullable FROM fuzz_scan WHERE id = 1`)
+			rows, err := db.Query(`SELECT s, i, r, b, nullable, extra FROM fuzz_scan WHERE id = 1`)
 			if err != nil {
 				t.Fatalf("query: %v", err)
 			}
@@ -106,7 +121,7 @@ func FuzzScanRoundTrip(f *testing.F) {
 		case 1, 2:
 			insert(1)
 			insert(2)
-			rows, err := db.Query(`SELECT s, i, r, b, nullable FROM fuzz_scan ORDER BY id`)
+			rows, err := db.Query(`SELECT s, i, r, b, nullable, extra FROM fuzz_scan ORDER BY id`)
 			if err != nil {
 				t.Fatalf("query: %v", err)
 			}
@@ -135,7 +150,7 @@ func FuzzScanRoundTrip(f *testing.F) {
 			}
 		case 3:
 			insert(1)
-			rows, err := db.Query(`SELECT nullable FROM fuzz_scan WHERE id = 1`)
+			rows, err := db.Query(`SELECT nullable, extra FROM fuzz_scan WHERE id = 1`)
 			if err != nil {
 				t.Fatalf("query nullable: %v", err)
 			}
@@ -150,9 +165,31 @@ func FuzzScanRoundTrip(f *testing.F) {
 			if got.N != want {
 				t.Fatalf("nullable scan = %q, want %q (set=%v)", got.N, want, nullableSet)
 			}
+		case 5:
+			insert(1)
+			rows, err := db.Query(`SELECT b FROM fuzz_scan WHERE id = 1`)
+			if err != nil {
+				t.Fatalf("query blob pointer: %v", err)
+			}
+			var got fuzzScanBlobPtrRow
+			if err := ScanStructClose(rows, &got); err != nil {
+				t.Fatalf("scan blob pointer: %v", err)
+			}
+			if b == nil {
+				if got.B != nil {
+					t.Fatalf("NULL blob scanned into *[]byte = %#v, want nil", *got.B)
+				}
+				return
+			}
+			if got.B == nil {
+				t.Fatalf("blob %x scanned into *[]byte = nil, want non-nil", b)
+			}
+			if !bytes.Equal(*got.B, b) {
+				t.Fatalf("blob pointer scan = %x, want %x", *got.B, b)
+			}
 		default:
 			insert(1)
-			rows, err := db.Query(`SELECT s, i, r, b, nullable FROM fuzz_scan WHERE id = 999`)
+			rows, err := db.Query(`SELECT s, i, r, b, nullable, extra FROM fuzz_scan WHERE id = 999`)
 			if err != nil {
 				t.Fatalf("query empty: %v", err)
 			}

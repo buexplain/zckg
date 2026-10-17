@@ -16,8 +16,8 @@ type fuzzGuardUpdate struct {
 	V string `db:"v"`
 }
 
-// FuzzDestructiveGuard 覆盖 Update/Delete/DeleteJoin 的无 WHERE 保护：
-// op=0 Update、1 Delete、2 DeleteJoin；whereFlags/joinFlags 选择条件形态，
+// FuzzDestructiveGuard 覆盖 Update/Increment/Decrement/Delete/DeleteJoin 的无 WHERE 保护：
+// op=0 Update、1 Delete、2 DeleteJoin、3 Increment、4 Decrement；whereFlags/joinFlags 选择条件形态，
 // force 控制显式放行。参考模型独立推导 where/join 是否构成有效限定。
 // 普通 go test 只运行种子；探索命令：
 //
@@ -48,6 +48,10 @@ func FuzzDestructiveGuard(f *testing.F) {
 		{1, false, 0, 2, "=", "x"},       // Delete 带 JOIN → ErrDeleteWithJoin
 		{2, false, 0, 0, "=", "x"},       // DeleteJoin 仅无条件 JOIN → 拒绝
 		{2, false, 0, 2, "=", "x"},       // DeleteJoin 有效 ON → 放行
+		{3, false, 0, 0, "=", "x"},       // Increment 无条件 → 拒绝
+		{3, false, 1, 0, "=", "x"},       // Increment 有 WHERE → 放行
+		{4, false, 0, 0, "=", "x"},       // Decrement 无条件 → 拒绝
+		{4, false, 0, 2, "=", "x"},       // Decrement 有效 JOIN → 放行
 		{0, false, 1, 0, "INVALID", "x"}, // 非法运算符，跳过判定
 	}
 	for _, seed := range seeds {
@@ -58,7 +62,7 @@ func FuzzDestructiveGuard(f *testing.F) {
 		if len(operator) > 256 || len(value) > 4<<10 {
 			return
 		}
-		op %= 3
+		op %= 5
 		joinFlags &= 0x0F // 仅低 4 位有对应 JOIN 形态
 		builder := buildGuardFuzzBuilder(NewMySQLGrammar(), op, force, whereFlags, joinFlags, operator, value)
 		if err := builder.validateWriteBuilder(); err != nil {
@@ -76,17 +80,26 @@ func FuzzDestructiveGuard(f *testing.F) {
 
 		ctx := context.Background()
 		switch op {
-		case 0:
+		case 0, 3, 4:
 			reject := !force && !wantWhere && !wantJoin
 			if !reject {
 				return
 			}
 			err := callGuardWithoutDAO(func() error {
-				_, err := builder.Update(ctx, fuzzGuardUpdate{V: "x"})
-				return err
+				switch op {
+				case 0:
+					_, err := builder.Update(ctx, fuzzGuardUpdate{V: "x"})
+					return err
+				case 3:
+					_, err := builder.Increment(ctx, "v", 1)
+					return err
+				default:
+					_, err := builder.Decrement(ctx, "v", 1)
+					return err
+				}
 			})
 			if !errors.Is(err, ErrUpdateWithoutWhere) {
-				t.Fatalf("Update with no effective where/join returned %v, want ErrUpdateWithoutWhere", err)
+				t.Fatalf("op=%d with no effective where/join returned %v, want ErrUpdateWithoutWhere", op, err)
 			}
 		case 1:
 			if joinFlags != 0 {
@@ -138,7 +151,7 @@ func callGuardWithoutDAO(fn func() error) (err error) {
 // buildGuardFuzzBuilder 按 flag 组合 WHERE/JOIN 形态；DeleteJoin 在没有任何 join flag 时
 // 追加一个无条件 JOIN，保证进入“无有效 WHERE/JOIN”保护分支而非 ErrDeleteJoinNoJoin。
 func buildGuardFuzzBuilder(g Grammar, op uint8, force bool, whereFlags, joinFlags uint8, operator, value string) *Builder {
-	builder := NewBuilder(g, nil).Table("t")
+	builder := newTestBuilder(g, nil).Table("t")
 	if whereFlags&1 != 0 {
 		builder.Where("id", operator, value)
 	}

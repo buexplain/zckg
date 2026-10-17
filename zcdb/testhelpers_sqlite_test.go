@@ -15,7 +15,7 @@ import (
 // openSQLiteTestDB 打开一个内存 SQLite 数据库，测试结束后自动关闭。
 // MaxOpenConns 必须为 1：SQLite :memory: 的每个连接持有各自独立的内存库，
 // 多连接下一个连接建表写入的数据在另一个连接上查不到（与 docReviewSQLiteDAO 一致）。
-func openSQLiteTestDB(t *testing.T) *DBDao {
+func openSQLiteTestDB(t testing.TB) *DBDao {
 	t.Helper()
 	pool, err := NewPool(PoolConfig{
 		DriverName:   "sqlite",
@@ -31,13 +31,17 @@ func openSQLiteTestDB(t *testing.T) *DBDao {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
-	t.Cleanup(func() { _ = dao.Close() })
+	t.Cleanup(func() {
+		if err := dao.Close(); err != nil {
+			t.Errorf("close sqlite test db: %v", err)
+		}
+	})
 	return dao
 }
 
 // openSQLiteCommentDAO 为每个测试建立唯一共享内存库和独立主从连接，以便验证路由。
 // 纯 Go 驱动，无外部服务或跳过分支；DSN 为 file:sql_comment_<testing.T地址>?mode=memory&cache=shared。
-func openSQLiteCommentDAO(t *testing.T, comment string, callback SlowSQLCallback) *DBDao {
+func openSQLiteCommentDAO(t testing.TB, comment string, callback SlowSQLCallback) *DBDao {
 	t.Helper()
 	dsn := fmt.Sprintf("file:sql_comment_%p?mode=memory&cache=shared", t)
 	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: dsn, SlaveDSNs: []string{dsn}, MaxOpenConns: 1})
