@@ -20,7 +20,7 @@
 
 ## 构建与测试命令
 
-```powershell
+```shell
 # 构建全部包
 go build ./...
 
@@ -35,7 +35,16 @@ go vet ./...
 gofmt -l .   # 输出应为空
 ```
 
-**环境注意**：本机为 Windows + PowerShell，不支持 `&&` 作为语句分隔符，多条命令请用 `;` 分隔。
+### 集成测试环境
+
+- 集成测试**内置门控**：目标数据库不可达时 `t.Skip`，保证无数据库环境下 `go test ./...` 不误报。
+- SQLite 集成测试使用纯 Go 驱动 `modernc.org/sqlite`，无需外部环境。
+- 需要真实 MySQL / PostgreSQL 时（DSN 硬编码于测试文件中）：
+
+```shell
+docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
+docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
+```
 
 ### 测试文件命名约定
 
@@ -48,25 +57,16 @@ gofmt -l .   # 输出应为空
 | `*_mysql_integration_test.go` / `*_postgres_integration_test.go` / `*_sqlite_integration_test.go` | 按数据库方言拆分的集成测试 |
 | `{模块}_extra_test.go` / `{模块}_extra_unit_test.go` | 同一被测模块内的扩展/边界用例（允许；不得跨模块聚合） |
 | `*_regression_test.go` | 回归锁死测试（如 zchttp `recursion_regression_test.go`） |
-| `{源码模块}_fuzz_test.go` / `{功能}_fuzz_test.go` | 模糊测试：按被测源码/功能归位（如 `builder_compile_fuzz_test.go`），种子、不变量与探索命令同文件 |
-| `docs_examples_compile_test.go` | 文档示例代码的编译级校验（zcdb、zchttp、zcmodel） |
-| `docs_deviation_review_test.go` | 文档-代码偏离审查的回归锁死测试 |
+| `{源码模块}_fuzz_test.go` / `{功能}_fuzz_test.go` | 模糊测试：zcdb 按被测源码/功能独立成文件（如 `builder_compile_fuzz_test.go`）；zchttp、zcmodel 的 `Fuzz*` 就近放入对应模块测试文件。种子、不变量与探索命令写在同文件注释中 |
+| `docs_examples_compile_test.go` | 文档示例代码的编译级校验（五个模块均有） |
+| `docs_deviation_review_test.go` | 文档-代码偏离审查的回归锁死测试（zcdb、zchttp） |
 
 **各模块布局**：
 
-- **zcdb**：Builder 相关按「功能 × 方言 × 类型」镜像组织，命名 `builder_{功能}_{方言}_{类型}_test.go`（功能 = select / where / join / order / group / exec / query / cursor / compile；方言 = mysql / postgres / sqlite；类型 = unit / integration）。三方言缺失的 unit 空占位文件是刻意预留的骨架，保持不动。跨方言共享用例集中在 `cross_dialect_integration_test.go`（共享主体）+ `cross_dialect_{mysql,postgres,sqlite}_integration_test.go`（方言执行入口）；方言特有用例必须放回对应 `builder_{功能}_{方言}_integration_test.go`，不得留在入口文件。建连/建表等共享基础设施放 `testhelpers_{mysql,postgres,sqlite}_test.go`。
+- **zcdb**：Builder 相关按「功能 × 方言 × 类型」镜像组织，命名 `builder_{功能}_{方言}_{类型}_test.go`（功能 = select / where / join / order / group / exec / query / cursor / compile；方言 = mysql / postgres / sqlite；类型 = unit / integration）。三方言缺失的 unit 占位文件（仅含 package 声明与说明注释）是刻意预留的骨架，保持不动。跨方言共享用例集中在 `cross_dialect_integration_test.go`（共享主体）+ `cross_dialect_{mysql,postgres,sqlite}_integration_test.go`（方言执行入口）；方言特有用例必须放回对应 `builder_{功能}_{方言}_integration_test.go`，不得留在入口文件。建连/建表等共享基础设施放 `testhelpers_{mysql,postgres,sqlite}_test.go`。
 - **zcdb（SchemaInspector 例外族）**：非 Builder 功能族的用例按被测源码归集——`schema_inspector_test.go` 放单元/接口契约用例，`schema_inspector_{mysql,postgres,sqlite}_integration_test.go` 放三方言集成用例（`schema_inspector.go` + `{mysql,postgres,sqlite}_schema.go`），**不混入** `builder_*_test.go`。
 - **zcdb（fuzz）**：fuzz 目标按被测源码/功能命名 `*_fuzz_test.go`；种子、不变量与探索命令写在同文件注释中。
 - **zchttp / zcconfig / zcmodel / zcquit**：按被测源码文件一一对应命名（如 `binding_test.go`、`validate_test.go`、`openapi_test.go`、`httpEngine_test.go`、`cast_test.go`、`quit_test.go`），新用例就近加入对应文件。跨测试文件共享的请求执行/建连等 helper 放 `testhelpers_test.go`。
-
-- 集成测试**内置门控**：目标数据库不可达时 `t.Skip`，保证无数据库环境下 `go test ./...` 不误报。
-- SQLite 集成测试使用纯 Go 驱动 `modernc.org/sqlite`，无需外部环境。
-- 需要真实数据库时的本地环境（DSN 硬编码于测试文件中）：
-
-```powershell
-docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --name zcdb_test_mysql mysql:8.4
-docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:15
-```
 
 ## 测试用例质量要求
 
@@ -84,6 +84,10 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
   - **主流程与增量再生成完整验证**：不仅验证"调用不报错"，还验证目标文件存在、包名、必要 import、全部字段及 tag、方法签名与**完整方法体**（不只签名）、每个字段的转换语句。增量再生成需确认用户手写方法体保留、旧结构被替换、新字段位置正确、转换方法同步更新、生成声明各只有一份；结果至少经 `parser.ParseFile`，含别名 import 的场景应排除编译级错误。
   - **映射完整性**：类型映射测试覆盖当前映射表的全部方言键（含多词类型、长度/精度、大小写、`unsigned`、时区后缀），对照 DDL、期望 map、源码映射表确认键集合一致；按 Go 结果类别覆盖主要类型（整型/浮点/布尔/字符串/时间/字节/未知）。
   - **原子写入验证**：失败阶段准确，且失败后上下文完整——目标目录/文件未被改变、无临时文件残留、不存在的目录未被隐式创建、语法校验失败时目标文件不落盘。
+  - **覆盖率真实性**：包级覆盖率数字高不等于新增代码被验证。功能提交后把非测试文件新增/修改的每一行映射到 `go tool cover` profile 的 block，确认没有 `count=0` 的可执行行；关键分支用 `go test -overlay` 注入单点变异，确认对应用例真的失败。测试重排/搬迁后必须重跑覆盖率并逐函数比对，下降要归因到具体分支再决定补不补。
+  - **差分与契约测试**：框架代码优先用独立权威做 oracle（`encoding/json`/`net/url`/`mime/multipart`、线性参考路由匹配器、`kin-openapi`、真实数据库引擎），不要手写与实现同源的期望；oracle 自身也会出错，fuzz/差分报错先分流「实现错」还是「oracle 错」，再补定向回归。
+  - **模糊测试**：fuzz 目标必须配差分 oracle 或明确不变量，不能只断言不 panic；输入空间不得越过文档声明的可信边界；发现的失败语料留在 `testdata/fuzz` 作永久回归种子；普通 `go test` 只跑种子与已存语料，探索需单独 `-fuzz`。优先纯函数目标，文件 I/O 与外部引擎目标要设输入上限或门控。
+  - **断言必须能失败**：新增回归用例要用变异或反向实现自检「实现退化 → 用例必失败」；避免空转断言（断言全在循环内却不先校验条数）和弱于声明的断言。
 
 3. **断言与错误处理**
   - **错误路径断言**：除 `err != nil` 外，验证错误消息包含关键信息或用 `errors.Is` 匹配哨兵错误；生成失败测试检查目标文件未创建，若从已有文件开始则检查原内容逐字节未变化。
@@ -127,6 +131,14 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
 1. **gofmt 强制**：提交前 `gofmt -l .` 必须无输出。Go 文档注释中的编号列表（步骤/清单）必须用**双空格**前缀格式 `//  1.`，单空格会被 gofmt 标记差异。
 2. **核心行为用测试锁死**：修改核心路径（路由、状态切换、数据库读写、类型转换语义）时，必须用单元 + 集成测试双重验证，并新增/保留锁死关键行为的用例防回归。
 3. **错误处理**：可导出错误统一定义为 `errors` 变量（如 zcdb 的 `ErrXxx` 系列），调用方可用 `errors.Is` 匹配；错误包装需携带上下文（如 zcconfig 的文件路径格式 `file_path: %s: %w`）。
+4. **日志统一 slog**：一律 `slog.Default()`，禁止标准库 `log`（`log.Fatal` 用 `slog.Default().Error(...)` + `os.Exit(1)` 替代）。自定义属性键避开 `level`/`msg`/`time`/`source`；框架自身日志统一带 `"zckg", "<模块名>"`，用户回调与文档示例不加；不封装 logger helper，调用点直接内联。注意 zcdb 集成测试中的 `log := &commentSQLLog{}` 是局部变量，与标准库无关。
+
+## 发版约定
+
+- **版本号严格按 semver**：新增公开 API（向后兼容的功能新增）→ MINOR；破坏性变更 → MAJOR；修 bug、升依赖、注释/格式整理 → PATCH。不要照搬仓库历史的补丁级累加习惯。
+- **v1.x 例外**：本仓库处于 v1.x 阶段时，破坏性变更可选择 MINOR，以避免把模块路径迁移到 `/v2` 并迫使消费方改 import。选 MINOR 时，Release 说明必须置顶「⚠️ 破坏性变更」一节，给出旧/新调用对照与迁移写法。
+- **tag 类型**：自 v1.2.0 起使用 annotated tag（`git cat-file -t <tag>` 返回 `tag`）；新建 tag 与仓库现状保持一致，不要沿用更早期的轻量 tag。
+- **发布说明**：范围以「上一个 tag → HEAD」界定，发版前确认这些提交已推送。**已发布的 tag 绝不重指**——Go 模块代理的版本内容是不可变缓存，重指会造成代理与仓库内容不一致、`GOPROXY=direct` 用户 checksum mismatch；内容不完整就发新的补丁版本。
 
 ## 关键行为不变量（改动前务必确认）
 
