@@ -1,5 +1,6 @@
 .idea
 .qoder
+.dsh
 
 # Go 覆盖率产物
 coverage.out
