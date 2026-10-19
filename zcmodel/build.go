@@ -68,17 +68,40 @@ func buildToEntityMethod(entityName, doName string, columns []Column) string {
 	return buf.String()
 }
 
-// sanitizeTagValue 净化写入结构体 tag 的值，保证生成代码语法合法且反射读取完整。
-// 结构体 tag 由反引号包裹，reflect.StructTag.Lookup 对值的约束：
-//   - 反引号会导致反引号字符串提前终止（语法错误），替换为单引号；
-//   - 裸换行/回车等控制字符会使 strconv.Unquote 解析失败，Get 返回空值；
-//   - 双引号会被误认为值分隔符，裸双引号会导致解析失败。
-//
-// 因此先用 strconv.Quote 将控制字符、双引号、反斜杠转义为标准转义序列（\n、\"、\\），
-// 反射读取时会通过 strconv.Unquote 完整还原原值。
-func sanitizeTagValue(v string) string {
-	q := strconv.Quote(v)
-	return strings.ReplaceAll(q[1:len(q)-1], "`", "'")
+// structTagPart 是结构体 tag 的一个键值对。
+type structTagPart struct {
+	key   string
+	value string
+}
+
+// formatStructTag 将键值对组装为结构体 tag 字面量，无条目时返回空串。
+// 值先经 strconv.Quote 转义（控制字符、双引号、反斜杠），保证 reflect.StructTag
+// 可通过 strconv.Unquote 完整还原原值。
+// 常规情况使用反引号原始字符串；任一键或值含反引号时，整体改用双引号解释型字符串
+// 字面量——反引号会提前终止原始字符串，但可安全出现在解释型字符串中，从而完整保留
+// 反引号（列名含反引号时列映射 tag 仍等于真实列名）。
+func formatStructTag(parts []structTagPart) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	hasBacktick := false
+	for i, p := range parts {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(p.key)
+		b.WriteByte(':')
+		b.WriteString(strconv.Quote(p.value))
+		if strings.ContainsRune(p.key, '`') || strings.ContainsRune(p.value, '`') {
+			hasBacktick = true
+		}
+	}
+	content := b.String()
+	if hasBacktick {
+		return strconv.Quote(content)
+	}
+	return "`" + content + "`"
 }
 
 // sanitizeCommentLine 将文本中的换行/回车替换为空格，避免注释被撑断成裸行导致生成代码语法错误。
@@ -113,7 +136,7 @@ var ddlExtraWhiteList = []struct {
 // assembleDDLFragment 组装字段的类 DDL 列定义片段：{Type} [{NULL|NOT NULL}] [DEFAULT 值] [EXTRA 白名单项]。
 // Type 与 Default 取方言元数据原样，NULL 标记为显式书写（Nullable 为 nil 表示未知，整段省略，
 // 避免手动构造 Input 时把可空列误标为 NOT NULL），EXTRA 仅保留白名单项。
-// 返回未净化的原始文本，写入 tag 前由调用方经 sanitizeTagValue 转义。
+// 返回未转义的原始文本，写入 tag 前由调用方经 formatStructTag 统一转义。
 func assembleDDLFragment(col Column) string {
 	parts := []string{col.Type}
 	if col.Nullable != nil {
@@ -241,7 +264,8 @@ func buildIndexCommentBlock(indexes []IndexInfo) []string {
 // comment 非空或 indexes 非空时在 type 声明前生成 doc 注释（含索引块）。
 // useAny 为 true 时字段类型使用 any（用于 DO 结构体），为 false 时使用具体类型（用于 Entity 结构体）。
 // columnTagName 指定结构体字段的 tag 名称（如 "column"、"db" 等），为空时不生成列名 tag，避免产生空 tag 名 `:"colname"`。
-// json、列映射、ddl、description 的 tag 值均经 sanitizeTagValue 转义，含引号、反斜杠、换行的列名也能经反射完整还原。
+// json、列映射、ddl、description 的 tag 值由 formatStructTag 统一转义；含引号、反斜杠、换行或
+// 反引号的列名也能经反射完整还原（含反引号时整个 tag 使用解释型字符串字面量）。
 func buildStruct(name string, columns []Column, useAny bool, comment string, columnTagName string, indexes []IndexInfo) string {
 	// 计算字段名和类型的最大宽度，用于对齐
 	maxNameLen, maxTypeLen := 0, 0
@@ -270,26 +294,23 @@ func buildStruct(name string, columns []Column, useAny bool, comment string, col
 			goType = col.StructFieldInfo.Type
 		}
 		// 构建字段 tag：顺序为 json、columnTagName、primary_key、ddl、description；各自数据为空时跳过
-		var tagParts []string
+		var tagParts []structTagPart
 		if col.StructFieldInfo.JsonTagValue != "" {
-			tagParts = append(tagParts, fmt.Sprintf("json:\"%s\"", sanitizeTagValue(col.StructFieldInfo.JsonTagValue)))
+			tagParts = append(tagParts, structTagPart{"json", col.StructFieldInfo.JsonTagValue})
 		}
 		if columnTagName != "" {
-			tagParts = append(tagParts, fmt.Sprintf("%s:\"%s\"", columnTagName, sanitizeTagValue(col.Name)))
+			tagParts = append(tagParts, structTagPart{columnTagName, col.Name})
 		}
 		if col.PrimaryKey {
-			tagParts = append(tagParts, `primary_key:"true"`)
+			tagParts = append(tagParts, structTagPart{"primary_key", "true"})
 		}
 		if col.Type != "" {
-			tagParts = append(tagParts, fmt.Sprintf("ddl:\"%s\"", sanitizeTagValue(assembleDDLFragment(col))))
+			tagParts = append(tagParts, structTagPart{"ddl", assembleDDLFragment(col)})
 		}
 		if col.Comment != "" {
-			tagParts = append(tagParts, fmt.Sprintf("description:\"%s\"", sanitizeTagValue(col.Comment)))
+			tagParts = append(tagParts, structTagPart{"description", col.Comment})
 		}
-		var tag string
-		if len(tagParts) > 0 {
-			tag = "`" + strings.Join(tagParts, " ") + "`"
-		}
+		tag := formatStructTag(tagParts)
 		buf.WriteString(fmt.Sprintf("\t%-*s %-*s %s\n", maxNameLen, col.StructFieldInfo.Name, maxTypeLen, goType, tag))
 	}
 	buf.WriteString("}")
@@ -393,18 +414,11 @@ func packageNameOf(filePath string) string {
 	return name
 }
 
-// importLocalName 返回 import spec 在文件内绑定的包名，无法确定时返回空串：
-// 具名别名取别名；_ 与 . 导入、"C" 不绑定可移除的包名；无别名时按 goimports 惯例取路径末段，
-// 末段不是合法标识符（如 yaml.v3）或为主版本后缀（如 v2）时实际包名不可知，返回空串。
-func importLocalName(spec *ast.ImportSpec) string {
-	if spec.Name != nil {
-		if spec.Name.Name == "_" || spec.Name.Name == "." {
-			return ""
-		}
-		return spec.Name.Name
-	}
-	path, err := strconv.Unquote(spec.Path.Value)
-	if err != nil || path == "C" {
+// importPathLocalName 返回导入路径在未指定别名时绑定的默认包名，无法确定时返回空串：
+// 按 goimports 惯例取路径末段；"C" 不是可引用的包名；末段不是合法标识符（如 yaml.v3）
+// 或为主版本后缀（如 v2）时实际包名不可知，返回空串。
+func importPathLocalName(path string) string {
+	if path == "C" {
 		return ""
 	}
 	name := path[strings.LastIndex(path, "/")+1:]
@@ -417,13 +431,33 @@ func importLocalName(spec *ast.ImportSpec) string {
 	return name
 }
 
-// collectSelectorRefs 收集节点内选择器表达式 X.Sel 中作为 X 的标识符名（包名引用的候选集合）。
+// importLocalName 返回 import spec 在文件内绑定的包名，无法确定时返回空串：
+// 具名别名取别名；_ 与 . 导入不绑定可移除的包名；无别名时取路径的默认包名（见 importPathLocalName）。
+func importLocalName(spec *ast.ImportSpec) string {
+	if spec.Name != nil {
+		if spec.Name.Name == "_" || spec.Name.Name == "." {
+			return ""
+		}
+		return spec.Name.Name
+	}
+	path, err := strconv.Unquote(spec.Path.Value)
+	if err != nil {
+		return ""
+	}
+	return importPathLocalName(path)
+}
+
+// collectSelectorRefs 收集节点内选择器表达式 X.Sel 中作为 X 的包引用标识符名。
+// 仅收集未绑定到文件内声明的标识符（id.Obj == nil）：局部变量遮蔽包名时
+// （如函数内 time := ...; time.Now），该选择器不是包引用，不能据此保留 import。
 func collectSelectorRefs(node ast.Node, into map[string]bool) {
 	ast.Inspect(node, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			if id, ok := sel.X.(*ast.Ident); ok {
-				into[id.Name] = true
-			}
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if id, ok := sel.X.(*ast.Ident); ok && id.Obj == nil {
+			into[id.Name] = true
 		}
 		return true
 	})
@@ -482,13 +516,16 @@ func splitGeneratedCode(code, structName, methodName string) (structText, method
 // 方法缺失补在其结构体后；两个都缺或都无配对时，追加到最后一个生成声明之后
 // （原文件没有任何生成声明时置于首个用户声明之前），并按标准顺序
 // Entity 结构体 → ToDO → DO 结构体 → ToEntity 排列。
+// 当结构体位于同一个 type 块内时，槽位是整个块：结构体缺失补在块前、方法缺失补在块后，
+// 不会插入块内；上述标准顺序只在独立声明之间保证。
 // 同类生成声明出现多份时（如用户手写的值接收者 ToDO 与生成的指针接收者 ToDO 共存），
 // 首个槽位原位替换、其余重复槽位移除，避免同名方法共存导致编译失败。
 //
 // type 声明块按 Spec 粒度处理：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，
 // 重复生成的 Spec（含跨槽位重复）只保留首个、其余剔除，用户类型（含各自注释）与块内
 // 不附着于任何 Spec 的游离注释原样保留；仅含一个生成 Spec 的声明以独立声明形态输出
-// （不保留括号块），与首次生成的形态保持一致。
+// （不保留括号块），与首次生成的形态保持一致；但若存在块级 Doc 或块内游离注释，
+// 则保留括号块，以免展开时丢失这些注释。
 //
 // go/parser 不会把 package 声明之前的 build tags/文件级注释放进 file.Decls，重建时按源码偏移
 // 显式前置保留；已有文件的包名尊重原文件，仅新建文件使用目录推导包名（见 packageNameOf）。
@@ -496,7 +533,9 @@ func splitGeneratedCode(code, structName, methodName string) (structText, method
 //
 // neededImports 为生成代码引用的包（如 time.Time 需要 time），写入时若文件缺少对应 import 会自动补上
 // （合并进第一个保留的 import 块，避免形成两个 import 块）；
-// 存量文件以别名（含 _、. 导入）引入所需包时不视为已存在，仍会补充默认导入，保证生成代码可编译。
+// 存量文件以不同名的别名（含 _、. 导入）引入所需包时，默认包名仍不可用，会补充默认导入；
+// 若别名恰好等于默认包名（如 time "time"），该导入已满足生成代码，不再重复追加；
+// 若同一本地名已绑定到另一路径，则返回冲突错误而不是写出重复绑定的不可编译文件。
 // 反向地，旧生成代码引用过、而新生成代码与保留的用户代码都不再引用的 import spec 会被移除
 // （如删去最后一个时间列后的 time），块内 spec 全部移除时整个 import 声明一并移除；
 // _、. 导入、"C" 及包名无法由路径确定的 import 不做移除。
@@ -839,6 +878,10 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 	carrierIdx := make(map[genKind]int) // 生成声明种类 → 承载它的槽位索引
 	seenGen := make(map[genKind]bool)   // 已建立槽位的生成声明种类（重复出现时去重）
 	existingImports := make(map[string]bool)
+	// existingImportNames 记录现有 import spec 绑定的本地包名（含具名别名）。
+	// 生成代码按默认包名引用（如 time.Time），因此同名别名 time "time" 也能满足需要；
+	// 若同一本地名已绑定到别的路径，追加默认导入会形成重复绑定，必须报错而不是写出坏文件。
+	existingImportNames := make(map[string]string)
 
 	prev := pkgEnd
 	pending := "" // 被移除声明之前的游离注释，顺延给下一个保留声明
@@ -863,17 +906,24 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 					continue
 				}
 				imports = append(imports, importEntry{decl: d, lead: takeLead(lead), start: start, end: end})
-				// 记录现有文件已导入的包路径，供 neededImports 校验缺失时补充。
-				// 仅统计无别名的导入：别名导入（含 _ 与 . 导入）绑定的是非默认包名，
-				// 生成代码引用的默认包名（如 time.Time 的 time）仍不可用，
-				// 不记入已存在，允许补充标准导入（两种导入可合法共存）。
+				// 记录现有文件已导入的包路径与本地包名，供 neededImports 校验缺失时补充。
+				// 无别名导入绑定默认包名（如 "time" 绑定 time），直接标记为已存在；
+				// 具名别名（如 mytime "time"）不绑定默认名，仍视为缺失并补充默认导入；
+				// 但同名别名（如 time "time"）已经绑定了生成代码需要的本地名，不能重复追加。
 				for _, spec := range d.Specs {
 					impSpec, ok := spec.(*ast.ImportSpec)
-					if !ok || removedSpecs[spec] || impSpec.Name != nil {
+					if !ok || removedSpecs[spec] {
 						continue
 					}
-					if path, err := strconv.Unquote(impSpec.Path.Value); err == nil {
+					path, err := strconv.Unquote(impSpec.Path.Value)
+					if err != nil {
+						continue
+					}
+					if impSpec.Name == nil {
 						existingImports[path] = true
+					}
+					if name := importLocalName(impSpec); name != "" {
+						existingImportNames[name] = path
 					}
 				}
 				continue
@@ -905,10 +955,38 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 					slots = append(slots, slot{text: takeLead(lead) + rendered})
 				case len(d.Specs) == 1 && userCount == 0 && dropCount == 0:
 					// 单一生成类型（标准的独立 type 声明，或仅含一个生成类型的括号块）：
-					// 以独立声明形态就地替换，不保留括号块，与首次生成的形态一致
+					// 通常以独立声明形态就地替换，不保留括号块，与首次生成的形态一致。
+					// 例外：块级 Doc 或块内游离注释存在时保留括号块，否则展开会静默丢弃这些注释。
 					k, _ := generatedTypeKind(d.Specs[0])
 					if seenGen[k] {
 						pending += lead
+						continue
+					}
+					specFrom, specTo := specSpan(d.Specs[0])
+					// 仅括号块才需要保留块形态；独立 type 声明的 Doc 属于被替换的生成声明，
+					// 按既有语义整体替换（旧 doc 丢弃），不能走 Spec 级替换。
+					isBlock := d.Lparen.IsValid()
+					keepBlock := isBlock && d.Doc != nil
+					if isBlock && !keepBlock {
+						for _, cg := range file.Comments {
+							from, to := off(cg.Pos()), off(cg.End())
+							if from < start || to > end {
+								continue
+							}
+							if from >= specFrom && to <= specTo {
+								continue // 生成 Spec 自身的 Doc/尾注释，随 Spec 替换
+							}
+							keepBlock = true
+							break
+						}
+					}
+					if keepBlock {
+						// 只有一个生成 Spec，且 genText[k] 非空、seenGen[k] 为 false，
+						// renderTypeBlock 必然写出该 Spec；保留块形态并原位替换。
+						rendered, _ := renderTypeBlock(d, start, end, seenGen)
+						slots = append(slots, slot{hasGen: true, text: takeLead(lead) + rendered})
+						seenGen[k] = true
+						carrierIdx[k] = len(slots) - 1
 						continue
 					}
 					seenGen[k] = true
@@ -965,9 +1043,21 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 	// （避免形成两个 import 块），否则新建一个 import 声明。
 	var missingImports []string
 	for _, p := range neededImports {
-		if !existingImports[p] {
-			missingImports = append(missingImports, p)
+		if existingImports[p] {
+			continue
 		}
+		// 生成代码按默认包名引用依赖；若该本地名已被现有导入绑定：
+		//   - 绑定到同一路径（典型是同名别名 time "time"）：已经满足，不再追加；
+		//   - 绑定到其他路径：追加默认导入会产生重复绑定，返回明确错误而不是写出不可编译的文件。
+		if local := importPathLocalName(p); local != "" {
+			if boundPath, ok := existingImportNames[local]; ok {
+				if boundPath == p {
+					continue
+				}
+				return fmt.Errorf("import 别名冲突: 本地名 %q 已绑定到 %q，生成代码需要 %q", local, boundPath, p)
+			}
+		}
+		missingImports = append(missingImports, p)
 	}
 	// renderImport 输出保留的 import 声明：按源码偏移剔除 removedSpecs（连同所在整行），
 	// 并把 missing 合并进来——已为 import (…) 块时在右括号前插入新 spec，其余原文（含注释）不变；

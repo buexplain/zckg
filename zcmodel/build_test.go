@@ -133,36 +133,61 @@ func TestBuildToEntityMethod(t *testing.T) {
 	}
 }
 
-// TestSanitizeTagValue 验证 tag 值净化：控制字符/双引号/反斜杠转义为标准转义序列，反引号替换为单引号
-func TestSanitizeTagValue(t *testing.T) {
+// TestFormatStructTag 验证 tag 组装：常规值使用反引号原始字符串；值含反引号时改用
+// 双引号解释型字符串字面量。两种形态都必须能被 strconv.Unquote 还原为 tag 内容，
+// 再经 reflect.StructTag.Get 完整还原原值（含双引号、换行、反斜杠与反引号）。
+func TestFormatStructTag(t *testing.T) {
 	tests := []struct {
-		name string
-		in   string
-		want string
+		name     string
+		parts    []structTagPart
+		wantRaw  bool
+		wantVals map[string]string
 	}{
-		{name: "普通文本", in: "用户名", want: "用户名"},
-		{name: "含双引号", in: "列表封面，示例：[{\"url\":\"https://a.c.cc/1.jpg\"}]", want: "列表封面，示例：[{\\\"url\\\":\\\"https://a.c.cc/1.jpg\\\"}]"},
-		{name: "含反引号", in: "列表`封面`", want: "列表'封面'"},
-		{name: "含换行", in: "第一行\n第二行", want: "第一行\\n第二行"},
-		{name: "含回车换行", in: "第一行\r\n第二行", want: "第一行\\r\\n第二行"},
-		{name: "含反斜杠", in: "C:\\temp\\a", want: "C:\\\\temp\\\\a"},
-		{name: "含空格", in: "list cover", want: "list cover"},
+		{name: "无条目", parts: nil, wantVals: nil},
+		{name: "普通文本", parts: []structTagPart{{"json", "userName"}}, wantRaw: true, wantVals: map[string]string{"json": "userName"}},
+		{name: "双引号与换行", parts: []structTagPart{{"description", "第一行\"quoted\"\n第二行"}}, wantRaw: true, wantVals: map[string]string{"description": "第一行\"quoted\"\n第二行"}},
+		{name: "反斜杠", parts: []structTagPart{{"description", `C:\temp\a`}}, wantRaw: true, wantVals: map[string]string{"description": `C:\temp\a`}},
+		{name: "反引号列名", parts: []structTagPart{{"db", "a`b"}}, wantRaw: false, wantVals: map[string]string{"db": "a`b"}},
+		{name: "反引号注释", parts: []structTagPart{{"description", "列表`封面`"}}, wantRaw: false, wantVals: map[string]string{"description": "列表`封面`"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := sanitizeTagValue(tt.in); got != tt.want {
-				t.Errorf("sanitizeTagValue() = %q, want %q", got, tt.want)
+			tag := formatStructTag(tt.parts)
+			if len(tt.parts) == 0 {
+				if tag != "" {
+					t.Fatalf("formatStructTag(nil) = %q, want empty", tag)
+				}
+				return
+			}
+			if tt.wantRaw {
+				if !strings.HasPrefix(tag, "`") || !strings.HasSuffix(tag, "`") {
+					t.Fatalf("普通值应使用反引号原始字符串，got %q", tag)
+				}
+			} else if !strings.HasPrefix(tag, `"`) {
+				t.Fatalf("含反引号的值应使用解释型字符串字面量，got %q", tag)
+			}
+			content, err := strconv.Unquote(tag)
+			if err != nil {
+				t.Fatalf("tag 字面量无法 Unquote: %v\n%s", err, tag)
+			}
+			for key, want := range tt.wantVals {
+				if got := reflect.StructTag(content).Get(key); got != want {
+					t.Errorf("tag %q 还原失败: got %q, want %q\ntag 字面量: %s", key, got, want, tag)
+				}
 			}
 		})
 	}
 }
 
-// TestSanitizeTagValue_ReflectRestore 验证净化后的 tag 值经 reflect.StructTag.Get 完整还原原注释（含换行与双引号）
-func TestSanitizeTagValue_ReflectRestore(t *testing.T) {
+// TestFormatStructTag_ReflectRestore 验证含换行与双引号的注释经两次 Unquote 后完整还原。
+func TestFormatStructTag_ReflectRestore(t *testing.T) {
 	comment := "列表封面，示例：[{\"url\":\"https://a.c.cc/1.jpg\"}]\n第二行说明"
-	sanitized := sanitizeTagValue(comment)
-	tag := reflect.StructTag(`json:"listCover" db:"list_cover" description:"` + sanitized + `"`)
-	if got := tag.Get("description"); got != comment {
+	tag := formatStructTag([]structTagPart{{"json", "listCover"}, {"db", "list_cover"}, {"description", comment}})
+	content, err := strconv.Unquote(tag)
+	if err != nil {
+		t.Fatalf("tag 字面量无法 Unquote: %v\n%s", err, tag)
+	}
+	if got := reflect.StructTag(content).Get("description"); got != comment {
 		t.Errorf("reflect 还原失败\ngot:  %q\nwant: %q", got, comment)
 	}
 }
@@ -193,7 +218,8 @@ func TestBuildStruct_CommentWithSpecialChars(t *testing.T) {
 	}
 }
 
-// fieldTagOf 从解析后的文件中提取指定结构体字段的 tag 内容（去除外层反引号），找不到返回空串。
+// fieldTagOf 从解析后的文件中提取指定结构体字段的 tag 内容（解码字面量外层引号），找不到返回空串。
+// tag 可能是反引号原始字符串，也可能是含反引号时使用的双引号解释型字符串，统一经 strconv.Unquote 取内容。
 func fieldTagOf(file *ast.File, fieldName string) string {
 	for _, decl := range file.Decls {
 		gd, ok := decl.(*ast.GenDecl)
@@ -212,8 +238,11 @@ func fieldTagOf(file *ast.File, fieldName string) string {
 			for _, f := range st.Fields.List {
 				for _, name := range f.Names {
 					if name.Name == fieldName && f.Tag != nil {
-						// f.Tag.Value 为含反引号的 raw string 字面量，reflect.StructTag 需要无引号的内容
-						return strings.Trim(f.Tag.Value, "`")
+						tag, err := strconv.Unquote(f.Tag.Value)
+						if err != nil {
+							return ""
+						}
+						return tag
 					}
 				}
 			}
@@ -244,30 +273,34 @@ func TestBuildStruct_JsonTagValueWithSpecialChars(t *testing.T) {
 	}
 }
 
-// TestBuildStruct_JsonTagValueWithBacktick 验证含反引号的 JsonTagValue 被替换为单引号，代码可解析。
+// TestBuildStruct_JsonTagValueWithBacktick 验证含反引号的 JsonTagValue 完整保留：
+// 整个 tag 改用双引号解释型字符串字面量，代码可解析且 reflect 读回原值。
 func TestBuildStruct_JsonTagValueWithBacktick(t *testing.T) {
+	const jsonTag = "列表`封面`"
 	cols := []Column{
-		{Name: "list_cover", StructFieldInfo: StructFieldInfo{Name: "ListCover", Type: "string", JsonTagValue: "列表`封面`"}},
+		{Name: "list_cover", StructFieldInfo: StructFieldInfo{Name: "ListCover", Type: "string", JsonTagValue: jsonTag}},
 	}
 	got := buildStruct("TEntity", cols, false, "", "db", nil)
-	if _, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors); err != nil {
+	file, err := parser.ParseFile(token.NewFileSet(), "", "package model\n"+got, parser.AllErrors)
+	if err != nil {
 		t.Fatalf("生成代码存在语法错误: %v\n%s", err, got)
 	}
-	if !strings.Contains(got, "json:\"列表'封面'\"") {
-		t.Errorf("反引号应替换为单引号:\n%s", got)
+	tag := fieldTagOf(file, "ListCover")
+	if gotJSON := reflect.StructTag(tag).Get("json"); gotJSON != jsonTag {
+		t.Errorf("json tag 未保留反引号: got %q, want %q\n%s", gotJSON, jsonTag, got)
 	}
 }
 
-// TestBuildStruct_ColumnTagValueWithSpecialChars 验证列映射 tag 的值（列名）与 json/ddl 一样经 sanitizeTagValue 转义：
+// TestBuildStruct_ColumnTagValueWithSpecialChars 验证列映射 tag 的值（列名）与 json/ddl 一样经统一转义：
 // PG/SQLite 引号标识符可含双引号、反斜杠、换行，未转义时 Lookup 会静默读出截断值或失败并连带吞掉后续 tag；
 // 转义后从 AST 提取的 tag 经 reflect.StructTag.Lookup 完整还原列名，且后续 ddl tag 不受影响。
-// 反引号列名按 sanitizeTagValue 的既有规则替换为单引号（保证语法合法）。
+// 反引号列名改用解释型字符串字面量承载 tag，从而完整保留真实列名。
 func TestBuildStruct_ColumnTagValueWithSpecialChars(t *testing.T) {
 	cases := []struct{ name, col, want string }{
 		{"双引号", `a"b`, `a"b`},
 		{"反斜杠", `a\b`, `a\b`},
 		{"换行", "a\nb", "a\nb"},
-		{"反引号替换为单引号", "a`b", "a'b"},
+		{"反引号完整保留", "a`b", "a`b"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -543,6 +576,72 @@ type UserEntity struct {
 			}
 			assertContains(t, got, "type UserEntity struct {", "生成代码应写入")
 		})
+	}
+}
+
+// TestWriteOrReplaceStruct_ExistingFile_SameNameAliasImport 锁定同名别名导入（time "time"）：
+// 该导入已绑定生成代码需要的默认本地名 time，不得再追加默认导入，否则同一 import 块中
+// 两个 time 绑定会触发 "time redeclared"；产物必须通过编译级类型检查。
+func TestWriteOrReplaceStruct_ExistingFile_SameNameAliasImport(t *testing.T) {
+	orig := `package model
+
+import time "time"
+
+var _ = time.Now
+
+type UserEntity struct {
+	ID int
+}
+`
+	entityCode := "type UserEntity struct {\n\tCreatedAt time.Time\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }"
+	doCode := "type UserDO struct {\n\tCreatedAt any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }"
+	got := writeAndVerify(t, orig, entityCode, doCode, []string{"time"})
+	assertContains(t, got, `time "time"`, "同名别名导入应保留")
+	assertNotContains(t, got, "\t\"time\"\n", "同名别名已满足默认包名，不应再追加默认导入")
+	if n := strings.Count(got, `"time"`); n != 1 {
+		t.Errorf("time 导入路径应只出现一次，实际 %d 次:\n%s", n, got)
+	}
+	typeCheckGoSource(t, got)
+}
+
+// TestWriteOrReplaceStruct_ImportLocalNameConflict 验证本地名已绑定到其他路径时返回明确错误：
+// 如 import time "other/time" 已占用 time 这个本地名，生成代码需要标准库 time，
+// 追加默认导入会形成重复绑定；此时必须报错且不覆盖原文件。
+func TestWriteOrReplaceStruct_ImportLocalNameConflict(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	filePath := filepath.Join(dir, "user.go")
+	orig := `package model
+
+import time "other/time"
+
+var _ = time.Now
+`
+	if err := os.WriteFile(filePath, []byte(orig), 0644); err != nil {
+		t.Fatalf("写入初始文件失败: %v", err)
+	}
+	err := writeOrReplaceStruct(
+		filePath,
+		"UserEntity",
+		"type UserEntity struct {\n\tCreatedAt time.Time\n}\n\nfunc (e *UserEntity) ToDO() { _ = e }",
+		"UserDO",
+		"type UserDO struct {\n\tCreatedAt any\n}\n\nfunc (d *UserDO) ToEntity() { _ = d }",
+		[]string{"time"},
+	)
+	if err == nil {
+		t.Fatal("本地名已绑定到其他路径时应返回 import 别名冲突错误")
+	}
+	if !strings.Contains(err.Error(), "import 别名冲突") {
+		t.Errorf("错误信息应说明 import 别名冲突，实际: %v", err)
+	}
+	content, readErr := os.ReadFile(filePath)
+	if readErr != nil {
+		t.Fatalf("读取原文件失败: %v", readErr)
+	}
+	if string(content) != orig {
+		t.Errorf("冲突时不得覆盖原文件\nwant:\n%s\ngot:\n%s", orig, content)
 	}
 }
 
@@ -1053,6 +1152,12 @@ func (d *UserDO) ToEntity() {
 			wantImports: []string{"time"},
 		},
 		{
+			// 局部变量 time 遮蔽包名：time.Now 不是包引用，不能据此保留已无用的 import
+			name:        "局部变量遮蔽包名时不保留 import",
+			orig:        "package model\n\nimport \"time\"\n\n" + oldGenerated + "\nfunc probeLocalTime() {\n\ttime := struct{ Now func() }{}\n\t_ = time.Now\n}\n",
+			wantImports: nil,
+		},
+		{
 			name:        "被移除 spec 的 Doc 注释随之移除",
 			orig:        "package model\n\nimport (\n\t\"fmt\"\n\t// 时间包\n\t\"time\"\n)\n\n" + oldGenerated + "\nvar _ = fmt.Sprint\n",
 			wantImports: []string{"fmt"},
@@ -1388,6 +1493,34 @@ func TestWriteOrReplaceStruct_MissingGenDeclsPairedInsertion(t *testing.T) {
 	}
 }
 
+// TestWriteOrReplaceStruct_MissingGenDeclsInMixedBlock 锁定混合 type 块的配对落点例外：
+// 槽位是整个 type 块，结构体缺失补在块前、方法缺失补在块后，不插入块内；
+// 因此两个方法都落在块之后，标准顺序只在独立声明之间保证。
+func TestWriteOrReplaceStruct_MissingGenDeclsInMixedBlock(t *testing.T) {
+	orig := `package model
+
+type (
+	UserEntity struct {
+		ID int
+	}
+	UserDO struct {
+		ID any
+	}
+)
+`
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContains(t, got, "type (", "混合 type 块形态应保留")
+	assertDeclOrder(t, got, []string{
+		"UserEntity struct {",
+		"UserDO struct {",
+		"func (e *UserEntity) ToDO()",
+		"func (d *UserDO) ToEntity()",
+	}, "混合 type 块内缺失方法按块边界落入块后")
+	typeCheckGoSource(t, got)
+}
+
 // TestWriteOrReplaceStruct_MissingGenDeclsUnpairedFallback 锁定无配对时的落点：
 // 生成声明追加到原文件最后一个生成声明之后；原文件没有任何生成声明时，按标准顺序
 // （Entity 结构体 → ToDO → DO 结构体 → ToEntity）置于首个用户声明之前。
@@ -1444,6 +1577,104 @@ func (d *UserDO) ToEntity() {}
 		"type UserDO struct {",
 		"func (d *UserDO) ToEntity()",
 	}, "单 spec 括号块展开后的声明顺序")
+	typeCheckGoSource(t, got)
+}
+
+// TestWriteOrReplaceStruct_SingleSpecTypeBlockKeepsFreeComment 锁定单 Spec 括号块含块级 Doc
+// 或块内游离注释时保留括号块：展开为独立声明会丢弃这些注释，必须原样保留。
+func TestWriteOrReplaceStruct_SingleSpecTypeBlockKeepsFreeComment(t *testing.T) {
+	orig := `package model
+
+// block doc
+type (
+	// free floating comment
+
+	UserEntity struct {
+		ID int
+	}
+)
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+`
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContainsAll(t, got, []string{
+		"// block doc",
+		"// free floating comment",
+		"type (",
+		"ID int64",
+	}, "单 Spec 块含注释时应保留块形态与注释")
+	assertContains(t, got, "func (e *UserEntity) ToDO()", "生成方法应写入")
+	typeCheckGoSource(t, got)
+}
+
+// TestWriteOrReplaceStruct_SingleSpecTypeBlockFreeCommentNoBlockDoc 覆盖无块级 Doc、
+// 但 Spec 自身带 Doc 且块内另有游离注释的单 Spec 块：循环应跳过 Spec 区间内的注释、
+// 命中游离注释并保留括号块；旧 Spec Doc 随生成 Spec 替换，游离注释保留。
+func TestWriteOrReplaceStruct_SingleSpecTypeBlockFreeCommentNoBlockDoc(t *testing.T) {
+	orig := `package model
+
+type (
+	// old spec doc
+	UserEntity struct {
+		ID int
+	}
+
+	// free floating comment
+)
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+`
+	entityCode := "// new generated doc\ntype UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContains(t, got, "type (", "含游离注释的单 Spec 块应保留括号块")
+	assertContains(t, got, "// free floating comment", "游离注释应保留")
+	assertContains(t, got, "// new generated doc", "新生成 Doc 应写入")
+	assertNotContains(t, got, "// old spec doc", "旧 Spec Doc 应随生成 Spec 替换丢弃")
+	typeCheckGoSource(t, got)
+}
+
+// TestWriteOrReplaceStruct_SingleSpecTypeBlockLeadCommentNormalized 覆盖单 Spec 块之前的
+// 游离注释（位于声明区间之外）：扫描时应跳过该注释，块仍展开为独立声明，前置注释保留。
+func TestWriteOrReplaceStruct_SingleSpecTypeBlockLeadCommentNormalized(t *testing.T) {
+	orig := `package model
+
+// lead free comment
+
+type (
+	UserEntity struct {
+		ID int
+	}
+)
+
+func (e *UserEntity) ToDO() {}
+
+type UserDO struct {
+	ID any
+}
+
+func (d *UserDO) ToEntity() {}
+`
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContains(t, got, "// lead free comment", "块前游离注释应保留")
+	assertNotContains(t, got, "type (", "没有块内注释时应展开为独立声明")
+	assertContains(t, got, "type UserEntity struct {", "生成结构体应写入")
 	typeCheckGoSource(t, got)
 }
 
@@ -2084,7 +2315,7 @@ func fuzzExtraFragmentExpectations() map[string]string {
 // FuzzAssembleDDLFragment 校验类 DDL 片段与 tag 净化：
 // 独立参考模型推导 NULL/NOT NULL、DEFAULT（空串为 ”）与 EXTRA 白名单/顺序/精度；
 // EXTRA 另用独立字面量期望表锚定白名单语义；再经 buildStruct + go/parser +
-// reflect.StructTag 验证 tag 值完整还原（反引号按约定替换为单引号）。
+// reflect.StructTag 验证 tag 值完整还原（含反引号时使用解释型字符串字面量）。
 // 普通 go test 只运行种子；探索命令：
 //
 //	go test ./zcmodel -run '^$' -fuzz '^FuzzAssembleDDLFragment$' -fuzztime=30s
@@ -2166,15 +2397,13 @@ func FuzzAssembleDDLFragment(f *testing.F) {
 		tag := reflect.StructTag(fieldTagOf(file, "F"))
 		// buildStruct 仅在 Column.Type 非空时输出 ddl tag；Type 为空属手工构造边界。
 		if colType != "" {
-			wantTag := strings.ReplaceAll(got, "`", "'")
-			if value, ok := tag.Lookup("ddl"); !ok || value != wantTag {
-				t.Fatalf("ddl tag round-trip: got (%q,%v), want %q\nfragment=%q", value, ok, wantTag, got)
+			if value, ok := tag.Lookup("ddl"); !ok || value != got {
+				t.Fatalf("ddl tag round-trip: got (%q,%v), want %q\nfragment=%q", value, ok, got, got)
 			}
 		}
 		if comment != "" {
-			wantComment := strings.ReplaceAll(comment, "`", "'")
-			if value, ok := tag.Lookup("description"); !ok || value != wantComment {
-				t.Fatalf("description tag round-trip: got (%q,%v), want %q", value, ok, wantComment)
+			if value, ok := tag.Lookup("description"); !ok || value != comment {
+				t.Fatalf("description tag round-trip: got (%q,%v), want %q", value, ok, comment)
 			}
 		}
 	})

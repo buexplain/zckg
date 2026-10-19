@@ -13,7 +13,7 @@ zcmodel 是一个数据库模型代码生成模块：输入一张表的结构信
 - **三种方言**：内置 MySQL / PostgreSQL / SQLite 的列类型 → Go 类型映射表；
 - **命名自动转换**：任意风格的表名/列名（snake_case、camelCase、kebab-case 等）自动转为 Go 规范的 PascalCase，`id` 统一转为 `ID`；转换结果不是导出标识符（如中文列名）时报错，需显式指定名称；
 - **增量再生成（骨架保持式合并）**：目标文件已存在时，顶层声明的排列结构（有哪些声明、顺序、各自位置）原封不动，生成声明（Entity/DO 结构体、ToDO/ToEntity 方法）在各自原位替换为新内容，**用户自定义代码（含自定义方法、声明间的游离注释、`//go:generate` 等指令、行尾注释与文件尾注释）的内容与顺序原样保留在原位置**；整个产物最终经 gofmt 统一格式化（缩进、对齐、import 排序，声明间统一以一个空行分隔），因此首次再生成的 diff 可能同时包含用户区的格式类变更，之后保持稳定；生成代码不再引用的 import 被移除；
-- **tag 安全**：json、列映射、`ddl`、`description` 的 tag 值写入前经过转义净化，含反引号、换行、双引号的注释或列名不会破坏生成代码的语法；
+- **tag 安全**：json、列映射、`ddl`、`description` 的 tag 值写入前经过转义净化，含反引号、换行、双引号的注释或列名不会破坏生成代码的语法；含反引号时整个 tag 改用双引号解释型字符串字面量，反引号与列名原值完整保留；
 - **元数据快照**：可选的 `ddl` tag 呈现该列的类 DDL 列定义片段（类型 / 可空 / 默认值 / MySQL EXTRA），`primary_key` tag 标记主键列，`Input.Indexes` 渲染为结构体 doc 注释中的索引清单——使读模型文件的人与 AI 编码代理不必回查数据库即可看到表的面貌。元数据是**生成时刻的快照**，表结构变更后需重新生成才会刷新（不做运行时校验）。
 
 zcmodel 是纯代码生成工具，不连接数据库、不依赖数据库驱动。表结构信息可由调用方手工构造，也可通过 [zcdb](../../zcdb/docs/schema.md) 的 Schema 能力从真实数据库读取。
@@ -119,9 +119,10 @@ func Generate(input Input) error
 | `输出目录为空` | `OutputDir` 为空字符串 |
 | `创建输出目录失败: ...` | `OutputDir` 无法创建 |
 | `输出文件路径逃逸输出目录: xxx` | 输出路径经清理后不在 `OutputDir` 内（防御性二次校验） |
+| `生成结构体失败: import 别名冲突: ...` | 存量文件已把生成代码需要的本地包名绑定到另一路径（如 `time "other/time"`）；追加默认导入会形成重复绑定，故报错且不覆盖原文件 |
 | `生成结构体失败: ...` | 目标文件存在但无法被 `go/parser` 解析（用户代码有语法错误）、生成产物未通过落盘前语法自校验等写文件失败场景；内部错误（`解析文件失败` / `创建临时文件失败` / `写入临时文件失败` / `设置文件权限失败` / `关闭临时文件失败` / `替换目标文件失败` / `生成代码存在语法错误`）均统一包裹为该错误 |
 
-> 上表错误文本中的列名、字段名、结构体名前缀与列映射 tag 名以 `%q` 格式输出（带双引号，如 `列 "2fa_code" …`），表名与文件名以原样输出。
+> 上表错误文本中的列名、字段名、结构体名前缀与列映射 tag 名以 `%q` 格式输出（带双引号，如 `列 "2fa_code" …`）；表名与文件名通常原样输出，但非法 UTF-8 名称以 `%q` 输出（转义非法字节，避免日志与终端出现裸非法字节）。
 
 ### Input
 
@@ -155,7 +156,7 @@ type Column struct {
 type StructFieldInfo struct {
     Name         string // 结构体字段名；留空则由列名自动推导（ToPascalCase）
     Type         string // 结构体字段类型；留空则由列类型自动映射（未命中兜底 string）
-    Import       string // Type 对应的 import 路径（如 time.Time 需 "time"）；留空不引入包
+    Import       string // Type 对应的 import 路径（如 time.Time 需 "time"）；留空时仅 time.Time 自动补 "time"，其余不引入包
     JsonTagValue string // json tag 的值；非空时直接使用（JsonTagValueCase 为空也会生成）；留空时按 JsonTagValueCase 自动推导
 }
 
@@ -224,7 +225,7 @@ imports
 
 - tag 顺序固定为：**json → {ColumnTagName} → primary_key → ddl → description**，各 tag 数据为空时跳过：
   - `json` tag 仅在 `JsonTagValue` 非空时生成；
-  - `{ColumnTagName}` tag 仅在 `ColumnTagName` 非空时生成（避免产生空 tag 名 `:"colname"`）；tag 值为列名，经 `sanitizeTagValue` 净化（见「注释净化」）；
+  - `{ColumnTagName}` tag 仅在 `ColumnTagName` 非空时生成（避免产生空 tag 名 `:"colname"`）；tag 值为列名，经 `formatStructTag` 转义（见「注释净化」）；
   - `primary_key:"true"` 仅在 `Column.PrimaryKey` 为 true 时生成（联合主键多列均标记）；主键在 DDL 中是表级约束，不并入 `ddl` 片段，另由 doc 注释的索引块呈现；
   - `ddl` tag 仅在 `Column.Type` 非空时生成（规则见下方「ddl 片段」）；
   - `description` tag 仅在列注释非空时生成；
@@ -307,6 +308,8 @@ type UserOrderDO struct {
 //   - UNIQUE KEY uk_order_no (order_no)
 //   - KEY idx_user_status (user_id, status)
 type UserOrderDO struct {
+	// 字段定义略
+}
 ```
 
 - **排序固定**：PRIMARY → UNIQUE（索引名字典序）→ 普通（索引名字典序），输出稳定利于 git diff 与 golden 断言；
@@ -413,9 +416,9 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
    - 生成声明槽位（内部由 `isGeneratedTypeSpec` / `isGeneratedMethod` 判定，含值接收者版本与括号包裹的接收者）在原位替换为新内容；
    - 用户声明（含 Entity/DO 上的自定义方法，指针/值接收者均识别，含括号包裹的接收者）的内容与顺序保留在原位置，**不再归位**到生成代码之后（整体仍会经 gofmt 重新格式化）；
    - **注释随声明原位保留**：每个声明的截取区间为「上一节点结束 → 本声明结束（含同行尾注释）」，声明之间的游离注释（含 `//go:generate` 等指令）内容保留在原位置；被移除的重复生成声明的游离注释顺延给下一个保留声明；只有被替换的生成声明自身区间内的注释（旧 doc、旧尾注释）随之丢弃；
-4. **type 声明块按 Spec 粒度处理**：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，用户类型（含各自注释）与块内不附着于任何 Spec 的游离注释内容与位置保留；仅含一个生成 Spec 的声明以独立声明形态输出（不保留括号块）；
-5. **缺失生成声明的配对落点**：Entity 结构体↔ToDO、DO 结构体↔ToEntity 互为配对，结构体缺失补在其方法前、方法缺失补在其结构体后；两个都缺或都无配对时追加到最后一个生成声明之后（无任何生成声明时置于首个用户声明之前），标准顺序为 Entity 结构体 → ToDO → DO 结构体 → ToEntity；同类生成声明出现多份时（如用户手写的值接收者 ToDO 与生成的指针接收者 ToDO 共存，或同一 type 块内重复的生成 Spec），首个槽位（块内为首个 Spec）原位替换、其余重复槽位（Spec）移除；
-6. **补齐与移除 import**：生成代码所需的包（如 `time`）若文件中缺失，自动补充并合并进原第一个 import 块（避免形成两个 import 块）；存量文件以**别名导入**（含 `_`、`.` 导入）所需包时不视为已存在，仍会补充默认导入（生成代码引用默认包名，两种导入可合法共存）。反向地，旧生成代码引用过、而新生成代码与保留的用户代码都不再引用的 import 会被移除（如删去最后一个时间列后的 `time`），块内导入全部移除时整个 import 声明一并移除；`_`、`.` 导入、`"C"` 以及路径末段无法确定包名的导入（如 `gopkg.in/yaml.v3`、主版本后缀 `/v2`）不做移除；
+4. **type 声明块按 Spec 粒度处理**：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，用户类型（含各自注释）与块内不附着于任何 Spec 的游离注释内容与位置保留；仅含一个生成 Spec 且块内没有游离注释、也没有块级 Doc 的声明以独立声明形态输出（不保留括号块），存在这些注释时保留括号块以保住注释；
+5. **缺失生成声明的配对落点**：Entity 结构体↔ToDO、DO 结构体↔ToEntity 互为配对，结构体缺失补在其方法前、方法缺失补在其结构体后；两个都缺或都无配对时追加到最后一个生成声明之后（无任何生成声明时置于首个用户声明之前），标准顺序为 Entity 结构体 → ToDO → DO 结构体 → ToEntity；当结构体位于同一个 `type (...)` 块内时，槽位是整个块，结构体缺失补在块前、方法缺失补在块后，不插入块内，上述标准顺序只在独立声明之间保证；同类生成声明出现多份时（如用户手写的值接收者 ToDO 与生成的指针接收者 ToDO 共存，或同一 type 块内重复的生成 Spec），首个槽位（块内为首个 Spec）原位替换、其余重复槽位（Spec）移除；
+6. **补齐与移除 import**：生成代码所需的包（如 `time`）若文件中缺失，自动补充并合并进原第一个 import 块（避免形成两个 import 块）；存量文件以**不同名的具名别名**（以及 `_`、`.` 导入）导入所需包时不视为已存在，仍会补充默认导入；若别名恰好等于默认包名（如 `time "time"`），该导入已满足生成代码，不再重复追加；若同一本地名已绑定到其他路径，则返回“import 别名冲突”错误且不写文件。反向地，旧生成代码引用过、而新生成代码与保留的用户代码都不再引用的 import 会被移除（如删去最后一个时间列后的 `time`），块内导入全部移除时整个 import 声明一并移除；`_`、`.` 导入、`"C"` 以及路径末段无法确定包名的导入（如 `gopkg.in/yaml.v3`、主版本后缀 `/v2`）不做移除；
 7. **落盘保障**：全部处理成功后，对完整内容执行 `go/format.Source` 语法自校验，再经同目录临时文件 + rename 原子替换目标文件（见下方“落盘安全三重防线”）。
 
 特殊情形：文件不存在或内容为空白时，按新建处理（包名取输出目录绝对路径的末级目录名，相对路径 `.` 也解析为实际目录名；位于根目录等无法推导时回退 `main`）。存量文件再生成时：package 声明之前的原文（build tags、文件级注释）与原 package 行按原文前置保留，包名不强制改为目录推导值；产物不追加任何声明块。
@@ -426,15 +429,15 @@ func (d *UserOrderDO) ToEntity(userOrderEntity ...*UserOrderEntity) *UserOrderEn
 2. **原子写入**：`writeFileAtomic` 在同目录创建临时文件写入后 rename 覆盖目标（Windows 上 rename 可直接覆盖已存在文件），进程中断/磁盘满不留半文件，且保留目标文件原权限位；
 3. **存量文件解析失败不覆盖**：已有文件无法被 `go/parser` 解析时直接报错返回，绝不覆盖用户代码。
 
-### 注释净化（sanitizeTagValue）
+### 注释净化（formatStructTag）
 
-全部 tag 值（`json`、列映射 tag 的列名、`ddl`、`description`）写入前均经 `strconv.Quote` 转义并将反引号替换为单引号，保证：
+全部 tag 值（`json`、列映射 tag 的列名、`ddl`、`description`）写入前均经 `strconv.Quote` 转义，保证：
 
-- 反引号不会提前终止 tag 的反引号字符串（语法错误）；
+- 常规 tag 使用反引号原始字符串；任一 tag 键或值含反引号时，整个 tag 改用双引号解释型字符串字面量，反引号与列名原值完整保留，不会提前终止 tag；
 - 换行、回车等控制字符转为 `\n`、`\r` 转义序列，`reflect.StructTag.Lookup` 可完整还原原值；
 - 双引号转义为 `\"`，不会被误认为 tag 值的分隔符。
 
-`ddl` 片段的 tag 值同样经此净化（enum 值域的单引号在 tag 值中合法、原样保留；双引号与反斜杠被转义）。
+`ddl` 片段的 tag 值同样经此转义（enum 值域的单引号在 tag 值中合法、原样保留；双引号与反斜杠被转义）。
 
 此外，进入 **doc 注释**的表注释、索引名与索引列文本经换行净化（`\n`/`\r` → 空格）：注释无法转义，含换行的文本会被撑断成裸行而导致生成代码语法错误（落盘自校验会报错，但根因难定位），故在组装注释时统一净化。同时，gofmt 会把 doc 注释中连续两个单引号或连续两个反引号规范化为弯引号（如 enum 空串值域、SQL 字面量中的成对引号），因此净化时在相邻两个引号之间插入零宽空格（U+200B），使注释在 gofmt 前后保持一致、读起来与原文相同（注释中会多出不可见字符，复制回 SQL 时需留意）。
 
@@ -562,15 +565,18 @@ func main() {
 
 ```go
 // JSON 列映射为自定义类型、特殊命名等场景，预先填好 StructFieldInfo 即可
-columns := []*zcmodel.Column{
-	{
-		Name: "extra", Type: "json", Comment: "扩展信息",
-		StructFieldInfo: zcmodel.StructFieldInfo{
-			Name:   "Extra",
-			Type:   "map[string]any", // 手工指定类型，跳过映射表
-			Import: "",                // 内置类型无需 import
+func example() {
+	columns := []*zcmodel.Column{
+		{
+			Name: "extra", Type: "json", Comment: "扩展信息",
+			StructFieldInfo: zcmodel.StructFieldInfo{
+				Name:   "Extra",
+				Type:   "map[string]any", // 手工指定类型，跳过映射表
+				Import: "",                // 内置类型无需 import
+			},
 		},
-	},
+	}
+	_ = columns
 }
 ```
 

@@ -114,6 +114,42 @@ func TestGenerate_JsonTagValueWithSpecialChars(t *testing.T) {
 	}
 }
 
+// TestGenerate_BacktickColumnNamePreserved 端到端验证含反引号的列名：
+// 生成文件可解析/编译，列映射 tag 与 json tag 都完整保留反引号（tag 使用解释型字符串字面量）。
+func TestGenerate_BacktickColumnNamePreserved(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "model")
+	if err := Generate(Input{
+		OutputDir:        dir,
+		Dialect:          DialectPostgres,
+		TableName:        "weird_column",
+		ColumnTagName:    "db",
+		JsonTagValueCase: NameCaseLowerCamel,
+		Columns: []*Column{{
+			Name:            "a`b",
+			Type:            "text",
+			StructFieldInfo: StructFieldInfo{Name: "AB"},
+		}},
+	}); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "weird_column.go"))
+	if err != nil {
+		t.Fatalf("读取生成文件失败: %v", err)
+	}
+	typeCheckGoSource(t, string(content))
+	file, err := parser.ParseFile(token.NewFileSet(), "weird_column.go", content, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("生成文件存在语法错误: %v\n%s", err, content)
+	}
+	tag := reflect.StructTag(fieldTagOf(file, "AB"))
+	if got := tag.Get("db"); got != "a`b" {
+		t.Errorf("db tag 未完整保留列名: got %q, want %q", got, "a`b")
+	}
+	if got := tag.Get("json"); got != "a`b" {
+		t.Errorf("json tag 未完整保留列名: got %q, want %q", got, "a`b")
+	}
+}
+
 // TestGenerate_ExplicitJsonTagWithEmptyCase 锁定「显式优先」：全局 JsonTagValueCase 为空
 // （不自动生成 json tag）时，单列显式指定的 StructFieldInfo.JsonTagValue 仍会生成 json tag；
 // 未显式指定的列则完全不生成 json tag。
@@ -581,9 +617,10 @@ func TestGenerate_InvalidUTF8Name(t *testing.T) {
 		tableName string
 		fileName  string
 		wantErr   string
+		wantExact string
 	}{
-		{"表名非法 UTF-8", "user\x8e", "", "表名不是合法的 UTF-8"},
-		{"显式文件名非法 UTF-8", "user", "user\x8e", "文件名不是合法的 UTF-8"},
+		{"表名非法 UTF-8", "user\x8e", "", "表名不是合法的 UTF-8", fmt.Sprintf("表名不是合法的 UTF-8: %q", "user\x8e")},
+		{"显式文件名非法 UTF-8", "user", "user\x8e", "文件名不是合法的 UTF-8", fmt.Sprintf("文件名不是合法的 UTF-8: %q", "user\x8e")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -600,6 +637,10 @@ func TestGenerate_InvalidUTF8Name(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("错误信息应包含 %q，实际: %v", tt.wantErr, err)
+			}
+			// 精确锁定错误文本格式：非法 UTF-8 名称以 %q 输出（带引号、转义非法字节）
+			if err.Error() != tt.wantExact {
+				t.Errorf("错误文本格式不符\nwant: %s\ngot:  %s", tt.wantExact, err.Error())
 			}
 			if after := snapshotFiles(t, base); !reflect.DeepEqual(after, before) {
 				t.Errorf("非法 UTF-8 名称生成了文件\nbefore: %v\nafter:  %v", before, after)
@@ -1585,7 +1626,8 @@ func fuzzShouldTypeCheck(src []byte) bool {
 }
 
 // fuzzAssertGeneratedStruct 校验生成的 Entity/DO 结构体：字段数量、顺序、名称、类型与 tag
-// 必须与输入列一致；tag 经 reflect.StructTag 语义读取，反引号按 sanitizeTagValue 约定替换为单引号。
+// 必须与输入列一致；tag 字面量先经 strconv.Unquote 解码（兼容反引号原始字符串与含反引号时的
+// 双引号解释型字符串），再经 reflect.StructTag 语义读取，值必须与输入逐字一致。
 func fuzzAssertGeneratedStruct(t *testing.T, file *ast.File, name string, columns []*Column, do bool, dialect Dialect, columnTag string, jsonCase NameCase) {
 	t.Helper()
 	st := fuzzFindGeneratedStruct(t, file, name)
@@ -1630,10 +1672,14 @@ func fuzzAssertGeneratedStruct(t *testing.T, file *ast.File, name string, column
 
 		tag := reflect.StructTag("")
 		if field.Tag != nil {
-			tag = reflect.StructTag(strings.Trim(field.Tag.Value, "`"))
+			tagText, err := strconv.Unquote(field.Tag.Value)
+			if err != nil {
+				t.Fatalf("%s field %q tag literal cannot be unquoted: %v", name, fieldName, err)
+			}
+			tag = reflect.StructTag(tagText)
 		}
 		if columnTag != "" {
-			want := strings.ReplaceAll(column.Name, "`", "'")
+			want := column.Name
 			got, ok := tag.Lookup(columnTag)
 			if want == "" {
 				if ok {
@@ -1644,7 +1690,7 @@ func fuzzAssertGeneratedStruct(t *testing.T, file *ast.File, name string, column
 			}
 		}
 		if jsonCase != "" {
-			want := strings.ReplaceAll(formatJSONTag(column.Name, jsonCase), "`", "'")
+			want := formatJSONTag(column.Name, jsonCase)
 			got, ok := tag.Lookup("json")
 			if want == "" {
 				if ok {
@@ -1664,7 +1710,7 @@ func fuzzAssertGeneratedStruct(t *testing.T, file *ast.File, name string, column
 			t.Fatalf("%s field %q unexpectedly has primary_key tag", name, fieldName)
 		}
 		if column.Type != "" {
-			want := strings.ReplaceAll(assembleDDLFragment(*column), "`", "'")
+			want := assembleDDLFragment(*column)
 			if got, ok := tag.Lookup("ddl"); !ok || got != want {
 				t.Fatalf("%s field %q ddl tag = (%q,%v), want %q", name, fieldName, got, ok, want)
 			}
@@ -1672,7 +1718,7 @@ func fuzzAssertGeneratedStruct(t *testing.T, file *ast.File, name string, column
 			t.Fatalf("%s field %q unexpectedly has ddl tag", name, fieldName)
 		}
 		if column.Comment != "" {
-			want := strings.ReplaceAll(column.Comment, "`", "'")
+			want := column.Comment
 			if got, ok := tag.Lookup("description"); !ok || got != want {
 				t.Fatalf("%s field %q description tag = (%q,%v), want %q", name, fieldName, got, ok, want)
 			}
