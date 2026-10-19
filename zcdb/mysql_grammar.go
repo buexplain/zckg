@@ -185,8 +185,9 @@ func (g *MySQLGrammar) CompileSelect(b *Builder, columns []SelectColumn) string 
 
 		// OFFSET
 		if b.offset > 0 {
-			// MySQL 的 OFFSET 必须配合 LIMIT，无 LIMIT 时使用最大行数
-			if b.limit == 0 {
+			// MySQL 的 OFFSET 必须配合 LIMIT：Limit 未设置或 <=0（按约定不输出 LIMIT）时
+			// 使用最大行数补位，否则只剩 OFFSET 的语句会被 MySQL 判为语法错误（Error 1064）
+			if b.limit <= 0 {
 				sb.WriteString(" LIMIT 18446744073709551615")
 			}
 			sb.WriteString(" OFFSET ")

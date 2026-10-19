@@ -4,10 +4,14 @@
 
 Schema 元数据查询**不自动追加 SQL 注释**，即使 DAO 第五参数配置了默认短业务标识也不追加；默认注释仅影响 Builder 的最终编译 SQL。`TableInfo.Comment` / `ColumnInfo.Comment` 是数据库中的表/列说明，与 `Builder.Comment` 的 SQL 尾部业务标识不同，模型生成行为不受影响。慢 SQL 回调仍可观察 Schema 实际执行的原始 SQL。
 
+> 本文档的 Go 示例统一包在 `func example()` 中，仅用于语法检查与上下文占位（`db`、`ctx` 等是外部变量），不保证可独立运行；可编译性由 `docs_examples_compile_test.go` 单独校验。
+
 ```go
-inspector, err := db.Schema()
-if err != nil {
-	panic(err)
+func example() {
+	inspector, err := db.Schema()
+	if err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -18,9 +22,11 @@ if err != nil {
 返回当前数据库（MySQL 为当前库、PostgreSQL 为 public schema）中所有基础表的名称与注释：
 
 ```go
-tables, err := inspector.Tables(ctx)
-for _, t := range tables {
-	fmt.Println(t.Name, t.Comment)
+func example() {
+	tables, err := inspector.Tables(ctx)
+	for _, t := range tables {
+		fmt.Println(t.Name, t.Comment)
+	}
 }
 ```
 
@@ -57,10 +63,12 @@ ORDER BY "name"
 返回指定表的所有字段元数据，按字段定义顺序排列：
 
 ```go
-columns, err := inspector.Columns(ctx, "users")
-for _, c := range columns {
-	fmt.Printf("%s %s nullable=%v default=%v comment=%s primary=%v extra=%s\n",
-		c.Name, c.Type, c.Nullable, c.Default, c.Comment, c.PrimaryKey, c.Extra)
+func example() {
+	columns, err := inspector.Columns(ctx, "users")
+	for _, c := range columns {
+		fmt.Printf("%s %s nullable=%v default=%v comment=%s primary=%v extra=%s\n",
+			c.Name, c.Type, c.Nullable, c.Default, c.Comment, c.PrimaryKey, c.Extra)
+	}
 }
 ```
 
@@ -122,9 +130,11 @@ PRAGMA table_info("users")
 返回指定表的索引元数据（主键、唯一、普通索引），`Columns` 按索引定义顺序聚合：
 
 ```go
-indexes, err := inspector.Indexes(ctx, "users")
-for _, idx := range indexes {
-	fmt.Printf("%s unique=%v primary=%v columns=%v\n", idx.Name, idx.Unique, idx.Primary, idx.Columns)
+func example() {
+	indexes, err := inspector.Indexes(ctx, "users")
+	for _, idx := range indexes {
+		fmt.Printf("%s unique=%v primary=%v columns=%v\n", idx.Name, idx.Unique, idx.Primary, idx.Columns)
+	}
 }
 ```
 
@@ -189,45 +199,47 @@ PRAGMA index_info("idx_name") -- seqno, cid, name
 ## 完整示例
 
 ```go
-inspector, err := db.Schema()
-if err != nil {
-	return err
-}
+func example() {
+	inspector, err := db.Schema()
+	if err != nil {
+		return err
+	}
 
-// 遍历所有表及其字段与索引，输出类似建表清单的信息
-tables, err := inspector.Tables(ctx)
-if err != nil {
-	return err
-}
-for _, t := range tables {
-	fmt.Printf("表 %s（%s）:\n", t.Name, t.Comment)
-	columns, err := inspector.Columns(ctx, t.Name)
+	// 遍历所有表及其字段与索引，输出类似建表清单的信息
+	tables, err := inspector.Tables(ctx)
 	if err != nil {
 		return err
 	}
-	for _, c := range columns {
-		null := "NOT NULL"
-		if c.Nullable {
-			null = "NULL"
+	for _, t := range tables {
+		fmt.Printf("表 %s（%s）:\n", t.Name, t.Comment)
+		columns, err := inspector.Columns(ctx, t.Name)
+		if err != nil {
+			return err
 		}
-		key := ""
-		if c.PrimaryKey {
-			key = " PRIMARY KEY"
+		for _, c := range columns {
+			null := "NOT NULL"
+			if c.Nullable {
+				null = "NULL"
+			}
+			key := ""
+			if c.PrimaryKey {
+				key = " PRIMARY KEY"
+			}
+			fmt.Printf("  %s %s %s%s\n", c.Name, c.Type, null, key)
 		}
-		fmt.Printf("  %s %s %s%s\n", c.Name, c.Type, null, key)
-	}
-	indexes, err := inspector.Indexes(ctx, t.Name)
-	if err != nil {
-		return err
-	}
-	for _, idx := range indexes {
-		kind := "KEY"
-		if idx.Primary {
-			kind = "PRIMARY KEY"
-		} else if idx.Unique {
-			kind = "UNIQUE KEY"
+		indexes, err := inspector.Indexes(ctx, t.Name)
+		if err != nil {
+			return err
 		}
-		fmt.Printf("  %s %s (%s)\n", kind, idx.Name, strings.Join(idx.Columns, ", "))
+		for _, idx := range indexes {
+			kind := "KEY"
+			if idx.Primary {
+				kind = "PRIMARY KEY"
+			} else if idx.Unique {
+				kind = "UNIQUE KEY"
+			}
+			fmt.Printf("  %s %s (%s)\n", kind, idx.Name, strings.Join(idx.Columns, ", "))
+		}
 	}
 }
 ```

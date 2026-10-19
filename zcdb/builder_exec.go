@@ -7,7 +7,7 @@ package zcdb
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 )
@@ -62,7 +62,7 @@ func (b *Builder) InsertGetId(ctx context.Context, data any) (int64, error) {
 
 	// lib/pq 不支持 LastInsertId：在执行前返回错误，避免「插入成功但返回错误」的半成功状态
 	if _, ok := b.grammar.(*PostgresGrammar); ok {
-		return 0, errors.New("zcdb: InsertGetId is not supported on postgres dialect (lib/pq does not support LastInsertId); use Insert or raw SQL with RETURNING instead")
+		return 0, fmt.Errorf("%w (lib/pq does not support LastInsertId); use Insert or raw SQL with RETURNING instead", ErrInsertGetIdUnsupported)
 	}
 
 	result, err := b.dao.Exec(ctx, sqlStr, args...)

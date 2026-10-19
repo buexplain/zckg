@@ -10,6 +10,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -835,5 +840,100 @@ func TestDocReview_QueryExecMd_TerminalSemantics(t *testing.T) {
 	}
 	if len(sqls) != 2 || !strings.HasPrefix(sqls[0], "SELECT COUNT(*) FROM") {
 		t.Errorf("Paginate 应先执行 COUNT: %v", sqls)
+	}
+}
+
+// errSentinelNameRE 匹配导出哨兵命名（Err 开头 + 大写字母，避免把 errXxx 之类内部变量算进去）。
+var errSentinelNameRE = regexp.MustCompile(`^Err[A-Z][A-Za-z0-9]*$`)
+
+// readmeErrCellRE 提取 README 错误表首列中的反引号哨兵名（兼容 `A` / `B` 合并写法）。
+var readmeErrCellRE = regexp.MustCompile("`(Err[A-Z][A-Za-z0-9]*)`")
+
+// exportedErrSentinels 用 go/ast 枚举 errors.go 中所有以 Err 开头的导出包级变量。
+// 直接解析源码而不是在测试里维护一份清单，新增哨兵忘写文档时才能报红。
+func exportedErrSentinels(path string) (map[string]bool, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool)
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for _, name := range valueSpec.Names {
+				if errSentinelNameRE.MatchString(name.Name) {
+					out[name.Name] = true
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// readmeErrorTableSentinels 提取 README「错误变量速查」表首列列出的哨兵名。
+// 只解析该二级章节内的表格首列，忽略表格解释列与其他章节的散文提及。
+func readmeErrorTableSentinels(path string) (map[string]bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	inSection := false
+	out := make(map[string]bool)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## ") {
+			inSection = trimmed == "## 错误变量速查"
+			continue
+		}
+		if !inSection || !strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(trimmed, "|"), "|")
+		if len(cells) == 0 {
+			continue
+		}
+		for _, match := range readmeErrCellRE.FindAllStringSubmatch(cells[0], -1) {
+			out[match[1]] = true
+		}
+	}
+	return out, nil
+}
+
+// TestDocReview_ErrorTableMatchesExportedSentinels 锁死 README「错误变量速查」表与 errors.go 的导出哨兵一致：
+// 两侧集合必须相等——新增哨兵未写表、或表里残留已删除/改名的哨兵都会失败。
+func TestDocReview_ErrorTableMatchesExportedSentinels(t *testing.T) {
+	codeSentinels, err := exportedErrSentinels("errors.go")
+	if err != nil {
+		t.Fatalf("解析 errors.go 失败: %v", err)
+	}
+	if len(codeSentinels) == 0 {
+		t.Fatal("errors.go 中未找到任何导出 Err 变量")
+	}
+	docSentinels, err := readmeErrorTableSentinels("docs/README.md")
+	if err != nil {
+		t.Fatalf("解析 docs/README.md 失败: %v", err)
+	}
+	if len(docSentinels) == 0 {
+		t.Fatal("README 错误变量速查表未解析到任何 Err 变量")
+	}
+
+	for name := range codeSentinels {
+		if !docSentinels[name] {
+			t.Errorf("哨兵 %s 已导出但未写入 README 错误变量速查表", name)
+		}
+	}
+	for name := range docSentinels {
+		if !codeSentinels[name] {
+			t.Errorf("README 错误变量速查表列出的 %s 在 errors.go 中不存在", name)
+		}
 	}
 }

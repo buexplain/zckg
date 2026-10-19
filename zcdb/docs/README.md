@@ -11,6 +11,8 @@ zcdb 是一个基于 `database/sql` 的数据库访问模块，核心是 **Build
 
 zcdb 本身不依赖具体数据库驱动，需由使用方引入 `database/sql` 驱动并传入驱动名。
 
+> 本文档的 Go 示例统一包在 `func example()` 中，仅用于语法检查与上下文占位（`db`、`ctx` 等是外部变量），不保证可独立运行；可编译性由 `docs_examples_compile_test.go` 单独校验。快速上手为完整程序，仅省略了 `package` 子句。
+
 ## 架构
 
 ```
@@ -69,7 +71,7 @@ zcdb 测试使用的驱动组合（可按需替换为任意 `database/sql` 驱�
 默认值随新 Builder 复制，`Comment` 可覆盖或用空文本清除，`Clone` 保留当前值。注释会把 `unicode.IsControl` 控制字符、`*`、`/` 与 `\` 替换为空格、去首尾空白并按 255 rune 截断，属于有损保存；不得透传外部输入、请求体或秘密。完整生命周期见[查询构造](query-builder.md)的 Comment 小节，DAO 级别的默认值与不可变语义见[连接与 DAO](connection.md)。
 
 ```go
-package main
+// 完整程序：实际运行请置于 package main 中（此处省略 package 子句以便文档语法检查）
 
 import (
 	"context"
@@ -143,12 +145,12 @@ func main() {
 
 ## 错误变量速查
 
-所有错误均为可导出的 `errors` 变量，可用 `errors.Is` 精确匹配：
+下表列出 zcdb 自身产生的可导出哨兵错误，均可用 `errors.Is` 精确匹配；驱动/数据库返回的错误原样透传或经 `%w` 包装，同样可用 `errors.Is` 匹配到驱动错误：
 
 | 变量 | 触发场景 |
 |---|---|
 | `ErrEmptyTable` | 未设置表名（Table/TableSub）就编译或执行 |
-| `ErrInvalidStruct` | Insert/Update 传入了非结构体类型 |
+| `ErrInvalidStruct` | Insert/Update/InsertGetId 数据不是结构体（或其指针/切片），或 ScanStruct 切片元素非法 |
 | `ErrNoFields` | 写入或 Pluck keyBy 映射没有可用导出字段（无可导出字段，或全部字段为 nil/不可用） |
 | `ErrEmptyData` | 插入数据为空 |
 | `ErrInvalidOperator` | 运算符不在白名单内 |
@@ -161,6 +163,7 @@ func main() {
 | `ErrPluckColumns` | Pluck 列数不匹配：切片/keyBy map 需 1 列，标量 map 需 2 列 |
 | `ErrDeleteWithoutWhere` / `ErrUpdateWithoutWhere` | 无有效限定条件的 Delete/Update 被保护机制拒绝 |
 | `ErrDeleteWithJoin` | 普通 Delete 带 JOIN（应使用 DeleteJoin） |
+| `ErrWriteOrderLimitUnsupported` | 写语句携带 ORDER BY/LIMIT，但方言或语句形态不支持（PG/SQLite 写语句、MySQL 多表 UPDATE 与 DeleteJoin） |
 | `ErrIncrementColumns` | Increment/Decrement 参数不成对，或 columns/amounts 为空、长度不等 |
 | `ErrInsertUsingColumnMismatch` | InsertUsing/InsertOrIgnoreUsing 的目标列数与子查询 SELECT 列数不一致（子查询列数可静态判定时） |
 | `ErrRawPlaceholderMismatch` | `CompileRaw` 的原始 SQL 占位符数量或 `$N` 编号与参数个数不一致 |
@@ -169,12 +172,20 @@ func main() {
 | `ErrDeleteJoinNoJoin` | DeleteJoin 没有任何 JOIN |
 | `ErrPgUnionLockNotSupported` | PostgreSQL 下 UNION + 锁 |
 | `ErrSQLiteLockNotSupported` | SQLite 下使用锁子句 |
-| `ErrNotPointer` / `ErrNotStruct` | 游标迭代目标不是结构体指针 |
+| `ErrNotPointer` / `ErrNotStruct` | ScanStruct / Cursor / CursorBy 的 dest 不是指针 / 不是结构体指针 |
 | `ErrCursorFieldNotFound` | 游标列在目标结构体中找不到对应字段 |
 | `ErrCursorFieldUnavailable` | 游标列字段不可用（nil 嵌入指针） |
 | `ErrCursorColumnNull` | 游标列值为 NULL，无法继续分页 |
 | `ErrScanDest` | Scan 目标类型非法（必须是结构体或切片指针） |
 | `ErrScanConvert` | Scan 结果值类型转换失败 |
 | `ErrTxOwnerMismatch` | 事务 context 被传给另一 Pool 的 DAO |
+| `ErrTxBegin` | 开启事务失败（底层错误仍可 `errors.Is`） |
+| `ErrTxCommit` | 提交事务失败（底层错误仍可 `errors.Is`） |
+| `ErrTxRollback` | 回滚事务失败（底层错误仍可 `errors.Is`） |
+| `ErrInsertGetIdUnsupported` | PostgreSQL 方言调用 `InsertGetId`（lib/pq 无 `LastInsertId`） |
+| `ErrDriverNameRequired` | `NewPool` 缺少 DriverName |
+| `ErrDSNRequired` | `NewPool` 缺少 DSN |
+| `ErrPoolConnect` | 主库或从库打开、Ping 失败（底层驱动错误仍可 `errors.Is`） |
+| `ErrPoolClosed` | 连接池已关闭后调用 `AddSlave` |
 | `ErrDialectRequired` / `ErrUnknownDialect` / `ErrPoolRequired` | DAO 创建参数错误 |
 | `ErrSchemaGrammarNotSupported` | 用非内置方言的 Grammar 创建 SchemaInspector（仅内置三方言，消息带出实际类型） |

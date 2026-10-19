@@ -3,7 +3,9 @@
 package zcdb
 
 import (
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -246,4 +248,110 @@ func (g *commentPanicGrammar) CompileSelect(b *Builder, _ []SelectColumn) string
 	}
 	// 不使用真实 Grammar 编译未知 WHERE 类型，确保 panic 来自绑定收集阶段。
 	return "SELECT 1"
+}
+
+// TestMySQLGrammar_WriteOrderLimit 验证写语句 ORDER BY/LIMIT 的编译期校验：
+// MySQL 单表 UPDATE/DELETE 支持该语法，保持原样编译（按序只改/删前 N 行）；
+// 多表 UPDATE（带 JOIN）会被引擎以 Error 1221 拒绝，DeleteJoin 同样不支持，
+// 两者在编译期返回 ErrWriteOrderLimitUnsupported，避免执行期才失败。
+func TestMySQLGrammar_WriteOrderLimit(t *testing.T) {
+	g := NewMySQLGrammar()
+	type updateData struct {
+		Name string `db:"name"`
+	}
+
+	t.Run("single_update_allowed", func(t *testing.T) {
+		sqlStr, args, err := newTestBuilder(g, nil).Table("users").Where("id", ">", 0).
+			OrderBy("id", "DESC").Limit(2).ToUpdate(updateData{Name: "x"})
+		assertNoError(t, err)
+		assertSQL(t, "UPDATE `users` SET `name` = ? WHERE `id` > ? ORDER BY `id` DESC LIMIT 2", sqlStr)
+		assertArgs(t, []any{"x", 0}, args)
+	})
+
+	t.Run("single_delete_allowed", func(t *testing.T) {
+		sqlStr, _, err := newTestBuilder(g, nil).Table("users").Where("id", ">", 0).
+			OrderByRaw("id DESC").Limit(2).ToDelete()
+		assertNoError(t, err)
+		assertSQL(t, "DELETE FROM `users` WHERE `id` > ? ORDER BY id DESC LIMIT 2", sqlStr)
+	})
+
+	t.Run("multi_update_rejected", func(t *testing.T) {
+		_, _, err := newTestBuilder(g, nil).Table("users").
+			Join("profiles", "profiles.user_id", "=", "users.id").
+			Where("users.id", ">", 0).OrderBy("users.id").Limit(1).
+			ToUpdate(updateData{Name: "x"})
+		if !errors.Is(err, ErrWriteOrderLimitUnsupported) {
+			t.Fatalf("多表 UPDATE + ORDER BY/LIMIT 应返回 ErrWriteOrderLimitUnsupported，got %v", err)
+		}
+		if !strings.Contains(err.Error(), "multi-table") {
+			t.Errorf("错误消息应指出多表形态: %v", err)
+		}
+	})
+
+	t.Run("delete_join_rejected", func(t *testing.T) {
+		_, _, err := newTestBuilder(g, nil).Table("users").
+			Join("orders", "orders.user_id", "=", "users.id").
+			Where("orders.status", "=", "paid").Limit(1).ToDeleteJoin()
+		if !errors.Is(err, ErrWriteOrderLimitUnsupported) {
+			t.Fatalf("DeleteJoin + LIMIT 应返回 ErrWriteOrderLimitUnsupported，got %v", err)
+		}
+	})
+}
+
+// TestMySQLGrammar_ExpressionPlaceholderBoundary 锁死 compile.md「占位符边界」矩阵在 MySQL 的形态：
+// Expression 内嵌的 `?` 在所有路径（WHERE/HAVING/IN/LIKE/NULL 安全比较、Raw 绑定、JOIN ON 值、
+// UPDATE SET、INSERT VALUES）都原样保留（MySQL 没有 $N 转换），且 Expression 不新增绑定参数。
+func TestMySQLGrammar_ExpressionPlaceholderBoundary(t *testing.T) {
+	expr := NewExpression("a ? b")
+	users := func(g Grammar) *Builder { return newTestBuilder(g, nil).Table("users") }
+	orders := func(g Grammar) *Builder { return newTestBuilder(g, nil).Table("orders") }
+	cases := []exprPlaceholderCase{
+		{"where", func(g Grammar) *Builder {
+			return users(g).Where("id", "=", expr)
+		}, (*Builder).ToSelect, "SELECT * FROM `users` WHERE `id` = a ? b", nil},
+		{"where_in", func(g Grammar) *Builder {
+			return users(g).WhereIn("id", []any{expr})
+		}, (*Builder).ToSelect, "SELECT * FROM `users` WHERE `id` IN (a ? b)", nil},
+		{"where_like", func(g Grammar) *Builder {
+			return users(g).WhereLike("name", expr)
+		}, (*Builder).ToSelect, "SELECT * FROM `users` WHERE `name` LIKE a ? b", nil},
+		{"null_safe", func(g Grammar) *Builder {
+			return users(g).WhereNullSafeEquals("name", expr)
+		}, (*Builder).ToSelect, "SELECT * FROM `users` WHERE `name` <=> a ? b", nil},
+		{"having", func(g Grammar) *Builder {
+			return orders(g).GroupBy("uid").Having("cnt", ">", expr)
+		}, (*Builder).ToSelect, "SELECT * FROM `orders` GROUP BY `uid` HAVING `cnt` > a ? b", nil},
+		{"having_raw", func(g Grammar) *Builder {
+			return orders(g).GroupBy("uid").HavingRaw("SUM(amount) > ?", expr)
+		}, (*Builder).ToSelect, "SELECT * FROM `orders` GROUP BY `uid` HAVING SUM(amount) > a ? b", nil},
+		{"group_by_raw", func(g Grammar) *Builder {
+			return orders(g).GroupByRaw("DATE(?)", expr)
+		}, (*Builder).ToSelect, "SELECT * FROM `orders` GROUP BY DATE(a ? b)", nil},
+		{"join_on_value", func(g Grammar) *Builder {
+			return users(g).JoinOn("orders", func(j *JoinBuilder) {
+				j.On("orders.uid", "=", "users.id").Where("orders.amt", ">", expr)
+			})
+		}, (*Builder).ToSelect,
+			"SELECT * FROM `users` INNER JOIN `orders` ON `orders`.`uid` = `users`.`id` AND `orders`.`amt` > a ? b", nil},
+		{"join_raw", func(g Grammar) *Builder {
+			return users(g).JoinOn("orders", func(j *JoinBuilder) {
+				j.On("orders.uid", "=", "users.id").Raw("YEAR(orders.created_at) = ?", expr)
+			})
+		}, (*Builder).ToSelect,
+			"SELECT * FROM `users` INNER JOIN `orders` ON `orders`.`uid` = `users`.`id` AND YEAR(orders.created_at) = a ? b", nil},
+		{"where_raw", func(g Grammar) *Builder {
+			return users(g).WhereRaw("x = ?", expr)
+		}, (*Builder).ToSelect, "SELECT * FROM `users` WHERE x = a ? b", nil},
+		{"update_set", func(g Grammar) *Builder {
+			return users(g).Where("id", "=", 1)
+		}, func(b *Builder) (string, []any, error) {
+			return b.ToUpdate(expressionPlaceholderRow{V: expr})
+		}, "UPDATE `users` SET `v` = a ? b WHERE `id` = ?", []any{1}},
+		{"insert_values", func(g Grammar) *Builder {
+			return users(g)
+		}, func(b *Builder) (string, []any, error) {
+			return b.ToInsert(expressionPlaceholderInsert{Name: "x", V: expr})
+		}, "INSERT INTO `users` (`name`, `v`) VALUES (?, a ? b)", []any{"x"}},
+	}
+	runExpressionPlaceholderCases(t, NewMySQLGrammar(), cases)
 }

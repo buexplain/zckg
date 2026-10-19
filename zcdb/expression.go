@@ -7,10 +7,11 @@ package zcdb
 // 绝不要将用户输入拼入 Expression，用户输入应走绑定参数（普通值）。
 //
 // 占位符边界：Expression 内容中的 `?` 在任何编译路径上都没有配对的绑定参数：
-// INSERT VALUES、Raw 子句绑定与 CompileRaw 中 Expression 直接内嵌为 SQL 文本，`?` 原样保留
-// （在 PostgreSQL 方言下成为非法占位符）；UPDATE SET 值中 PostgreSQL 还会把 `?`
-// 转为 $N 并占用占位符编号（内部自增/自减编译依赖该机制并另行配对绑定），
-// 用户自带的 Expression 均无配对绑定。请勿在 Expression 内容中使用 `?` 占位符。
+// INSERT VALUES、WHERE/HAVING/IN/LIKE/NULL 安全比较、Raw 绑定与 CompileRaw 中
+// Expression 直接内嵌为 SQL 文本，`?` 原样保留（PostgreSQL 下成为非法占位符）；
+// PostgreSQL 的 UPDATE SET 值与 JOIN ON 值比较还会把 `?` 转为 $N 并占用占位符编号
+// （内部自增/自减编译依赖该机制并另行配对绑定），用户自带的 Expression 仍无配对绑定。
+// 请勿在 Expression 内容中使用 `?` 占位符。
 type Expression struct {
 	value string
 }

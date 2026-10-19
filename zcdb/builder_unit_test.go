@@ -2330,6 +2330,13 @@ func commentCompileFixtures(g Grammar) []commentCompileFixture {
 	using := func(sub *Builder) {
 		sub.Table("source").Select("name").Where("score", ">", 11).Comment("inner:source")
 	}
+	// delete 夹具在 PostgreSQL/SQLite 上不能携带 ORDER BY/LIMIT：这两个方言的写语句
+	// 会在编译期返回 ErrWriteOrderLimitUnsupported（见 validateWriteOrderLimit），
+	// 而 MySQL 单表 DELETE 支持该语法，保留 base() 以覆盖 ORDER BY/LIMIT 的注释位置。
+	deleteBuilder := base()
+	if _, mysql := g.(*MySQLGrammar); !mysql {
+		deleteBuilder = NewBuilder(g, nil).Table("users").Select("name").Where("id", 7).Offset(2)
+	}
 	row := commentCompileRow{Name: "alice", Age: 23}
 	columns, rows := []string{"name", "age"}, [][]any{{"alice", 23}}
 	fixtures := []commentCompileFixture{
@@ -2356,7 +2363,7 @@ func commentCompileFixtures(g Grammar) []commentCompileFixture {
 			return g.CompileInsertOrIgnoreUsing(b, []string{"name"}, sub)
 		}},
 		{"update", joined(), func(b *Builder) (string, []any, error) { return b.ToUpdate(row) }, func(b *Builder) string { return g.CompileUpdate(b, columns, rows[0]) }},
-		{"delete", base(), (*Builder).ToDelete, g.CompileDelete},
+		{"delete", deleteBuilder, (*Builder).ToDelete, g.CompileDelete},
 		{"delete_join", joined(), (*Builder).ToDeleteJoin, g.CompileDeleteJoin},
 		{"truncate", base(), func(b *Builder) (string, []any, error) { sql, err := b.ToTruncate(); return sql, nil, err }, g.CompileTruncate},
 		{"count", base().LockForUpdate(), (*Builder).ToCount, nil},

@@ -8,6 +8,8 @@ Builder 的所有终端执行方法（Find/Insert/Update 等）内部都是"先 
 
 所有 ToXxx 方法返回 `(sql string, args []any, err error)` 三元组（`ToTruncate` 只返回 `(sql, err)`）。Builder 本身及挂入 FROM/SELECT/WHERE/JOIN/HAVING/UNION 等位置的任意层子 Builder 在链式构造中已产生的错误（如非法运算符），都会在外层编译时统一返回；不会静默丢弃子查询错误后继续生成 SQL。
 
+> 本文档的 Go 示例统一包在 `func example()` 中，仅用于语法检查与上下文占位（`db`、`ctx` 等是外部变量），不保证可独立运行；可编译性由 `docs_examples_compile_test.go` 单独校验。
+
 ## SQL 注释的最终编译边界
 
 全部 15 个公开编译入口（`ToSelect`、`ToInsert`、`ToInsertOrIgnore`、`ToUpsert`、`ToInsertUsing`、`ToInsertOrIgnoreUsing`、`ToUpdate`、`ToDelete`、`ToDeleteJoin`、`ToTruncate`、`ToCount`、`ToExists`、`ToAggregate`、`ToIncrement`、`ToDecrement`）均在成功生成完整 SQL 后，按当前 Builder 的注释追加一次 ` /* 短业务标识 */`。无注释时原 SQL 逐字节不变，本文原有输出均为无注释基线。
@@ -26,27 +28,33 @@ DAO 第五参数与 `Comment` 仅用于短业务标识，不得透传外部输�
 编译完整 SELECT。未设置 Table/TableSub 时返回 `ErrEmptyTable`；SQLite 下使用锁子句报 `ErrSQLiteLockNotSupported`；PostgreSQL 下 UNION + 锁报 `ErrPgUnionLockNotSupported`。
 
 ```go
-sql, args, _ := db.Builder().Table("users").Where("age", ">", 25).ToSelect()
-// SQL:  SELECT * FROM `users` WHERE `age` > ?
-// args: [25]
+func example() {
+	sql, args, _ := db.Builder().Table("users").Where("age", ">", 25).ToSelect()
+	// SQL:  SELECT * FROM `users` WHERE `age` > ?
+	// args: [25]
+}
 ```
 
 ### ToCount
 
 ```go
-sql, args, _ := db.Builder().Table("users").Where("status", "=", "active").ToCount()
-// SQL:  SELECT COUNT(*) FROM `users` WHERE `status` = ?
-// args: [active]
+func example() {
+	sql, args, _ := db.Builder().Table("users").Where("status", "=", "active").ToCount()
+	// SQL:  SELECT COUNT(*) FROM `users` WHERE `status` = ?
+	// args: [active]
+}
 ```
 
 包含 UNION / GROUP BY / HAVING / DISTINCT 时自动将整个查询包裹为子查询再计数（保留分组、HAVING 筛选与去重语义），并自动清除分页、排序、锁子句。HAVING 引用显式 SELECT 别名时保留原投影：
 
 ```go
-sql, _, _ := db.Builder().Table("orders").GroupBy("user_id").ToCount()
-// SQL: SELECT COUNT(*) FROM (SELECT 1 FROM `orders` GROUP BY `user_id`) AS `t`
+func example() {
+	sql, _, _ := db.Builder().Table("orders").GroupBy("user_id").ToCount()
+	// SQL: SELECT COUNT(*) FROM (SELECT 1 FROM `orders` GROUP BY `user_id`) AS `t`
 
-sql, _, _ = db.Builder().Table("users").Select("city").Distinct().ToCount()
-// SQL: SELECT COUNT(*) FROM (SELECT DISTINCT `city` FROM `users`) AS `t`
+	sql, _, _ = db.Builder().Table("users").Select("city").Distinct().ToCount()
+	// SQL: SELECT COUNT(*) FROM (SELECT DISTINCT `city` FROM `users`) AS `t`
+}
 ```
 
 ### ToExists
@@ -54,9 +62,11 @@ sql, _, _ = db.Builder().Table("users").Select("city").Distinct().ToCount()
 编译存在性查询并清除分页、排序、锁。普通查询使用 `SELECT 1 ... LIMIT 1`；UNION 为保持各分支列数一致、HAVING 为保留 SELECT 别名，都会保留原投影并整体包裹子查询后附加 `LIMIT 1`：
 
 ```go
-sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToExists()
-// SQL:  SELECT 1 FROM `users` WHERE `id` = ? LIMIT 1
-// args: [1]
+func example() {
+	sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToExists()
+	// SQL:  SELECT 1 FROM `users` WHERE `id` = ? LIMIT 1
+	// args: [1]
+}
 ```
 
 ### ToAggregate
@@ -64,9 +74,11 @@ sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToExists()
 编译 MAX/MIN/SUM/AVG 聚合，仅接受这四个函数名，否则返回 `ErrInvalidAggregate`。UNION 时整体包裹子查询后聚合；分页/排序/锁被自动清除。带 GROUP BY 或 HAVING 时会产生多行分组语义，与标量返回值冲突，因此返回 `ErrAggregateGrouped`，应改用 `Select` + `Find` 接收各组结果：
 
 ```go
-sql, args, _ := db.Builder().Table("orders").Where("status", "=", "paid").ToAggregate("MAX", "amount")
-// SQL:  SELECT MAX(`amount`) AS `aggregate` FROM `orders` WHERE `status` = ?
-// args: [paid]
+func example() {
+	sql, args, _ := db.Builder().Table("orders").Where("status", "=", "paid").ToAggregate("MAX", "amount")
+	// SQL:  SELECT MAX(`amount`) AS `aggregate` FROM `orders` WHERE `status` = ?
+	// args: [paid]
+}
 ```
 
 ## 插入类编译
@@ -76,12 +88,14 @@ sql, args, _ := db.Builder().Table("orders").Where("status", "=", "paid").ToAggr
 data 必须是结构体或结构体切片（可带指针），否则返回 `ErrInvalidStruct`；字段映射规则见[写操作文档](mutate.md)。
 
 ```go
-sql, args, _ := db.Builder().Table("users").ToInsert([]User{
-	{Name: "alice", Age: 25},
-	{Name: "bob", Age: 30},
-})
-// SQL:  INSERT INTO `users` (`name`, `age`) VALUES (?, ?), (?, ?)
-// args: [alice 25 bob 30]
+func example() {
+	sql, args, _ := db.Builder().Table("users").ToInsert([]User{
+		{Name: "alice", Age: 25},
+		{Name: "bob", Age: 30},
+	})
+	// SQL:  INSERT INTO `users` (`name`, `age`) VALUES (?, ?), (?, ?)
+	// args: [alice 25 bob 30]
+}
 ```
 
 ### ToInsertOrIgnore
@@ -89,20 +103,24 @@ sql, args, _ := db.Builder().Table("users").ToInsert([]User{
 冲突时静默跳过，三方言形态：
 
 ```go
-sql, args, _ := db.Builder().Table("users").ToInsertOrIgnore(user)
-// MySQL:      INSERT IGNORE INTO `users` (`name`, `age`, `email`) VALUES (?, ?, ?)
-// PostgreSQL: INSERT INTO "users" ("name", "age", "email") VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
-// SQLite:     INSERT OR IGNORE INTO "users" ("name", "age", "email") VALUES (?, ?, ?)
+func example() {
+	sql, args, _ := db.Builder().Table("users").ToInsertOrIgnore(user)
+	// MySQL:      INSERT IGNORE INTO `users` (`name`, `age`, `email`) VALUES (?, ?, ?)
+	// PostgreSQL: INSERT INTO "users" ("name", "age", "email") VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+	// SQLite:     INSERT OR IGNORE INTO "users" ("name", "age", "email") VALUES (?, ?, ?)
+}
 ```
 
 ### ToUpsert
 
 ```go
-sql, args, _ := db.Builder().Table("users").
-	ToUpsert(user, []string{"email"}, []string{"name", "age"})
-// MySQL: INSERT INTO `users` (`name`, `age`, `email`) VALUES (?, ?, ?)
-//        ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`)
-// PG:    INSERT INTO "users" (...) VALUES (...) ON CONFLICT ("email") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"
+func example() {
+	sql, args, _ := db.Builder().Table("users").
+		ToUpsert(user, []string{"email"}, []string{"name", "age"})
+	// MySQL: INSERT INTO `users` (`name`, `age`, `email`) VALUES (?, ?, ?)
+	//        ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`)
+	// PG:    INSERT INTO "users" (...) VALUES (...) ON CONFLICT ("email") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"
+}
 ```
 
 `updateColumns` 为空时默认更新所有插入列（排除 uniqueBy 列；全部插入列均为 uniqueBy 时退化为「冲突时不更新」：PG/SQLite 编译为 `DO NOTHING`，MySQL 编译为自赋值 no-op）；PostgreSQL/SQLite 下 `uniqueBy` 为空返回 `ErrUpsertUniqueByRequired`。
@@ -112,12 +130,14 @@ sql, args, _ := db.Builder().Table("users").
 编译 `INSERT INTO ... SELECT`，callback 内构造子查询；子查询未设置数据源或编译出错时整体返回错误：
 
 ```go
-sql, args, _ := db.Builder().Table("users_archive").
-	ToInsertUsing([]string{"name", "age"}, func(sub *zcdb.Builder) {
-		sub.Table("users").Select("name", "age").Where("status", "=", "active")
-	})
-// SQL:  INSERT INTO `users_archive` (`name`, `age`) SELECT `name`, `age` FROM `users` WHERE `status` = ?
-// args: [active]
+func example() {
+	sql, args, _ := db.Builder().Table("users_archive").
+		ToInsertUsing([]string{"name", "age"}, func(sub *zcdb.Builder) {
+			sub.Table("users").Select("name", "age").Where("status", "=", "active")
+		})
+	// SQL:  INSERT INTO `users_archive` (`name`, `age`) SELECT `name`, `age` FROM `users` WHERE `status` = ?
+	// args: [active]
+}
 ```
 
 ## 更新与删除类编译
@@ -131,26 +151,32 @@ sql, args, _ := db.Builder().Table("users_archive").
 | MySQL | `UPDATE ... JOIN(ON) ... SET ... WHERE` | JOIN → SET → WHERE |
 | PostgreSQL / SQLite | `UPDATE ... SET ... FROM ... WHERE`（JOIN 条件并入 WHERE 前部） | SET → JOIN → WHERE |
 
+写操作携带 `OrderBy` / `Limit` 时按方言校验：MySQL 仅单表支持，PostgreSQL/SQLite 与 MySQL 多表 UPDATE/DeleteJoin 在编译期返回 `ErrWriteOrderLimitUnsupported`，详见[写操作文档](mutate.md)的「ORDER BY / LIMIT」小节。
+
 ```go
-sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToUpdate(UserUpdate{Name: &name, Age: &age})
-// SQL:  UPDATE `users` SET `name` = ?, `age` = ? WHERE `id` = ?
-// args: [alice_new 26 1]
+func example() {
+	sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToUpdate(UserUpdate{Name: &name, Age: &age})
+	// SQL:  UPDATE `users` SET `name` = ?, `age` = ? WHERE `id` = ?
+	// args: [alice_new 26 1]
+}
 ```
 
 ### ToDelete / ToDeleteJoin / ToTruncate
 
 ```go
-sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToDelete()
-// SQL:  DELETE FROM `users` WHERE `id` = ?
-// args: [1]
+func example() {
+	sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).ToDelete()
+	// SQL:  DELETE FROM `users` WHERE `id` = ?
+	// args: [1]
 
-sql, err := db.Builder().Table("users").ToTruncate()
-// MySQL:  TRUNCATE TABLE `users`
-// PG:     TRUNCATE TABLE "users" RESTART IDENTITY
-// SQLite: DELETE FROM "users"
+	sql, err := db.Builder().Table("users").ToTruncate()
+	// MySQL:  TRUNCATE TABLE `users`
+	// PG:     TRUNCATE TABLE "users" RESTART IDENTITY
+	// SQLite: DELETE FROM "users"
+}
 ```
 
-`ToDelete` 不编译 JOIN；Builder 带 JOIN 时返回 `ErrDeleteWithJoin`，即使同时有 WHERE 或调用了 `Force()` 也不会生成 SQL。关联删除应使用 `ToDeleteJoin`。
+`ToDelete` 不编译 JOIN；Builder 带 JOIN 时返回 `ErrDeleteWithJoin`，即使同时有 WHERE 或调用了 `Force()` 也不会生成 SQL。关联删除应使用 `ToDeleteJoin`。`ToDelete` / `ToDeleteJoin` 同样受写操作 `ORDER BY` / `LIMIT` 校验约束：PostgreSQL/SQLite、MySQL `ToDeleteJoin` 携带时返回 `ErrWriteOrderLimitUnsupported`（MySQL 单表 `ToDelete` 支持）。
 
 `ToDeleteJoin` 要求至少一个 JOIN（否则 `ErrDeleteJoinNoJoin`）。无派生表 JOIN 时三方言都是 ON → WHERE；带多个 `JoinSub` 时按实际 SQL 占位符顺序收集：
 
@@ -164,10 +190,12 @@ sql, err := db.Builder().Table("users").ToTruncate()
 接收等长且非空的列名切片与增量切片，编译为 `SET col = col op ?`；任一切片为空或长度不等时返回 `ErrIncrementColumns`：
 
 ```go
-sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).
-	ToIncrement([]string{"wallet", "level"}, []any{100, 1})
-// SQL:  UPDATE `users` SET `wallet` = `wallet` + ?, `level` = `level` + ? WHERE `id` = ?
-// args: [100 1 1]
+func example() {
+	sql, args, _ := db.Builder().Table("users").Where("id", "=", 1).
+		ToIncrement([]string{"wallet", "level"}, []any{100, 1})
+	// SQL:  UPDATE `users` SET `wallet` = `wallet` + ?, `level` = `level` + ? WHERE `id` = ?
+	// args: [100 1 1]
+}
 ```
 
 ## 绑定参数顺序规则
@@ -187,47 +215,58 @@ SELECT_SUB → FROM_SUB → JOIN → WHERE → GROUP BY → HAVING → UNION
 `NewExpression` 创建原始 SQL 片段，是类型安全 API 的"逃逸口"，可用于所有接受值的位置（Where 比较值、Insert/Update 字段值、Having 等）：
 
 ```go
-// 作为 Where 比较值：列等于另一列
-sql, _, _ := db.Builder().Table("users").
-	Where("id", "=", zcdb.NewExpression("parent_id")).ToSelect()
-// SQL: SELECT * FROM `users` WHERE `id` = parent_id
+func example() {
+	// 作为 Where 比较值：列等于另一列
+	sql, _, _ := db.Builder().Table("users").
+		Where("id", "=", zcdb.NewExpression("parent_id")).ToSelect()
+	// SQL: SELECT * FROM `users` WHERE `id` = parent_id
 
-// 作为 Insert/Update 字段值：使用数据库函数
-sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).
-	ToUpdate(struct {
-		UpdatedAt any `db:"updated_at"`
-	}{UpdatedAt: zcdb.NewExpression("NOW()")})
-// SQL: UPDATE `users` SET `updated_at` = NOW() WHERE `id` = ?
+	// 作为 Insert/Update 字段值：使用数据库函数
+	sql, _, _ = db.Builder().Table("users").Where("id", "=", 1).
+		ToUpdate(struct {
+			UpdatedAt any `db:"updated_at"`
+		}{UpdatedAt: zcdb.NewExpression("NOW()")})
+	// SQL: UPDATE `users` SET `updated_at` = NOW() WHERE `id` = ?
+}
 ```
 
 > Expression 内容**不会被参数化、不做标识符包裹、不做任何转义**，直接拼接进 SQL。请勿将用户输入拼入 Expression，防 SQL 注入。
 >
-> 占位符边界：请勿在 Expression 内容中使用 `?` 占位符——它没有任何配对的绑定参数：INSERT VALUES 与 Raw 子句中 `?` 会原样保留（PostgreSQL 方言下成为非法占位符），PostgreSQL 的 UPDATE SET 路径还会把 `?` 转为 `$N` 并占用占位符编号（仅框架内部自增/自减编译依赖该机制）。
+> 占位符边界：请勿在 Expression 内容中使用 `?` 占位符——它没有配对的绑定参数，按编译路径分两类：
+>
+> - **原样保留**（`?` 直接进入 SQL 文本，PostgreSQL 下成为非法占位符）：INSERT / INSERT IGNORE / UPSERT 的 VALUES，WHERE / HAVING 的值比较，WHERE IN，LIKE，NULL 安全比较，以及 Raw 绑定（WhereRaw / JoinBuilder.Raw / HavingRaw / GroupByRaw）与 `CompileRaw` 的 Expression 参数；
+> - **转成 `$N` 并占用占位符编号**（仅 PostgreSQL）：UPDATE SET 值、JOIN ON 值比较——只有框架内部自增/自减编译依赖该机制并另行配对绑定，用户自带的 Expression 仍无配对参数。
+>
+> MySQL / SQLite 没有 `$N` 转换，上述两类路径都把 `?` 原样保留。
 
 ## 原始 SQL 内联编译（CompileRaw）
 
 需要把一条带占位符的原始 SQL 与参数合成**一条完整 SQL**（不含占位符、不需要参数）时用 `Grammar.CompileRaw`——典型场景是手工执行、日志留档、贴给 DBA 复核。占位符形态随方言而定：MySQL/SQLite 用 `?`，PostgreSQL 用 `$N`。Grammar 实例经 `db.Grammar()` 取得：
 
 ```go
-// MySQL / SQLite：? 占位符
-sqlStr, err := db.Grammar().CompileRaw(
-	"UPDATE `users` SET `name` = ?, `updated_at` = ? WHERE `id` = ?",
-	[]any{"张三", zcdb.NewExpression("NOW()"), 7})
-// MySQL： UPDATE `users` SET `name` = '张三', `updated_at` = NOW() WHERE `id` = 7
+func example() {
+	// MySQL / SQLite：? 占位符
+	sqlStr, err := db.Grammar().CompileRaw(
+		"UPDATE `users` SET `name` = ?, `updated_at` = ? WHERE `id` = ?",
+		[]any{"张三", zcdb.NewExpression("NOW()"), 7})
+	// MySQL： UPDATE `users` SET `name` = '张三', `updated_at` = NOW() WHERE `id` = 7
 
-// PostgreSQL：$N 占位符（`?` 在 PostgreSQL 里是 jsonb 键存在操作符等运算符，不参与占位符识别）
-sqlStr, err = db.Grammar().CompileRaw(
-	`UPDATE "users" SET "name" = $1, "updated_at" = $2 WHERE "id" = $3`,
-	[]any{"张三", zcdb.NewExpression("NOW()"), 7})
-// PostgreSQL： UPDATE "users" SET "name" = '张三', "updated_at" = NOW() WHERE "id" = 7
-// 产物无需参数即可执行：db.Exec(ctx, sqlStr)
+	// PostgreSQL：$N 占位符（`?` 在 PostgreSQL 里是 jsonb 键存在操作符等运算符，不参与占位符识别）
+	sqlStr, err = db.Grammar().CompileRaw(
+		`UPDATE "users" SET "name" = $1, "updated_at" = $2 WHERE "id" = $3`,
+		[]any{"张三", zcdb.NewExpression("NOW()"), 7})
+	// PostgreSQL： UPDATE "users" SET "name" = '张三', "updated_at" = NOW() WHERE "id" = 7
+	// 产物无需参数即可执行：db.Exec(ctx, sqlStr)
+}
 ```
 
 也可以直接吃 Builder 编译出来的产物（PostgreSQL 下是 `$N` + args，`CompileRaw` 会按编号取值内联，无需自己把 `$1` 改写成 `?`）：
 
 ```go
-sqlStr, args, _ := db.Builder().Table("users").Where("id", "=", 7).ToSelect()
-complete, err := db.Grammar().CompileRaw(sqlStr, args)
+func example() {
+	sqlStr, args, _ := db.Builder().Table("users").Where("id", "=", 7).ToSelect()
+	complete, err := db.Grammar().CompileRaw(sqlStr, args)
+}
 ```
 
 > **安全警示**：产物把参数值直接写成了 SQL 文本，等于放弃占位符绑定这道注入防线。绝不允许把不可信输入（用户提交、请求体、密钥）当作 args 传入；`Expression` 参数同样原样内嵌，安全责任归调用方。常规执行请继续走 Builder 或带参数的 `Exec`/`Query`。

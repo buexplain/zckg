@@ -34,3 +34,25 @@ func TestSQLiteGrammar_LockSQL(t *testing.T) {
 		})
 	}
 }
+
+// TestSQLiteGrammar_OffsetWithoutLimit 锁死「只有 OFFSET、没有有效 LIMIT」时补 LIMIT -1：
+// Limit 未调用、Limit(0)、Limit(负数) 三种情形都不输出 LIMIT 子句（见 Limit 约定），
+// 而 SQLite 要求 OFFSET 必须跟在 LIMIT 之后，缺补位会得到语法错误。
+func TestSQLiteGrammar_OffsetWithoutLimit(t *testing.T) {
+	g := &SQLiteGrammar{}
+	cases := []struct {
+		name    string
+		builder *Builder
+	}{
+		{"limit_unset", newTestBuilder(g, nil).Table("users").Offset(20)},
+		{"limit_zero", newTestBuilder(g, nil).Table("users").Limit(0).Offset(20)},
+		{"limit_negative", newTestBuilder(g, nil).Table("users").Limit(-5).Offset(20)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sql, _, err := c.builder.ToSelect()
+			assertNoError(t, err)
+			assertSQL(t, `SELECT * FROM "users" LIMIT -1 OFFSET 20`, sql)
+		})
+	}
+}

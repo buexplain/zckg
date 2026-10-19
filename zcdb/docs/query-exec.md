@@ -6,6 +6,8 @@
 
 设置默认注释或 `Builder.Comment` 后，查询终端方法使用最终编译的带注释 SQL，不再次追加；First/Value/Pluck 等内部派生查询保留当前注释，包括显式清空。慢 SQL 回调收到实际执行的 SQL 和原绑定参数。DAO 原始 `Exec` / `Query` / `QueryPrimary` 原文透传（也不剥离手写注释），Schema 查询不自动追加。仅用短业务标识，不透传外部输入或秘密。
 
+> 本文档的 Go 示例统一包在 `func example()` 中，仅用于语法检查与上下文占位（`db`、`ctx` 等是外部变量），不保证可独立运行；可编译性由 `docs_examples_compile_test.go` 单独校验。
+
 ## Find / First / Value
 
 三者都是"执行 SELECT 并扫描结果"的方法，区别在于结果基数：
@@ -19,44 +21,50 @@
 `First` 与 `Value` 内部按需克隆并强制附加 `LIMIT 1`（limit 已为 1 时跳过克隆），不修改原对象。
 
 ```go
-// Find：多条记录
-var users []User
-err := db.Builder().Table("users").Where("status", "=", "active").Find(ctx, &users)
-// SQL:  SELECT * FROM `users` WHERE `status` = ?
-// args: [active]
+func example() {
+	// Find：多条记录
+	var users []User
+	err := db.Builder().Table("users").Where("status", "=", "active").Find(ctx, &users)
+	// SQL:  SELECT * FROM `users` WHERE `status` = ?
+	// args: [active]
 
-// First：单条记录，未命中返回 sql.ErrNoRows
-var user User
-err = db.Builder().Table("users").Where("id", "=", 1).First(ctx, &user)
-// SQL:  SELECT * FROM `users` WHERE `id` = ? LIMIT 1
-// args: [1]
+	// First：单条记录，未命中返回 sql.ErrNoRows
+	var user User
+	err = db.Builder().Table("users").Where("id", "=", 1).First(ctx, &user)
+	// SQL:  SELECT * FROM `users` WHERE `id` = ? LIMIT 1
+	// args: [1]
 
-// Value：单个标量值
-var name string
-err = db.Builder().Table("users").Select("name").Where("id", "=", 1).Value(ctx, &name)
-// SQL:  SELECT `name` FROM `users` WHERE `id` = ? LIMIT 1
-// args: [1]
+	// Value：单个标量值
+	var name string
+	err = db.Builder().Table("users").Select("name").Where("id", "=", 1).Value(ctx, &name)
+	// SQL:  SELECT `name` FROM `users` WHERE `id` = ? LIMIT 1
+	// args: [1]
+}
 ```
 
 `Value` 的 dest 支持二级指针用于区分 NULL 与空字符串：
 
 ```go
-var remark *string
-err = db.Builder().Table("users").Select("remark").Where("id", "=", 1).Value(ctx, &remark)
-// err == nil 且 remark == nil → 该列值为 NULL
-// err == nil 且 remark != nil → 正常字符串
+func example() {
+	var remark *string
+	err = db.Builder().Table("users").Select("remark").Where("id", "=", 1).Value(ctx, &remark)
+	// err == nil 且 remark == nil → 该列值为 NULL
+	// err == nil 且 remark != nil → 正常字符串
+}
 ```
 
 ## Count / Exists
 
 ```go
-count, err := db.Builder().Table("users").Where("status", "=", "active").Count(ctx)
-// SQL:  SELECT COUNT(*) FROM `users` WHERE `status` = ?
-// args: [active]
+func example() {
+	count, err := db.Builder().Table("users").Where("status", "=", "active").Count(ctx)
+	// SQL:  SELECT COUNT(*) FROM `users` WHERE `status` = ?
+	// args: [active]
 
-exists, err := db.Builder().Table("users").Where("email", "=", "a@t.com").Exists(ctx)
-// SQL:  SELECT 1 FROM `users` WHERE `email` = ? LIMIT 1
-// args: [a@t.com]
+	exists, err := db.Builder().Table("users").Where("email", "=", "a@t.com").Exists(ctx)
+	// SQL:  SELECT 1 FROM `users` WHERE `email` = ? LIMIT 1
+	// args: [a@t.com]
+}
 ```
 
 - `Count`：包含 UNION / GROUP BY / HAVING / DISTINCT 时自动包裹子查询计数，保留分组、HAVING 筛选与去重语义（见[编译文档](compile.md)的 ToCount）；
@@ -67,12 +75,14 @@ exists, err := db.Builder().Table("users").Where("email", "=", "a@t.com").Exists
 聚合方法返回单个 `float64`，生成 `SELECT AGG(col) AS aggregate FROM ...`。带 GROUP BY/HAVING 时返回 `ErrAggregateGrouped`，请改用 `Select` + `Find` 接收多组结果：
 
 ```go
-maxAge, err := db.Builder().Table("users").Max(ctx, "age")
-// SQL: SELECT MAX(`age`) AS `aggregate` FROM `users`
+func example() {
+	maxAge, err := db.Builder().Table("users").Max(ctx, "age")
+	// SQL: SELECT MAX(`age`) AS `aggregate` FROM `users`
 
-total, err := db.Builder().Table("orders").Where("status", "=", "paid").Sum(ctx, "amount")
-// SQL:  SELECT SUM(`amount`) AS `aggregate` FROM `orders` WHERE `status` = ?
-// args: [paid]
+	total, err := db.Builder().Table("orders").Where("status", "=", "paid").Sum(ctx, "amount")
+	// SQL:  SELECT SUM(`amount`) AS `aggregate` FROM `orders` WHERE `status` = ?
+	// args: [paid]
+}
 ```
 
 空集语义（SQL 聚合函数对空集返回 NULL 的归一化处理）：
@@ -89,26 +99,32 @@ total, err := db.Builder().Table("orders").Where("status", "=", "paid").Sum(ctx,
 **模式一：切片提取单列**（dest 为切片指针，columns 只能传一列）
 
 ```go
-var names []string
-err := db.Builder().Table("users").Where("vip", "=", 1).Pluck(ctx, &names, "name")
-// SQL: SELECT `name` FROM `users` WHERE `vip` = ?
-// args: [1]
+func example() {
+	var names []string
+	err := db.Builder().Table("users").Where("vip", "=", 1).Pluck(ctx, &names, "name")
+	// SQL: SELECT `name` FROM `users` WHERE `vip` = ?
+	// args: [1]
+}
 ```
 
 **模式二：map 键值对**（dest 为 map 指针，columns 传两列：第一列为值、第二列为键）
 
 ```go
-var m map[int64]string
-err := db.Builder().Table("users").Pluck(ctx, &m, "name", "id") // id => name
-// SQL: SELECT `name`, `id` FROM `users`
+func example() {
+	var m map[int64]string
+	err := db.Builder().Table("users").Pluck(ctx, &m, "name", "id") // id => name
+	// SQL: SELECT `name`, `id` FROM `users`
+}
 ```
 
 **模式三：map 结构体（keyBy）**（dest 为 `map[K]struct`/`map[K]*struct`，columns 只传键列，整行按 db 标签扫描进结构体）
 
 ```go
-var m map[int64]User
-err := db.Builder().Table("users").Pluck(ctx, &m, "id") // id => User 整行
-// SQL: SELECT `id`, `name`, `age` FROM `users`   // SELECT 列 = 结构体字段列（键列已在字段中则不重复）
+func example() {
+	var m map[int64]User
+	err := db.Builder().Table("users").Pluck(ctx, &m, "id") // id => User 整行
+	// SQL: SELECT `id`, `name`, `age` FROM `users`   // SELECT 列 = 结构体字段列（键列已在字段中则不重复）
+}
 ```
 
 注意事项：
@@ -122,14 +138,16 @@ err := db.Builder().Table("users").Pluck(ctx, &m, "id") // id => User 整行
 分页查询并自动统计总数，返回 `(totalCount, err)`：
 
 ```go
-var users []User
-total, err := db.Builder().Table("users").
-	Where("status", "=", "active").
-	OrderBy("id", "ASC").
-	ForPage(2, 20). // 第 2 页、每页 20 条
-	Paginate(ctx, &users)
-// COUNT SQL: SELECT COUNT(*) FROM `users` WHERE `status` = ?           args: [active]
-// 数据 SQL:  SELECT * FROM `users` WHERE `status` = ? ORDER BY `id` ASC LIMIT 20 OFFSET 20
+func example() {
+	var users []User
+	total, err := db.Builder().Table("users").
+		Where("status", "=", "active").
+		OrderBy("id", "ASC").
+		ForPage(2, 20). // 第 2 页、每页 20 条
+		Paginate(ctx, &users)
+	// COUNT SQL: SELECT COUNT(*) FROM `users` WHERE `status` = ?           args: [active]
+	// 数据 SQL:  SELECT * FROM `users` WHERE `status` = ? ORDER BY `id` ASC LIMIT 20 OFFSET 20
+}
 ```
 
 内部行为：
@@ -144,15 +162,17 @@ total, err := db.Builder().Table("users").
 `Cursor` 返回 Go 1.23 的 `iter.Seq[error]` 迭代器：一次查询、通过 `*sql.Rows` 逐行扫描，适合中小表全量遍历。迭代期间持有数据库连接，循环 break 时自动释放。
 
 ```go
-var user User
-for err := range db.Builder().Table("users").OrderBy("id", "ASC").Cursor(ctx, &user) {
-	if err != nil {
-		slog.Default().Error(err.Error())
-		os.Exit(1)
+func example() {
+	var user User
+	for err := range db.Builder().Table("users").OrderBy("id", "ASC").Cursor(ctx, &user) {
+		if err != nil {
+			slog.Default().Error(err.Error())
+			os.Exit(1)
+		}
+		fmt.Println(user.Name) // 每次迭代覆盖写入同一个 user
 	}
-	fmt.Println(user.Name) // 每次迭代覆盖写入同一个 user
+	// SQL: SELECT * FROM `users` ORDER BY `id` ASC（一次执行，逐行扫描）
 }
-// SQL: SELECT * FROM `users` ORDER BY `id` ASC（一次执行，逐行扫描）
 ```
 
 dest 要求：结构体指针（如 `*User`），字段按 db 标签匹配列名，未匹配的列被忽略。
@@ -162,16 +182,18 @@ dest 要求：结构体指针（如 `*User`），字段按 db 标签匹配列名
 `CursorBy` 通过 `WHERE cursorColumn > lastValue` 分批查询，每批独立执行、不长时间占用连接，适合大表批量处理：
 
 ```go
-var user User
-for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
-	if err != nil {
-		slog.Default().Error(err.Error())
-		os.Exit(1)
+func example() {
+	var user User
+	for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
+		if err != nil {
+			slog.Default().Error(err.Error())
+			os.Exit(1)
+		}
+		process(user)
 	}
-	process(user)
+	// 首批 SQL: SELECT * FROM `users` ORDER BY `id` ASC LIMIT 101
+	// 后续批次: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 101   args: [上批最后一行的 id]
 }
-// 首批 SQL: SELECT * FROM `users` ORDER BY `id` ASC LIMIT 101
-// 后续批次: SELECT * FROM `users` WHERE `id` > ? ORDER BY `id` ASC LIMIT 101   args: [上批最后一行的 id]
 ```
 
 参数与规则：
@@ -184,9 +206,11 @@ for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id") {
 - 变参 `desc` 为 true 时倒序分批（条件变为 `<`、排序 `DESC`）：
 
 ```go
-for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id", true) {
-	// 首批 SQL: SELECT * FROM `users` ORDER BY `id` DESC LIMIT 101
-	// 后续批次: SELECT * FROM `users` WHERE `id` < ? ORDER BY `id` DESC LIMIT 101
+func example() {
+	for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id", true) {
+		// 首批 SQL: SELECT * FROM `users` ORDER BY `id` DESC LIMIT 101
+		// 后续批次: SELECT * FROM `users` WHERE `id` < ? ORDER BY `id` DESC LIMIT 101
+	}
 }
 ```
 
@@ -199,33 +223,37 @@ for err := range db.Builder().Table("users").CursorBy(ctx, &user, 100, "id", tru
 > 嵌入结构体字段展开为「外层优先」：匿名嵌入结构体的字段被提升到外层，若外层与嵌入层存在同名列，**外层字段遮蔽嵌入层字段**（浅层优先，与 `encoding/json` 的“外层优先”一致）。同深度（如两个匿名嵌入结构体）发生同名列冲突时，本库取声明顺序靠前的字段，而 `encoding/json` 会丢弃冲突字段，二者不同。
 
 ```go
-rows, err := db.Query(ctx, "SELECT id, name, age FROM users WHERE age > ?", 18)
-if err != nil {
-	return err
-}
-defer rows.Close() // ScanStruct 不关闭 rows，调用方负责
+func example() {
+	rows, err := db.Query(ctx, "SELECT id, name, age FROM users WHERE age > ?", 18)
+	if err != nil {
+		return err
+	}
+	defer rows.Close() // ScanStruct 不关闭 rows，调用方负责
 
-var users []User
-if err := zcdb.ScanStruct(rows, &users); err != nil {
-	return err
-}
+	var users []User
+	if err := zcdb.ScanStruct(rows, &users); err != nil {
+		return err
+	}
 
-// 扫描单行：dest 传 *struct，未找到返回 sql.ErrNoRows
-var user User
-if err := zcdb.ScanStruct(rows, &user); err != nil {
-	return err
+	// 扫描单行：dest 传 *struct，未找到返回 sql.ErrNoRows
+	var user User
+	if err := zcdb.ScanStruct(rows, &user); err != nil {
+		return err
+	}
 }
 ```
 
 `ScanStructClose` 是自动关闭 rows 的便捷包装：
 
 ```go
-rows, err := db.Query(ctx, "SELECT id, name FROM users WHERE id = ?", 1)
-if err != nil {
-	return err
+func example() {
+	rows, err := db.Query(ctx, "SELECT id, name FROM users WHERE id = ?", 1)
+	if err != nil {
+		return err
+	}
+	var user User
+	err = zcdb.ScanStructClose(rows, &user) // 扫描完成后自动 rows.Close()，无需 defer
 }
-var user User
-err = zcdb.ScanStructClose(rows, &user) // 扫描完成后自动 rows.Close()，无需 defer
 ```
 
 | dest 类型 | 行为 |
@@ -250,12 +278,14 @@ ScanStruct 系列可能返回以下哨兵错误（均可用 `errors.Is` 匹配�
 示例：
 
 ```go
-if err := zcdb.ScanStruct(rows, &user); err != nil {
-    if errors.Is(err, zcdb.ErrScanConvert) {
-        slog.Default().Error("数据转换失败", "err", err)
-    }
-    if errors.Is(err, sql.ErrNoRows) {
-        slog.Default().Info("未找到记录")
-    }
+func example() {
+	if err := zcdb.ScanStruct(rows, &user); err != nil {
+	    if errors.Is(err, zcdb.ErrScanConvert) {
+	        slog.Default().Error("数据转换失败", "err", err)
+	    }
+	    if errors.Is(err, sql.ErrNoRows) {
+	        slog.Default().Info("未找到记录")
+	    }
+	}
 }
 ```

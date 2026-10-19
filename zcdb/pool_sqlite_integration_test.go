@@ -21,7 +21,7 @@ func TestPoolInteg_CloseIdempotent(t *testing.T) {
 	}
 }
 
-// TestPoolInteg_AddSlaveAfterClose 验证 Close 后 AddSlave 返回 errPoolClosed。
+// TestPoolInteg_AddSlaveAfterClose 验证 Close 后 AddSlave 返回 ErrPoolClosed。
 func TestPoolInteg_AddSlaveAfterClose(t *testing.T) {
 	pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:"})
 	if err != nil {
@@ -30,8 +30,8 @@ func TestPoolInteg_AddSlaveAfterClose(t *testing.T) {
 	if err := pool.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := pool.AddSlave("file::memory:?cache=shared"); !errors.Is(err, errPoolClosed) {
-		t.Fatalf("expected errPoolClosed, got %v", err)
+	if err := pool.AddSlave("file::memory:?cache=shared"); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("expected ErrPoolClosed, got %v", err)
 	}
 }
 

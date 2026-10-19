@@ -3,21 +3,17 @@ package zcdb
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// errPoolClosed 连接池已关闭后拒绝新增从库时返回。
-var errPoolClosed = errors.New("zcdb: pool is closed")
-
 // defaultConnectTimeout 创建主库/从库连接时 Ping 验证的默认超时。
 const defaultConnectTimeout = 5 * time.Second
 
 // Pool 数据库连接池，封装主从 *sql.DB 的创建和配置。
-// 生命周期约定：Close 幂等（重复调用返回 nil）；Close 后 AddSlave 返回 errPoolClosed；
+// 生命周期约定：Close 幂等（重复调用返回 nil）；Close 后 AddSlave 返回 ErrPoolClosed；
 // Close 后 Pick 仍返回已关闭的连接（后续查询报 sql: database is closed），详见 docs/connection.md。
 type Pool struct {
 	mu            sync.RWMutex  // 保护 slaves 切片的并发读写
@@ -51,10 +47,10 @@ type PoolConfig struct {
 // SlaveDSNs 中的每个 DSN 都会创建一个独立的从库 *sql.DB。
 func NewPool(cfg PoolConfig) (*Pool, error) {
 	if cfg.DriverName == "" {
-		return nil, errors.New("zcdb: DriverName is required")
+		return nil, ErrDriverNameRequired
 	}
 	if cfg.DSN == "" {
-		return nil, errors.New("zcdb: DSN is required")
+		return nil, ErrDSNRequired
 	}
 
 	// 默认值
@@ -78,7 +74,7 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	// 打开主库
 	master, err := sql.Open(cfg.DriverName, cfg.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("zcdb: open master failed: %w", err)
+		return nil, fmt.Errorf("%w: open master: %w", ErrPoolConnect, err)
 	}
 	master.SetMaxOpenConns(maxOpenConns)
 	master.SetMaxIdleConns(maxIdleConns)
@@ -90,7 +86,7 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	pingCancel()
 	if err != nil {
 		_ = master.Close()
-		return nil, fmt.Errorf("zcdb: ping master failed: %w", err)
+		return nil, fmt.Errorf("%w: ping master: %w", ErrPoolConnect, err)
 	}
 
 	pool := &Pool{
@@ -129,7 +125,7 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 func (p *Pool) AddSlave(dsn string) error {
 	// 已关闭的池拒绝新增从库，避免形成“池已关闭但持有活从库”的不一致状态
 	if p.closed.Load() {
-		return errPoolClosed
+		return ErrPoolClosed
 	}
 
 	// 锁外取参数快照，避免在网络 IO 期间持有写锁
@@ -147,7 +143,7 @@ func (p *Pool) AddSlave(dsn string) error {
 
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
-		return fmt.Errorf("open slave db: %w", err)
+		return fmt.Errorf("%w: open slave: %w", ErrPoolConnect, err)
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)
@@ -159,7 +155,7 @@ func (p *Pool) AddSlave(dsn string) error {
 	pingCancel()
 	if err != nil {
 		_ = db.Close()
-		return fmt.Errorf("ping slave db: %w", err)
+		return fmt.Errorf("%w: ping slave: %w", ErrPoolConnect, err)
 	}
 
 	// 验证成功后短暂持写锁追加。锁内复检 closed：Ping 网络往返期间 Close 可能已完成
@@ -169,7 +165,7 @@ func (p *Pool) AddSlave(dsn string) error {
 	if p.closed.Load() {
 		p.mu.Unlock()
 		_ = db.Close()
-		return errPoolClosed
+		return ErrPoolClosed
 	}
 	p.slaves = append(p.slaves, db)
 	p.mu.Unlock()
@@ -199,7 +195,7 @@ func (p *Pool) Ping(ctx context.Context) error {
 
 // Close 关闭连接池（主库 + 所有从库）。
 // 幂等：首次关闭执行实际清理并置位 closed 标记，重复调用直接返回 nil。
-// Close 后 AddSlave 返回 errPoolClosed；Pick 仍返回已关闭连接（后续查询报
+// Close 后 AddSlave 返回 ErrPoolClosed；Pick 仍返回已关闭连接（后续查询报
 // sql: database is closed，签名所限不做快速失败），调用方应确保 Close 后不再使用池。
 func (p *Pool) Close() error {
 	if !p.closed.CompareAndSwap(false, true) {

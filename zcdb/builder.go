@@ -141,7 +141,7 @@ func (b *Builder) Force() *Builder {
 // Primary 标记本次读查询强制走写（主库）连接，不加任何锁。
 // 典型场景：写后立即读（如订单写入后立刻查询回读），从库可能因复制延迟尚无数据；
 // 与 LockForUpdate 的区别：Primary 不改变编译出的 SQL（无锁子句），仅影响连接路由。
-// 该标记经 Clone 保留，First/Value/Paginate 等内部克隆的终端方法同样生效。
+// 该标记经 Clone 保留；First/Value 等内部克隆的终端方法与不克隆的 Paginate 均生效。
 //
 //	var order Order
 //	err := db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &order)

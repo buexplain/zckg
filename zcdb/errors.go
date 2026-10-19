@@ -22,6 +22,24 @@ var (
 	ErrUnknownDialect  = errors.New("zcdb: unknown dialect")
 	ErrPoolRequired    = errors.New("zcdb: pool is required")
 
+	// ErrDriverNameRequired NewPool 未提供 DriverName
+	ErrDriverNameRequired = errors.New("zcdb: DriverName is required")
+	// ErrDSNRequired NewPool 未提供主库 DSN
+	ErrDSNRequired = errors.New("zcdb: DSN is required")
+	// ErrPoolClosed 连接池已关闭：Close 后 AddSlave 返回本错误（Close 本身幂等返回 nil）
+	ErrPoolClosed = errors.New("zcdb: pool is closed")
+	// ErrPoolConnect 主库/从库的打开或 Ping 验证失败；底层驱动错误以 %w 包装，仍可用 errors.Is 匹配
+	ErrPoolConnect = errors.New("zcdb: pool connect failed")
+
+	// ErrTxBegin 开启事务失败；ErrTxCommit 提交失败；ErrTxRollback 回滚失败。
+	// 三者均以 %w 包装底层错误，原始错误仍可 errors.Is 匹配。
+	ErrTxBegin    = errors.New("zcdb: begin transaction failed")
+	ErrTxCommit   = errors.New("zcdb: commit failed")
+	ErrTxRollback = errors.New("zcdb: rollback failed")
+
+	// ErrInsertGetIdUnsupported PostgreSQL 方言不支持 InsertGetId（lib/pq 无 LastInsertId）
+	ErrInsertGetIdUnsupported = errors.New("zcdb: InsertGetId is not supported on postgres dialect")
+
 	// ErrPgUnionLockNotSupported 锁子句不支持错误
 	ErrPgUnionLockNotSupported = errors.New("zcdb: PostgreSQL does not support LOCK with UNION queries")
 	ErrSQLiteLockNotSupported  = errors.New("zcdb: SQLite does not support LOCK clauses")
@@ -79,6 +97,12 @@ var (
 
 	// ErrRawValueNotInlinable CompileRaw 的参数值无法内联成 SQL 字面量（类型不支持、NaN/Inf、Valuer 报错）
 	ErrRawValueNotInlinable = errors.New("zcdb: raw SQL arg cannot be inlined as a SQL literal")
+
+	// ErrWriteOrderLimitUnsupported 写语句携带 ORDER BY/LIMIT，但当前方言或语句形态不支持：
+	// PostgreSQL/SQLite 的 UPDATE/DELETE 没有该语法（忽略子句会把写范围放大到全部命中行），
+	// MySQL 的多表 UPDATE/DeleteJoin 会被引擎以 Error 1221 拒绝。编译期直接返回本错误，
+	// 避免「静默全量」或执行期才失败；MySQL 单表 UPDATE/DELETE 不受影响。
+	ErrWriteOrderLimitUnsupported = errors.New("zcdb: ORDER BY/LIMIT is not supported on this write statement")
 
 	// ErrDeleteWithJoin 普通 Delete/ToDelete 不编译 JOIN，带 JOIN 时拒绝以免 JOIN 限定被静默丢弃
 	ErrDeleteWithJoin = errors.New("zcdb: Delete does not compile JOIN clauses, use DeleteJoin instead")

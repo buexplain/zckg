@@ -6,6 +6,7 @@ package zcdb
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -116,5 +117,25 @@ func TestDBDao_SlowSQLCallbackReceivesGrammar(t *testing.T) {
 	}
 	if got != dao.Grammar() {
 		t.Errorf("回调收到的 grammar 与 DAO 持有实例不同：got %p，want %p", got, dao.Grammar())
+	}
+}
+
+// TestDBDao_TransactionBeginSentinel 验证开启事务失败返回 ErrTxBegin，且底层错误仍可 errors.Is：
+// 关闭底层连接池后 BeginTx 必然失败，错误消息保持「zcdb: begin transaction failed」前缀。
+func TestDBDao_TransactionBeginSentinel(t *testing.T) {
+	db := openSQLiteTestDB(t)
+	if err := db.Pool().Close(); err != nil {
+		t.Fatalf("关闭连接池失败: %v", err)
+	}
+	called := false
+	err := db.Transaction(context.Background(), func(context.Context) error {
+		called = true
+		return nil
+	})
+	if called {
+		t.Fatal("开启事务失败时不应执行回调")
+	}
+	if !errors.Is(err, ErrTxBegin) {
+		t.Fatalf("应返回 ErrTxBegin，实际 %v", err)
 	}
 }

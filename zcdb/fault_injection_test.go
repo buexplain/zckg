@@ -25,6 +25,7 @@ type faultConfig struct {
 	failExec      bool
 	failBegin     bool
 	failCommit    bool
+	failRollback  bool
 	failScan      bool
 	failNextAfter int // <0 关闭；否则 rowsSeen >= 该值时 Next 返回错误
 }
@@ -39,6 +40,7 @@ func (c *faultConfig) reset() {
 	c.failExec = false
 	c.failBegin = false
 	c.failCommit = false
+	c.failRollback = false
 	c.failScan = false
 	c.failNextAfter = -1
 }
@@ -55,6 +57,7 @@ type faultSnapshot struct {
 	failExec      bool
 	failBegin     bool
 	failCommit    bool
+	failRollback  bool
 	failScan      bool
 	failNextAfter int
 }
@@ -64,8 +67,8 @@ func (c *faultConfig) snapshot() faultSnapshot {
 	defer c.mu.Unlock()
 	return faultSnapshot{
 		failPrepare: c.failPrepare, failQuery: c.failQuery, failExec: c.failExec,
-		failBegin: c.failBegin, failCommit: c.failCommit, failScan: c.failScan,
-		failNextAfter: c.failNextAfter,
+		failBegin: c.failBegin, failCommit: c.failCommit, failRollback: c.failRollback,
+		failScan: c.failScan, failNextAfter: c.failNextAfter,
 	}
 }
 
@@ -184,7 +187,12 @@ func (t *faultTx) Commit() error {
 	return t.tx.Commit()
 }
 
-func (t *faultTx) Rollback() error { return t.tx.Rollback() }
+func (t *faultTx) Rollback() error {
+	if testFaultConfig.snapshot().failRollback {
+		return errInjectedFault
+	}
+	return t.tx.Rollback()
+}
 
 var registerFaultDriverOnce sync.Once
 
@@ -262,8 +270,8 @@ func TestFaultInjection_QueryExecPrepareBegin(t *testing.T) {
 			called = true
 			return nil
 		})
-		if !errors.Is(err, errInjectedFault) || called {
-			t.Fatalf("transaction err=%v called=%v, want injected fault and callback not called", err, called)
+		if !errors.Is(err, errInjectedFault) || !errors.Is(err, ErrTxBegin) || called {
+			t.Fatalf("transaction err=%v called=%v, want injected fault + ErrTxBegin and callback not called", err, called)
 		}
 	})
 
@@ -271,8 +279,18 @@ func TestFaultInjection_QueryExecPrepareBegin(t *testing.T) {
 		dao := openFaultDAO(t)
 		testFaultConfig.configure(func(c *faultConfig) { c.failCommit = true })
 		err := dao.Transaction(ctx, func(context.Context) error { return nil })
-		if !errors.Is(err, errInjectedFault) {
-			t.Fatalf("commit err=%v, want injected fault", err)
+		if !errors.Is(err, errInjectedFault) || !errors.Is(err, ErrTxCommit) {
+			t.Fatalf("commit err=%v, want injected fault + ErrTxCommit", err)
+		}
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		dao := openFaultDAO(t)
+		testFaultConfig.configure(func(c *faultConfig) { c.failRollback = true })
+		original := errors.New("forced rollback callback error")
+		err := dao.Transaction(ctx, func(context.Context) error { return original })
+		if !errors.Is(err, errInjectedFault) || !errors.Is(err, ErrTxRollback) || !errors.Is(err, original) {
+			t.Fatalf("rollback err=%v, want injected fault + ErrTxRollback + original error", err)
 		}
 	})
 }

@@ -219,3 +219,39 @@ func rawTestArgs(n int) []any {
 func isRawPlaceholderMismatch(err error) bool {
 	return errors.Is(err, ErrRawPlaceholderMismatch)
 }
+
+// expressionPlaceholderRow 用于 UPDATE SET 中内嵌 Expression 的测试数据。
+type expressionPlaceholderRow struct {
+	V any `db:"v"`
+}
+
+// expressionPlaceholderInsert 用于 INSERT VALUES 中内嵌 Expression 的测试数据。
+type expressionPlaceholderInsert struct {
+	Name string `db:"name"`
+	V    any    `db:"v"`
+}
+
+// exprPlaceholderCase 是「Expression 内嵌 `?`」的编译用例：
+// build 返回未编译的 Builder，compile 调用对应终端方法，wantSQL/wantArgs 为人工核对的期望值。
+type exprPlaceholderCase struct {
+	name     string
+	build    func(g Grammar) *Builder
+	compile  func(*Builder) (string, []any, error)
+	wantSQL  string
+	wantArgs []any
+}
+
+// runExpressionPlaceholderCases 执行 Expression `?` 边界用例，供三方言的编译单测共用。
+// 用例覆盖 compile.md「占位符边界」小节列出的全部路径：WHERE/HAVING/IN/LIKE/NULL 安全比较、
+// Raw 绑定（WhereRaw/HavingRaw/GroupByRaw/JoinBuilder.Raw）、JOIN ON 值、UPDATE SET、INSERT VALUES。
+func runExpressionPlaceholderCases(t *testing.T, g Grammar, cases []exprPlaceholderCase) {
+	t.Helper()
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sqlStr, args, err := c.compile(c.build(g))
+			assertNoError(t, err)
+			assertSQL(t, c.wantSQL, sqlStr)
+			assertArgs(t, c.wantArgs, args)
+		})
+	}
+}

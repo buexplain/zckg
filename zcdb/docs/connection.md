@@ -2,53 +2,61 @@
 
 本文介绍 `Pool`（连接池）、`DBDao`（数据访问对象）的创建与使用，以及事务、原始 SQL 执行、慢 SQL 回调。
 
+> 本文档的 Go 示例统一包在 `func example()` 中，仅用于语法检查与上下文占位（`db`、`ctx` 等是外部变量），不保证可独立运行；可编译性由 `docs_examples_compile_test.go` 单独校验。
+
 ## 创建连接池
 
 `NewPool` 接收 `PoolConfig`，内部完成 `sql.Open → 池参数配置 → Ping` 验证，主库 Ping 失败时直接返回错误。
 
 ```go
-pool, err := zcdb.NewPool(zcdb.PoolConfig{
-	DriverName:            "mysql",   // 驱动名，传给 sql.Open
-	DSN:                   "user:pass@tcp(127.0.0.1:3306)/test?parseTime=true",
-	SlaveDSNs:             []string{ // 从库列表，为空则不分读写
-		"user:pass@tcp(127.0.0.1:3307)/test?parseTime=true",
-	},
-	MaxOpenConns:          50,  // 最大打开连接数（主库与每个从库独立应用），默认 50
-	MaxIdleConns:          50,  // 最大空闲连接数，默认 50
-	ConnMaxLifetimeSecond: 600, // 连接最大存活秒数，默认 600
-	ConnectTimeout:        5 * time.Second, // 主库/从库 Ping 验证超时，默认 5s
-	SlaveStrategy:         &zcdb.RandomStrategy{}, // 从库选择策略，默认 RandomStrategy
-})
+func example() {
+	pool, err := zcdb.NewPool(zcdb.PoolConfig{
+		DriverName:            "mysql",   // 驱动名，传给 sql.Open
+		DSN:                   "user:pass@tcp(127.0.0.1:3306)/test?parseTime=true",
+		SlaveDSNs:             []string{ // 从库列表，为空则不分读写
+			"user:pass@tcp(127.0.0.1:3307)/test?parseTime=true",
+		},
+		MaxOpenConns:          50,  // 最大打开连接数（主库与每个从库独立应用），默认 50
+		MaxIdleConns:          50,  // 最大空闲连接数，默认 50
+		ConnMaxLifetimeSecond: 600, // 连接最大存活秒数，默认 600
+		ConnectTimeout:        5 * time.Second, // 主库/从库 Ping 验证超时，默认 5s
+		SlaveStrategy:         &zcdb.RandomStrategy{}, // 从库选择策略，默认 RandomStrategy
+	})
+}
 ```
 
 说明：
 
-- `DriverName` 与 `DSN` 必填，缺失分别返回错误 `zcdb: DriverName is required` / `zcdb: DSN is required`；
-- 每个从库 DSN 都会创建独立的 `*sql.DB` 并 Ping 验证，任一失败则整体回滚关闭；
+- `DriverName` 与 `DSN` 必填，缺失分别返回哨兵 `ErrDriverNameRequired` / `ErrDSNRequired`（消息 `zcdb: DriverName is required` / `zcdb: DSN is required`）；
+- 每个从库 DSN 都会创建独立的 `*sql.DB` 并 Ping 验证，任一失败则整体回滚关闭，失败统一返回 `ErrPoolConnect`（底层驱动错误仍可 `errors.Is`）；
 - 主库与从库的 Ping 验证均受 `ConnectTimeout` 限时（默认 5s，`<=0` 取默认值），防止不可达主机静默丢包时启动/热加载长时间挂起；
 - 从库选择策略内置两种：`RandomStrategy`（随机，默认）与 `RoundRobinStrategy`（轮询）；也可实现 `SlaveStrategy` 接口自定义（`Pick` 返回 nil 时自动降级到主库）。
 
 DSN 可手写，也可由 `zcconfig.DBConfig` 按驱动自动组装（`GetMasterDSN` / `GetSlaveDSN`，见 zcconfig 文档）：
 
 ```go
-testDB := zcconfig.Config("database.test_db", zcconfig.DBConfig{})
-pool, err := zcdb.NewPool(zcdb.PoolConfig{
-    DriverName: testDB.Driver,
-    DSN:        testDB.GetMasterDSN(),
-    SlaveDSNs:  testDB.GetSlaveDSN(),
-})
+func example() {
+	testDB := zcconfig.Config("database.test_db", zcconfig.DBConfig{})
+	pool, err := zcdb.NewPool(zcdb.PoolConfig{
+	    DriverName: testDB.Driver,
+	    DSN:        testDB.GetMasterDSN(),
+	    SlaveDSNs:  testDB.GetSlaveDSN(),
+	})
+}
 ```
 
 运行期可热加载从库（并发安全）：
 
 ```go
-err := pool.AddSlave("user:pass@tcp(127.0.0.1:3308)/test?parseTime=true")
+func example() {
+	err := pool.AddSlave("user:pass@tcp(127.0.0.1:3308)/test?parseTime=true")
+}
 ```
 
 ### 连接池生命周期约定
 
 - **Close 幂等**：首次调用执行实际清理（关闭主库与全部从库），重复调用直接返回 nil；
-- **Close 后不得再使用池**：`AddSlave` 在池关闭后返回 `zcdb: pool is closed` 错误；`PickReadDB`/`PickWriteDB` 仍会返回已关闭的连接（返回值签名所限不做快速失败），后续在其上执行的查询将报 `sql: database is closed`，调用方应自行保证 Close 后不再发起请求；
+- **Close 后不得再使用池**：`AddSlave` 在池关闭后返回 `ErrPoolClosed`（消息 `zcdb: pool is closed`）；`PickReadDB`/`PickWriteDB` 仍会返回已关闭的连接（返回值签名所限不做快速失败），后续在其上执行的查询将报 `sql: database is closed`，调用方应自行保证 Close 后不再发起请求；
 - 推荐的关闭时机：进程退出流程（如 zcquit 的高级别清理 handler）中调用一次 `pool.Close()` 或 `db.Close()`（DAO 的 Close 委托给池）。
 
 ## 创建 DAO
@@ -56,12 +64,14 @@ err := pool.AddSlave("user:pass@tcp(127.0.0.1:3308)/test?parseTime=true")
 `DBDao` 是面向用户的唯一入口，由方言名推导 SQL 编译器：
 
 ```go
-db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
-// dialect 取值：
-//   "mysql"                        → MySQLGrammar
-//   "postgresql"/"postgres"/"pgsql" → PostgresGrammar
-//   "sqlite"/"sqlite3"             → SQLiteGrammar
-defer db.Close()
+func example() {
+	db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
+	// dialect 取值：
+	//   "mysql"                        → MySQLGrammar
+	//   "postgresql"/"postgres"/"pgsql" → PostgresGrammar
+	//   "sqlite"/"sqlite3"             → SQLiteGrammar
+	defer db.Close()
+}
 ```
 
 第三个参数为慢 SQL 回调（见下文），第四个参数为列映射标签名（见下节，传空串使用默认 `db` 标签），第五个参数 `comment` 为默认 SQL **短业务标识**（例如服务名，空串表示无注释）。这是五参数接口，不兼容旧四参数调用；迁移时在末尾补 `""` 即可保留原 SQL 基线，函数值引用也需同步更新签名。回调类型为 `SlowSQLCallback`，签名的第二个参数是 DAO 的 SQL 编译器（`ctx, grammar, elapsed, sqlStr, args`），已有回调实现需在 `ctx` 之后补一个参数。`dialect` 为空返回 `ErrDialectRequired`，未知方言返回 `ErrUnknownDialect`，`pool` 为 nil 返回 `ErrPoolRequired`。
@@ -79,11 +89,13 @@ defer db.Close()
 结构体与数据库列的映射默认读取 `db` 标签，可在创建 DAO 时通过 `NewDBDao` 的第四个参数改为任意标签名（如与其它 ORM 共用结构体时复用其标签），初始化后不可变更：
 
 ```go
-db, err := zcdb.NewDBDao(pool, "mysql", nil, "zc", "") // 该 DAO 下的结构体映射读取 zc 标签，不添加 SQL 注释
+func example() {
+	db, err := zcdb.NewDBDao(pool, "mysql", nil, "zc", "") // 该 DAO 下的结构体映射读取 zc 标签，不添加 SQL 注释
 
-type User struct {
-	Name string `zc:"user_name"` // 映射到 user_name 列
-	Age  int    // 无标签，自动转 snake_case → age
+	type User struct {
+		Name string `zc:"user_name"` // 映射到 user_name 列
+		Age  int    // 无标签，自动转 snake_case → age
+	}
 }
 ```
 
@@ -95,10 +107,12 @@ type User struct {
 - 直接使用包级 `ScanStruct`/`ScanStructClose` 扫描原始 SQL 结果时，通过变参指定标签名：
 
 ```go
-rows, _ := db.Query(ctx, "SELECT user_name, age FROM users")
-defer rows.Close()
-var users []User
-_ = zcdb.ScanStruct(rows, &users, "zc") // 第三个参数指定标签名，缺省为 "db"
+func example() {
+	rows, _ := db.Query(ctx, "SELECT user_name, age FROM users")
+	defer rows.Close()
+	var users []User
+	_ = zcdb.ScanStruct(rows, &users, "zc") // 第三个参数指定标签名，缺省为 "db"
+}
 ```
 
 ## 读写分离路由
@@ -120,67 +134,77 @@ _ = zcdb.ScanStruct(rows, &users, "zc") // 第三个参数指定标签名，缺�
 `Transaction` 通过 context 传播事务，回调返回 nil 提交、返回 error 回滚、panic 时 defer 兜底回滚：
 
 ```go
-err := db.Transaction(ctx, func(ctx context.Context) error {
-	// 事务内的所有 Builder 执行自动走事务连接
-	if _, err := db.Builder().Table("users").
-		Where("id", "=", 1).
-		Update(ctx, User{Name: "alice"}); err != nil {
-		return err // 返回 error → 整体回滚
-	}
+func example() {
+	err := db.Transaction(ctx, func(ctx context.Context) error {
+		// 事务内的所有 Builder 执行自动走事务连接
+		if _, err := db.Builder().Table("users").
+			Where("id", "=", 1).
+			Update(ctx, User{Name: "alice"}); err != nil {
+			return err // 返回 error → 整体回滚
+		}
 
-	// 事务内的读查询也走事务连接（而非从库）
-	var user User
-	if err := db.Builder().Table("users").
-		Where("id", "=", 1).
-		First(ctx, &user); err != nil {
-		return err
-	}
-	return nil // 返回 nil → 提交
-})
-// SQL（事务内依次执行）:
-//   UPDATE `users` SET `name` = ? WHERE `id` = ?    args: [alice 1]
-//   SELECT * FROM `users` WHERE `id` = ? LIMIT 1    args: [1]
+		// 事务内的读查询也走事务连接（而非从库）
+		var user User
+		if err := db.Builder().Table("users").
+			Where("id", "=", 1).
+			First(ctx, &user); err != nil {
+			return err
+		}
+		return nil // 返回 nil → 提交
+	})
+	// SQL（事务内依次执行）:
+	//   UPDATE `users` SET `name` = ? WHERE `id` = ?    args: [alice 1]
+	//   SELECT * FROM `users` WHERE `id` = ? LIMIT 1    args: [1]
+}
 ```
 
 嵌套调用时检测到 ctx 中已有事务，且 DAO 属于同一 `Pool` 时直接复用（不会开启新事务），因此同一连接池上的业务函数可以自由组合：
 
 ```go
-err := db.Transaction(ctx, func(ctx context.Context) error {
-	// orderService.Create 使用同一 Pool，其内部 Transaction 会复用当前事务
-	return orderService.Create(ctx, order)
-})
+func example() {
+	err := db.Transaction(ctx, func(ctx context.Context) error {
+		// orderService.Create 使用同一 Pool，其内部 Transaction 会复用当前事务
+		return orderService.Create(ctx, order)
+	})
+}
 ```
 
 若嵌套业务使用另一 `Pool`，必须显式结束当前事务边界后再调用；直接传递事务 context 会返回 `ErrTxOwnerMismatch`。
+
+开启、提交、回滚失败分别返回哨兵 `ErrTxBegin` / `ErrTxCommit` / `ErrTxRollback`；被包装的底层错误（包括回调返回的原始 error 与回滚错误）仍可用 `errors.Is` 匹配。
 
 ## 原始 SQL
 
 不适合用 Builder 表达的语句可直接走 DAO。`Exec`、`Query`、`QueryPrimary` 均原文透传：不会添加 DAO 默认注释，也不剥离调用方手工添加的注释，**也不转换占位符**——`?` 由驱动解释，PostgreSQL（`lib/pq`）只接受 `$1`、`$2`…，因此 PostgreSQL 下上面的示例要写成 `$n`；若要把原始 SQL 变成一条**不需要参数**的完整 SQL（手工执行、日志留档），用 `db.Grammar().CompileRaw` 内联参数——它按方言自身的占位符形态识别：MySQL/SQLite 写 `?`、PostgreSQL 写 `$n`（也正是 PostgreSQL 下 Builder 编译产物的形态），见[编译](compile.md)的「原始 SQL 内联编译」。
 
 ```go
-// Exec：写语句（走写库或事务连接）
-result, err := db.Exec(ctx, "DELETE FROM logs WHERE created_at < ?", cutoff)
+func example() {
+	// Exec：写语句（走写库或事务连接）
+	result, err := db.Exec(ctx, "DELETE FROM logs WHERE created_at < ?", cutoff)
 
-// Query：读语句（走从库或事务连接），调用方负责 Close rows
-rows, err := db.Query(ctx, "SELECT id, name FROM users WHERE age > ?", 18)
-if err != nil {
-	return err
-}
-defer rows.Close()
-var users []User
-if err := zcdb.ScanStruct(rows, &users); err != nil { // 按 db 标签扫描到结构体切片
-	return err
-}
+	// Query：读语句（走从库或事务连接），调用方负责 Close rows
+	rows, err := db.Query(ctx, "SELECT id, name FROM users WHERE age > ?", 18)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var users []User
+	if err := zcdb.ScanStruct(rows, &users); err != nil { // 按 db 标签扫描到结构体切片
+		return err
+	}
 
-// QueryPrimary：强制走写（主库）连接，用于手写带锁查询
-rows, err = db.QueryPrimary(ctx, "SELECT * FROM users WHERE id = ? FOR UPDATE", 1)
+	// QueryPrimary：强制走写（主库）连接，用于手写带锁查询
+	rows, err = db.QueryPrimary(ctx, "SELECT * FROM users WHERE id = ? FOR UPDATE", 1)
+}
 ```
 
 Builder 链式查询需要强制主库时（如订单写入后立刻回读，从库可能尚未同步），用 `Primary()` 标记，不加锁、不改变编译 SQL：
 
 ```go
-var order Order
-err = db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &order)
+func example() {
+	var order Order
+	err = db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &order)
+}
 ```
 
 `ScanStruct` 不关闭 rows（调用方负责），`ScanStructClose` 扫描完成后自动关闭，详见[查询执行文档](query-exec.md)。
@@ -190,12 +214,14 @@ err = db.Builder().Table("orders").Where("id", "=", id).Primary().First(ctx, &or
 创建 DAO 时传入回调即可记录每条 SQL 的耗时：
 
 ```go
-db, err := zcdb.NewDBDao(pool, "mysql",
-	func(ctx context.Context, grammar zcdb.Grammar, elapsed time.Duration, sqlStr string, args []any) {
-		if elapsed > 200*time.Millisecond {
-			slog.Default().Info("slow sql", "elapsed", elapsed, "sql", sqlStr, "args", args)
-		}
-	}, "", "")
+func example() {
+	db, err := zcdb.NewDBDao(pool, "mysql",
+		func(ctx context.Context, grammar zcdb.Grammar, elapsed time.Duration, sqlStr string, args []any) {
+			if elapsed > 200*time.Millisecond {
+				slog.Default().Info("slow sql", "elapsed", elapsed, "sql", sqlStr, "args", args)
+			}
+		}, "", "")
+}
 ```
 
 `NewDBDao` 的回调参数语义与 Builder 链式构造无关，作用于所有经 DAO 执行的 SQL。第二个参数 `grammar` 是 DAO 持有的 SQL 编译器（与 `db.Grammar()` 返回同一实例），可用于判断方言、按方言格式化 SQL 或自行编译，与 DAO 共用实例、**只读使用**。`slowSQLMillis` 概念由回调内部自行判断；回调为 nil 时不计时（零开销）。
@@ -205,5 +231,7 @@ db, err := zcdb.NewDBDao(pool, "mysql",
 ## 连接探活
 
 ```go
-err := pool.Ping(ctx) // 依次 Ping 主库与所有从库，任一失败即返回错误
+func example() {
+	err := pool.Ping(ctx) // 依次 Ping 主库与所有从库，任一失败即返回错误
+}
 ```

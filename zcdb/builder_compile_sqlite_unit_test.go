@@ -3,6 +3,8 @@
 package zcdb
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -165,4 +167,121 @@ func TestSQLiteCompile_SQLCommentSubqueries(t *testing.T) {
 		"insert_ignore_using":  {`INSERT OR IGNORE INTO "users" ("name") SELECT "name" FROM "source" WHERE "score" > ?`, []any{11}},
 		"select_from_where":    {`SELECT "name", (SELECT "name" FROM "source" WHERE "score" > ?) AS "picked" FROM (SELECT "name" FROM "source" WHERE "score" > ?) AS "s" WHERE "id" = ? AND "name" IN (SELECT "name" FROM "source" WHERE "score" > ?)`, []any{11, 11, 7, 11}},
 	})
+}
+
+// TestSQLiteGrammar_WriteOrderLimitRejected 验证 SQLite 写语句不支持 ORDER BY/LIMIT：
+// 该语法需要 SQLITE_ENABLE_UPDATE_DELETE_LIMIT 编译选项，仓库使用的 modernc 构建未启用；
+// 若静默忽略会把写范围放大到全部命中行，因此编译期统一返回 ErrWriteOrderLimitUnsupported。
+func TestSQLiteGrammar_WriteOrderLimitRejected(t *testing.T) {
+	g := NewSQLiteGrammar()
+	type updateData struct {
+		Name string `db:"name"`
+	}
+	cases := []struct {
+		name    string
+		compile func() error
+	}{
+		{"update", func() error {
+			_, _, err := newTestBuilder(g, nil).Table("users").Where("id", ">", 0).
+				OrderBy("id").Limit(1).ToUpdate(updateData{Name: "x"})
+			return err
+		}},
+		{"delete", func() error {
+			_, _, err := newTestBuilder(g, nil).Table("users").Where("id", ">", 0).
+				OrderBy("id").Limit(1).ToDelete()
+			return err
+		}},
+		{"delete_join", func() error {
+			_, _, err := newTestBuilder(g, nil).Table("users").
+				Join("orders", "orders.user_id", "=", "users.id").
+				Where("users.id", ">", 0).Limit(1).ToDeleteJoin()
+			return err
+		}},
+		{"increment", func() error {
+			_, _, err := newTestBuilder(g, nil).Table("users").Where("id", ">", 0).
+				OrderBy("id").Limit(1).ToIncrement([]string{"wallet"}, []any{1})
+			return err
+		}},
+		{"decrement", func() error {
+			_, _, err := newTestBuilder(g, nil).Table("users").Where("id", ">", 0).
+				OrderBy("id").Limit(1).ToDecrement([]string{"wallet"}, []any{1})
+			return err
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := c.compile()
+			if !errors.Is(err, ErrWriteOrderLimitUnsupported) {
+				t.Fatalf("应返回 ErrWriteOrderLimitUnsupported，got %v", err)
+			}
+			if !strings.Contains(err.Error(), "sqlite") {
+				t.Errorf("错误消息应指出方言: %v", err)
+			}
+		})
+	}
+
+	// 不携带 ORDER BY/LIMIT 的写语句不受影响。
+	t.Run("without_order_limit_allowed", func(t *testing.T) {
+		sqlStr, _, err := newTestBuilder(g, nil).Table("users").Where("id", ">", 0).
+			ToUpdate(updateData{Name: "x"})
+		assertNoError(t, err)
+		assertSQL(t, `UPDATE "users" SET "name" = ? WHERE "id" > ?`, sqlStr)
+	})
+}
+
+// TestSQLiteGrammar_ExpressionPlaceholderBoundary 锁死 compile.md「占位符边界」矩阵在 SQLite 的形态：
+// Expression 内嵌的 `?` 在所有路径都原样保留（SQLite 没有 $N 转换），且 Expression 不新增绑定参数。
+func TestSQLiteGrammar_ExpressionPlaceholderBoundary(t *testing.T) {
+	expr := NewExpression("a ? b")
+	users := func(g Grammar) *Builder { return newTestBuilder(g, nil).Table("users") }
+	orders := func(g Grammar) *Builder { return newTestBuilder(g, nil).Table("orders") }
+	cases := []exprPlaceholderCase{
+		{"where", func(g Grammar) *Builder {
+			return users(g).Where("id", "=", expr)
+		}, (*Builder).ToSelect, `SELECT * FROM "users" WHERE "id" = a ? b`, nil},
+		{"where_in", func(g Grammar) *Builder {
+			return users(g).WhereIn("id", []any{expr})
+		}, (*Builder).ToSelect, `SELECT * FROM "users" WHERE "id" IN (a ? b)`, nil},
+		{"where_like", func(g Grammar) *Builder {
+			return users(g).WhereLike("name", expr)
+		}, (*Builder).ToSelect, `SELECT * FROM "users" WHERE "name" LIKE a ? b`, nil},
+		{"null_safe", func(g Grammar) *Builder {
+			return users(g).WhereNullSafeEquals("name", expr)
+		}, (*Builder).ToSelect, `SELECT * FROM "users" WHERE "name" IS a ? b`, nil},
+		{"having", func(g Grammar) *Builder {
+			return orders(g).GroupBy("uid").Having("cnt", ">", expr)
+		}, (*Builder).ToSelect, `SELECT * FROM "orders" GROUP BY "uid" HAVING "cnt" > a ? b`, nil},
+		{"having_raw", func(g Grammar) *Builder {
+			return orders(g).GroupBy("uid").HavingRaw("SUM(amount) > ?", expr)
+		}, (*Builder).ToSelect, `SELECT * FROM "orders" GROUP BY "uid" HAVING SUM(amount) > a ? b`, nil},
+		{"group_by_raw", func(g Grammar) *Builder {
+			return orders(g).GroupByRaw("DATE(?)", expr)
+		}, (*Builder).ToSelect, `SELECT * FROM "orders" GROUP BY DATE(a ? b)`, nil},
+		{"join_on_value", func(g Grammar) *Builder {
+			return users(g).JoinOn("orders", func(j *JoinBuilder) {
+				j.On("orders.uid", "=", "users.id").Where("orders.amt", ">", expr)
+			})
+		}, (*Builder).ToSelect,
+			`SELECT * FROM "users" INNER JOIN "orders" ON "orders"."uid" = "users"."id" AND "orders"."amt" > a ? b`, nil},
+		{"join_raw", func(g Grammar) *Builder {
+			return users(g).JoinOn("orders", func(j *JoinBuilder) {
+				j.On("orders.uid", "=", "users.id").Raw("YEAR(orders.created_at) = ?", expr)
+			})
+		}, (*Builder).ToSelect,
+			`SELECT * FROM "users" INNER JOIN "orders" ON "orders"."uid" = "users"."id" AND YEAR(orders.created_at) = a ? b`, nil},
+		{"where_raw", func(g Grammar) *Builder {
+			return users(g).WhereRaw("x = ?", expr)
+		}, (*Builder).ToSelect, `SELECT * FROM "users" WHERE x = a ? b`, nil},
+		{"update_set", func(g Grammar) *Builder {
+			return users(g).Where("id", "=", 1)
+		}, func(b *Builder) (string, []any, error) {
+			return b.ToUpdate(expressionPlaceholderRow{V: expr})
+		}, `UPDATE "users" SET "v" = a ? b WHERE "id" = ?`, []any{1}},
+		{"insert_values", func(g Grammar) *Builder {
+			return users(g)
+		}, func(b *Builder) (string, []any, error) {
+			return b.ToInsert(expressionPlaceholderInsert{Name: "x", V: expr})
+		}, `INSERT INTO "users" ("name", "v") VALUES (?, a ? b)`, []any{"x"}},
+	}
+	runExpressionPlaceholderCases(t, NewSQLiteGrammar(), cases)
 }

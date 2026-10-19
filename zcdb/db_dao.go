@@ -231,7 +231,7 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 	// 开启事务（始终走主库）
 	tx, err := d.pool.master.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("zcdb: begin transaction failed: %w", err)
+		return fmt.Errorf("%w: %w", ErrTxBegin, err)
 	}
 
 	// 将事务绑定到 ctx
@@ -250,7 +250,8 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 	if err := fn(txCtx); err != nil {
 		// 回滚
 		if rbErr := tx.Rollback(); rbErr != nil {
-			return fmt.Errorf("zcdb: rollback failed: %v, original error: %w", rbErr, err)
+			// 回滚错误与回调原始错误都用 %w 包装，两者均可 errors.Is 匹配
+			return fmt.Errorf("%w: %w, original error: %w", ErrTxRollback, rbErr, err)
 		}
 		settled = true // 已终结（回滚完成），defer 不再重复 Rollback
 		return err
@@ -261,7 +262,7 @@ func (d *DBDao) Transaction(ctx context.Context, fn func(ctx context.Context) er
 		// Commit 失败后事务已结束，database/sql 会自动回滚，
 		// 再调用 Rollback 只会返回 ErrTxDone 这类误导性错误，故直接返回提交错误。
 		settled = true // 已终结（提交失败，由 database/sql 自动回滚），defer 不再重复 Rollback
-		return fmt.Errorf("zcdb: commit failed: %w", err)
+		return fmt.Errorf("%w: %w", ErrTxCommit, err)
 	}
 	settled = true
 	return nil

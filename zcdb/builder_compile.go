@@ -17,6 +17,35 @@ func (b *Builder) appendSQLComment(sql string) string {
 	return sql + " /* " + b.comment + " */"
 }
 
+// hasWriteOrderLimit 报告 Builder 是否携带会被编译进写语句的 ORDER BY/LIMIT 状态。
+// Limit(n<=0) 不输出 LIMIT 子句（见 Limit 约定），不计入；Offset 不进入任何写语句，也不在判定范围。
+func (b *Builder) hasWriteOrderLimit() bool {
+	return len(b.orders) > 0 || b.limit > 0
+}
+
+// validateWriteOrderLimit 在编译写语句前拒绝方言/语句形态不支持的 ORDER BY / LIMIT：
+//   - PostgreSQL/SQLite 的 UPDATE/DELETE 没有该语法，忽略子句会把写范围静默放大到全部命中行；
+//   - MySQL 只有单表 UPDATE/DELETE 支持，多表 UPDATE（带 JOIN）会被引擎以 Error 1221 拒绝，
+//     DeleteJoin 同样不支持。
+//
+// 返回 ErrWriteOrderLimitUnsupported 并带出具体方言/形态；MySQL 单表写语句放行。
+func (b *Builder) validateWriteOrderLimit() error {
+	if !b.hasWriteOrderLimit() {
+		return nil
+	}
+	switch b.grammar.(type) {
+	case *MySQLGrammar:
+		if len(b.joins) > 0 {
+			return fmt.Errorf("%w: MySQL multi-table UPDATE/DELETE JOIN does not support ORDER BY/LIMIT", ErrWriteOrderLimitUnsupported)
+		}
+	case *PostgresGrammar:
+		return fmt.Errorf("%w: postgres dialect has no ORDER BY/LIMIT on write statements", ErrWriteOrderLimitUnsupported)
+	case *SQLiteGrammar:
+		return fmt.Errorf("%w: sqlite dialect has no ORDER BY/LIMIT on write statements", ErrWriteOrderLimitUnsupported)
+	}
+	return nil
+}
+
 // ==================== 终端方法：编译 SQL ====================
 
 // ToSelect 编译 SELECT 查询。
@@ -427,6 +456,9 @@ func (b *Builder) ToUpdate(data any) (string, []any, error) {
 	if err := b.validateAcyclic(); err != nil {
 		return "", nil, err
 	}
+	if err := b.validateWriteOrderLimit(); err != nil {
+		return "", nil, err
+	}
 
 	columns, values, err := extractUpdateData(data, b.tagName())
 	if err != nil {
@@ -489,6 +521,9 @@ func (b *Builder) ToDelete() (string, []any, error) {
 	if len(b.joins) > 0 {
 		return "", nil, ErrDeleteWithJoin
 	}
+	if err := b.validateWriteOrderLimit(); err != nil {
+		return "", nil, err
+	}
 
 	sql := b.grammar.CompileDelete(b)
 	args := b.collectWhereBindings()
@@ -528,6 +563,9 @@ func (b *Builder) ToDeleteJoin() (string, []any, error) {
 	}
 	if len(b.joins) == 0 {
 		return "", nil, ErrDeleteJoinNoJoin
+	}
+	if err := b.validateWriteOrderLimit(); err != nil {
+		return "", nil, err
 	}
 
 	sqlStr := b.grammar.CompileDeleteJoin(b)
@@ -824,6 +862,9 @@ func (b *Builder) toIncDec(columns []string, amounts []any, op string) (string, 
 	}
 	if len(columns) == 0 || len(columns) != len(amounts) {
 		return "", nil, ErrIncrementColumns
+	}
+	if err := b.validateWriteOrderLimit(); err != nil {
+		return "", nil, err
 	}
 
 	values := make([]any, len(columns))

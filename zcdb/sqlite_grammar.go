@@ -195,8 +195,9 @@ func (g *SQLiteGrammar) CompileSelect(b *Builder, columns []SelectColumn) string
 
 		// OFFSET
 		if b.offset > 0 {
-			// SQLite 的 OFFSET 必须配合 LIMIT，无 LIMIT 时用 -1 表示不限制行数
-			if b.limit == 0 {
+			// SQLite 的 OFFSET 必须配合 LIMIT：Limit 未设置或 <=0（按约定不输出 LIMIT）时
+			// 用 -1 表示不限制行数，否则只剩 OFFSET 的语句会被判为语法错误
+			if b.limit <= 0 {
 				sb.WriteString(" LIMIT -1")
 			}
 			sb.WriteString(" OFFSET ")

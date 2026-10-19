@@ -236,8 +236,8 @@ func TestPool_CloseIdempotentAndAddSlaveAfterClose(t *testing.T) {
 		t.Errorf("重复 Close 应幂等返回 nil，实际: %v", err)
 	}
 	// Close 后 AddSlave 快速失败，不形成“池已关闭但持有活从库”的不一致状态
-	if err := pool.AddSlave("slave1"); !errors.Is(err, errPoolClosed) {
-		t.Errorf("Close 后 AddSlave 应返回 errPoolClosed，实际: %v", err)
+	if err := pool.AddSlave("slave1"); !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("Close 后 AddSlave 应返回 ErrPoolClosed，实际: %v", err)
 	}
 }
 
@@ -286,8 +286,8 @@ func TestPool_AddSlaveCloseRace(t *testing.T) {
 	close(release)
 	select {
 	case err := <-addDone:
-		if !errors.Is(err, errPoolClosed) {
-			t.Fatalf("AddSlave 在 Ping 期间遭遇 Close 应返回 errPoolClosed，实际: %v", err)
+		if !errors.Is(err, ErrPoolClosed) {
+			t.Fatalf("AddSlave 在 Ping 期间遭遇 Close 应返回 ErrPoolClosed，实际: %v", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("AddSlave did not complete after release")
@@ -388,6 +388,85 @@ func TestPool_CloseReportsConnCloseError(t *testing.T) {
 		pool := &Pool{master: master, slaves: []*sql.DB{openCloseErrDB(t, "slave")}}
 		if err := pool.Close(); !errors.Is(err, errForcedConnClose) {
 			t.Fatalf("从库关闭失败应上报原始错误，实际 %v", err)
+		}
+	})
+}
+
+// errForcedPingFailure 是 failingPingDriver 注入的 Ping 失败原因。
+var errForcedPingFailure = errors.New("zcdb test: forced ping failure")
+
+// failingPingDriver 测试专用驱动：Open 成功、Ping 固定失败，用于验证 ErrPoolConnect 的包装：
+// 错误信息应同时可 errors.Is 到 ErrPoolConnect 与底层驱动错误。
+type failingPingDriver struct{}
+
+func (failingPingDriver) Open(string) (driver.Conn, error) { return failingPingConn{}, nil }
+
+type failingPingConn struct{}
+
+func (failingPingConn) Prepare(string) (driver.Stmt, error) { return nil, errForcedPingFailure }
+func (failingPingConn) Close() error                        { return nil }
+func (failingPingConn) Begin() (driver.Tx, error)           { return nil, errForcedPingFailure }
+func (failingPingConn) Ping(context.Context) error          { return errForcedPingFailure }
+
+var registerFailingPingDriverOnce sync.Once
+
+// registerFailingPingDriver 注册强制 Ping 失败的测试驱动（进程内仅一次）。
+func registerFailingPingDriver() {
+	registerFailingPingDriverOnce.Do(func() {
+		sql.Register("zcdb_test_ping_fail_driver", failingPingDriver{})
+	})
+}
+
+// TestPool_ErrorSentinels 验证连接池自身的错误均为可导出哨兵，且底层错误仍可 errors.Is：
+// 配置缺失（ErrDriverNameRequired/ErrDSNRequired）、连接失败（ErrPoolConnect + 驱动错误）、
+// 池已关闭（ErrPoolClosed）。AddSlave 的 Ping 失败同样包装为 ErrPoolConnect。
+func TestPool_ErrorSentinels(t *testing.T) {
+	registerFailingPingDriver()
+
+	t.Run("driver_name_required", func(t *testing.T) {
+		if _, err := NewPool(PoolConfig{}); !errors.Is(err, ErrDriverNameRequired) {
+			t.Fatalf("缺 DriverName 应返回 ErrDriverNameRequired，实际 %v", err)
+		}
+	})
+	t.Run("dsn_required", func(t *testing.T) {
+		if _, err := NewPool(PoolConfig{DriverName: "sqlite"}); !errors.Is(err, ErrDSNRequired) {
+			t.Fatalf("缺 DSN 应返回 ErrDSNRequired，实际 %v", err)
+		}
+	})
+	t.Run("master_ping_failed", func(t *testing.T) {
+		_, err := NewPool(PoolConfig{DriverName: "zcdb_test_ping_fail_driver", DSN: "dsn"})
+		if !errors.Is(err, ErrPoolConnect) || !errors.Is(err, errForcedPingFailure) {
+			t.Fatalf("主库 Ping 失败应同时匹配 ErrPoolConnect 与驱动错误，实际 %v", err)
+		}
+	})
+	t.Run("add_slave_ping_failed", func(t *testing.T) {
+		master, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			t.Fatalf("open master failed: %v", err)
+		}
+		t.Cleanup(func() { _ = master.Close() })
+		pool := &Pool{
+			master:                master,
+			driverName:            "zcdb_test_ping_fail_driver",
+			maxOpenConns:          1,
+			maxIdleConns:          1,
+			connMaxLifetimeSecond: 1,
+			connectTimeout:        time.Second,
+		}
+		if err := pool.AddSlave("dsn"); !errors.Is(err, ErrPoolConnect) || !errors.Is(err, errForcedPingFailure) {
+			t.Fatalf("从库 Ping 失败应同时匹配 ErrPoolConnect 与驱动错误，实际 %v", err)
+		}
+	})
+	t.Run("pool_closed", func(t *testing.T) {
+		pool, err := NewPool(PoolConfig{DriverName: "sqlite", DSN: ":memory:"})
+		if err != nil {
+			t.Fatalf("NewPool 失败: %v", err)
+		}
+		if err := pool.Close(); err != nil {
+			t.Fatalf("Close 失败: %v", err)
+		}
+		if err := pool.AddSlave(":memory:"); !errors.Is(err, ErrPoolClosed) {
+			t.Fatalf("Close 后 AddSlave 应返回 ErrPoolClosed，实际 %v", err)
 		}
 	})
 }
