@@ -62,14 +62,15 @@ func (r *Router) Group(prefix string, middlewares ...MiddlewareHandler) *RouterG
 }
 
 // register 是所有 HTTP 方法共用的注册逻辑：先完整准备，再写入路由树与顺序索引。
-func (r *Router) register(method, path string, handler any, groupMiddlewares []MiddlewareHandler) {
-	registration := r.prepareRegistration(method, path, handler, groupMiddlewares)
+// routeMiddlewares 为该路由私有的中间件，注册时快照到路由条目，位于全局与分组中间件之后（最内层）。
+func (r *Router) register(method, path string, handler any, groupMiddlewares, routeMiddlewares []MiddlewareHandler) {
+	registration := r.prepareRegistration(method, path, handler, groupMiddlewares, routeMiddlewares)
 	r.commitRegistration(registration)
 }
 
-func (r *Router) prepareRegistration(method, path string, handler any, groupMiddlewares []MiddlewareHandler) routeRegistration {
+func (r *Router) prepareRegistration(method, path string, handler any, groupMiddlewares, routeMiddlewares []MiddlewareHandler) routeRegistration {
 	path = normalizePath(path)
-	entry, err := buildEntry(handler, r.middlewares, groupMiddlewares)
+	entry, err := buildEntry(handler, r.middlewares, groupMiddlewares, routeMiddlewares)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -87,10 +88,10 @@ func (r *Router) commitRegistration(registration routeRegistration) {
 	r.routes = append(r.routes, routeRecord{method: registration.method, path: registration.path, entry: registration.entry})
 }
 
-func (r *Router) registerAny(path string, handler any, groupMiddlewares []MiddlewareHandler) {
+func (r *Router) registerAny(path string, handler any, groupMiddlewares, routeMiddlewares []MiddlewareHandler) {
 	registrations := make([]routeRegistration, 0, len(allHTTPMethods))
 	for _, method := range allHTTPMethods {
-		registrations = append(registrations, r.prepareRegistration(method, path, handler, groupMiddlewares))
+		registrations = append(registrations, r.prepareRegistration(method, path, handler, groupMiddlewares, routeMiddlewares))
 	}
 	for _, registration := range registrations {
 		rootCopy := cloneRouteNode(r.trees[registration.method])
@@ -190,54 +191,64 @@ func parseRoutePath(path string) ([]routeSegment, error) {
 	return segments, nil
 }
 
-// GET 注册处理 GET 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) GET(path string, handler any) {
-	r.register(http.MethodGet, path, handler, nil)
+// GET 注册处理 GET 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) GET(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodGet, path, handler, nil, middlewares)
 }
 
-// POST 注册处理 POST 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) POST(path string, handler any) {
-	r.register(http.MethodPost, path, handler, nil)
+// POST 注册处理 POST 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) POST(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodPost, path, handler, nil, middlewares)
 }
 
-// PUT 注册处理 PUT 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) PUT(path string, handler any) {
-	r.register(http.MethodPut, path, handler, nil)
+// PUT 注册处理 PUT 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) PUT(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodPut, path, handler, nil, middlewares)
 }
 
-// DELETE 注册处理 DELETE 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) DELETE(path string, handler any) {
-	r.register(http.MethodDelete, path, handler, nil)
+// DELETE 注册处理 DELETE 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) DELETE(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodDelete, path, handler, nil, middlewares)
 }
 
-// PATCH 注册处理 PATCH 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) PATCH(path string, handler any) {
-	r.register(http.MethodPatch, path, handler, nil)
+// PATCH 注册处理 PATCH 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) PATCH(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodPatch, path, handler, nil, middlewares)
 }
 
-// HEAD 注册处理 HEAD 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) HEAD(path string, handler any) {
-	r.register(http.MethodHead, path, handler, nil)
+// HEAD 注册处理 HEAD 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) HEAD(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodHead, path, handler, nil, middlewares)
 }
 
-// OPTIONS 注册处理 OPTIONS 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) OPTIONS(path string, handler any) {
-	r.register(http.MethodOptions, path, handler, nil)
+// OPTIONS 注册处理 OPTIONS 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) OPTIONS(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodOptions, path, handler, nil, middlewares)
 }
 
-// CONNECT 注册处理 CONNECT 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) CONNECT(path string, handler any) {
-	r.register(http.MethodConnect, path, handler, nil)
+// CONNECT 注册处理 CONNECT 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) CONNECT(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodConnect, path, handler, nil, middlewares)
 }
 
-// TRACE 注册处理 TRACE 方法的路由；handler 签名非法或路由冲突时 panic。
-func (r *Router) TRACE(path string, handler any) {
-	r.register(http.MethodTrace, path, handler, nil)
+// TRACE 注册处理 TRACE 方法的路由；middlewares 为该路由私有的中间件，注册时快照并位于链的最内层；
+// handler 签名非法或路由冲突时 panic。
+func (r *Router) TRACE(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.register(http.MethodTrace, path, handler, nil, middlewares)
 }
 
 // Any 为全部 9 个受支持的 HTTP 方法原子注册同一路由；预检全部通过后才统一提交。
-func (r *Router) Any(path string, handler any) {
-	r.registerAny(path, handler, nil)
+// middlewares 为这 9 条路由共用的路由级中间件，注册时快照并位于各自链的最内层。
+func (r *Router) Any(path string, handler any, middlewares ...MiddlewareHandler) {
+	r.registerAny(path, handler, nil, middlewares)
 }
 
 // =============== RouterGroup ===============
@@ -284,54 +295,64 @@ func (g *RouterGroup) fullPath(path string) string {
 	return joinGroupPath(g.prefix, path)
 }
 
-// GET 在分组内注册 GET 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) GET(path string, handler any) {
-	g.router.register(http.MethodGet, g.fullPath(path), handler, g.middlewareChain())
+// GET 在分组内注册 GET 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) GET(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodGet, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// POST 在分组内注册 POST 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) POST(path string, handler any) {
-	g.router.register(http.MethodPost, g.fullPath(path), handler, g.middlewareChain())
+// POST 在分组内注册 POST 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) POST(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodPost, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// PUT 在分组内注册 PUT 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) PUT(path string, handler any) {
-	g.router.register(http.MethodPut, g.fullPath(path), handler, g.middlewareChain())
+// PUT 在分组内注册 PUT 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) PUT(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodPut, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// DELETE 在分组内注册 DELETE 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) DELETE(path string, handler any) {
-	g.router.register(http.MethodDelete, g.fullPath(path), handler, g.middlewareChain())
+// DELETE 在分组内注册 DELETE 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) DELETE(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodDelete, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// PATCH 在分组内注册 PATCH 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) PATCH(path string, handler any) {
-	g.router.register(http.MethodPatch, g.fullPath(path), handler, g.middlewareChain())
+// PATCH 在分组内注册 PATCH 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) PATCH(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodPatch, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// HEAD 在分组内注册 HEAD 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) HEAD(path string, handler any) {
-	g.router.register(http.MethodHead, g.fullPath(path), handler, g.middlewareChain())
+// HEAD 在分组内注册 HEAD 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) HEAD(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodHead, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// OPTIONS 在分组内注册 OPTIONS 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) OPTIONS(path string, handler any) {
-	g.router.register(http.MethodOptions, g.fullPath(path), handler, g.middlewareChain())
+// OPTIONS 在分组内注册 OPTIONS 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) OPTIONS(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodOptions, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// CONNECT 在分组内注册 CONNECT 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) CONNECT(path string, handler any) {
-	g.router.register(http.MethodConnect, g.fullPath(path), handler, g.middlewareChain())
+// CONNECT 在分组内注册 CONNECT 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) CONNECT(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodConnect, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// TRACE 在分组内注册 TRACE 方法路由；注册时快照全局及祖先分组的当前中间件链。
-func (g *RouterGroup) TRACE(path string, handler any) {
-	g.router.register(http.MethodTrace, g.fullPath(path), handler, g.middlewareChain())
+// TRACE 在分组内注册 TRACE 方法路由；注册时快照全局及祖先分组的当前中间件链，
+// 并追加该路由私有的 middlewares（位于链的最内层）。
+func (g *RouterGroup) TRACE(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.register(http.MethodTrace, g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
-// Any 在分组内为全部 9 个受支持的方法原子注册同一路由。
-func (g *RouterGroup) Any(path string, handler any) {
-	g.router.registerAny(g.fullPath(path), handler, g.middlewareChain())
+// Any 在分组内为全部 9 个受支持的方法原子注册同一路由；
+// middlewares 为这 9 条路由共用的路由级中间件，注册时快照并位于各自链的最内层。
+func (g *RouterGroup) Any(path string, handler any, middlewares ...MiddlewareHandler) {
+	g.router.registerAny(g.fullPath(path), handler, g.middlewareChain(), middlewares)
 }
 
 func joinGroupPath(prefix, path string) string {

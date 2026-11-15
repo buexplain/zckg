@@ -25,7 +25,7 @@ type testRes struct {
 // ========== 错误场景测试 ==========
 
 func TestBuildEntry_NilHandler(t *testing.T) {
-	_, err := buildEntry(nil, nil, nil)
+	_, err := buildEntry(nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for nil handler")
 	}
@@ -35,7 +35,7 @@ func TestBuildEntry_NilHandler(t *testing.T) {
 }
 
 func TestBuildEntry_NonFuncHandler(t *testing.T) {
-	_, err := buildEntry("not a function", nil, nil)
+	_, err := buildEntry("not a function", nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for non-function handler")
 	}
@@ -46,7 +46,7 @@ func TestBuildEntry_NonFuncHandler(t *testing.T) {
 
 func TestBuildEntry_WrongNumIn_Zero(t *testing.T) {
 	fn := func() (testRes, error) { return testRes{}, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with 0 inputs")
 	}
@@ -57,7 +57,7 @@ func TestBuildEntry_WrongNumIn_Zero(t *testing.T) {
 
 func TestBuildEntry_WrongNumIn_One(t *testing.T) {
 	fn := func(ctx context.Context) (testRes, error) { return testRes{}, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with 1 input")
 	}
@@ -68,7 +68,7 @@ func TestBuildEntry_WrongNumIn_One(t *testing.T) {
 
 func TestBuildEntry_WrongNumIn_Three(t *testing.T) {
 	fn := func(ctx context.Context, req testReq, extra int) (testRes, error) { return testRes{}, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with 3 inputs")
 	}
@@ -79,7 +79,7 @@ func TestBuildEntry_WrongNumIn_Three(t *testing.T) {
 
 func TestBuildEntry_FirstArgNotContext(t *testing.T) {
 	fn := func(s string, req testReq) (testRes, error) { return testRes{}, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with non-context first arg")
 	}
@@ -90,7 +90,7 @@ func TestBuildEntry_FirstArgNotContext(t *testing.T) {
 
 func TestBuildEntry_SecondArgNotStruct_String(t *testing.T) {
 	fn := func(ctx context.Context, name string) (testRes, error) { return testRes{}, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with non-struct second arg")
 	}
@@ -101,7 +101,7 @@ func TestBuildEntry_SecondArgNotStruct_String(t *testing.T) {
 
 func TestBuildEntry_SecondArgNotStruct_Int(t *testing.T) {
 	fn := func(ctx context.Context, n int) (testRes, error) { return testRes{}, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with int second arg")
 	}
@@ -112,7 +112,7 @@ func TestBuildEntry_SecondArgNotStruct_Int(t *testing.T) {
 
 func TestBuildEntry_SecondArgNotStruct_Map(t *testing.T) {
 	fn := func(ctx context.Context, m map[string]any) (testRes, error) { return testRes{}, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with map second arg")
 	}
@@ -123,7 +123,7 @@ func TestBuildEntry_SecondArgNotStruct_Map(t *testing.T) {
 
 func TestBuildEntry_WrongNumOut_Zero(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) {}
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with 0 returns")
 	}
@@ -134,7 +134,7 @@ func TestBuildEntry_WrongNumOut_Zero(t *testing.T) {
 
 func TestBuildEntry_WrongNumOut_One(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) error { return nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with 1 return")
 	}
@@ -145,7 +145,7 @@ func TestBuildEntry_WrongNumOut_One(t *testing.T) {
 
 func TestBuildEntry_WrongNumOut_Three(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) (testRes, error, int) { return testRes{}, nil, 0 }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with 3 returns")
 	}
@@ -156,7 +156,7 @@ func TestBuildEntry_WrongNumOut_Three(t *testing.T) {
 
 func TestBuildEntry_FirstReturnNotStruct_String(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) (string, error) { return "", nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with non-struct first return")
 	}
@@ -167,7 +167,7 @@ func TestBuildEntry_FirstReturnNotStruct_String(t *testing.T) {
 
 func TestBuildEntry_FirstReturnNotStruct_Int(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) (int, error) { return 0, nil }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with int first return")
 	}
@@ -178,7 +178,7 @@ func TestBuildEntry_FirstReturnNotStruct_Int(t *testing.T) {
 
 func TestBuildEntry_SecondReturnNotError(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) (testRes, string) { return testRes{}, "" }
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for handler with non-error second return")
 	}
@@ -193,7 +193,7 @@ func TestBuildEntry_CustomErrorType(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) (testRes, *myErr) {
 		return testRes{}, nil
 	}
-	_, err := buildEntry(fn, nil, nil)
+	_, err := buildEntry(fn, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for custom type not implementing error")
 	}
@@ -205,7 +205,7 @@ func TestBuildEntry_ValueStructParams(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) (testRes, error) {
 		return testRes{Message: req.Name}, nil
 	}
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestBuildEntry_PointerStructParams(t *testing.T) {
 	fn := func(ctx context.Context, req *testReq) (*testRes, error) {
 		return &testRes{Message: req.Name}, nil
 	}
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestBuildEntry_MixedParams_ValueReqPointerRes(t *testing.T) {
 	fn := func(ctx context.Context, req testReq) (*testRes, error) {
 		return &testRes{Message: req.Name}, nil
 	}
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestBuildEntry_MixedParams_PointerReqValueRes(t *testing.T) {
 	fn := func(ctx context.Context, req *testReq) (testRes, error) {
 		return testRes{Message: req.Name}, nil
 	}
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -320,22 +320,27 @@ func TestBuildEntry_MiddlewareSnapshot(t *testing.T) {
 	mw3 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
 		return next(w, r)
 	}
+	mw4 := func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		return next(w, r)
+	}
 
 	global := []MiddlewareHandler{mw1, mw2}
 	group := []MiddlewareHandler{mw3}
+	route := []MiddlewareHandler{mw4}
 
-	entry, err := buildEntry(fn, global, group)
+	entry, err := buildEntry(fn, global, group, route)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(entry.middlewares) != 3 {
-		t.Fatalf("expected 3 middlewares, got %d", len(entry.middlewares))
+	if len(entry.middlewares) != 4 {
+		t.Fatalf("expected 4 middlewares, got %d", len(entry.middlewares))
 	}
 
 	p1 := reflect.ValueOf(entry.middlewares[0]).Pointer()
 	p2 := reflect.ValueOf(entry.middlewares[1]).Pointer()
 	p3 := reflect.ValueOf(entry.middlewares[2]).Pointer()
+	p4 := reflect.ValueOf(entry.middlewares[3]).Pointer()
 
 	if p1 != reflect.ValueOf(mw1).Pointer() {
 		t.Fatal("first middleware should be mw1")
@@ -345,6 +350,9 @@ func TestBuildEntry_MiddlewareSnapshot(t *testing.T) {
 	}
 	if p3 != reflect.ValueOf(mw3).Pointer() {
 		t.Fatal("third middleware should be mw3")
+	}
+	if p4 != reflect.ValueOf(mw4).Pointer() {
+		t.Fatal("fourth middleware should be mw4 (route-level, innermost)")
 	}
 }
 
@@ -358,16 +366,21 @@ func TestBuildEntry_MiddlewareSnapshot_IndependentCopy(t *testing.T) {
 	}
 
 	global := []MiddlewareHandler{mw1}
+	route := []MiddlewareHandler{mw1}
 
-	entry, err := buildEntry(fn, global, nil)
+	entry, err := buildEntry(fn, global, nil, route)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 修改原始 global 切片，不应影响 entry
+	// 修改原始 global / route 切片，不应影响 entry 的快照
 	global[0] = nil
+	route[0] = nil
 	if entry.middlewares[0] == nil {
-		t.Fatal("entry middleware should not be affected by external modification")
+		t.Fatal("entry global middleware should not be affected by external modification")
+	}
+	if entry.middlewares[1] == nil {
+		t.Fatal("entry route middleware should not be affected by external modification")
 	}
 }
 
@@ -376,7 +389,7 @@ func TestBuildEntry_EmptyMiddlewares(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -391,7 +404,7 @@ func TestBuildEntry_HandlerLocation(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -414,7 +427,7 @@ func TestBuildEntry_HandlerEquality(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -429,7 +442,7 @@ func TestBuildEntry_NilGlobalMiddlewares(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -446,7 +459,7 @@ func TestBuildEntry_AnonymousStructReq(t *testing.T) {
 		return testRes{Message: req.Name}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -472,7 +485,7 @@ func TestBuildEntry_EmbeddedStructReq(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -547,7 +560,7 @@ func TestBuildEntryKeepRawBody(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			entry, err := buildEntry(c.handler, nil, nil)
+			entry, err := buildEntry(c.handler, nil, nil, nil)
 			if c.errPart != nil {
 				if err == nil {
 					t.Fatalf("expected error containing %v, got nil", c.errPart)
@@ -582,7 +595,7 @@ func TestBuildEntry_ReqMeta_Fields(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -609,7 +622,7 @@ func TestBuildEntry_NeedsNonzeroValidation_TopLevel(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -633,7 +646,7 @@ func TestBuildEntry_NeedsNonzeroValidation_NestedOnly(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -655,7 +668,7 @@ func TestBuildEntry_NeedsNonzeroValidation_None(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -674,7 +687,7 @@ func TestBuildEntry_ReqMeta_HasDefault(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -693,7 +706,7 @@ func TestBuildEntry_ReqMeta_NoDefault(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -721,7 +734,7 @@ func TestBuildEntry_ReqMeta_ImplementsValidator(t *testing.T) {
 	// 由于 go 限制不能在函数内定义带方法的类型，这里只验证 fields 不为空
 	// 完整的 implementsValidator 测试通过已有集成测试覆盖
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -740,7 +753,7 @@ func TestBuildEntry_ReqMeta_PointerReq(t *testing.T) {
 		return &testRes{Message: req.Title}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -839,7 +852,7 @@ func TestBuildEntry_NeedsDeepCopy_True(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -859,7 +872,7 @@ func TestBuildEntry_NeedsDeepCopy_SliceDefault(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -879,7 +892,7 @@ func TestBuildEntry_DefaultReq_Template(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -908,7 +921,7 @@ func TestBuildEntry_OpMeta_Computed(t *testing.T) {
 		return testRes{}, nil
 	}
 
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -934,7 +947,7 @@ func TestBuildEntry_NeedsRequestPhaseDefaults(t *testing.T) {
 	fn1 := func(ctx context.Context, req reqValDefault) (testRes, error) {
 		return testRes{}, nil
 	}
-	entry1, err := buildEntry(fn1, nil, nil)
+	entry1, err := buildEntry(fn1, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -949,7 +962,7 @@ func TestBuildEntry_NeedsRequestPhaseDefaults(t *testing.T) {
 	fn2 := func(ctx context.Context, req reqPtrDefault) (testRes, error) {
 		return testRes{}, nil
 	}
-	entry2, err := buildEntry(fn2, nil, nil)
+	entry2, err := buildEntry(fn2, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -964,7 +977,7 @@ func TestBuildEntry_NeedsRequestPhaseDefaults(t *testing.T) {
 	fn3 := func(ctx context.Context, req reqNoDefault) (testRes, error) {
 		return testRes{}, nil
 	}
-	entry3, err := buildEntry(fn3, nil, nil)
+	entry3, err := buildEntry(fn3, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -981,7 +994,7 @@ func TestBuildEntry_NeedsRequestPhaseDefaults(t *testing.T) {
 	fn4 := func(ctx context.Context, req reqNestedPtrDefault) (testRes, error) {
 		return testRes{}, nil
 	}
-	entry4, err := buildEntry(fn4, nil, nil)
+	entry4, err := buildEntry(fn4, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1069,7 +1082,7 @@ func TestBuildEntry_WarnsOnInertEmbeddedInRes(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 			defer slog.SetDefault(old)
 
-			if _, err := buildEntry(tc.handler, nil, nil); err != nil {
+			if _, err := buildEntry(tc.handler, nil, nil, nil); err != nil {
 				t.Fatalf("buildEntry 不应因无效嵌入而失败: %v", err)
 			}
 			if got := strings.Contains(buf.String(), warnText); got != tc.wantWarn {

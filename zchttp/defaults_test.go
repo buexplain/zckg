@@ -483,7 +483,7 @@ func TestCheckUnsupportedDefaults_EmbeddedPtrNoWarning(t *testing.T) {
 
 	// 注册期 applyDefaults 应实际填充嵌入结构体的默认值（与无告警结论一致）
 	fn := func(_ context.Context, _ req) (embedDefaultRes, error) { return embedDefaultRes{}, nil }
-	entry, err := buildEntry(fn, nil, nil)
+	entry, err := buildEntry(fn, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

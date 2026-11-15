@@ -410,6 +410,41 @@ func TestDocExamples_KeepRawBody(t *testing.T) {
 	}
 }
 
+// docRouteMiddlewareReq 对应 routing.md「注册路由」一节路由级中间件示例的空请求结构。
+type docRouteMiddlewareReq struct{}
+
+// TestDocExamples_RouteMiddleware 编译并运行 routing.md「注册路由」一节的路由级中间件示例：
+// 路由级中间件只对本次注册的路由生效，且执行位置位于全局与分组中间件之后（最内层）。
+func TestDocExamples_RouteMiddleware(t *testing.T) {
+	var order []string
+	record := func(name string) zchttp.MiddlewareHandler {
+		return func(ctx context.Context, w http.ResponseWriter, r *http.Request, next zchttp.NextFunc) error {
+			order = append(order, name+"-before")
+			err := next(w, r)
+			order = append(order, name+"-after")
+			return err
+		}
+	}
+
+	e := zchttp.NewEngine()
+	e.Router.Use(record("global"))
+	api := e.Router.Group("/api", record("group"))
+	api.GET("/users", func(_ context.Context, _ docRouteMiddlewareReq) (docExampleRes, error) {
+		order = append(order, "handler")
+		return docExampleRes{OK: true}, nil
+	}, record("route"))
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/users", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/users = %d, want 200，body=%q", rec.Code, rec.Body.String())
+	}
+	want := "global-before,group-before,route-before,handler,route-after,group-after,global-after"
+	if got := strings.Join(order, ","); got != want {
+		t.Fatalf("执行顺序 = %q, want %q", got, want)
+	}
+}
+
 // writeDocFile 写入文档示例运行所需的文件（自动创建父目录）。
 func writeDocFile(t *testing.T, name, content string) {
 	t.Helper()

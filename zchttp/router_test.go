@@ -746,6 +746,191 @@ func TestParentGroupLateMiddlewareAffectsLaterChildRoutes(t *testing.T) {
 	}
 }
 
+// recordingMiddleware 返回一个把 name-before / name-after 写入 order 的中间件，
+// 供路由级中间件的顺序、隔离与快照类用例复用。
+func recordingMiddleware(order *[]string, name string) MiddlewareHandler {
+	return func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		*order = append(*order, name+"-before")
+		err := next(w, r)
+		*order = append(*order, name+"-after")
+		return err
+	}
+}
+
+// TestRouteMiddlewareChainOrder 验证路由级中间件位于全局与分组中间件之后（链的最内层）：
+// 前置顺序为 全局 → 父组 → 子组 → 路由级 → handler，后置顺序完全相反。
+func TestRouteMiddlewareChainOrder(t *testing.T) {
+	var order []string
+	router := NewRouter()
+	router.Use(recordingMiddleware(&order, "global"))
+	parent := router.Group("/api", recordingMiddleware(&order, "parent"))
+	child := parent.Group("/v1", recordingMiddleware(&order, "child"))
+	child.POST("/run", func(_ context.Context, _ helloReq) (helloRes, error) {
+		order = append(order, "handler")
+		return helloRes{}, nil
+	}, recordingMiddleware(&order, "route"))
+
+	rec := serveRequest(t, router, http.MethodPost, "/api/v1/run", `{"name":"x"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	want := []string{
+		"global-before", "parent-before", "child-before", "route-before", "handler",
+		"route-after", "child-after", "parent-after", "global-after",
+	}
+	if got := strings.Join(order, ","); got != strings.Join(want, ",") {
+		t.Fatalf("route middleware chain order = %q, want %q", got, strings.Join(want, ","))
+	}
+}
+
+// TestRouteMiddlewareScopeIsolation 验证路由级中间件只作用于注册它的那条路由：
+// 同组的其他路径、同路径的其他方法都不执行它。
+func TestRouteMiddlewareScopeIsolation(t *testing.T) {
+	var calls []string
+	routeMW := func(_ context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		return next(w, r)
+	}
+
+	router := NewRouter()
+	api := router.Group("/api")
+	api.GET("/with", hello, routeMW)
+	api.GET("/without", hello)
+	api.POST("/with", hello)
+
+	cases := []struct {
+		method, target, body string
+		wantMW               bool
+	}{
+		{http.MethodGet, "/api/with?name=x", "", true},
+		{http.MethodGet, "/api/without?name=x", "", false},
+		{http.MethodPost, "/api/with", `{"name":"x"}`, false},
+	}
+	for _, tc := range cases {
+		calls = nil
+		rec := serveRequest(t, router, tc.method, tc.target, tc.body)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s %s expected 200, got %d", tc.method, tc.target, rec.Code)
+			continue
+		}
+		if got := len(calls) == 1; got != tc.wantMW {
+			t.Errorf("%s %s: route middleware executed = %t, want %t; calls=%v", tc.method, tc.target, got, tc.wantMW, calls)
+		}
+	}
+}
+
+// TestRouteMiddlewareSnapshotAfterRegistration 验证路由级中间件在注册时快照：
+// 注册后修改调用方切片、向 Router 追加全局中间件，都不会改变已注册路由的链。
+func TestRouteMiddlewareSnapshotAfterRegistration(t *testing.T) {
+	var order []string
+	router := NewRouter()
+	middlewares := []MiddlewareHandler{recordingMiddleware(&order, "route-a")}
+	router.GET("/snap", hello, middlewares...)
+	middlewares[0] = recordingMiddleware(&order, "route-b")
+	router.Use(recordingMiddleware(&order, "late-global"))
+
+	rec := serveRequest(t, router, http.MethodGet, "/snap?name=x", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if got, want := strings.Join(order, ","), "route-a-before,route-a-after"; got != want {
+		t.Fatalf("registered route chain = %q, want %q (slice mutation and late Use must not affect it)", got, want)
+	}
+}
+
+// TestRouteMiddlewareAny 验证 Any 注册的路由级中间件对全部 9 个方法生效，且每个请求只执行一次。
+func TestRouteMiddlewareAny(t *testing.T) {
+	calls := 0
+	mw := func(_ context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		calls++
+		return next(w, r)
+	}
+
+	cases := []struct {
+		name     string
+		target   string
+		register func(*Router)
+	}{
+		{"Router", "/any-mw", func(r *Router) { r.Any("/any-mw", hello, mw) }},
+		{"RouterGroup", "/api/any-mw", func(r *Router) { r.Group("/api").Any("/any-mw", hello, mw) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := NewRouter()
+			tc.register(router)
+			for _, method := range allHTTPMethods {
+				t.Run(method, func(t *testing.T) {
+					calls = 0
+					target := tc.target
+					var body string
+					if method == http.MethodGet || method == http.MethodHead || method == http.MethodDelete {
+						target += "?name=x"
+					} else {
+						body = `{"name":"x"}`
+					}
+					rec := serveRequest(t, router, method, target, body)
+					if rec.Code != http.StatusOK {
+						t.Fatalf("%s %s expected 200, got %d", method, target, rec.Code)
+					}
+					if calls != 1 {
+						t.Fatalf("%s %s route middleware executed %d times, want 1", method, target, calls)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestRouteMiddlewareShortCircuit 验证路由级中间件不调用 next 时可短路：
+// handler 不执行，响应由该中间件写出。
+func TestRouteMiddlewareShortCircuit(t *testing.T) {
+	handlerCalls := 0
+	router := NewRouter()
+	router.GET("/short", func(_ context.Context, _ helloReq) (helloRes, error) {
+		handlerCalls++
+		return helloRes{}, nil
+	}, func(_ context.Context, w http.ResponseWriter, _ *http.Request, _ NextFunc) error {
+		w.WriteHeader(http.StatusUnauthorized)
+		return nil
+	})
+
+	rec := serveRequest(t, router, http.MethodGet, "/short", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 written by route middleware, got %d", rec.Code)
+	}
+	if handlerCalls != 0 {
+		t.Fatalf("handler executed %d times, want 0 (route middleware short-circuited)", handlerCalls)
+	}
+}
+
+// TestRouteMiddlewareEquivalentToEmptyPrefixGroup 验证路由级中间件与"空前缀分组中间件"等价：
+// 两种注册方式产生相同的执行序列与响应，说明路由级中间件位于与分组中间件相同的位置。
+func TestRouteMiddlewareEquivalentToEmptyPrefixGroup(t *testing.T) {
+	run := func(register func(*Router, MiddlewareHandler)) []string {
+		var order []string
+		router := NewRouter()
+		register(router, recordingMiddleware(&order, "mw"))
+		rec := serveRequest(t, router, http.MethodGet, "/same?name=x", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		return order
+	}
+
+	routeLevel := run(func(r *Router, mw MiddlewareHandler) {
+		r.GET("/same", hello, mw)
+	})
+	groupLevel := run(func(r *Router, mw MiddlewareHandler) {
+		r.Group("").GET("/same", hello, mw)
+	})
+	if !reflect.DeepEqual(routeLevel, groupLevel) {
+		t.Fatalf("route-level chain = %v, empty-prefix group chain = %v; want identical", routeLevel, groupLevel)
+	}
+	if got, want := strings.Join(routeLevel, ","), "mw-before,mw-after"; got != want {
+		t.Fatalf("execution order = %q, want %q", got, want)
+	}
+}
+
 // TestRouterGroupAllHTTPMethods 验证 RouterGroup 的所有 HTTP 方法快捷注册
 func TestRouterGroupAllHTTPMethods(t *testing.T) {
 	router := NewRouter()

@@ -211,23 +211,33 @@ func example() {
 
 ## 七、注册方式
 
-中间件通过 `Use(...)` 注册，分为全局与分组两级：
+中间件有三级注册入口：全局 `Use(...)`、分组（`Group` 创建时传入或组内 `Use(...)` 追加）与路由级（注册方法的尾部变参）：
 
 ```go
 func example() {
     r := zchttp.NewRouter()
-    r.Use(logger, recoverError)         // 全局中间件
+    r.Use(logger, recoverError)              // 全局中间件
 
     api := r.Group("/api", authMiddleware)   // 分组中间件
-    api.GET("/users", listUsers)
+    api.GET("/users", listUsers, auditMiddleware) // 路由级中间件：仅 /api/users
 }
 ```
 
 关键规则：
 
-- **只对此后注册的路由生效**：注册路由时会将全局中间件与当前分组祖先链的当前状态快照到路由条目；已注册路由不受后续 `Use(...)` 影响。
+- **只对此后注册的路由生效**：注册路由时会将全局中间件、当前分组祖先链与路由级中间件的当前状态快照到路由条目；已注册路由不受后续 `Use(...)` 影响。
 - 子分组保留父分组引用。先创建子分组、后向父分组追加中间件时，之后注册的子路由仍会继承新增中间件。
-- 最终链顺序为 `[全局中间件..., 最外层分组中间件..., 当前分组中间件...]`。
+- 路由级中间件只作用于本次注册的那条路由；`Any` 的 9 个方法共用同一份路由级中间件。传入的切片在注册后即使被修改，也不影响已注册路由。
+- 最终链顺序为 `[全局中间件..., 最外层分组中间件..., 当前分组中间件..., 路由级中间件...]`；路由级位于链的最内层、紧贴 handler。
+- 与 `Use(...)` 一致，框架不校验中间件是否为 nil，也不去重：nil 中间件会在请求期 panic 并由 `OnPanic` 兜底，重复传入的同一中间件会执行多次。
+
+```go
+func exampleRouteLevel(r *zchttp.Router, logger, auth, audit zchttp.MiddlewareHandler) {
+    r.Use(logger)
+    api := r.Group("/api", auth)
+    api.GET("/users", listUsers, audit) // 执行顺序: logger → auth → audit → handler
+}
+```
 
 > 注册与快照的细节详见 `routing.md`。
 

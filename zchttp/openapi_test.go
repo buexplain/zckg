@@ -3372,7 +3372,7 @@ func TestOpenAPIIgnoredPathParamsDeclared(t *testing.T) {
 	type wantParam struct{ name, in string }
 	cases := []struct {
 		method   string
-		register func(*Router, string, any)
+		register func(*Router, string, any, ...MiddlewareHandler)
 	}{
 		{http.MethodGet, (*Router).GET},
 		{http.MethodPost, (*Router).POST},
@@ -3444,7 +3444,7 @@ func TestOpenAPIDeprecated_AllMethodsPathParams(t *testing.T) {
 	}
 	cases := []struct {
 		method   string
-		register func(*Router, string, any)
+		register func(*Router, string, any, ...MiddlewareHandler)
 		query    bool
 	}{
 		{http.MethodGet, (*Router).GET, true},
@@ -3898,7 +3898,7 @@ func TestOpenAPIDeprecated_RuntimeUnchanged(t *testing.T) {
 						return []reflect.Value{reflect.ValueOf(res), reflect.Zero(reflect.TypeFor[error]())}
 					}).Interface()
 					r := NewRouter()
-					r.register(method, "/dep/runtime/{id}", handler, nil)
+					r.register(method, "/dep/runtime/{id}", handler, nil, nil)
 					GenerateOpenAPI(r, OpenAPIInfo{Title: "Dep", Version: "1"})
 					target, body := tc.path, tc.body
 					if method == http.MethodGet {
@@ -4011,7 +4011,7 @@ func TestOpenAPIKeepRawBody(t *testing.T) {
 	wantBody := map[string]any{"content": map[string]any{"*/*": map[string]any{"schema": map[string]any{}}}}
 	cases := []struct {
 		method   string
-		register func(*Router, string, any)
+		register func(*Router, string, any, ...MiddlewareHandler)
 	}{
 		{http.MethodPost, (*Router).POST},
 		{http.MethodPut, (*Router).PUT},

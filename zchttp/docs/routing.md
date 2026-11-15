@@ -34,6 +34,19 @@ func registerRoutes(r *zchttp.Router) {
 
 `Any` 只注册 `NewRouter` 支持的 9 个标准方法，不包含 `PROPFIND` 等自定义方法。注册过程具有原子性：先构建并预检全部 9 个方法，全部通过后才统一写入路由树与顺序索引；handler 校验或任一方法的路由冲突导致 panic 时，不会残留部分方法。
 
+每条路由还可在注册时通过尾部变参直接追加**路由级中间件**，只作用于该条路由：
+
+```go
+func registerRoutesWithMiddleware(r *zchttp.Router) {
+    r.GET("/users", listUsers, authMiddleware)      // 仅 /users
+    api := r.Group("/api", groupMiddleware)
+    api.GET("/orders", listOrders, auditMiddleware) // 仅 /api/orders
+    r.Any("/webhook", webhook, signMiddleware)      // 9 个方法共用同一份路由级中间件
+}
+```
+
+路由级中间件位于全局与分组中间件之后（链的最内层），注册时快照；完整规则见第七节「中间件注册与快照」。
+
 路由匹配基于单一基数树：**静态段 > 参数段 > 通配尾段**，前者分支失败时依次回溯尝试后者（见下文“路由参数”章节），均未命中则走 `OnNotFound`。
 
 ### 路径归一化（normalizePath）
@@ -103,7 +116,7 @@ handler 注册时，`buildEntry` 会通过反射一次性预计算以下信息�
 - **Req 元信息**（`reqMeta`，类型 `structMeta`）：缓存 Req 顶层字段的绑定名、`nonzero` 判定、`default` 标签值、`time_format`/`time_location`、文件字段标记等，绑定、校验与 OpenAPI 生成阶段直接使用。嵌套结构体的 meta 不在注册阶段计算，而是在递归校验/默认值填充首次使用时经 `cachedStructMeta` 构建，随后存入进程级缓存（`sync.Map`），后续请求直接复用，无重复反射开销。Res **不预计算 meta**：响应 schema 不读 `default`/`nonzero`/`time_format` 等请求侧标签，只用类型反射生成，注册期仅检查 Res 上是否嵌入了只在 Req 生效的声明（`OpenAPIMeta`/`KeepRawBody`，命中时输出告警）。
 - **Req 模板**（`defaultReq`）：创建 Req 实例并通过 `applyDefaults` 初始化 `default` 标签字段（注册阶段：所有零值字段均填充）。请求阶段浅拷贝复用，绑定后再次调用 `applyDefaults(requestPhase=true)` 补填动态创建的子元素（slice/数组/map/nested ptr）中的 nil 指针字段。详见[默认值机制](parameter-binding.md#六默认值机制)。
 - **操作级元信息**（`opMeta`，类型 `operationMeta`）：从 Req 嵌入的 `OpenAPIMeta` 中提取 `tags`/`summary`/`description`/`deprecated`（`Res` 不参与操作级元信息解析），供 OpenAPI 文档生成。
-- **中间件快照**（`middlewares`）：注册时将当前 `[全局中间件..., 分组中间件...]` 的副本固定到该路由条目，后续 `Use(...)` 不影响已注册路由。
+- **中间件快照**（`middlewares`）：注册时将当前 `[全局中间件..., 分组祖先中间件..., 当前分组中间件..., 路由级中间件...]` 的副本固定到该路由条目，后续 `Use(...)` 不影响已注册路由；路由级中间件来自注册方法的尾部变参。
 - **深拷贝标记**（`needsDeepCopy`）：若模板中存在非 nil 的指针/切片/map 字段或元素内含引用的数组字段，标记为需深拷贝，请求时对模板浅拷贝后通过 `deepCopyDefaults` 断开共享引用。
 - **请求阶段默认值标记**（`needsRequestPhaseDefaults`）：通过 `hasRequestPhaseDefaults` 扫描结构体树，判断是否存在带 `default` 的指针字段。仅当该标记为 `true` 时，请求阶段才执行 `applyDefaults(requestPhase=true)` 补填 nil 指针字段，避免无意义的递归遍历。
 - **nonzero 校验标记**（`needsNonzeroValidation`）：通过 `hasNonzeroInTree` 扫描 Req 整棵类型树（穿透嵌套结构体、指针、容器），判断任意深度是否存在 `nonzero:"true"` 字段。仅当该标记为 `true` 时，请求阶段才执行 `validateNonzero` 遍历，全树无 nonzero 字段的接口整体跳过。详见 `parameter-validate.md` 中"零值判定与快速跳过"章节。
@@ -341,13 +354,25 @@ func example(r *zchttp.Router, mwA, mwB zchttp.MiddlewareHandler) {
 ## 七、中间件注册与快照
 
 - `Use(...)` 向 `Router`（全局）或 `RouterGroup`（分组）追加中间件，返回自身支持链式调用。
-- **中间件只对此后注册的路由生效**：注册路由时才读取全局中间件以及当前分组的完整祖先链，并将结果快照到该路由的 `routeEntry.middlewares`。
+- 各注册方法（`GET`/`POST`/…/`Any`，`Router` 与 `RouterGroup` 均有）可在 `handler` 之后以尾部变参直接传入**路由级中间件**，只作用于本次注册的那条路由；`Any` 的 9 个方法共用同一份路由级中间件。
+- **中间件只对此后注册的路由生效**：注册路由时才读取全局中间件、当前分组的完整祖先链以及本次注册的路由级中间件，并将结果快照到该路由的 `routeEntry.middlewares`。
 - 子分组保留父分组引用。即使先创建子分组、后向父分组调用 `Use(...)`，只要子路由尚未注册，注册时仍会继承父分组新增的中间件。
-- 已注册路由持有独立快照，之后对全局、父分组或当前分组调用 `Use(...)` 都不会追溯修改它。
-- 最终中间件链顺序为 `[全局中间件..., 最外层分组中间件..., 当前分组中间件...]`。
+- 已注册路由持有独立快照，之后对全局、父分组或当前分组调用 `Use(...)` 都不会追溯修改它；注册后再修改传给路由级变参的切片也不会影响已注册路由。路由级中间件没有“注册后追加”的入口。
+- 最终中间件链顺序为 `[全局中间件..., 最外层分组中间件..., 当前分组中间件..., 路由级中间件...]`，路由级位于最内层、紧贴 handler。
+- 与 `Use(...)` 一致，框架不校验中间件是否为 nil，也不去重：nil 中间件在请求期 panic 并由 `OnPanic` 兜底，重复传入的同一中间件会执行多次。
 
 ```go
-func example(r *zchttp.Router, logger, auth zchttp.MiddlewareHandler) {
+func example(r *zchttp.Router, logger, auth, audit zchttp.MiddlewareHandler) {
+    r.Use(logger)
+    api := r.Group("/api", auth)
+
+    api.GET("/users", listUsers, audit) // 链: logger, auth, audit
+    api.GET("/orders", listOrders)      // 链: logger, auth
+}
+```
+
+```go
+func exampleSnapshot(r *zchttp.Router, logger, auth zchttp.MiddlewareHandler) {
     r.Use(logger)
     api := r.Group("/api")
     v1 := api.Group("/v1")

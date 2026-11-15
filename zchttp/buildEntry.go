@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// routeEntry 是单条路由在注册表中的存储单元，包含 handler、该路由作用域内的中间件链快照，
-// 以及注册阶段预计算的反射信息（避免请求阶段重复反射）
+// routeEntry 是单条路由在注册表中的存储单元，包含 handler、该路由作用域内的中间件链快照
+// （顺序为全局 → 分组祖先 → 当前分组 → 路由级），以及注册阶段预计算的反射信息（避免请求阶段重复反射）
 type routeEntry struct {
 	handler     any
 	middlewares []MiddlewareHandler
@@ -59,8 +59,9 @@ type pathParamBinding struct {
 // buildEntry 校验 handler 签名、构建中间件链、预计算反射信息，返回完整的 routeEntry。
 // handler 必须是 func(ctx context.Context, req Req) (Res, error) 的形式，
 // 其中 Req 和 Res 必须是结构体或结构体指针。
-// globalMiddlewares 与 groupMiddlewares 合并后作为该路由的中间件链快照。
-func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHandler) (*routeEntry, error) {
+// 全局、分组与路由级中间件按 globalMiddlewares → groupMiddlewares → routeMiddlewares
+// 的顺序合并后作为该路由的中间件链快照（路由级位于最内层，紧贴 handler）。
+func buildEntry(handler any, globalMiddlewares, groupMiddlewares, routeMiddlewares []MiddlewareHandler) (*routeEntry, error) {
 	if handler == nil {
 		return nil, fmt.Errorf("handler must not be nil")
 	}
@@ -146,10 +147,11 @@ func buildEntry(handler any, globalMiddlewares, groupMiddlewares []MiddlewareHan
 	// 仅当类型树任意深度存在 nonzero 字段时才需要（传递性扫描，嵌套层 nonzero 也计入）
 	needsNonzeroValidation := hasNonzeroInTree(reqElemType, nil)
 
-	// 快照中间件链
-	mws := make([]MiddlewareHandler, 0, len(globalMiddlewares)+len(groupMiddlewares))
+	// 快照中间件链：全局在最外层，其次分组祖先链，路由级在最内层
+	mws := make([]MiddlewareHandler, 0, len(globalMiddlewares)+len(groupMiddlewares)+len(routeMiddlewares))
 	mws = append(mws, globalMiddlewares...)
 	mws = append(mws, groupMiddlewares...)
+	mws = append(mws, routeMiddlewares...)
 
 	return &routeEntry{
 		handler:                   handler,
