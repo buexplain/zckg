@@ -1,6 +1,7 @@
 package zcconfig
 
 import (
+	"reflect"
 	"strings"
 	"sync"
 )
@@ -76,7 +77,13 @@ func mergeMap(dst, src map[string]any) {
 // Config 从业务配置存储中按 key 查找值，转换为 T 类型返回。
 // key 支持用 "." 做分隔符，按层级递归查找嵌套的 map[string]any{}。
 // 例如 key 为 "app.database.host" 时，依次查找 configData["app"]["database"]["host"]。
-// 若任意层级的 key 不存在或路径中途值非 map 类型，返回默认值 def。
+//
+// 行为约定：
+//   - key 不存在（任一层级缺少节点）时返回默认值 def；
+//   - key 存在但值无法转换为 T 时 panic(*TypeMismatchError)，消息携带 key、期望类型与实际类型；
+//   - 路径中间层的值存在但不是 map[string]any 时同样 panic(*TypeMismatchError)，
+//     期望类型记为 map[string]any，key 为调用方传入的完整 key；
+//   - 存储值为 nil 视为未配置，返回默认值 def，不 panic。
 func Config[T any](key string, def T) T {
 	configMu.RLock()
 	defer configMu.RUnlock()
@@ -88,14 +95,21 @@ func Config[T any](key string, def T) T {
 		if !ok {
 			return def
 		}
-		// 最后一个 key，直接取值并做类型转换
+		// 最后一个 key，直接取值并做类型转换；类型不符时 panic
 		if i == len(parts)-1 {
-			return cast(v, def)
+			return castOrPanic(key, v, def)
 		}
-		// 中间层级必须是 map[string]any，否则路径无效
+		// 中间层级必须是 map[string]any，否则属于配置结构错误；nil 视为未配置
 		next, ok := v.(map[string]any)
 		if !ok {
-			return def
+			if v == nil {
+				return def
+			}
+			panic(&TypeMismatchError{
+				Key:      key,
+				Expected: reflect.TypeFor[map[string]any](),
+				Actual:   reflect.TypeOf(v),
+			})
 		}
 		current = next
 	}

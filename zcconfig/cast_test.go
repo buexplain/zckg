@@ -1,62 +1,197 @@
 package zcconfig
 
 import (
+	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestCast_NilReturnsDefault(t *testing.T) {
-	if v := cast[string](nil, "fallback"); v != "fallback" {
-		t.Errorf("nil -> string 期望 'fallback'，实际 %q", v)
-	}
-	if v := cast[int](nil, 42); v != 42 {
-		t.Errorf("nil -> int 期望 42，实际 %d", v)
-	}
-	if v := cast[bool](nil, true); v != true {
-		t.Errorf("nil -> bool 期望 true，实际 %v", v)
-	}
-	if v := cast[float64](nil, 1.5); v != 1.5 {
-		t.Errorf("nil -> float64 期望 1.5，实际 %f", v)
-	}
+// castProbeStringer 用于验证接口目标只接受直接类型断言（值必须实现该接口）。
+type castProbeStringer struct{ Label string }
+
+func (s castProbeStringer) String() string { return s.Label }
+
+// castProbeStructA/B/Tagged/Diff 用于验证结构体源值的 reflect 转换与拒绝路径：
+// A→B 与 A→Tagged 底层类型相同（tag 不参与底层类型判定），A→Diff 字段不同不可转换。
+type castProbeStructA struct {
+	X int
+	Y string
 }
 
-// TestCast_NilInterfaceDefReturnsNil 验证目标为接口类型且 def 为 nil、断言失败时返回 nil 而非 panic。
-// 触发路径：reflect.TypeOf(nil 接口) 返回 nil，若未加守卫会对 nil reflect.Type 调用 Kind() 触发空指针 panic。
-func TestCast_NilInterfaceDefReturnsNil(t *testing.T) {
-	if v := cast[error]("not-an-error", nil); v != nil {
-		t.Errorf("nil 接口默认值 + 断言失败 期望 nil，实际 %v", v)
-	}
-	if v := cast[fmt.Stringer](42, nil); v != nil {
-		t.Errorf("nil 接口默认值 + 断言失败 期望 nil，实际 %v", v)
-	}
+type castProbeStructB struct {
+	X int
+	Y string
 }
 
-// castCase 构造单条 cast 断言子测试，供 table-driven 测试按行复用，
+type castProbeStructTagged struct {
+	X int    `json:"x"`
+	Y string `json:"y"`
+}
+
+type castProbeStructDiff struct {
+	X int
+	Z string
+}
+
+// castCase 构造单条 cast 成功断言子测试，供 table-driven 测试按行复用，
 // 目标类型由 def/want 的类型推断。
 func castCase[T comparable](input any, def, want T) func(t *testing.T) {
 	return func(t *testing.T) {
-		if got := cast(input, def); got != want {
+		t.Helper()
+		got, ok := cast(input, def)
+		if !ok {
+			t.Fatalf("cast(%v, def=%v) 期望可转换，实际转换失败", input, def)
+		}
+		if got != want {
 			t.Errorf("cast(%v, def=%v) 期望 %v，实际 %v", input, def, want, got)
 		}
+	}
+}
+
+// castFails 构造单条 cast 失败断言子测试：期望返回 (def, false)，此时由 Env/Config 决定 panic。
+func castFails[T comparable](input any, def T) func(t *testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+		got, ok := cast(input, def)
+		if ok {
+			t.Fatalf("cast(%v, def=%v) 期望转换失败，实际成功返回 %v", input, def, got)
+		}
+		if got != def {
+			t.Errorf("转换失败时应返回 def %v，实际 %v", def, got)
+		}
+	}
+}
+
+// assertTypeMismatchPanic 断言 fn panic 出 *TypeMismatchError，且 Key / Expected / Actual
+// 与错误消息三要素（key、期望类型、实际类型）均符合预期。
+func assertTypeMismatchPanic(t *testing.T, key string, expected, actual reflect.Type, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("期望 panic(*TypeMismatchError)，实际正常返回")
+		}
+		err, ok := r.(error)
+		if !ok {
+			t.Fatalf("panic 值期望实现 error，实际 %T(%v)", r, r)
+		}
+		var mismatch *TypeMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("panic 值期望可 errors.As 为 *TypeMismatchError，实际 %T(%v)", err, err)
+		}
+		if mismatch.Key != key {
+			t.Errorf("Key 期望 %q，实际 %q", key, mismatch.Key)
+		}
+		if mismatch.Expected != expected {
+			t.Errorf("Expected 期望 %v，实际 %v", expected, mismatch.Expected)
+		}
+		if mismatch.Actual != actual {
+			t.Errorf("Actual 期望 %v，实际 %v", actual, mismatch.Actual)
+		}
+		msg := mismatch.Error()
+		for _, want := range []string{"zcconfig: key", fmt.Sprintf("%q", key), expected.String(), actual.String()} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("错误消息 %q 期望包含 %q", msg, want)
+			}
+		}
+	}()
+	fn()
+}
+
+// --- nil 源值 ---
+
+// TestCast_NilNotConvertible 验证 nil 源值不参与转换：返回 (def, false)，
+// 由 Env/Config 的取值策略把 nil 视为“无值”返回默认值，而不是类型不符。
+func TestCast_NilNotConvertible(t *testing.T) {
+	if got, ok := cast[string](nil, "fallback"); ok || got != "fallback" {
+		t.Errorf("nil -> string 期望 (fallback,false)，实际 (%q,%v)", got, ok)
+	}
+	if got, ok := cast[int](nil, 42); ok || got != 42 {
+		t.Errorf("nil -> int 期望 (42,false)，实际 (%d,%v)", got, ok)
+	}
+	if got, ok := cast[bool](nil, true); ok || got != true {
+		t.Errorf("nil -> bool 期望 (true,false)，实际 (%v,%v)", got, ok)
+	}
+	if got, ok := cast[float64](nil, 1.5); ok || got != 1.5 {
+		t.Errorf("nil -> float64 期望 (1.5,false)，实际 (%v,%v)", got, ok)
+	}
+}
+
+// TestCastOrPanic_NilReturnsDefault 验证 key 存在但值为 nil 时按缺省处理：返回 def，不 panic。
+func TestCastOrPanic_NilReturnsDefault(t *testing.T) {
+	if got := castOrPanic("NIL_STRING", nil, "fallback"); got != "fallback" {
+		t.Errorf("nil -> string 期望 fallback，实际 %q", got)
+	}
+	if got := castOrPanic("NIL_INT", nil, 42); got != 42 {
+		t.Errorf("nil -> int 期望 42，实际 %d", got)
+	}
+}
+
+// --- TypeMismatchError 诊断信息 ---
+
+// TestTypeMismatchError_Message 验证错误消息精确包含 key、期望类型与实际类型。
+func TestTypeMismatchError_Message(t *testing.T) {
+	err := &TypeMismatchError{
+		Key:      "db.port",
+		Expected: reflect.TypeFor[int](),
+		Actual:   reflect.TypeFor[string](),
+	}
+	want := `zcconfig: key "db.port" 类型不匹配：期望 int，实际 string`
+	if got := err.Error(); got != want {
+		t.Errorf("Error() 期望 %q，实际 %q", want, got)
+	}
+}
+
+// TestCastOrPanic_TypeMismatchDiagnostics 验证转换失败 panic 的三要素：
+// key 为调用方原始 key，期望类型取目标 T 的静态类型，实际类型取存储值动态类型。
+func TestCastOrPanic_TypeMismatchDiagnostics(t *testing.T) {
+	assertTypeMismatchPanic(t, "DB_PORT", reflect.TypeFor[int](), reflect.TypeFor[string](), func() {
+		castOrPanic("DB_PORT", "abc", 0)
+	})
+
+	// 目标为接口类型且值未实现该接口：期望类型报接口本身，而不是 def 的动态类型。
+	assertTypeMismatchPanic(t, "ERR", reflect.TypeFor[error](), reflect.TypeFor[int](), func() {
+		castOrPanic[error]("ERR", 42, nil)
+	})
+}
+
+// TestCast_InterfaceTargetRequiresImplementation 验证接口目标只接受直接类型断言，
+// 未实现接口的值不参与任何后续转换。
+func TestCast_InterfaceTargetRequiresImplementation(t *testing.T) {
+	if got, ok := cast[error]("not-an-error", nil); ok || got != nil {
+		t.Errorf("string 未实现 error，期望 (nil,false)，实际 (%v,%v)", got, ok)
+	}
+	if got, ok := cast[fmt.Stringer](42, nil); ok || got != nil {
+		t.Errorf("int 未实现 fmt.Stringer，期望 (nil,false)，实际 (%v,%v)", got, ok)
+	}
+
+	wantErr := errors.New("boom")
+	if got, ok := cast[error](wantErr, nil); !ok || !errors.Is(got, wantErr) {
+		t.Errorf("error 实现值期望断言命中，实际 (%v,%v)", got, ok)
+	}
+	if got, ok := cast[fmt.Stringer](castProbeStringer{Label: "s"}, nil); !ok || got.String() != "s" {
+		t.Errorf("Stringer 实现值期望断言命中，实际 (%v,%v)", got, ok)
 	}
 }
 
 // --- string -> string ---
 
 func TestCast_StringToString(t *testing.T) {
-	if v := cast("hello", "fallback"); v != "hello" {
-		t.Errorf("期望 'hello'，实际 %q", v)
+	if v, ok := cast("hello", "fallback"); !ok || v != "hello" {
+		t.Errorf("期望 'hello'，实际 (%q,%v)", v, ok)
 	}
-	if v := cast("", "fallback"); v != "" {
-		t.Errorf("空字符串期望 ''，实际 %q", v)
+	if v, ok := cast("", "fallback"); !ok || v != "" {
+		t.Errorf("空字符串期望 ''，实际 (%q,%v)", v, ok)
 	}
-	if v := cast("中文内容", "fallback"); v != "中文内容" {
-		t.Errorf("期望 '中文内容'，实际 %q", v)
+	if v, ok := cast("中文内容", "fallback"); !ok || v != "中文内容" {
+		t.Errorf("期望 '中文内容'，实际 (%q,%v)", v, ok)
 	}
-	if v := cast("with spaces", "fallback"); v != "with spaces" {
-		t.Errorf("期望 'with spaces'，实际 %q", v)
+	if v, ok := cast("with spaces", "fallback"); !ok || v != "with spaces" {
+		t.Errorf("期望 'with spaces'，实际 (%q,%v)", v, ok)
 	}
 }
 
@@ -82,28 +217,24 @@ func TestCast_StringToIntSeries(t *testing.T) {
 }
 
 func TestCast_StringToIntOverflow(t *testing.T) {
-	// 超出目标范围应返回 def；def 取非零值，避免与"错误返回类型零值"混淆
-	if v := cast("200", int8(77)); v != int8(77) {
-		t.Errorf("超出 int8 范围期望默认值 77，实际 %d", v)
-	}
-	if v := cast("99999999999", int32(42)); v != int32(42) {
-		t.Errorf("超出 int32 范围期望默认值 42，实际 %d", v)
+	// 超出目标范围不可转换；def 取非零值，避免与“失败返回类型零值”混淆
+	for _, run := range []func(t *testing.T){
+		castFails("200", int8(77)),
+		castFails("99999999999", int32(42)),
+	} {
+		run(t)
 	}
 }
 
 func TestCast_StringToIntInvalid(t *testing.T) {
-	// 各用例 def 取互不相同的非零值，避免与"错误返回类型零值"混淆
-	if v := cast("abc", 99); v != 99 {
-		t.Errorf("非数字字符串期望默认值 99，实际 %d", v)
-	}
-	if v := cast("12.5", 88); v != 88 {
-		t.Errorf("浮点字符串转 int 期望默认值 88，实际 %d", v)
-	}
-	if v := cast("", 77); v != 77 {
-		t.Errorf("空字符串转 int 期望默认值 77，实际 %d", v)
-	}
-	if v := cast("  42", 66); v != 66 {
-		t.Errorf("带空格字符串期望默认值 66，实际 %d", v)
+	// 各用例 def 取互不相同的非零值，避免与“失败返回类型零值”混淆
+	for _, run := range []func(t *testing.T){
+		castFails("abc", 99),
+		castFails("12.5", 88),
+		castFails("", 77),
+		castFails("  42", 66),
+	} {
+		run(t)
 	}
 }
 
@@ -125,17 +256,13 @@ func TestCast_StringToUintSeries(t *testing.T) {
 }
 
 func TestCast_StringToUintNegative(t *testing.T) {
-	// 负数无法转 uint，应返回默认值
-	if v := cast("-1", uint(0)); v != uint(0) {
-		t.Errorf("负数转 uint 期望默认值 0，实际 %d", v)
-	}
+	// 负数无法转 uint，不可转换
+	castFails("-1", uint(0))(t)
 }
 
 func TestCast_StringToUintOverflow(t *testing.T) {
-	// def 取非零值，避免与"错误返回类型零值"混淆
-	if v := cast("300", uint8(77)); v != uint8(77) {
-		t.Errorf("超出 uint8 范围期望默认值 77，实际 %d", v)
-	}
+	// def 取非零值，避免与“失败返回类型零值”混淆
+	castFails("300", uint8(77))(t)
 }
 
 // --- string -> float 系列 ---
@@ -158,32 +285,24 @@ func TestCast_StringToFloatSeries(t *testing.T) {
 }
 
 func TestCast_StringToFloatInvalid(t *testing.T) {
-	// def 取非零值，避免与"错误返回类型零值"混淆
-	if v := cast("abc", 1.23); v != 1.23 {
-		t.Errorf("非数字字符串转 float64 期望默认值 1.23，实际 %f", v)
-	}
-	if v := cast("", 4.56); v != 4.56 {
-		t.Errorf("空字符串转 float64 期望默认值 4.56，实际 %f", v)
+	// def 取非零值，避免与“失败返回类型零值”混淆
+	for _, run := range []func(t *testing.T){
+		castFails("abc", 1.23),
+		castFails("", 4.56),
+	} {
+		run(t)
 	}
 }
 
 func TestCast_StringToFloatNaNInf(t *testing.T) {
-	// NaN/Inf 字面量可被 ParseFloat 接受，但配置场景应视为非法输入返回 def
-	if v := cast("NaN", 0.0); v != 0.0 {
-		t.Errorf("'NaN' 转 float64 期望默认值 0.0，实际 %f", v)
-	}
-	if v := cast("Inf", 1.5); v != 1.5 {
-		t.Errorf("'Inf' 转 float64 期望默认值 1.5，实际 %f", v)
-	}
-	if v := cast("-Inf", 2.5); v != 2.5 {
-		t.Errorf("'-Inf' 转 float64 期望默认值 2.5，实际 %f", v)
-	}
-	if v := cast("NaN", float32(0)); v != float32(0) {
-		t.Errorf("'NaN' 转 float32 期望默认值 0，实际 %f", v)
-	}
-	// 溢出为 Inf 的指数（ParseFloat 返回 +Inf 且带 ErrRange 错误）同样返回 def
-	if v := cast("1e999", 3.5); v != 3.5 {
-		t.Errorf("'1e999' 转 float64 期望默认值 3.5，实际 %f", v)
+	// NaN/Inf 字面量可被 ParseFloat 接受，但配置场景应视为非法输入、不可转换
+	for _, run := range []func(t *testing.T){
+		castFails("NaN", 0.0),
+		castFails("Inf", 1.5),
+		castFails("-Inf", 2.5),
+		castFails("1e999", 3.5),
+	} {
+		run(t)
 	}
 }
 
@@ -192,27 +311,25 @@ func TestCast_StringToFloatNaNInf(t *testing.T) {
 func TestCast_StringToBool(t *testing.T) {
 	validTrue := []string{"1", "t", "T", "true", "TRUE", "True"}
 	for _, s := range validTrue {
-		if v := cast(s, false); v != true {
-			t.Errorf("字符串 %q 转 bool 期望 true，实际 %v", s, v)
+		if v, ok := cast(s, false); !ok || v != true {
+			t.Errorf("字符串 %q 转 bool 期望 true，实际 (%v,%v)", s, v, ok)
 		}
 	}
 	validFalse := []string{"0", "f", "F", "false", "FALSE", "False"}
 	for _, s := range validFalse {
-		if v := cast(s, true); v != false {
-			t.Errorf("字符串 %q 转 bool 期望 false，实际 %v", s, v)
+		if v, ok := cast(s, true); !ok || v != false {
+			t.Errorf("字符串 %q 转 bool 期望 false，实际 (%v,%v)", s, v, ok)
 		}
 	}
 }
 
 func TestCast_StringToBoolInvalid(t *testing.T) {
-	if v := cast("yes", false); v != false {
-		t.Errorf("无效布尔字符串 'yes' 期望默认值 false，实际 %v", v)
-	}
-	if v := cast("", true); v != true {
-		t.Errorf("空字符串转 bool 期望默认值 true，实际 %v", v)
-	}
-	if v := cast("2", false); v != false {
-		t.Errorf("'2' 转 bool 期望默认值 false，实际 %v", v)
+	for _, run := range []func(t *testing.T){
+		castFails("yes", false),
+		castFails("", true),
+		castFails("2", false),
+	} {
+		run(t)
 	}
 }
 
@@ -232,52 +349,48 @@ func TestCast_StringToDuration(t *testing.T) {
 		{"0s", 0},
 	}
 	for _, c := range cases {
-		if v := cast(c.s, time.Duration(0)); v != c.exp {
-			t.Errorf("%q 转 Duration 期望 %v，实际 %v", c.s, c.exp, v)
+		if v, ok := cast(c.s, time.Duration(0)); !ok || v != c.exp {
+			t.Errorf("%q 转 Duration 期望 %v，实际 (%v,%v)", c.s, c.exp, v, ok)
 		}
 	}
 }
 
 func TestCast_StringToDurationInvalid(t *testing.T) {
 	def := 5 * time.Second
-	if v := cast("abc", def); v != def {
-		t.Errorf("无效字符串转 Duration 期望默认值 %v，实际 %v", def, v)
-	}
-	if v := cast("", def); v != def {
-		t.Errorf("空字符串转 Duration 期望默认值 %v，实际 %v", def, v)
-	}
-	if v := cast("10", def); v != def {
-		t.Errorf("无单位字符串 '10' 转 Duration 期望默认值 %v，实际 %v", def, v)
+	for _, run := range []func(t *testing.T){
+		castFails("abc", def),
+		castFails("", def),
+		castFails("10", def),
+	} {
+		run(t)
 	}
 }
 
 // --- string -> 非数值类型（走 default 分支） ---
 
-func TestCast_StringToStructReturnsDefault(t *testing.T) {
+func TestCast_StringToStructRejected(t *testing.T) {
 	type MyStruct struct{ X int }
 	def := MyStruct{X: 99}
-	if v := cast("hello", def); v != def {
-		t.Errorf("string 转 struct 期望默认值，实际 %v", v)
-	}
+	castFails("hello", def)(t)
 }
 
 // --- 非 string 源值，走 reflect ConvertibleTo 路径 ---
 
 func TestCast_IntToFloat64(t *testing.T) {
-	if v := cast(42, 0.0); v != 42.0 {
-		t.Errorf("int -> float64 期望 42.0，实际 %f", v)
+	if v, ok := cast(42, 0.0); !ok || v != 42.0 {
+		t.Errorf("int -> float64 期望 42.0，实际 (%v,%v)", v, ok)
 	}
 }
 
 func TestCast_Int64ToInt(t *testing.T) {
-	if v := cast(int64(100), 0); v != 100 {
-		t.Errorf("int64 -> int 期望 100，实际 %d", v)
+	if v, ok := cast(int64(100), 0); !ok || v != 100 {
+		t.Errorf("int64 -> int 期望 100，实际 (%d,%v)", v, ok)
 	}
 }
 
 func TestCast_Float64ToFloat32(t *testing.T) {
-	if v := cast(3.14, float32(0)); v != float32(3.14) {
-		t.Errorf("float64 -> float32 期望 %f，实际 %f", float32(3.14), v)
+	if v, ok := cast(3.14, float32(0)); !ok || v != float32(3.14) {
+		t.Errorf("float64 -> float32 期望 %f，实际 (%f,%v)", float32(3.14), v, ok)
 	}
 }
 
@@ -285,17 +398,17 @@ func TestCast_Float64ToFloat32(t *testing.T) {
 // 该截断语义已在 docs/zcconfig.md 显式声明，本测试固化截断行为：
 // 典型触发链为 .env 中 PRICE=99.99 被推断为 float64，调用方 Env("PRICE", 0) 得到 99。
 func TestCast_Float64ToIntTruncation(t *testing.T) {
-	if v := cast(99.99, 0); v != 99 {
-		t.Errorf("float64(99.99) -> int 期望向零截断为 99，实际 %d", v)
+	if v, ok := cast(99.99, 0); !ok || v != 99 {
+		t.Errorf("float64(99.99) -> int 期望向零截断为 99，实际 (%d,%v)", v, ok)
 	}
-	if v := cast(-99.99, 0); v != -99 {
-		t.Errorf("float64(-99.99) -> int 期望向零截断为 -99，实际 %d", v)
+	if v, ok := cast(-99.99, 0); !ok || v != -99 {
+		t.Errorf("float64(-99.99) -> int 期望向零截断为 -99，实际 (%d,%v)", v, ok)
 	}
-	if v := cast(100.0, 0); v != 100 {
-		t.Errorf("float64(100.0) -> int 期望 100，实际 %d", v)
+	if v, ok := cast(100.0, 0); !ok || v != 100 {
+		t.Errorf("float64(100.0) -> int 期望 100，实际 (%d,%v)", v, ok)
 	}
-	if v := cast(1.5, int8(0)); v != int8(1) {
-		t.Errorf("float64(1.5) -> int8 期望向零截断为 1，实际 %d", v)
+	if v, ok := cast(1.5, int8(0)); !ok || v != int8(1) {
+		t.Errorf("float64(1.5) -> int8 期望向零截断为 1，实际 (%d,%v)", v, ok)
 	}
 }
 
@@ -304,78 +417,74 @@ func TestCast_Float64ToIntTruncation(t *testing.T) {
 func TestCast_IntToBool(t *testing.T) {
 	// 数值类型 -> bool 特判：C 语言惯例，零值为 false，非零为 true。
 	// 此特判解决 .env 中 "1"/"0" 被 parseValue 推断为 int 后无法转 bool 的问题。
-	if v := cast(1, false); v != true {
-		t.Errorf("int(1) -> bool 期望 true，实际 %v", v)
+	cases := []struct {
+		value any
+		def   bool
+		want  bool
+	}{
+		{1, false, true},
+		{0, false, false},
+		{int64(42), false, true},
+		{0, true, false},
+		{3.14, false, true},
+		{0.0, true, false},
 	}
-	if v := cast(0, false); v != false {
-		t.Errorf("int(0) -> bool 期望 false，实际 %v", v)
-	}
-	if v := cast(int64(42), false); v != true {
-		t.Errorf("int64(42) -> bool 期望 true，实际 %v", v)
-	}
-	if v := cast(0, true); v != false {
-		t.Errorf("int(0) -> bool 期望 false，实际 %v", v)
-	}
-	if v := cast(3.14, false); v != true {
-		t.Errorf("float64(3.14) -> bool 期望 true，实际 %v", v)
-	}
-	if v := cast(0.0, true); v != false {
-		t.Errorf("float64(0) -> bool 期望 false，实际 %v", v)
+	for _, c := range cases {
+		if v, ok := cast(c.value, c.def); !ok || v != c.want {
+			t.Errorf("%T(%v) -> bool 期望 %v，实际 (%v,%v)", c.value, c.value, c.want, v, ok)
+		}
 	}
 }
 
 func TestCast_UintToBool(t *testing.T) {
 	// uint 系列 -> bool 走同一 C 惯例分支（cast.go 的 uint 分支）。
-	if v := cast(uint(1), false); v != true {
-		t.Errorf("uint(1) -> bool 期望 true，实际 %v", v)
+	cases := []struct {
+		value any
+		def   bool
+		want  bool
+	}{
+		{uint(1), false, true},
+		{uint(0), true, false},
+		{uint64(42), false, true},
+		{uint32(0), true, false},
 	}
-	if v := cast(uint(0), true); v != false {
-		t.Errorf("uint(0) -> bool 期望 false，实际 %v", v)
-	}
-	if v := cast(uint64(42), false); v != true {
-		t.Errorf("uint64(42) -> bool 期望 true，实际 %v", v)
-	}
-	if v := cast(uint32(0), true); v != false {
-		t.Errorf("uint32(0) -> bool 期望 false，实际 %v", v)
+	for _, c := range cases {
+		if v, ok := cast(c.value, c.def); !ok || v != c.want {
+			t.Errorf("%T(%v) -> bool 期望 %v，实际 (%v,%v)", c.value, c.value, c.want, v, ok)
+		}
 	}
 }
 
 // --- 数值类型 → string 防护（拒绝 Unicode 码点语义） ---
 
-func TestCast_IntToStringReturnsDefault(t *testing.T) {
-	// 数值类型 -> string 是 Unicode 码点语义（65 -> "A"），不是数字转字符串，应返回 def
-	if v := cast(65, "fallback"); v != "fallback" {
-		t.Errorf("int -> string 应返回默认值，实际 %q（码点陷阱）", v)
-	}
-	if v := cast(int64(100), "def"); v != "def" {
-		t.Errorf("int64 -> string 应返回默认值，实际 %q", v)
-	}
-	if v := cast(uint(42), ""); v != "" {
-		t.Errorf("uint -> string 应返回默认值，实际 %q", v)
-	}
-	if v := cast(3.14, "def"); v != "def" {
-		t.Errorf("float64 -> string 应返回默认值，实际 %q", v)
+func TestCast_IntToStringRejected(t *testing.T) {
+	// 数值类型 -> string 是 Unicode 码点语义（65 -> "A"），不是数字转字符串，应不可转换
+	for _, run := range []func(t *testing.T){
+		castFails(65, "fallback"),
+		castFails(int64(100), "def"),
+		castFails(uint(42), ""),
+		castFails(3.14, "def"),
+	} {
+		run(t)
 	}
 }
 
 func TestCast_BoolToIntNotConvertible(t *testing.T) {
-	// bool 不可转换为 int，应返回默认值
-	if v := cast(true, 0); v != 0 {
-		t.Errorf("bool -> int 不可转换，期望默认值 0，实际 %d", v)
-	}
+	// bool 不可转换为 int，应不可转换
+	castFails(true, 0)(t)
 }
 
 // --- 直接类型断言命中 ---
 
 func TestCast_DirectAssertion(t *testing.T) {
-	if v := cast(42, 0); v != 42 {
-		t.Errorf("int -> int 期望 42，实际 %d", v)
+	if v, ok := cast(42, 0); !ok || v != 42 {
+		t.Errorf("int -> int 期望 42，实际 (%d,%v)", v, ok)
 	}
-	if v := cast(true, false); v != true {
-		t.Errorf("bool -> bool 期望 true，实际 %v", v)
+	if v, ok := cast(true, false); !ok || v != true {
+		t.Errorf("bool -> bool 期望 true，实际 (%v,%v)", v, ok)
 	}
-	if v := cast(3.14, 0.0); v != 3.14 {
-		t.Errorf("float64 -> float64 期望 3.14，实际 %f", v)
+	if v, ok := cast(3.14, 0.0); !ok || v != 3.14 {
+		t.Errorf("float64 -> float64 期望 3.14，实际 (%v,%v)", v, ok)
 	}
 }
 
@@ -408,11 +517,11 @@ func TestCast_NumericToNamedBool(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := cast(tt.zero, flag(true)); got != flag(false) {
-				t.Errorf("cast(%T(%v), true) = %v, want false", tt.zero, tt.zero, got)
+			if got, ok := cast(tt.zero, flag(true)); !ok || got != flag(false) {
+				t.Errorf("cast(%T(%v), true) = (%v,%v), want false", tt.zero, tt.zero, got, ok)
 			}
-			if got := cast(tt.nonzero, flag(false)); got != flag(true) {
-				t.Errorf("cast(%T(%v), false) = %v, want true", tt.nonzero, tt.nonzero, got)
+			if got, ok := cast(tt.nonzero, flag(false)); !ok || got != flag(true) {
+				t.Errorf("cast(%T(%v), false) = (%v,%v), want true", tt.nonzero, tt.nonzero, got, ok)
 			}
 		})
 	}
@@ -433,8 +542,8 @@ func TestCast_NamedString(t *testing.T) {
 		{"empty_to_named", castCase("", label("fallback"), label(""))},
 		{"named_empty_to_plain", castCase(label(""), "fallback", "")},
 		{"named_numeric_to_int", castCase(label("42"), 7, 42)},
-		{"int_to_named_rejected", castCase(65, label("fallback"), label("fallback"))},
-		{"string_to_struct_rejected", castCase("hello", struct{ N int }{7}, struct{ N int }{7})},
+		{"int_to_named_rejected", castFails(65, label("fallback"))},
+		{"string_to_struct_rejected", castFails("hello", struct{ N int }{7})},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, tt.run)
@@ -453,38 +562,38 @@ func TestCast_Uintptr(t *testing.T) {
 		{"string", castCase("42", uintptr(7), uintptr(42))},
 		{"named_target", castCase("42", address(7), address(42))},
 		{"max", castCase(strconv.FormatUint(uint64(maxValue), 10), uintptr(7), maxValue)},
-		{"overflow", castCase("18446744073709551616", uintptr(7), uintptr(7))},
-		{"negative", castCase("-1", uintptr(7), uintptr(7))},
-		{"invalid", castCase("invalid", uintptr(7), uintptr(7))},
+		{"overflow", castFails("18446744073709551616", uintptr(7))},
+		{"negative", castFails("-1", uintptr(7))},
+		{"invalid", castFails("invalid", uintptr(7))},
 		{"zero_to_bool", castCase(uintptr(0), true, false)},
 		{"nonzero_to_bool", castCase(uintptr(65), false, true)},
 		{"named_source_to_bool", castCase(address(65), false, true)},
-		{"string_rejected", castCase(uintptr(65), "fallback", "fallback")},
-		{"named_string_rejected", castCase(address(65), label("fallback"), label("fallback"))},
+		{"string_rejected", castFails(uintptr(65), "fallback")},
+		{"named_string_rejected", castFails(address(65), label("fallback"))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, tt.run)
 	}
 }
 
-// TestCast_ComplexToBoolReturnsDefault 验证复数不参与数值转 bool 特判，零与非零均返回调用方默认值。
-func TestCast_ComplexToBoolReturnsDefault(t *testing.T) {
+// TestCast_ComplexToBoolRejected 验证复数不参与数值转 bool 特判，零与非零均不可转换。
+func TestCast_ComplexToBoolRejected(t *testing.T) {
 	type flag bool
 	for _, value := range []any{complex64(0), complex64(1 + 2i), complex128(0), complex128(1 + 2i)} {
 		t.Run(fmt.Sprintf("%T_%v", value, value), func(t *testing.T) {
 			for _, def := range []bool{false, true} {
-				if got := cast(value, def); got != def {
-					t.Errorf("cast(%v, %v) = %v, want default", value, def, got)
+				if got, ok := cast(value, def); ok || got != def {
+					t.Errorf("cast(%v, %v) = (%v,%v), want default", value, def, got, ok)
 				}
-				if got := cast(value, flag(def)); got != flag(def) {
-					t.Errorf("cast(%v, flag(%v)) = %v, want default", value, def, got)
+				if got, ok := cast(value, flag(def)); ok || got != flag(def) {
+					t.Errorf("cast(%v, flag(%v)) = (%v,%v), want default", value, flag(def), got, ok)
 				}
 			}
 		})
 	}
 }
 
-// TestCast_SliceToArrayValueSafety 验证短切片转换失败返回原默认值，足长切片正常转数组及数组指针。
+// TestCast_SliceToArrayValueSafety 验证短切片不可转换，足长切片正常转数组及数组指针。
 func TestCast_SliceToArrayValueSafety(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -501,24 +610,58 @@ func TestCast_SliceToArrayValueSafety(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			def := [2]int{8, 9}
-			if got := cast(tt.value, def); got != tt.want {
-				t.Errorf("array conversion = %v, want %v", got, tt.want)
+			got, ok := cast(tt.value, def)
+			if tt.valid {
+				if !ok || got != tt.want {
+					t.Fatalf("数组转换 = (%v,%v), want (%v,true)", got, ok, tt.want)
+				}
+			} else if ok || got != def {
+				t.Fatalf("不可转换时期望 (%v,false)，实际 (%v,%v)", def, got, ok)
 			}
-			got := cast(tt.value, &def)
-			if got == nil || *got != tt.want {
-				t.Fatalf("array pointer conversion = %v, want %v", got, tt.want)
-			}
-			if !tt.valid && got != &def {
-				t.Error("failed conversion did not return original default pointer")
+
+			gotPtr, ok := cast(tt.value, &def)
+			if tt.valid {
+				if !ok || gotPtr == nil || *gotPtr != tt.want {
+					t.Fatalf("数组指针转换 = (%v,%v), want 指向 (%v,true)", gotPtr, ok, tt.want)
+				}
+			} else if ok || gotPtr != &def {
+				t.Fatalf("不可转换时期望返回原默认值指针，实际 (%v,%v)", gotPtr, ok)
 			}
 		})
 	}
 }
 
-// TestCast_DurationUnitlessZero 验证仅零及符号零可省略单位，非零数字字符串仍返回非零默认值。
+// TestCast_DurationUnitlessZero 验证仅零及符号零可省略单位，非零数字字符串不可转换。
 func TestCast_DurationUnitlessZero(t *testing.T) {
 	for _, value := range []string{"0", "+0", "-0"} {
 		t.Run(value, castCase(value, 5*time.Second, time.Duration(0)))
 	}
-	t.Run("nonzero", castCase("10", 5*time.Second, 5*time.Second))
+	t.Run("nonzero", castFails("10", 5*time.Second))
+}
+
+// TestCast_StructToSameUnderlyingStruct 锁定结构体源值的转换路径：
+// 直接断言失败后走 reflect.CanConvert，底层类型相同的结构体（含 tag 不同、匿名结构体）会被转换；
+// 字段不同的结构体不可转换，返回 (def,false) 并由 Env/Config panic。
+func TestCast_StructToSameUnderlyingStruct(t *testing.T) {
+	src := castProbeStructA{X: 1, Y: "a"}
+
+	if got, ok := cast(src, castProbeStructB{}); !ok || got != (castProbeStructB{X: 1, Y: "a"}) {
+		t.Errorf("同底层结构体期望转换成功，实际 (%+v,%v)", got, ok)
+	}
+	if got, ok := cast(src, castProbeStructTagged{}); !ok || got != (castProbeStructTagged{X: 1, Y: "a"}) {
+		t.Errorf("tag 不同的同底层结构体期望转换成功，实际 (%+v,%v)", got, ok)
+	}
+	if got, ok := cast(struct {
+		X int
+		Y string
+	}{X: 1, Y: "a"}, castProbeStructB{}); !ok || got != (castProbeStructB{X: 1, Y: "a"}) {
+		t.Errorf("匿名结构体期望转换为具名同底层结构体，实际 (%+v,%v)", got, ok)
+	}
+	if got, ok := cast(src, castProbeStructDiff{X: 9, Z: "def"}); ok || got != (castProbeStructDiff{X: 9, Z: "def"}) {
+		t.Errorf("字段不同的结构体期望不可转换，实际 (%+v,%v)", got, ok)
+	}
+	// Config 不做 JSON 式解码：map[string]any 不能转换为结构体。
+	if got, ok := cast(map[string]any{"X": 1}, castProbeStructB{}); ok || got != (castProbeStructB{}) {
+		t.Errorf("map 期望不可转换为结构体，实际 (%+v,%v)", got, ok)
+	}
 }

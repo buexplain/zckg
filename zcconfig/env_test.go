@@ -156,10 +156,10 @@ STR_VAL=hello
 		t.Errorf("期望 true，实际 %v", v)
 	}
 
-	// 无法转换时返回默认值
-	if v := Env("STR_VAL", 0); v != 0 {
-		t.Errorf("期望默认值 0，实际 %d", v)
-	}
+	// 无法转换时 panic：key 存在但值类型不符，不再静默返回默认值
+	assertTypeMismatchPanic(t, "STR_VAL", reflect.TypeFor[int](), reflect.TypeFor[string](), func() {
+		Env("STR_VAL", 0)
+	})
 }
 
 func TestEnv_OsEnvFallback(t *testing.T) {
@@ -180,6 +180,39 @@ func TestEnv_OsEnvFallback(t *testing.T) {
 	if v := Env(key, "default"); v != "os_value" {
 		t.Errorf("期望 'os_value'，实际 %s", v)
 	}
+}
+
+// TestEnv_OsEnvFallbackConversion 验证 OS 环境变量恒为 string，但宽松转换规则仍然生效：
+// "8080"/"true"/"10s" 可解析为 int/bool/time.Duration；无法解析时按 key 存在但类型不符 panic。
+func TestEnv_OsEnvFallbackConversion(t *testing.T) {
+	t.Run("int", func(t *testing.T) {
+		resetForTest(t)
+		t.Setenv("ZCCONFIG_OS_PORT", "8080")
+		if got := Env("ZCCONFIG_OS_PORT", 0); got != 8080 {
+			t.Errorf("OS 字符串 8080 转 int 期望 8080，实际 %d", got)
+		}
+	})
+	t.Run("bool", func(t *testing.T) {
+		resetForTest(t)
+		t.Setenv("ZCCONFIG_OS_DEBUG", "true")
+		if got := Env("ZCCONFIG_OS_DEBUG", false); got != true {
+			t.Errorf("OS 字符串 true 转 bool 期望 true，实际 %v", got)
+		}
+	})
+	t.Run("duration", func(t *testing.T) {
+		resetForTest(t)
+		t.Setenv("ZCCONFIG_OS_TIMEOUT", "10s")
+		if got := Env("ZCCONFIG_OS_TIMEOUT", time.Second); got != 10*time.Second {
+			t.Errorf("OS 字符串 10s 转 Duration 期望 10s，实际 %v", got)
+		}
+	})
+	t.Run("mismatch_panics", func(t *testing.T) {
+		resetForTest(t)
+		t.Setenv("ZCCONFIG_OS_BAD_PORT", "abc")
+		assertTypeMismatchPanic(t, "ZCCONFIG_OS_BAD_PORT", reflect.TypeFor[int](), reflect.TypeFor[string](), func() {
+			Env("ZCCONFIG_OS_BAD_PORT", 0)
+		})
+	})
 }
 
 func TestEnvAll(t *testing.T) {
@@ -368,19 +401,18 @@ func TestLoadEnv_BOMIndentedFirstLine(t *testing.T) {
 	}
 }
 
-// TestEnv_NilInterfaceDefKeyExists 验证键存在、目标为接口类型且默认值为 nil 时，
-// Env 返回 nil 而非 panic（cast 对 nil reflect.Type 的守卫，修复 P1）。
-// 绕过 LoadEnv 直接写 envData 是因为需要构造 LoadEnv 无法产生的 any 类型值
-// （string 类型值存入 envData 后以 error 接口读取），以验证 cast 对 nil reflect.Type 的守卫。
-func TestEnv_NilInterfaceDefKeyExists(t *testing.T) {
+// TestEnv_NilInterfaceDefKeyExistsPanics 验证键存在、目标为接口类型且默认值为 nil 时，
+// 值未实现该接口属于类型不符：panic 的期望类型报接口本身；绕过 LoadEnv 直接写 envData
+// 是为了构造 LoadEnv 无法产生的 any 类型值（string 写入后以 error 接口读取）。
+func TestEnv_NilInterfaceDefKeyExistsPanics(t *testing.T) {
 	resetForTest(t)
 	envMu.Lock()
 	envData["SOME_KEY"] = "some-value"
 	envMu.Unlock()
 
-	if v := Env[error]("SOME_KEY", nil); v != nil {
-		t.Errorf("Env[error] 期望 nil，实际 %v", v)
-	}
+	assertTypeMismatchPanic(t, "SOME_KEY", reflect.TypeFor[error](), reflect.TypeFor[string](), func() {
+		Env[error]("SOME_KEY", nil)
+	})
 }
 
 // TestEnv_NamedBoolConversion 验证 .env 推断的数值与布尔值、OS 字符串均可转换为具名 bool。

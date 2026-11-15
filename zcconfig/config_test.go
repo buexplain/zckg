@@ -64,10 +64,74 @@ func TestConfig_DefaultValues(t *testing.T) {
 	if v := Config("app.notexist", "default"); v != "default" {
 		t.Errorf("期望 'default'，实际 %s", v)
 	}
+}
 
-	// 路径中间层不是 map
-	if v := Config("app.name.sub", "default"); v != "default" {
-		t.Errorf("期望 'default'，实际 %s", v)
+// TestConfig_IntermediateNonMapPanics 验证路径中途已存在标量值时 panic：
+// key 为调用方传入的完整 key，期望类型为 map[string]any，实际类型为中途标量类型。
+func TestConfig_IntermediateNonMapPanics(t *testing.T) {
+	resetForTest(t)
+	Register("app", func() map[string]any {
+		return map[string]any{"name": "myapp"}
+	})
+	assertTypeMismatchPanic(t, "app.name.sub", reflect.TypeFor[map[string]any](), reflect.TypeFor[string](), func() {
+		Config("app.name.sub", "default")
+	})
+}
+
+// TestConfig_TypeMismatchPanics 验证 key 存在但值无法转换为 T 时 panic，
+// 诊断信息包含完整 key、目标类型 T 与实际存储类型；结构体目标同样适用。
+func TestConfig_TypeMismatchPanics(t *testing.T) {
+	t.Run("string_to_int", func(t *testing.T) {
+		resetForTest(t)
+		Register("app", func() map[string]any {
+			return map[string]any{"port": "abc"}
+		})
+		assertTypeMismatchPanic(t, "app.port", reflect.TypeFor[int](), reflect.TypeFor[string](), func() {
+			Config("app.port", 3306)
+		})
+	})
+	t.Run("string_to_struct", func(t *testing.T) {
+		resetForTest(t)
+		Register("app", func() map[string]any {
+			return map[string]any{"db": "not-a-struct"}
+		})
+		assertTypeMismatchPanic(t, "app.db", reflect.TypeFor[DBConfig](), reflect.TypeFor[string](), func() {
+			Config("app.db", DBConfig{})
+		})
+	})
+	t.Run("map_to_struct", func(t *testing.T) {
+		// Config 不做 JSON 式解码：注册值是 map[string]any 时不能读成结构体。
+		resetForTest(t)
+		Register("app", func() map[string]any {
+			return map[string]any{"db": map[string]any{"host": "localhost"}}
+		})
+		assertTypeMismatchPanic(t, "app.db", reflect.TypeFor[DBConfig](), reflect.TypeFor[map[string]any](), func() {
+			Config("app.db", DBConfig{})
+		})
+	})
+	t.Run("numeric_to_string", func(t *testing.T) {
+		resetForTest(t)
+		Register("app", func() map[string]any {
+			return map[string]any{"name": 42}
+		})
+		assertTypeMismatchPanic(t, "app.name", reflect.TypeFor[string](), reflect.TypeFor[int](), func() {
+			Config("app.name", "default")
+		})
+	})
+}
+
+// TestConfig_NilValueReturnsDefault 验证存储值为 nil 视为未配置：
+// 叶子节点与路径中途节点均返回 def，不 panic。
+func TestConfig_NilValueReturnsDefault(t *testing.T) {
+	resetForTest(t)
+	Register("app", func() map[string]any {
+		return map[string]any{"leaf": nil, "child": nil}
+	})
+	if got := Config("app.leaf", "def"); got != "def" {
+		t.Errorf("nil 叶子节点期望默认值 def，实际 %q", got)
+	}
+	if got := Config("app.child.sub", "def"); got != "def" {
+		t.Errorf("nil 中间节点期望默认值 def，实际 %q", got)
 	}
 }
 
@@ -288,17 +352,17 @@ func TestReset_ThenRead(t *testing.T) {
 	}
 }
 
-// TestConfig_NilInterfaceDefKeyExists 验证业务配置键存在、目标为接口类型且默认值为 nil 时，
-// Config 返回 nil 而非 panic。
-func TestConfig_NilInterfaceDefKeyExists(t *testing.T) {
+// TestConfig_NilInterfaceDefKeyExistsPanics 验证业务配置键存在、目标为接口类型且默认值为 nil 时，
+// 值未实现该接口属于类型不符：panic 的期望类型报接口本身，而不是 def 的动态类型。
+func TestConfig_NilInterfaceDefKeyExistsPanics(t *testing.T) {
 	resetForTest(t)
 	Register("app", func() map[string]any {
 		return map[string]any{"value": "some-value"}
 	})
 
-	if v := Config[fmt.Stringer]("app.value", nil); v != nil {
-		t.Errorf("Config[fmt.Stringer] 期望 nil，实际 %v", v)
-	}
+	assertTypeMismatchPanic(t, "app.value", reflect.TypeFor[fmt.Stringer](), reflect.TypeFor[string](), func() {
+		Config[fmt.Stringer]("app.value", nil)
+	})
 }
 
 // TestConfig_NamedBoolConversion 验证有符号、无符号、浮点数的零与非零值以及字符串转换到具名 bool。
@@ -358,47 +422,55 @@ func TestConfig_NamedStringConversion(t *testing.T) {
 	}
 }
 
-// TestConfig_SliceToArrayConversion 验证 nil、空、短切片转数组及数组指针返回非零默认值，长度足够时读取前两个元素。
+// TestConfig_SliceToArrayConversion 验证长度足够的切片转换为数组及数组指针；长度不足时 panic，
+// 期望类型分别是 [2]int 与 *[2]int，实际类型为 []int。
 func TestConfig_SliceToArrayConversion(t *testing.T) {
 	for _, target := range []string{"array", "pointer"} {
 		for _, tt := range []struct {
 			name  string
 			value []int
+			want  [2]int
 			valid bool
 		}{
-			{"nil", nil, false},
-			{"empty", []int{}, false},
-			{"short", []int{1}, false},
-			{"exact", []int{1, 2}, true},
-			{"long", []int{1, 2, 3}, true},
+			{"nil", nil, [2]int{8, 9}, false},
+			{"empty", []int{}, [2]int{8, 9}, false},
+			{"short", []int{1}, [2]int{8, 9}, false},
+			{"exact", []int{1, 2}, [2]int{1, 2}, true},
+			{"long", []int{1, 2, 3}, [2]int{1, 2}, true},
 		} {
 			t.Run(target+"/"+tt.name, func(t *testing.T) {
 				resetForTest(t)
 				Register("app", func() map[string]any { return map[string]any{"values": tt.value} })
 				def := [2]int{8, 9}
-				want := def
-				if tt.valid {
-					want = [2]int{1, 2}
-				}
 				if target == "array" {
-					if got := Config("app.values", def); got != want {
-						t.Errorf("Config 数组期望 %v，实际 %v", want, got)
+					if tt.valid {
+						if got := Config("app.values", def); got != tt.want {
+							t.Errorf("Config 数组期望 %v，实际 %v", tt.want, got)
+						}
+						return
 					}
-				} else {
-					got := Config("app.values", &def)
-					if got == nil || *got != want {
-						t.Fatalf("Config 数组指针期望指向 %v，实际 %#v", want, got)
-					}
-					if !tt.valid && got != &def {
-						t.Error("转换失败应返回原默认值指针")
-					}
+					assertTypeMismatchPanic(t, "app.values", reflect.TypeFor[[2]int](), reflect.TypeFor[[]int](), func() {
+						Config("app.values", def)
+					})
+					return
 				}
+				if tt.valid {
+					got := Config("app.values", &def)
+					if got == nil || *got != tt.want {
+						t.Fatalf("Config 数组指针期望指向 %v，实际 %#v", tt.want, got)
+					}
+					return
+				}
+				assertTypeMismatchPanic(t, "app.values", reflect.TypeFor[*[2]int](), reflect.TypeFor[[]int](), func() {
+					Config("app.values", &def)
+				})
 			})
 		}
 	}
 }
 
-// TestConfig_UintptrConversion 验证 uintptr 的码点转 string 被拒绝，零与非零可转 bool，字符串可解析为 uintptr。
+// TestConfig_UintptrConversion 验证 uintptr 的码点转 string 被拒绝（panic），零与非零可转 bool，
+// 字符串可解析为 uintptr。
 func TestConfig_UintptrConversion(t *testing.T) {
 	type Label string
 	type Flag bool
@@ -413,12 +485,12 @@ func TestConfig_UintptrConversion(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			resetForTest(t)
 			Register("app", func() map[string]any { return map[string]any{"value": tt.value} })
-			if got := Config("app.value", "fallback"); got != "fallback" {
-				t.Errorf("uintptr 不应转换为码点字符串，实际 %q", got)
-			}
-			if got := Config("app.value", Label("fallback")); got != Label("fallback") {
-				t.Errorf("uintptr 不应转换为具名码点字符串，实际 %q", got)
-			}
+			assertTypeMismatchPanic(t, "app.value", reflect.TypeFor[string](), reflect.TypeFor[uintptr](), func() {
+				Config("app.value", "fallback")
+			})
+			assertTypeMismatchPanic(t, "app.value", reflect.TypeFor[Label](), reflect.TypeFor[uintptr](), func() {
+				Config("app.value", Label("fallback"))
+			})
 			if got := Config("app.value", !tt.want); got != tt.want {
 				t.Errorf("uintptr(%d) 转 bool 期望 %v，实际 %v", tt.value, tt.want, got)
 			}
@@ -436,8 +508,9 @@ func TestConfig_UintptrConversion(t *testing.T) {
 	})
 }
 
-// TestConfig_ComplexBoolDefaults 验证 complex64/128 的零与非零值不支持转 bool，始终返回指定默认值。
-func TestConfig_ComplexBoolDefaults(t *testing.T) {
+// TestConfig_ComplexBoolPanics 验证 complex64/128 的零与非零值不支持转 bool，
+// 均 panic 且期望类型为 bool / 具名 Flag，实际类型为复数类型。
+func TestConfig_ComplexBoolPanics(t *testing.T) {
 	type Flag bool
 	for _, tt := range []struct {
 		name  string
@@ -452,31 +525,39 @@ func TestConfig_ComplexBoolDefaults(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/default_%v", tt.name, def), func(t *testing.T) {
 				resetForTest(t)
 				Register("app", func() map[string]any { return map[string]any{"value": tt.value} })
-				if got := Config("app.value", def); got != def {
-					t.Errorf("%T(%v) 转 bool 期望默认值 %v，实际 %v", tt.value, tt.value, def, got)
-				}
-				if got := Config("app.value", Flag(def)); got != Flag(def) {
-					t.Errorf("%T(%v) 转 Flag 期望默认值 %v，实际 %v", tt.value, tt.value, def, got)
-				}
+				assertTypeMismatchPanic(t, "app.value", reflect.TypeFor[bool](), reflect.TypeOf(tt.value), func() {
+					Config("app.value", def)
+				})
+				assertTypeMismatchPanic(t, "app.value", reflect.TypeFor[Flag](), reflect.TypeOf(tt.value), func() {
+					Config("app.value", Flag(def))
+				})
 			})
 		}
 	}
 }
 
-// TestConfig_DurationUnitlessStrings 验证无单位字符串 0、+0、-0 可解析，10 返回 5s 默认值。
+// TestConfig_DurationUnitlessStrings 验证无单位字符串 0、+0、-0 可解析，
+// 非零数字字符串缺少时间单位、无法解析转为 Duration 时 panic。
 func TestConfig_DurationUnitlessStrings(t *testing.T) {
 	for _, tt := range []struct {
 		input string
 		want  time.Duration
+		valid bool
 	}{
-		{"0", 0},
-		{"+0", 0},
-		{"-0", 0},
-		{"10", 5 * time.Second},
+		{"0", 0, true},
+		{"+0", 0, true},
+		{"-0", 0, true},
+		{"10", 5 * time.Second, false},
 	} {
 		t.Run(tt.input, func(t *testing.T) {
 			resetForTest(t)
 			Register("app", func() map[string]any { return map[string]any{"timeout": tt.input} })
+			if !tt.valid {
+				assertTypeMismatchPanic(t, "app.timeout", reflect.TypeFor[time.Duration](), reflect.TypeFor[string](), func() {
+					Config("app.timeout", 5*time.Second)
+				})
+				return
+			}
 			if got := Config("app.timeout", 5*time.Second); got != tt.want {
 				t.Errorf("Config 字符串 %q 配默认 5s 期望 %v，实际 %v", tt.input, tt.want, got)
 			}

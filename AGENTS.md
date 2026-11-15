@@ -147,5 +147,5 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
 - **zchttp**：`HttpEngine` 必须通过 `NewEngine()` 构造（自动装配默认回调，`MaxBodyBytes` 与 `MultipartFormMaxMemory` 默认 32 MB），禁止字面量构造；handler 签名固定为 `func(ctx context.Context, req Req) (Res, error)`，注册时校验不通过即 panic。
 - **zcquit**：`Shutdown()` 先于 `Listen()` 调用时，`Listen()` 必须立即返回。
 - **zcmodel**：`ColumnTagName` 为空时不生成对应标签；生成文件落盘前经 go/format 语法自校验 + 临时文件原子写入，非法产物不落盘。
-- **zcconfig**：float→int 采用 Go 原生向零截断语义；数值→bool 为 C 风格（非零为 true）；`.env` 解析首行需剥离 UTF-8 BOM。
+- **zcconfig**：float→int 采用 Go 原生向零截断语义；数值→bool 为 C 风格（非零为 true）；`.env` 解析首行需剥离 UTF-8 BOM；key 不存在（含 Config 路径缺失、值为 nil）返回默认值，key 存在但值无法转换为目标类型（含 Config 路径中途非 map）panic `*TypeMismatchError`（携带 key、期望类型、实际类型），不得静默回退为默认值。
 - **zcdb**：无 WHERE 的 Update/Delete 默认拒绝（需 `Force()`）；`Primary()` 标记的查询强制走主库；三方言的标识符包裹与占位符差异由 Grammar 隔离，勿在 Builder 层写死方言细节。

@@ -126,19 +126,23 @@ func parseValue(value string) any {
 }
 
 // Env 从 env 存储中按 key 查找值，转换为 T 类型返回。
-// 若 key 不存在或类型转换失败，返回默认值 def。
 // 查找顺序：先查 LoadEnv 加载的数据，再回退到操作系统环境变量。
+//
+// 行为约定：
+//   - key 不存在（.env 与 OS 环境变量都没有该 key）时返回默认值 def；
+//   - key 存在但值无法转换为 T 时 panic(*TypeMismatchError)，消息携带 key、期望类型与实际类型；
+//   - 存储值为 nil 视为未配置，返回默认值 def，不 panic。
 func Env[T any](key string, def T) T {
 	envMu.RLock()
 	v, ok := envData[key]
 	envMu.RUnlock()
 	if ok {
-		return cast(v, def)
+		return castOrPanic(key, v, def)
 	}
 
 	// 回退到操作系统环境变量
 	if s, ok := os.LookupEnv(key); ok {
-		return cast(s, def)
+		return castOrPanic(key, s, def)
 	}
 
 	return def

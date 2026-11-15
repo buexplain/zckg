@@ -13,7 +13,7 @@ zcconfig 是一个轻量级配置加载与读取模块，提供两条独立的�
 
 ```
 zcconfig/
-├── cast.go                        # 泛型类型转换引擎（内部）
+├── cast.go                        # 泛型类型转换引擎与 TypeMismatchError（内部）
 ├── env.go                         # .env 文件加载与 Env 泛型读取
 ├── config.go                      # 业务配置注册与 Config 泛型读取
 ├── dbConfig.go                    # 数据库连接配置与 DSN 生成（DBConfig / DBSlaveConfig）
@@ -81,15 +81,19 @@ zcconfig/
 │                                                      │
 │  ┌───────────── 公共引擎 ───────────────┐           │
 │  │                                      │           │
-│  │  cast[T any](v any, def T) T         │           │
-│  │    1. nil → 返回 def                  │           │
+│  │  cast[T any](v any, def T) (T, bool) │           │
+│  │    1. nil → 未命中                   │           │
 │  │    2. 直接类型断言 v.(T)             │           │
 │  │    3. string → time.ParseDuration    │           │
 │  │    4. string 互转或 strconv 解析     │           │
 │  │    5. 数值→bool 特判（非零为 true）   │           │
-│  │    6. 数值→string 防护（返回 def）    │           │
+│  │    6. 数值→string 防护（未命中）      │           │
 │  │    7. reflect Value.CanConvert 转换  │           │
-│  │    8. 均失败 → 返回 def              │           │
+│  │    8. 均失败 → 未命中                │           │
+│  │                                      │           │
+│  │  castOrPanic(key, v, def)            │           │
+│  │    ├─ nil → 返回 def                 │           │
+│  │    └─ 未命中 → panic(TypeMismatch)   │           │
 │  │                                      │           │
 │  └──────────────────────────────────────┘           │
 └──────────────────────────────────────────────────────┘
@@ -102,7 +106,7 @@ zcconfig/
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `LoadEnv` | `func LoadEnv(path string) error` | 读取 `.env` 文件，解析键值对存入 env 存储。值自动推断类型（int / float64 / bool / string），支持注释行、`export` 前缀（大小写不敏感，兼容多空格/Tab）、引号去除，首行 UTF-8 BOM 自动剥离。单行上限 1MB（超出返回错误），打开/读取失败的错误信息均包含文件路径。先解析到局部 map，全部成功后才合并，加载失败不修改已有数据。多次调用合并数据，后加载覆盖先前。 |
-| `Env` | `func Env[T any](key string, def T) T` | 按 key 查找 env 值并转换为 T 类型。查找顺序：先查 `LoadEnv` 加载的数据，再回退 OS 环境变量。未找到或转换失败时返回默认值 `def`。 |
+| `Env` | `func Env[T any](key string, def T) T` | 按 key 查找 env 值并转换为 T 类型。查找顺序：先查 `LoadEnv` 加载的数据，再回退 OS 环境变量。key 不存在（两处都没有）时返回默认值 `def`；key 存在但值无法转换为 T 时 panic(`*TypeMismatchError`)，携带 key、期望类型与实际类型。 |
 | `EnvAll` | `func EnvAll() map[string]any` | 返回内部 env 存储的直接引用（零拷贝，不含 OS 环境变量）。**仅限只读场景**：写操作会污染全局配置并与并发读取产生数据竞争，详见[架构约定](#架构约定)。 |
 
 ### Config 通道
@@ -110,18 +114,19 @@ zcconfig/
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `Register` | `func Register(key string, fn func() map[string]any)` | 注册业务配置。`fn` 在调用时**立即执行**，返回的数据按 `key` 路径深度合并到配置树；`fn` 返回 nil 时静默忽略（不合并任何数据）。`key` 为空字符串时合并到根节点。多次调用深度合并，同名 key 后注册覆盖先前的值。约定：`fn` 返回的 map 在 Register 之后不得再被修改（zcconfig 不拷贝返回值，直接存储引用）；若 `key` 路径中间层级已存在标量值或 nil map，注册子节点会将其初始化为可写 map；深度合并遇到 nil 目标 map 时以源值替换；nil 源 map 不清空已有非 nil map。 |
-| `Config` | `func Config[T any](key string, def T) T` | 按 `.` 分隔的 key 递归查找嵌套 `map[string]any{}`，找到后转换为 T 类型返回。路径不存在或中间层级非 map 时返回默认值 `def`。`key` 为空字符串时查找根层的 `""` 键（`Register` 的根级合并不创建该键，通常返回 `def`）。纯读操作，使用 `RLock`。 |
+| `Config` | `func Config[T any](key string, def T) T` | 按 `.` 分隔的 key 递归查找嵌套 `map[string]any{}`，找到后转换为 T 类型返回。key 不存在（任一层级缺失或值为 nil）时返回默认值 `def`；key 存在但值无法转换为 T、或路径中间层级存在但不是 map 时 panic(`*TypeMismatchError`)。`key` 为空字符串时查找根层的 `""` 键（`Register` 的根级合并不创建该键，通常返回 `def`）。纯读操作，使用 `RLock`。 |
 | `ConfigAll` | `func ConfigAll() map[string]any` | 返回内部配置存储的直接引用（零拷贝）。**仅限只读场景**：写操作会污染全局配置并与并发读取产生数据竞争，详见[架构约定](#架构约定)。 |
 
 ### 辅助方法
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
+| `TypeMismatchError` | `type TypeMismatchError struct { Key string; Expected, Actual reflect.Type }` | 类型不符的 panic 载荷。`Key` 为调用方原始 key，`Expected` 为目标类型 T 的静态类型（接口目标即接口类型），`Actual` 为存储值动态类型；`Error()` 消息形如 `zcconfig: key "app.db" 类型不匹配：期望 zcconfig.DBConfig，实际 string`。调用方可用 `errors.As` 捕获。 |
 | `reset` | `func reset()` | 清空所有 env 数据和 config 数据（**小写未导出**，仅测试场景内部使用）。 |
 
 ## 数据库连接配置（DBConfig）
 
-`DBConfig` 承载数据库连接所需的各项参数，注册到 Config 通道读取后，通过 `GetMasterDSN` / `GetSlaveDSN` 生成主从库连接字符串（DSN），可直接对接 `zcdb.NewPool`。DSN 格式按 `Driver` 选择（`Driver` 为空时回退 `Dialect`）：
+`DBConfig` 承载数据库连接所需的各项参数，注册到 Config 通道读取后，通过 `GetMasterDSN` / `GetSlaveDSN` 生成主从库连接字符串（DSN），可直接对接 `zcdb.NewPool`。读取时若该路径的注册值无法转换为 `DBConfig`（例如误注册为 string 或 map），`Config` 会 panic(`*TypeMismatchError`)，不会静默返回零值结构体。DSN 格式按 `Driver` 选择（`Driver` 为空时回退 `Dialect`）：
 
 | 驱动 | 格式 | 说明 |
 |------|------|------|
@@ -168,53 +173,81 @@ pool, err := zcdb.NewPool(zcdb.PoolConfig{
 
 ## 类型转换引擎 cast
 
-`cast` 是内部函数（小写，不导出），被 `Env` 和 `Config` 共用，负责将 `any` 类型的存储值转换为目标泛型类型 `T`。
+`cast` 是内部函数（小写，不导出），被 `Env` 和 `Config` 共用，负责判断 `any` 类型的存储值能否转换为目标泛型类型 `T`，返回 `(T, bool)`；`bool` 为 false 表示类型不符。`Env` / `Config` 通过内部函数 `castOrPanic` 使用它：key 不存在直接返回 `def`；key 存在但 `cast` 未命中时 panic(`*TypeMismatchError`)。
 
 ### 转换优先级
 
 ```
-1. v == nil              → 返回 def
+1. v == nil              → 未命中（调用方视为“无值”返回 def）
 2. v.(T) 直接断言        → 命中则返回
 3. string → time.Duration → time.ParseDuration（如 "10s"、"1h30m"）
 4. string 转换          → 普通/具名 string 互转，或
                             ParseInt / ParseUint / ParseFloat / ParseBool
 5. 数值 → bool 特判      → 整数（含 uintptr）与浮点：零值 false、非零 true；
                             支持具名 bool，不含 complex
-6. 数值 → string 防护    → 直接返回 def（包括 uintptr 和具名 string 目标，
+6. 数值 → string 防护    → 未命中（包括 uintptr 和具名 string 目标，
                             防止 65→"A" 等 Unicode 码点语义）
 7. reflect 转换          → Value.CanConvert 检查（类型及具体值均可转换）
-8. 全部失败               → 返回 def
+8. 全部失败               → 未命中
 ```
 
-> **time.Duration 特殊处理**：`time.Duration` 底层为 `int64`，若不特殊处理会走 `strconv.ParseInt` 路径，但 `"10s"` 等格式无法被 `ParseInt` 解析。因此在 strconv 分支之前优先用 `time.ParseDuration` 解析，解析失败直接返回 `def`，不回退到 `ParseInt`。`Env` 和 `Config` 共用同一个 `cast`，所以两者都自动支持 `time.Duration`。
+目标为接口类型时只接受第 2 步的直接断言（值必须实现该接口），不参与其余转换。
+
+> **time.Duration 特殊处理**：`time.Duration` 底层为 `int64`，若不特殊处理会走 `strconv.ParseInt` 路径，但 `"10s"` 等格式无法被 `ParseInt` 解析。因此在 strconv 分支之前优先用 `time.ParseDuration` 解析，解析失败判定为未命中（key 存在时 panic），不回退到 `ParseInt`。`Env` 和 `Config` 共用同一个 `cast`，所以两者都自动支持 `time.Duration`。
+
+### 类型不符：TypeMismatchError
+
+| 场景 | 行为 |
+|---|---|
+| key 不存在（Env 的 `.env` 与 OS 环境变量都没有；Config 任一层级缺失） | 返回 `def` |
+| key 存在且值为 nil | 返回 `def`（视为未配置） |
+| key 存在且转换成功 | 返回转换结果 |
+| key 存在但转换失败 | panic(`*TypeMismatchError`) |
+| Config 路径中间层存在但不是 map | panic(`*TypeMismatchError`)，期望类型记为 `map[string]any`（消息按反射名称显示为 `map[string]interface {}`） |
+
+`*TypeMismatchError` 携带 `Key`（调用方原始 key）、`Expected`（目标类型 T 的静态类型，接口目标即接口类型）、`Actual`（存储值动态类型），消息形如 `zcconfig: key "app.db" 类型不匹配：期望 zcconfig.DBConfig，实际 string`。需要兜底时用 `errors.As` 捕获：
+
+```go
+defer func() {
+    if r := recover(); r != nil {
+        var mismatch *zcconfig.TypeMismatchError
+        if err, ok := r.(error); ok && errors.As(err, &mismatch) {
+            fmt.Printf("key=%s expected=%v actual=%v\n", mismatch.Key, mismatch.Expected, mismatch.Actual)
+        }
+        panic(r) // 继续向上传播
+    }
+}()
+```
 
 ### string 源值转换表
+
+以下两张转换表均以 **key 存在** 为前提；key 不存在时直接返回 `def`，不进入 `cast`，也不会 panic。
 
 | 源值示例 | 目标类型 | 转换路径 | 结果 |
 |---------|---------|---------|------|
 | `"42"` | `int` | `strconv.ParseInt` | `42` |
 | `"-42"` | `int` | `strconv.ParseInt` | `-42` |
 | `"42"` | `int8` | `strconv.ParseInt` + 溢出检查 | `42` |
-| `"200"` | `int8` | `strconv.ParseInt` + 溢出检查 | 返回 `def`（超出范围） |
+| `"200"` | `int8` | `strconv.ParseInt` + 溢出检查 | panic（超出范围） |
 | `"42"` | `uint` / `uintptr`（含具名类型） | `strconv.ParseUint` | `42` |
-| `"-1"` | `uint` / `uintptr` | `strconv.ParseUint` | 返回 `def`（负数无法转无符号整数） |
+| `"-1"` | `uint` / `uintptr` | `strconv.ParseUint` | panic（负数无法转无符号整数） |
 | `"3.14"` | `float64` | `strconv.ParseFloat` | `3.14` |
 | `"100"` | `float64` | `strconv.ParseFloat` | `100.0` |
-| `"NaN"` / `"Inf"` / `"-Inf"` | `float64` | `strconv.ParseFloat` | 返回 `def`（NaN/Inf 视为非法配置值） |
-| `"1e999"` | `float64` | `strconv.ParseFloat` | 返回 `def`（溢出为 Inf，带范围错误） |
+| `"NaN"` / `"Inf"` / `"-Inf"` | `float64` | `strconv.ParseFloat` | panic（NaN/Inf 视为非法配置值） |
+| `"1e999"` | `float64` | `strconv.ParseFloat` | panic（溢出为 Inf，带范围错误） |
 | `"true"` | `bool` | `strconv.ParseBool` | `true` |
 | `"1"` | `bool` | `strconv.ParseBool` | `true` |
 | `"0"` | `bool` | `strconv.ParseBool` | `false` |
-| `"yes"` | `bool` | `strconv.ParseBool` | 返回 `def`（非法布尔值） |
+| `"yes"` | `bool` | `strconv.ParseBool` | panic（非法布尔值） |
 | `"10s"` | `time.Duration` | `time.ParseDuration` | `10 * time.Second` |
 | `"1h30m"` | `time.Duration` | `time.ParseDuration` | `90 * time.Minute` |
 | `"500ms"` | `time.Duration` | `time.ParseDuration` | `500 * time.Millisecond` |
-| `"10"` | `time.Duration` | `time.ParseDuration` | 返回 `def`（缺少时间单位） |
+| `"10"` | `time.Duration` | `time.ParseDuration` | panic（缺少时间单位） |
 | `"0"` / `"+0"` / `"-0"` | `time.Duration` | `time.ParseDuration` | `0`（零值可不带单位） |
-| `"abc"` | `int` | `strconv.ParseInt` | 返回 `def`（解析失败） |
+| `"abc"` | `int` | `strconv.ParseInt` | panic（解析失败） |
 | `"hello"` | `string` | 直接类型断言 | `"hello"` |
-| 普通 / 具名 string（含空字符串） | 普通 / 其他具名 string | 同类型直接断言，否则 reflect 转换 | 保留字符串内容，不返回默认值 |
-| `"hello"` | `struct{}` | default 分支 | 返回 `def` |
+| 普通 / 具名 string（含空字符串） | 普通 / 其他具名 string | 同类型直接断言，否则 reflect 转换 | 保留字符串内容，转换成功 |
+| `"hello"` | `struct{}` | default 分支 | panic（类型不符） |
 
 ### 非 string 源值转换表
 
@@ -224,15 +257,19 @@ pool, err := zcdb.NewPool(zcdb.PoolConfig{
 | `int64(100)` | `int` | `reflect.Value.CanConvert` | `100` |
 | `3.14` (float64) | `float32` | `reflect.Value.CanConvert` | `float32(3.14)` |
 | `42` (int) / `uintptr(42)` / `99.99` (float64) | `bool` 或具名 bool | 数值→bool 特判 | `true`（整数含 uintptr 及浮点，零值为 false；源值也可为具名类型） |
-| `complex(1, 2)` | `bool` 或具名 bool | 不可转换 | 返回 `def`，不属于数值→bool 特判范围 |
-| `uintptr(65)` | `string` 或具名 string | 数值→string 防护 | 返回 `def`，不会得到 `"A"` |
+| `complex(1, 2)` | `bool` 或具名 bool | 不可转换 | panic，不属于数值→bool 特判范围 |
+| `uintptr(65)` | `string` 或具名 string | 数值→string 防护 | panic，不会得到 `"A"` |
 | `99.99` (float64) | `int` | `reflect.Value.CanConvert` | `99`（向零截断，见下方截断语义声明） |
-| `[]int{1}` | `[2]int` / `*[2]int` | 值长度不足，不可转换 | 返回原 `def`，不 panic |
+| `[]int{1}` | `[2]int` / `*[2]int` | 值长度不足，不可转换 | panic（不返回原 `def`） |
 | `[]int{1, 2, 3}` | `[2]int` / `*[2]int` | `reflect.Value.CanConvert` | 转换成功，数组内容为 `[2]int{1, 2}` |
-| `true` (bool) | `int` | 不可转换 | 返回 `def` |
+| 结构体 A（字段名/类型/顺序相同） | 结构体 B（含 tag 不同；底层类型相同） | 直接断言失败后 `reflect.Value.CanConvert` | 转换成功，字段值复制 |
+| 结构体 A（字段不同） | 结构体 B | 底层类型不同，不可转换 | panic |
+| `map[string]any` | 任意结构体 | 未实现 map→struct 解码，不可转换 | panic（不要把 Config 当 JSON 反序列化） |
+| `&T`（结构体指针） | `T`（结构体） | 不可转换 | panic |
+| `true` (bool) | `int` | 不可转换 | panic |
 | `42` (int) | `int` | 直接类型断言 | `42` |
 
-> **reflect 兜底截断语义声明**：优先级第 7 步的 reflect 兜底转换采用 Go 原生类型转换语义：`float→int` 向零截断（如 `99.99→99`、`-99.99→-99`），大位宽→小位宽（如 32 位平台上 `int64→int`、`float64→float32`）可能溢出或损失精度。典型触发链：`.env` 中 `PRICE=99.99` 被推断为 float64，调用方 `Env("PRICE", 0)`（int 默认值）将静默得到 `99`。**调用方应保证默认值类型与存储的配置值类型匹配**。
+> **reflect 兜底截断语义声明**：优先级第 7 步的 reflect 兜底转换采用 Go 原生类型转换语义：`float→int` 向零截断（如 `99.99→99`、`-99.99→-99`），大位宽→小位宽（如 32 位平台上 `int64→int`、`float64→float32`）可能溢出或损失精度。转换成功不会 panic，因此这类截断仍是静默的。典型触发链：`.env` 中 `PRICE=99.99` 被推断为 float64，调用方 `Env("PRICE", 0)`（int 默认值）将静默得到 `99`。**调用方应保证默认值类型与存储的配置值类型匹配**。
 
 ## .env 文件格式
 
@@ -275,6 +312,7 @@ NO_QUOTE=hello world
 
   返回值的生命周期与内部存储一致——外部保存的引用在后续 `Register` / `LoadEnv` 合并后仍指向同一底层数据（深合并不替换 map 根节点），**不要在返回值上做任何写操作**。
 - **启动期注册、运行期只读**：`Register` / `LoadEnv` 仅允许在启动阶段调用，运行期配置只读。
+- **键缺失与类型不符二分**：key 不存在（含 Config 路径缺失、值为 nil）返回调用方默认值 `def`；key 存在但值无法转换为目标类型（含 Config 路径中途非 map）panic(`*TypeMismatchError`)，绝不静默回退为 `def`。类型不符属于配置错误，应在启动阶段立即暴露。
 - **注册后不可变**：`Register` 的 `fn` 返回的 map 及其嵌套结构在 Register 之后不得再被修改；zcconfig 不拷贝返回值，直接存储引用。
 - 模块选择不引入任何拷贝（浅拷贝或深拷贝）的原因：`map[string]any` 的 value 可为任意 Go 类型，部分拷贝（无论深浅）无法覆盖 slice/指针/chan/func 等全部引用类型，反而制造虚假安全感。
 
@@ -392,7 +430,7 @@ timeout := zcconfig.Config("server.timeout", 10*time.Second)        // 30 * time
 pollInterval := zcconfig.Config("server.poll_interval", 1*time.Second) // 2 * time.Second
 ```
 
-支持的 Duration 格式遵循 Go `time.ParseDuration` 规范，如 `"10s"`、`"1h30m"`、`"500ms"`、`"100us"`、`"100ns"` 等。普通纯数字字符串（如 `"10"`）缺少时间单位，解析失败返回默认值；`"0"`、`"+0"`、`"-0"` 是例外，均解析为零时长。
+支持的 Duration 格式遵循 Go `time.ParseDuration` 规范，如 `"10s"`、`"1h30m"`、`"500ms"`、`"100us"`、`"100ns"` 等。普通纯数字字符串（如 `"10"`）缺少时间单位，属于类型不符（key 存在时 panic）；`"0"`、`"+0"`、`"-0"` 是例外，均解析为零时长。
 
 > 注意：`time.ParseDuration` 仅对 **string 源值**生效。若存储值是数值类型（如 `.env` 中 `TIMEOUT=30` 被推断为 int），会走 reflect 兜底转换为 `time.Duration` 底层 int64——`Env("TIMEOUT", 5*time.Second)` 仍得到 `30ns`，默认值的单位不会改变已有数值的含义。`.env` 中写成 `TIMEOUT="30"` 也会在去引号后推断为 int。需要秒级语义时请写成 `TIMEOUT=30s`，或按整数读取后显式乘以 `time.Second`。
 
