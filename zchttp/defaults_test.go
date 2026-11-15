@@ -313,6 +313,62 @@ func TestIsDefaultSupported(t *testing.T) {
 	}
 }
 
+// TestIsDefaultSupported_PointerDepthBoundary 锁死 default 支持的指针层数边界：
+// 文档声明最多 32 层，31/32 层必须为 true，33 层为 false（与 parseScalar 的 32 层一致）。
+func TestIsDefaultSupported_PointerDepthBoundary(t *testing.T) {
+	base := reflect.TypeOf(0)
+	for _, tc := range []struct {
+		layers int
+		want   bool
+	}{{30, true}, {31, true}, {32, true}, {33, false}} {
+		typ := base
+		for i := 0; i < tc.layers; i++ {
+			typ = reflect.PtrTo(typ)
+		}
+		if got := isDefaultSupported(typ); got != tc.want {
+			t.Errorf("isDefaultSupported(%d 层指针) = %v, want %v", tc.layers, got, tc.want)
+		}
+	}
+}
+
+// TestParseDefaultValue 锁死 default 解析与运行时 applyDefaults 规则一致：
+// 标量 TrimSpace、切片逗号切分并 Trim、空切片合法、非法元素/NaN/Inf 视为无法解析。
+func TestParseDefaultValue(t *testing.T) {
+	cases := []struct {
+		name  string
+		typ   reflect.Type
+		raw   string
+		want  any
+		valid bool
+	}{
+		{"int trim", reflect.TypeOf(0), " 42 ", int(42), true},
+		{"int invalid", reflect.TypeOf(0), "abc", nil, false},
+		{"bool invalid", reflect.TypeOf(false), "yes", nil, false},
+		{"float NaN", reflect.TypeOf(float64(0)), "NaN", nil, false},
+		{"float +Inf", reflect.TypeOf(float64(0)), "+Inf", nil, false},
+		{"string trim", reflect.TypeOf(""), "  x  ", "x", true},
+		{"string empty", reflect.TypeOf(""), "   ", "", true},
+		{"slice trim and split", reflect.TypeOf([]string{}), " a, b ", []string{"a", "b"}, true},
+		{"slice empty", reflect.TypeOf([]string{}), " ,, ", []string{}, true},
+		{"slice invalid element", reflect.TypeOf([]int{}), "1,x", nil, false},
+		{"byte slice", reflect.TypeOf([]byte{}), "1,2", []byte{1, 2}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseDefaultValue(tc.typ, tc.raw)
+			if ok != tc.valid {
+				t.Fatalf("parseDefaultValue(%v, %q) ok = %v, want %v", tc.typ, tc.raw, ok, tc.valid)
+			}
+			if !ok {
+				return
+			}
+			if !reflect.DeepEqual(got.Interface(), tc.want) {
+				t.Fatalf("parseDefaultValue(%v, %q) = %#v, want %#v", tc.typ, tc.raw, got.Interface(), tc.want)
+			}
+		})
+	}
+}
+
 // ========== checkUnsupportedDefaults 测试 ==========
 
 func TestCheckUnsupportedDefaults_NoPanic(t *testing.T) {
@@ -1297,26 +1353,24 @@ func TestBindDefaultsPartial(t *testing.T) {
 	}
 }
 
-// TestBindDefaultsParseErrorKeepsDefault 验证"传递了但解析失败"时保留默认值
-func TestBindDefaultsParseErrorKeepsDefault(t *testing.T) {
+// TestBindDefaultsParseErrorQueryReturns400 验证 query 严格绑定：page=abc 无法解析为 int
+// 时返回 400，而不是保留默认值；默认值保留只适用于表单 body 的尽力绑定。
+func TestBindDefaultsParseErrorQueryReturns400(t *testing.T) {
 	router := NewRouter()
 	router.GET("/list", defaultHandler)
 
 	engine := NewEngine()
 	engine.Router = router
 
-	// page=abc 无法解析为 int，应保留默认值 1
 	req := httptest.NewRequest(http.MethodGet, "/list?page=abc", nil)
 	rec := httptest.NewRecorder()
 	engine.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid query, got %d; body=%s", rec.Code, rec.Body.String())
 	}
-	var res defaultRes
-	decodeData(t, rec, &res)
-	if res.Page != 1 {
-		t.Fatalf("parse error should keep default 1, got %d", res.Page)
+	if !strings.Contains(rec.Body.String(), "invalid query") {
+		t.Fatalf("400 body should mention invalid query: %s", rec.Body.String())
 	}
 }
 

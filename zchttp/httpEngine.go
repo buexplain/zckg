@@ -323,15 +323,13 @@ func (e *HttpEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deepCopyDefaults(reqPtr.Elem())
 	}
 
-	if len(entry.reqMeta.fields) > 0 {
-		if err := bindRequestData(r, reqPtr, entry.reqMeta, e.MultipartFormMaxMemory, entry.keepRawBody); err != nil {
-			// 绑定失败不提前返回，将错误存入状态，随中间件链穿透到 core 层再处理
+	if err := bindRequestData(r, reqPtr, entry.reqMeta, e.MultipartFormMaxMemory, entry.keepRawBody); err != nil {
+		// 绑定失败不提前返回，将错误存入状态，随中间件链穿透到 core 层再处理
+		st.bindingErr = NewBindingError(err)
+	} else if len(entry.pathParams) > 0 {
+		// 路由路径参数在 query/body 之后绑定，覆盖同名参数；转换失败同样走 BindingError 通道（400）
+		if err := bindPathParams(reqPtr, entry.pathParams, paramValues); err != nil {
 			st.bindingErr = NewBindingError(err)
-		} else if len(entry.pathParams) > 0 {
-			// 路由路径参数在 query/body 之后绑定，覆盖同名参数；转换失败同样走 BindingError 通道（400）
-			if err := bindPathParams(reqPtr, entry.pathParams, paramValues); err != nil {
-				st.bindingErr = NewBindingError(err)
-			}
 		}
 	}
 

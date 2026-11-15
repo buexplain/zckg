@@ -5,7 +5,10 @@
 ## 一、创建路由器
 
 ```go
-r := zchttp.NewRouter()
+func example() {
+    r := zchttp.NewRouter()
+    _ = r
+}
 ```
 
 `NewRouter` 预初始化以下 HTTP 方法的路由表：`GET`、`POST`、`PUT`、`DELETE`、`PATCH`、`HEAD`、`OPTIONS`、`CONNECT`、`TRACE`。
@@ -15,16 +18,18 @@ r := zchttp.NewRouter()
 `Router` 与 `RouterGroup` 均提供对应各 HTTP 方法的注册方法，以及一次注册全部受支持方法的 `Any`：
 
 ```go
-r.GET("/users", listUsers)
-r.POST("/users", createUser)
-r.PUT("/users", updateUser)
-r.DELETE("/users", deleteUser)
-r.PATCH("/users", patchUser)
-r.HEAD("/users", headUsers)
-r.OPTIONS("/users", optionsUsers)
-r.CONNECT("/proxy", connectProxy)
-r.TRACE("/debug", traceHandler)
-r.Any("/webhook", webhook) // 同时注册上述 9 个方法
+func registerRoutes(r *zchttp.Router) {
+    r.GET("/users", listUsers)
+    r.POST("/users", createUser)
+    r.PUT("/users", updateUser)
+    r.DELETE("/users", deleteUser)
+    r.PATCH("/users", patchUser)
+    r.HEAD("/users", headUsers)
+    r.OPTIONS("/users", optionsUsers)
+    r.CONNECT("/proxy", connectProxy)
+    r.TRACE("/debug", traceHandler)
+    r.Any("/webhook", webhook) // 同时注册上述 9 个方法
+}
 ```
 
 `Any` 只注册 `NewRouter` 支持的 9 个标准方法，不包含 `PROPFIND` 等自定义方法。注册过程具有原子性：先构建并预检全部 9 个方法，全部通过后才统一写入路由树与顺序索引；handler 校验或任一方法的路由冲突导致 panic 时，不会残留部分方法。
@@ -56,7 +61,7 @@ r.Any("/webhook", webhook) // 同时注册上述 9 个方法
 所有 handler 必须满足如下签名，否则注册时（`buildEntry` 内联校验）会 **panic**：
 
 ```go
-func(ctx context.Context, req Req) (Res, error)
+type Handler func(ctx context.Context, req Req) (Res, error)
 ```
 
 校验规则：
@@ -75,10 +80,16 @@ func(ctx context.Context, req Req) (Res, error)
 
 ```go
 // 值类型
-func hello(ctx context.Context, req HelloReq) (HelloRes, error) { ... }
+func helloValue(ctx context.Context, req HelloReq) (HelloRes, error) {
+    // ...
+    return HelloRes{}, nil
+}
 
 // 指针类型
-func hello(ctx context.Context, req *HelloReq) (*HelloRes, error) { ... }
+func helloPtr(ctx context.Context, req *HelloReq) (*HelloRes, error) {
+    // ...
+    return nil, nil
+}
 ```
 
 > `Req` / `Res` 支持值类型与指针类型；引擎会根据声明类型自动构造并传参。
@@ -109,7 +120,7 @@ type GetCommentReq struct {
     CommentID int    `json:"comment_id" default:"99"` // 可选参数省略时的回退值
 }
 
-r.GET("/posts/{post_id}/comments/{comment_id?}", getComment)
+// 注册：r.GET("/posts/{post_id}/comments/{comment_id?}", getComment)
 // GET /posts/1/comments/2  → PostID=1, CommentID=2
 // GET /posts/1/comments    → PostID=1, CommentID=99（省略，保留 default）
 ```
@@ -142,7 +153,7 @@ type ProxyReq struct {
     Rest string `json:"rest"`
 }
 
-r.GET("/dify/{rest...}", getDify)
+// 注册：r.GET("/dify/{rest...}", getDify)
 // GET /dify/v1/chat-messages → Rest="v1/chat-messages"
 // GET /dify/health           → Rest="health"
 // GET /dify  或  /dify/      → 零段命中，Rest 保留 default 或零值
@@ -217,8 +228,8 @@ func difyProxy(ctx context.Context, req ProxyReq) (ProxyRes, error) {
 	return ProxyRes{}, nil
 }
 
-g := r.Group("/dify", authMiddleware)
-g.Any("/{rest...}", difyProxy)
+// 注册：g := r.Group("/dify", authMiddleware)
+//       g.Any("/{rest...}", difyProxy)
 ```
 
 注意事项（框架层无性能瓶颈，转发性能取决于 `ReverseProxy` 配置）：
@@ -255,9 +266,9 @@ func serveStatic(ctx context.Context, req StaticReq) (StaticRes, error) {
 	return StaticRes{}, nil
 }
 
-static := r.Group("/static") // 不挂重型中间件
-static.GET("/{file...}", serveStatic)
-static.HEAD("/{file...}", serveStatic)
+// 注册：static := r.Group("/static") // 不挂重型中间件
+//       static.GET("/{file...}", serveStatic)
+//       static.HEAD("/{file...}", serveStatic)
 ```
 
 **路径穿越（比性能更关键）**：捕获值为解码后原样、不清理，`%2e%2e` 会还原为 `..`。**禁止** `os.Open(filepath.Join(root, req.File))`——`filepath.Join("/srv", "../etc/passwd")` 结果为 `/etc/passwd`，直接逃逸根目录。安全做法三选一：
@@ -279,7 +290,7 @@ static.HEAD("/{file...}", serveStatic)
 - 参数值在 query/body 绑定之后写入 Req，**路径参数覆盖同名 query/body 值**。绑定实现（`bindPathParams`）复用 `setScalar` 类型转换，支持 string/bool/int 全系/uint 全系/float/指针及 `time_format`/`time_location` 标签（其他目标类型注册即 panic，见上文“语法与注册期校验”）。详见 `parameter-binding.md` 中“路由路径参数”章节。
 - 必选参数类型转换失败（如 int 字段收到 `/posts/abc/comments`）返回 **400**（`BindingError` 通道），而非 404；段数不匹配才返回 404。
 - 可选参数被省略、通配尾段零段命中时不写入字段，保留注册阶段模板的 `default` 值或零值。
-- 必选参数字段上的 `default` 标签无害但无效（路径值必然覆盖）。
+- 必选参数 `{name}` 字段上的 `default` 标签无害但无效（路径值必然覆盖）；OpenAPI 不会为必选 `{name}` 展示该 default。可选参数 `{name?}` 省略与通配尾段 `{name...}` 零段命中时不会写入字段，仍会保留 default（因此 schema 保留展示）。
 
 ## 五、路由冲突检测
 
@@ -297,10 +308,12 @@ conflicting with main.listUsersV2 (/app/main.go:35)
 ### 创建分组
 
 ```go
-api := r.Group("/api", authMiddleware)
-api.GET("/users", listUsers)   // 实际路径 /api/users
-api.GET("orders", listOrders)  // 同样自动拼接为 /api/orders
-api.GET("/", apiIndex)         // 根子路径注册为 /api
+func example(r *zchttp.Router, authMiddleware zchttp.MiddlewareHandler) {
+    api := r.Group("/api", authMiddleware)
+    api.GET("/users", listUsers)   // 实际路径 /api/users
+    api.GET("orders", listOrders)  // 同样自动拼接为 /api/orders
+    api.GET("/", apiIndex)         // 根子路径注册为 /api
+}
 ```
 
 分组会为组内路由自动拼接 `prefix` 前缀，并叠加分组中间件。分组前缀和子路径均可省略前导 `/`；拼接时会保证前缀与子路径之间恰有一个 `/`，不会出现 `/apiusers` 这类静默错路由。
@@ -310,9 +323,11 @@ api.GET("/", apiIndex)         // 根子路径注册为 /api
 分组可嵌套，前缀逐层拼接，父分组中间件被继承且位于子分组中间件**之前**：
 
 ```go
-api := r.Group("api", mwA)
-v1 := api.Group("v1", mwB)
-v1.GET("users", listUsers)    // 路径 /api/v1/users，中间件顺序 [全局..., mwA, mwB]
+func example(r *zchttp.Router, mwA, mwB zchttp.MiddlewareHandler) {
+    api := r.Group("api", mwA)
+    v1 := api.Group("v1", mwB)
+    v1.GET("users", listUsers)    // 路径 /api/v1/users，中间件顺序 [全局..., mwA, mwB]
+}
 ```
 
 ### 前缀规范化（normalizePrefix）
@@ -332,13 +347,15 @@ v1.GET("users", listUsers)    // 路径 /api/v1/users，中间件顺序 [全局.
 - 最终中间件链顺序为 `[全局中间件..., 最外层分组中间件..., 当前分组中间件...]`。
 
 ```go
-r.Use(logger)
-api := r.Group("/api")
-v1 := api.Group("/v1")
+func example(r *zchttp.Router, logger, auth zchttp.MiddlewareHandler) {
+    r.Use(logger)
+    api := r.Group("/api")
+    v1 := api.Group("/v1")
 
-v1.GET("/before", handlerA) // 应用 [logger]
-api.Use(auth)                // 子组已创建，但 /after 尚未注册
-v1.GET("/after", handlerB)  // 应用 [logger, auth]；/before 不受影响
+    v1.GET("/before", handlerA) // 应用 [logger]
+    api.Use(auth)                // 子组已创建，但 /after 尚未注册
+    v1.GET("/after", handlerB)  // 应用 [logger, auth]；/before 不受影响
+}
 ```
 
 > 中间件的执行模型（洋葱模型）详见 `middleware.md`。

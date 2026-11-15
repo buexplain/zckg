@@ -3,16 +3,71 @@ package zchttp
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"reflect"
 	"strings"
 )
 
-// checkUnsupportedDefaults 递归遍历结构体类型树，检测三种 default 误用：
+// parseDefaultValue 用与运行时 applyDefaults 完全相同的规则解析 default 标签值。
+// 返回值 ok=false 表示值无法解析（调用方按未设置处理并告警）；ok=true 时返回填充后的值，
+// 供 required 推断判断该默认值是否满足 nonzero。
+// 标量先 TrimSpace；切片先 TrimSpace 再去除首尾逗号，Trim 后为空视为空切片。
+func parseDefaultValue(t reflect.Type, raw string) (reflect.Value, bool) {
+	v := reflect.New(t).Elem()
+	var values []string
+	if t.Kind() == reflect.Slice {
+		trimmed := strings.Trim(strings.TrimSpace(raw), ",")
+		if trimmed != "" {
+			values = strings.Split(trimmed, ",")
+			for i := range values {
+				values[i] = strings.TrimSpace(values[i])
+			}
+		}
+	} else {
+		values = []string{strings.TrimSpace(raw)}
+	}
+	if err := setFieldValue(v, values, "", nil); err != nil {
+		return v, false
+	}
+	if !hasFiniteFloatValue(v) {
+		// JSON 无法表示 NaN/Inf；这类 default 既无法安全写入文档，也会让响应 JSON 编码失败。
+		return v, false
+	}
+	return v, true
+}
+
+// hasFiniteFloatValue 检查值树中的 float32/float64 是否都是有限值（非 NaN/Inf）。
+// 只遍历 default 支持的标量/指针/切片形态，足以覆盖 parseDefaultValue 的输入。
+func hasFiniteFloatValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		if v.IsNil() {
+			return true
+		}
+		return hasFiniteFloatValue(v.Elem())
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if !hasFiniteFloatValue(v.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Float32, reflect.Float64:
+		f := v.Float()
+		return !math.IsNaN(f) && !math.IsInf(f, 0)
+	default:
+		return true
+	}
+}
+
+// checkUnsupportedDefaults 递归遍历结构体类型树，检测四类 default 误用：
 //
 //  1. 类型不支持：default 写在 time.Time / struct 等非标量类型上，注册阶段即不填充。
-//  2. 值类型无法到达：default 写在值类型字段（int/string/bool）上，但所在 struct
+//  2. 值无法解析：类型支持但标签值不能被运行时解析（如 int 的 "abc"、float 的 "NaN"），
+//     按未设置处理。
+//  3. 值类型无法到达：default 写在值类型字段（int/string/bool）上，但所在 struct
 //     非"值嵌套可达"（即路径上存在指针/切片/map 边），请求阶段永不填充。
-//  3. 指针类型无法到达：default 写在指针字段（*int/*string/*bool）上，但所在 struct
+//  4. 指针类型无法到达：default 写在指针字段（*int/*string/*bool）上，但所在 struct
 //     非"默认值可达"（即 applyDefaults 递归无法穿透的路径，如 map 值类型为切片），
 //     请求阶段永不填充。
 //
@@ -62,6 +117,18 @@ func checkUnsupportedDefaults(t reflect.Type, viaValue bool, viaDefaults bool, m
 					"struct", t.Name(),
 					"field", f.Name,
 					"type", f.Type.String(),
+				)
+			} else if _, ok := parseDefaultValue(f.Type, f.Tag.Get("default")); !ok {
+				// 情况 1b：类型支持但值无法解析（如 int 的 "abc"、float 的 "NaN"）。
+				// 按未设置处理：hasDefault=false，运行时/文档都不填充该 default。
+				slog.Warn("default tag value cannot be parsed, ignored",
+					"zckg", "zchttp",
+					"route", method+" "+path,
+					"handler", handlerLoc,
+					"struct", t.Name(),
+					"field", f.Name,
+					"type", f.Type.String(),
+					"default", f.Tag.Get("default"),
 				)
 			} else if f.Type.Kind() != reflect.Ptr && !viaValue {
 				// 情况 2：值类型字段在非"值嵌套可达"的 struct 中。
@@ -206,6 +273,9 @@ func applyDefaultsWithVisiting(reqPtr reflect.Value, meta structMeta, rp bool, v
 				trimmed = strings.Trim(trimmed, ",")
 				if trimmed != "" {
 					values = strings.Split(trimmed, ",")
+					for i := range values {
+						values[i] = strings.TrimSpace(values[i])
+					}
 				}
 			} else {
 				values = []string{strings.TrimSpace(fm.defaultVal)}
@@ -508,8 +578,9 @@ func hasRequestPhaseDefaults(t reflect.Type, visiting map[reflect.Type]bool) boo
 	return false
 }
 
-// isDefaultSupported 判定字段类型是否支持 default 标签：标量、标量的任意层指针，
-// 以及元素为标量（或标量指针）的切片。
+// isDefaultSupported 判定字段类型是否可承载 default 标签：标量、标量的任意层指针，
+// 以及元素为标量（或标量指针）的切片。类型可承载不等于值合法——值能否解析由
+// parseDefaultValue 判定，非法值时 hasDefault 保持 false。
 // 指向容器（如 *[]int）或容器的容器（如 [][]int、[]*[]int）不支持：
 // applyDefaults 的 setFieldValue 不会展开这些形态，误判为支持会导致
 // “注册/OpenAPI 宣称有默认值、运行时永不填充”。
@@ -521,7 +592,7 @@ func isDefaultSupported(t reflect.Type) bool {
 // Ptr/Slice 只允许解引用到标量链（可含多层指针），不允许再遇到 Slice/Array/Map；
 // 防自引用命名类型（如 type S []S）无限递归，超限视为不支持
 func isDefaultSupportedDepth(t reflect.Type, depth int) bool {
-	if depth >= maxPtrDerefDepth {
+	if depth > maxPtrDerefDepth {
 		return false
 	}
 	switch t.Kind() {
@@ -540,7 +611,7 @@ func isDefaultSupportedDepth(t reflect.Type, depth int) bool {
 // isScalarOrPtrToScalar 判定 t 是否为标量或指向标量的指针链（允许任意层指针）。
 // 用作 default 支持的 Ptr/Slice 元素判定：元素不允许再是容器。
 func isScalarOrPtrToScalar(t reflect.Type, depth int) bool {
-	if depth >= maxPtrDerefDepth {
+	if depth > maxPtrDerefDepth {
 		return false
 	}
 	switch t.Kind() {

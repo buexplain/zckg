@@ -2,6 +2,7 @@ package zchttp
 
 import (
 	"context"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"reflect"
@@ -10,6 +11,135 @@ import (
 	"testing"
 	"time"
 )
+
+// TestBuildStructMeta_DuplicateBindingNamePanic 锁死 PB-05：两个字段解析出同一绑定名时，
+// 注册阶段（buildStructMeta）直接 panic，避免 query 写全部、path 只写第一个的不确定行为。
+func TestBuildStructMeta_DuplicateBindingNamePanic(t *testing.T) {
+	type req struct {
+		A string `form:"x" json:"a"`
+		B string `form:"x" json:"b"`
+	}
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("duplicate binding name should panic")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), `duplicate form binding name "x"`) {
+			t.Fatalf("unexpected panic: %v", recovered)
+		}
+	}()
+	_ = buildStructMeta(reflect.TypeOf(req{}))
+}
+
+// TestBuildStructMeta_DuplicateJSONNamePanic 锁死 JSON 重复名注册期 panic：
+// 使用不同 form 名、相同 json 名，确保 Form 检查通过后 JSON 检查仍拒绝歧义定义。
+func TestBuildStructMeta_DuplicateJSONNamePanic(t *testing.T) {
+	type dupA struct {
+		X string
+	}
+	type req struct {
+		dupA
+		Y string `form:"-" json:"X"`
+	}
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("duplicate JSON name should panic")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), `duplicate json name "X"`) {
+			t.Fatalf("unexpected panic: %v", recovered)
+		}
+	}()
+	_ = buildStructMeta(reflect.TypeOf(req{}))
+}
+
+// TestBuildStructMeta_SourceFlags 锁死注册期预计算的来源能力：
+// Form 文本、Form 文件、JSON、任意 body 字段四个标志与字段投影规则一致。
+func TestBuildStructMeta_SourceFlags(t *testing.T) {
+	type normal struct {
+		A string
+	}
+	type formDash struct {
+		A string `form:"-" json:"a"`
+	}
+	type jsonDash struct {
+		A string `json:"-"`
+	}
+	type jsonDashComma struct {
+		A string `json:"-,"`
+	}
+	type mapField struct {
+		A map[string]any
+	}
+	type fileField struct {
+		F *multipart.FileHeader
+	}
+	type bothSkipped struct {
+		A string `form:"-" json:"-"`
+	}
+	type empty struct{}
+
+	cases := []struct {
+		name        string
+		typ         reflect.Type
+		wantForm    bool
+		wantFile    bool
+		wantJSON    bool
+		wantAnyBody bool
+	}{
+		{"normal", reflect.TypeOf(normal{}), true, false, true, true},
+		{"form dash", reflect.TypeOf(formDash{}), false, false, true, true},
+		{"json dash", reflect.TypeOf(jsonDash{}), true, false, false, true},
+		{"json dash comma", reflect.TypeOf(jsonDashComma{}), true, false, true, true},
+		{"map", reflect.TypeOf(mapField{}), false, false, true, true},
+		{"file", reflect.TypeOf(fileField{}), false, true, true, true},
+		{"both skipped", reflect.TypeOf(bothSkipped{}), false, false, false, false},
+		{"empty", reflect.TypeOf(empty{}), false, false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			meta := buildStructMeta(tc.typ)
+			if meta.hasFormText != tc.wantForm || meta.hasFormFile != tc.wantFile ||
+				meta.hasJSON != tc.wantJSON || meta.hasAnyBody != tc.wantAnyBody {
+				t.Fatalf("flags = form:%v file:%v json:%v any:%v, want form:%v file:%v json:%v any:%v",
+					meta.hasFormText, meta.hasFormFile, meta.hasJSON, meta.hasAnyBody,
+					tc.wantForm, tc.wantFile, tc.wantJSON, tc.wantAnyBody)
+			}
+		})
+	}
+}
+
+// TestBuildStructMeta_BothSkippedFields 覆盖 form:"-" + json:"-" 的整体排除分支：
+// 字段本身与匿名嵌入中的该字段都不进入元数据，且不解析 default/nonzero。
+func TestBuildStructMeta_BothSkippedFields(t *testing.T) {
+	type embeddedBoth struct {
+		Hidden string `form:"-" json:"-" default:"x" nonzero:"true"`
+	}
+	type req struct {
+		embeddedBoth
+		Only string `form:"-" json:"-" default:"x" nonzero:"true"`
+		Kept string `json:"kept"`
+	}
+	meta := buildStructMeta(reflect.TypeOf(req{}))
+	foundKept := false
+	for _, fm := range meta.fields {
+		if fm.field.Name == "Only" {
+			if !fm.excluded || fm.nonzero || fm.hasDefault {
+				t.Fatalf("Only should be fully excluded without tags, got %+v", fm)
+			}
+			continue
+		}
+		if fm.excluded {
+			t.Fatalf("匿名嵌入中的整体排除字段不应进入可绑定集合: %+v", fm)
+		}
+		if fm.field.Name == "Kept" {
+			foundKept = true
+		}
+	}
+	if !foundKept {
+		t.Fatal("正常字段 Kept 应进入可绑定集合")
+	}
+}
 
 // ========== buildStructMeta 字段类型判定 ==========
 
@@ -174,6 +304,41 @@ func TestBuildStructMeta_JsonDash(t *testing.T) {
 				t.Fatal("json:'-' field should not have nonzero/hasDefault parsed")
 			}
 		}
+	}
+}
+
+// TestBuildStructMeta_DashCommaAndFormDash 锁死 Form/JSON 两套 tag 语义：
+// json:"-," 是名为 "-" 的合法 JSON 字段；json:"-" 只跳过 JSON，Form 链回退字段名；
+// form:"-" 无条件跳过 Form 链，但 JSON 仍按 json 标签绑定。
+func TestBuildStructMeta_DashCommaAndFormDash(t *testing.T) {
+	type dashTags struct {
+		Dash      string    `json:"-," default:"d" nonzero:"true"`
+		TimeForm  time.Time `form:"-" json:"when" time_format:"unix"`
+		FormDash  string    `form:"-" json:"v" default:"v" nonzero:"true"`
+		Excluded  string    `json:"-" default:"x" nonzero:"true"`
+		QueryOnly string    `form:"q" json:"-" default:"q" nonzero:"true"`
+	}
+
+	meta := buildStructMeta(reflect.TypeOf(dashTags{}))
+	fields := make(map[string]fieldMeta, len(meta.fields))
+	for _, fm := range meta.fields {
+		fields[fm.field.Name] = fm
+	}
+
+	if fm := fields["Dash"]; fm.excluded || fm.name != "Dash" || !fm.jsonIncluded || !fm.hasDefault || !fm.nonzero || !fm.defaultSatisfiesNonzero {
+		t.Errorf("json:\"-,\" should keep form field name and tags, got %+v", fm)
+	}
+	if fm := fields["FormDash"]; fm.excluded || fm.name != "" || !fm.jsonIncluded || !fm.hasDefault || !fm.nonzero || !fm.defaultSatisfiesNonzero {
+		t.Errorf("form:\"-\" should skip Form chain but keep JSON tags, got %+v", fm)
+	}
+	if fm := fields["TimeForm"]; fm.excluded || fm.name != "" || !fm.jsonIncluded || fm.timeFormat != "unix" {
+		t.Errorf("form:\"-\" time field should keep time_format, got %+v", fm)
+	}
+	if fm := fields["Excluded"]; fm.excluded || fm.name != "Excluded" || fm.jsonIncluded || !fm.hasDefault || !fm.nonzero {
+		t.Errorf("json:\"-\" without form name should keep Form fallback and tags, got %+v", fm)
+	}
+	if fm := fields["QueryOnly"]; fm.excluded || fm.name != "q" || fm.jsonIncluded || !fm.hasDefault || !fm.nonzero {
+		t.Errorf("json:\"-\" with valid form name should remain Form-bindable, got %+v", fm)
 	}
 }
 
@@ -521,7 +686,7 @@ func TestRegister_SelfRecursiveEmbedding(t *testing.T) {
 	}
 }
 
-// embedIgnored 嵌入结构体含 json:"-" 字段，展开时应被跳过。
+// embedIgnored 嵌入结构体含 json:"-" 字段：JSON 跳过，但 Form 链回退字段名。
 type embedIgnored struct {
 	Secret string `json:"-"`
 	Shown  string `json:"shown"`
@@ -531,25 +696,30 @@ type embedIgnoredReq struct {
 	embedIgnored
 }
 
-// TestBuildStructMeta_EmbeddedFieldSkipped 覆盖嵌入展开循环中
-// name 为空或 "-" 的子字段被跳过的分支。
+// TestBuildStructMeta_EmbeddedFieldSkipped 覆盖嵌入展开：json:"-" 子字段仍进入
+// Form 链（字段名 Secret），JSON 不参与；正常嵌入字段 Shown 同时进入两套来源。
 func TestBuildStructMeta_EmbeddedFieldSkipped(t *testing.T) {
 	m := buildStructMeta(reflect.TypeOf(embedIgnoredReq{}))
+	secretFound := false
+	shownFound := false
 	for _, fm := range m.fields {
-		if fm.name == "-" || fm.name == "" {
-			t.Fatalf("meta 不应包含需跳过的字段: %+v", fm)
+		if fm.name == "" {
+			t.Fatalf("meta 不应包含 Form 链跳过的字段: %+v", fm)
 		}
-		if fm.name == "Secret" {
-			t.Fatal("json:\"-\" 的嵌入字段不应进入可绑定集合")
+		if fm.field.Name == "Secret" {
+			secretFound = true
+			if fm.name != "Secret" || fm.jsonIncluded {
+				t.Fatalf("json:\"-\" 嵌入字段应仅参与 Form 链: %+v", fm)
+			}
 		}
-	}
-	found := false
-	for _, fm := range m.fields {
 		if fm.name == "shown" {
-			found = true
+			shownFound = true
 		}
 	}
-	if !found {
+	if !secretFound {
+		t.Fatal("json:\"-\" 的嵌入字段应按字段名进入 Form 链")
+	}
+	if !shownFound {
 		t.Fatal("正常嵌入字段 shown 应进入可绑定集合")
 	}
 }

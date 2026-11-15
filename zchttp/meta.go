@@ -1,6 +1,7 @@
 package zchttp
 
 import (
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strconv"
@@ -46,25 +47,42 @@ var keepRawBodyType = reflect.TypeOf(KeepRawBody{})
 // validatorType 是 Validator 接口的 reflect.Type，用于快速判断结构体是否实现了校验接口
 var validatorType = reflect.TypeOf((*Validator)(nil)).Elem()
 
-// fieldMeta 缓存单个结构体字段的绑定元信息，包括字段名、类型特征、标签值等
+// fieldMeta 缓存单个结构体字段的绑定元信息，包括 Form/JSON 两套来源信息、类型特征、标签值等
 type fieldMeta struct {
-	name         string              // 字段绑定名（form/json 标签或字段名）
+	name         string              // Form 链绑定名（query/form/multipart/path）；空表示不参与
 	indices      []int               // 从根结构体出发的字段索引路径，如 []int{0}；嵌入字段展开后可能为多级如 []int{0,1}
 	field        reflect.StructField // 实际字段的反射信息（类型、标签等），供 OpenAPI 生成使用
+	jsonIncluded bool                // 是否参与 JSON body（精确 json:"-" 为 false；json:"-," 为 true，键名 "-"）
+	excluded     bool                // Form 与 JSON 都不参与（form:"-" 且 json:"-"），整体跳过
 	nonzero      bool                // 是否不允许零值（nonzero:"true"）
-	hasDefault   bool                // 是否声明了 default 标签
-	defaultVal   string              // default 标签的值
-	isSlice      bool                // 是否为非文件切片（用于默认值逗号分隔展开）
-	isFile       bool                // 是否为 *multipart.FileHeader
-	isFileSlice  bool                // 是否为 []*multipart.FileHeader
-	timeFormat   string              // time_format 标签值
-	timeLocation *time.Location      // time_location 标签解析后的时区
+	hasDefault   bool                // 是否声明了可解析的 default 标签（值非法时为 false）
+	defaultVal   string              // default 标签的原始值
+	// defaultSatisfiesNonzero 表示已解析的 default 值本身不是零值：
+	// 只有它为 true 时，default 才能取消 OpenAPI 的 required 推断（与运行时 validateNonzero 一致）。
+	defaultSatisfiesNonzero bool
+	isSlice                 bool           // 是否为非文件切片（用于默认值逗号分隔展开）
+	isFile                  bool           // 是否为 *multipart.FileHeader
+	isFileSlice             bool           // 是否为 []*multipart.FileHeader
+	timeFormat              string         // time_format 标签值
+	timeLocation            *time.Location // time_location 标签解析后的时区
+}
+
+// requiredByNonzero 判定字段是否必须在 OpenAPI 中标记为 required：
+// 声明 nonzero:"true"，且不存在能通过运行时非零校验的 default。
+// 注意 default 为 0/空串等零值时不能满足 nonzero，此时仍需 required。
+func (fm fieldMeta) requiredByNonzero() bool {
+	return fm.nonzero && (!fm.hasDefault || !fm.defaultSatisfiesNonzero)
 }
 
 // structMeta 缓存单个结构体类型的聚合元信息
 type structMeta struct {
 	fields              []fieldMeta // 所有可绑定字段的元信息列表
 	implementsValidator bool        // 结构体是否实现 Validator 接口
+	// 注册期预计算的来源能力：避免请求期反复扫描 fields。
+	hasFormText bool // 至少一个 Form 链可绑定的标量/标量切片字段
+	hasFormFile bool // 至少一个 multipart 文件字段
+	hasJSON     bool // 至少一个 JSON body 可绑定字段
+	hasAnyBody  bool // hasFormText || hasFormFile || hasJSON
 }
 
 // operationMeta 从 Req 结构体的 OpenAPIMeta 嵌入字段解析出的操作级元信息
@@ -111,9 +129,15 @@ func cachedStructMeta(t reflect.Type) structMeta {
 	return m
 }
 
+// isJSONExcluded 判断字段是否被精确的 json:"-" 排除（json:"-," 是合法键名，不排除）。
+func isJSONExcluded(f reflect.StructField) bool {
+	return f.Tag.Get("json") == "-"
+}
+
 // buildStructMeta 通过反射遍历结构体字段，预计算 structMeta 与 fieldMeta 列表。
 // 注册阶段一次性完成，请求阶段直接复用 meta 避免重复反射。
-// 预计算内容包括：字段名解析、文件字段判定、nonzero/hasDefault 判定、时间格式预解析。
+// 预计算内容包括：字段名解析、整体排除标记、文件字段判定、nonzero/hasDefault（含 default 值解析）
+// 判定、时间格式预解析。
 // 自引用嵌入（如 type E1 struct{ *E1 }）经 visiting 防环：首次命中环时展开为空 meta，
 // 结果与入口路径无关（确定性），可安全缓存（修复 REC-01）。
 func buildStructMeta(t reflect.Type) structMeta {
@@ -184,7 +208,7 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 				}
 				subMeta := buildStructMetaWithVisiting(embeddedType, visiting)
 				for _, subFm := range subMeta.fields {
-					if subFm.name == "" || subFm.name == "-" {
+					if subFm.excluded {
 						continue
 					}
 					// 多级索引：父字段索引 + 子字段索引
@@ -199,33 +223,42 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 		}
 
 		fm := fieldMeta{indices: []int{i}, field: f}
-		fm.name = resolveFieldName(f)
-		if fm.name == "" || fm.name == "-" {
-			// 仍然记录字段，bindValues 中根据 name 跳过
+		fm.name = resolveFormName(f)
+		fm.jsonIncluded = !isJSONExcluded(f)
+		fm.excluded = fm.name == "" && !fm.jsonIncluded
+		if fm.excluded {
+			// form:"-" 且 json:"-"：两个来源都不接收，整体跳过运行时标签解析。
 			meta.fields = append(meta.fields, fm)
 			continue
 		}
 
-		// 文件字段判定
+		// 文件字段判定。只有 Form 链绑定名非空时才视为文件字段；
+		// form:"-" 的字段仍可走 JSON（若未被 json:"-" 排除），不参与 multipart 文件绑定。
 		switch {
-		case f.Type == fileHeaderPtrType:
+		case fm.name != "" && f.Type == fileHeaderPtrType:
 			fm.isFile = true
-		case f.Type.Kind() == reflect.Slice && f.Type.Elem() == fileHeaderPtrType:
+		case fm.name != "" && f.Type.Kind() == reflect.Slice && f.Type.Elem() == fileHeaderPtrType:
 			fm.isFileSlice = true
 		case f.Type.Kind() == reflect.Slice:
 			fm.isSlice = true
 		}
 
-		// default 与 nonzero 标签独立解析，两者不互斥。
+		// nonzero 与 default 独立解析，两者不互斥。
 		// hasDefault 同时驱动运行时默认值填充（applyDefaults）与 OpenAPI required 判定；
-		// nonzero 校验不受 default 影响。
-		if _, ok := f.Tag.Lookup("default"); ok && isDefaultSupported(f.Type) {
-			fm.hasDefault = true
-			fm.defaultVal = f.Tag.Get("default")
-		}
+		// 只有 default 值能被运行时解析时才置 true，非法值按未设置处理（注册期由
+		// checkUnsupportedDefaults 输出告警），避免文档宣称一个永远不会填充的默认值。
 		if v, ok := f.Tag.Lookup("nonzero"); ok {
 			if b, err := strconv.ParseBool(v); err == nil && b {
 				fm.nonzero = true
+			}
+		}
+		if _, ok := f.Tag.Lookup("default"); ok && isDefaultSupported(f.Type) {
+			fm.defaultVal = f.Tag.Get("default")
+			if parsed, ok := parseDefaultValue(f.Type, fm.defaultVal); ok {
+				fm.hasDefault = true
+				if fm.nonzero {
+					fm.defaultSatisfiesNonzero = !parsed.IsZero()
+				}
 			}
 		}
 
@@ -249,7 +282,99 @@ func buildStructMetaWithVisiting(t reflect.Type, visiting map[reflect.Type]bool)
 
 		meta.fields = append(meta.fields, fm)
 	}
+	computeStructMetaFlags(&meta)
+	checkDuplicateFormNames(t, meta.fields)
+	checkDuplicateJSONNames(t)
 	return meta
+}
+
+// computeStructMetaFlags 在注册期计算来源能力，请求期直接使用，避免重复扫描 fields。
+func computeStructMetaFlags(meta *structMeta) {
+	for i := range meta.fields {
+		fm := &meta.fields[i]
+		if fm.isFile || fm.isFileSlice {
+			meta.hasFormFile = true
+		} else if fm.name != "" && isQueryBindableType(fm.field.Type) {
+			meta.hasFormText = true
+		}
+		if fm.jsonIncluded {
+			meta.hasJSON = true
+		}
+	}
+	meta.hasAnyBody = meta.hasFormText || meta.hasFormFile || meta.hasJSON
+}
+
+// checkDuplicateFormNames 在注册期拒绝重复 Form 链绑定名：query/form/multipart/path
+// 对同名字段会产生不确定行为，Req 定义必须显式无歧义。
+func checkDuplicateFormNames(t reflect.Type, fields []fieldMeta) {
+	seen := make(map[string]fieldMeta, len(fields))
+	for _, fm := range fields {
+		if fm.name == "" {
+			continue
+		}
+		if prev, ok := seen[fm.name]; ok {
+			panic(fmt.Sprintf(
+				"zchttp: duplicate form binding name %q in Req struct %s: fields %s and %s",
+				fm.name, t.String(), prev.field.Name, fm.field.Name,
+			))
+		}
+		seen[fm.name] = fm
+	}
+}
+
+// checkDuplicateJSONNames 在注册期拒绝重复 JSON 名。递归展开无 json 名的匿名嵌入，
+// 带 json 名的嵌入作为普通字段，不递归；json:"-" 跳过，json:"-," 是名为 "-" 的字段。
+// 与 encoding/json 的“同深度冲突丢弃/浅层遮蔽”不同，Req 定义出现任何重复 JSON 名都 panic。
+func checkDuplicateJSONNames(t reflect.Type) {
+	seen := make(map[string]reflect.StructField)
+	var walk func(reflect.Type)
+	visiting := make(map[reflect.Type]bool)
+	walk = func(rt reflect.Type) {
+		if visiting[rt] {
+			return
+		}
+		visiting[rt] = true
+		defer delete(visiting, rt)
+		for i := 0; i < rt.NumField(); i++ {
+			sf := rt.Field(i)
+			if sf.Anonymous && sf.Type == metaType {
+				continue
+			}
+			if !sf.IsExported() {
+				if !sf.Anonymous {
+					continue
+				}
+				et := derefType(sf.Type)
+				if sf.Type.Kind() == reflect.Ptr || et.Kind() != reflect.Struct {
+					continue
+				}
+			}
+			if isJSONExcluded(sf) {
+				continue
+			}
+			name := tagName(sf.Tag.Get("json"))
+			if !isValidJSONTag(name) {
+				name = ""
+			}
+			if name == "" && sf.Anonymous {
+				if et := derefType(sf.Type); et.Kind() == reflect.Struct {
+					walk(et)
+					continue
+				}
+			}
+			if name == "" {
+				name = sf.Name
+			}
+			if prev, ok := seen[name]; ok {
+				panic(fmt.Sprintf(
+					"zchttp: duplicate json name %q in Req struct %s: fields %s and %s",
+					name, t.String(), prev.Name, sf.Name,
+				))
+			}
+			seen[name] = sf
+		}
+	}
+	walk(t)
 }
 
 // isBoundTimeType 判断字段类型是否为绑定链路支持解析的时间形态，与 binding.go 的

@@ -1676,7 +1676,8 @@ func oaTimeHandler(_ context.Context, _ oaTimeReq) (oaTimeRes, error) {
 	return oaTimeRes{}, nil
 }
 
-// TestGenerateOpenAPI_TimeField 验证 time.Time 字段根据 time_format 生成不同 schema
+// TestGenerateOpenAPI_TimeField 验证 JSON 请求体中的 time.Time 字段：
+// time_format 只对表单绑定生效，JSON body 由 encoding/json 处理，恒为 date-time。
 func TestGenerateOpenAPI_TimeField(t *testing.T) {
 	r := NewRouter()
 	r.POST("/time", oaTimeHandler)
@@ -1700,35 +1701,44 @@ func TestGenerateOpenAPI_TimeField(t *testing.T) {
 		t.Errorf("createdAt.description = %v, want 创建时间", createdField["description"])
 	}
 
-	// unixTs: time_format:"unix" → integer + int64
-	unixField := props["unixTs"].(map[string]any)
-	if unixField["type"] != "integer" {
-		t.Errorf("unixTs.type = %v, want integer", unixField["type"])
-	}
-	if unixField["format"] != "int64" {
-		t.Errorf("unixTs.format = %v, want int64", unixField["format"])
-	}
-
-	// milliTs: time_format:"unixmilli" → integer + int64
-	milliField := props["milliTs"].(map[string]any)
-	if milliField["type"] != "integer" {
-		t.Errorf("milliTs.type = %v, want integer", milliField["type"])
-	}
-	if milliField["format"] != "int64" {
-		t.Errorf("milliTs.format = %v, want int64", milliField["format"])
-	}
-
-	// customFmt: time_format:"2006-01-02" → string + date-time
-	customField := props["customFmt"].(map[string]any)
-	if customField["type"] != "string" {
-		t.Errorf("customFmt.type = %v, want string", customField["type"])
-	}
-	if customField["format"] != "date-time" {
-		t.Errorf("customFmt.format = %v, want date-time", customField["format"])
+	// JSON body 中 time_format 不参与：unixTs/milliTs/customFmt 均应为 date-time。
+	for _, name := range []string{"unixTs", "milliTs", "customFmt"} {
+		field := props[name].(map[string]any)
+		if field["type"] != "string" || field["format"] != "date-time" {
+			t.Errorf("JSON body 的 %s 应为 date-time: got %v", name, field)
+		}
 	}
 
 	if _, err := json.Marshal(doc); err != nil {
 		t.Fatalf("doc not JSON-serializable: %v", err)
+	}
+}
+
+// TestGenerateOpenAPI_TimeFieldQuery 验证 query 参数中的 time_format 仍然生效：
+// unix* 映射为 integer，其他/未设置映射为 date-time。
+func TestGenerateOpenAPI_TimeFieldQuery(t *testing.T) {
+	r := NewRouter()
+	r.GET("/time", oaTimeHandler)
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Time Query", Version: "1.0.0"})
+	op := doc["paths"].(map[string]any)["/time"].(map[string]any)["get"].(map[string]any)
+	params := map[string]map[string]any{}
+	for _, p := range op["parameters"].([]any) {
+		pm := p.(map[string]any)
+		params[pm["name"].(string)] = pm["schema"].(map[string]any)
+	}
+
+	if got := params["unixTs"]; got["type"] != "integer" || got["format"] != "int64" {
+		t.Errorf("query unixTs = %v, want integer/int64", got)
+	}
+	if got := params["milliTs"]; got["type"] != "integer" || got["format"] != "int64" {
+		t.Errorf("query milliTs = %v, want integer/int64", got)
+	}
+	for _, name := range []string{"createdAt", "customFmt"} {
+		got := params[name]
+		if got["type"] != "string" || got["format"] != "date-time" {
+			t.Errorf("query %s = %v, want date-time", name, got)
+		}
 	}
 }
 
@@ -2484,6 +2494,90 @@ func TestBuildQueryParamsSkipBranches(t *testing.T) {
 	}
 }
 
+// TestGenerateOpenAPI_ResponseWrapperJSONDashComma 验证 ResponseWrapper 中 json:"-," 按
+// encoding/json 语义命名为 "-"，而不是像 json:"-" 一样被排除；该 interface 字段可作为 data 占位符。
+func TestGenerateOpenAPI_ResponseWrapperJSONDashComma(t *testing.T) {
+	type dashWrapper struct {
+		Payload any `json:"-,"`
+		Code    int `json:"code"`
+	}
+	type dashReq struct{}
+	type dashRes struct {
+		OK bool `json:"ok"`
+	}
+
+	r := NewRouter()
+	r.GET("/dash-wrapper", func(context.Context, dashReq) (dashRes, error) { return dashRes{}, nil })
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "dash", Version: "1", ResponseWrapper: dashWrapper{}})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	wrap, ok := schemas["Response_dashRes"].(map[string]any)
+	if !ok {
+		t.Fatalf("Response_dashRes schema missing: %v", schemas)
+	}
+	props := wrap["properties"].(map[string]any)
+	payload, ok := props["-"].(map[string]any)
+	if !ok {
+		t.Fatalf(`json:"-," interface field should be emitted as property "-", got %v`, props)
+	}
+	if ref := payload["$ref"]; ref != "#/components/schemas/dashResResponse" {
+		t.Errorf("property '-' $ref = %v, want dashResResponse", ref)
+	}
+	if typ := props["code"].(map[string]any)["type"]; typ != "integer" {
+		t.Errorf("property code.type = %v, want integer", typ)
+	}
+}
+
+// TestGenerateOpenAPI_ResponseWrapperJSONDashCommaSecondPlaceholder 验证 json:"-," 的 interface
+// 字段参与占位符计数：它不能被当作排除而静默丢掉第二个 data 占位符。
+func TestGenerateOpenAPI_ResponseWrapperJSONDashCommaSecondPlaceholder(t *testing.T) {
+	type dashWrapper struct {
+		Data any `json:"data"`
+		Dash any `json:"-,"`
+	}
+	expectPanicContains(t, []string{"ResponseWrapper", "exactly one"}, func() {
+		GenerateOpenAPI(NewRouter(), OpenAPIInfo{ResponseWrapper: dashWrapper{}})
+	})
+}
+
+// TestGenerateOpenAPI_FileUploadSchemaNoNullable 锁死 openapi.md 的类型映射例外：
+// 单文件与文件切片 schema 按 binary/array 描述，不附加 nullable（区别于普通切片/指针）。
+func TestGenerateOpenAPI_FileUploadSchemaNoNullable(t *testing.T) {
+	type oaFileSchemaReq struct {
+		File  *multipart.FileHeader   `json:"file"`
+		Files []*multipart.FileHeader `json:"files"`
+	}
+	type oaFileSchemaRes struct{}
+
+	r := NewRouter()
+	r.POST("/file-schema", func(context.Context, oaFileSchemaReq) (oaFileSchemaRes, error) {
+		return oaFileSchemaRes{}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "file", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	props := schemas["oaFileSchemaReq"].(map[string]any)["properties"].(map[string]any)
+
+	file := props["file"].(map[string]any)
+	if file["type"] != "string" || file["format"] != "binary" {
+		t.Errorf("file schema = %v, want string/binary", file)
+	}
+	if _, has := file["nullable"]; has {
+		t.Errorf("file schema must not carry nullable: %v", file)
+	}
+
+	files := props["files"].(map[string]any)
+	if files["type"] != "array" {
+		t.Errorf("files.type = %v, want array", files["type"])
+	}
+	if _, has := files["nullable"]; has {
+		t.Errorf("file slice schema must not carry nullable: %v", files)
+	}
+	items := files["items"].(map[string]any)
+	if items["type"] != "string" || items["format"] != "binary" {
+		t.Errorf("files.items = %v, want string/binary", items)
+	}
+}
+
 // ======== M1: 参数路由 OpenAPI 生成 ========
 
 // TestGenerateOpenAPI_ParamRoute 验证参数路由（必选 + 可选参数）被生成到 paths：
@@ -2754,7 +2848,7 @@ func TestBuildPathParams_NonStruct(t *testing.T) {
 		reachedViaValue:   map[reflect.Type]bool{},
 		reachedByDefaults: map[reflect.Type]bool{},
 	}
-	if got := g.buildPathParams(reflect.TypeOf(42), structMeta{}, map[string]bool{"a": true}, nil); got != nil {
+	if got := g.buildPathParams(reflect.TypeOf(42), structMeta{}, map[string]bool{"a": true}, nil, nil); got != nil {
 		t.Fatalf("非结构体应返回 nil，实际: %v", got)
 	}
 }
@@ -3980,21 +4074,8 @@ type oaJSONNameBase struct {
 	Inner string `json:"inner" default:"x"`
 }
 
-type oaJSONNameDupA struct {
-	Dup string
-}
-
-type oaJSONNameDupB struct {
-	Dup string
-}
-
-type oaJSONNameShadow struct {
-	Q    string `json:"keyword"`
-	Deep string `json:"deep"`
-}
-
 // oaJSONNameReq 汇集 form 名与 json 名分歧的各种写法：双标签、json:"-"、json:"-,"、仅 form 标签、
-// 空 json 名、非法 json 名、form:"-"、带 json 名的嵌入、同深度同名冲突与深层同名遮蔽
+// 空 json 名、非法 json 名、form:"-"、带 json 名的嵌入。
 type oaJSONNameReq struct {
 	Q              string `form:"q" json:"keyword" nonzero:"true"`
 	H              string `form:"h" json:"-"`
@@ -4004,10 +4085,7 @@ type oaJSONNameReq struct {
 	Bad            string `json:"a'b"`
 	Hidden         string `form:"-" json:"hidden"`
 	oaJSONNameBase `json:"base"`
-	oaJSONNameDupA
-	oaJSONNameDupB
-	oaJSONNameShadow
-	Nested oaJSONNameNested `json:"nested"`
+	Nested         oaJSONNameNested `json:"nested"`
 }
 
 type oaJSONNameRes struct {
@@ -4051,7 +4129,7 @@ func oaSortedKeys(m map[string]any) []string {
 // TestGenerateOpenAPI_JSONBodyUsesEncodingJSONNames 锁死 application/json 请求体 schema 的属性集合
 // 与 encoding/json 实际键集合一致（以 json.Marshal 为判据，并同时比对显式期望）：json 名优先于 form 名，
 // json:"-" 排除、json:"-," 名为 "-"、无 json 名回退字段名、非法 json 名回退字段名、form:"-" 不影响 JSON，
-// 带 json 名的嵌入为嵌套对象、同深度同名冲突双双丢弃、深层同名被浅层遮蔽；嵌套结构体同样按 json 名，
+// 带 json 名的嵌入为嵌套对象；嵌套结构体同样按 json 名，
 // required 按 json 名输出；带 json 名的值嵌入其值类型 default 仍展示。query 参数保持 form 优先绑定名。
 func TestGenerateOpenAPI_JSONBodyUsesEncodingJSONNames(t *testing.T) {
 	r := NewRouter()
@@ -4065,8 +4143,7 @@ func TestGenerateOpenAPI_JSONBodyUsesEncodingJSONNames(t *testing.T) {
 	props := obj["properties"].(map[string]any)
 
 	sample := oaJSONNameReq{Q: "1", H: "1", Dash: "1", Plain: "1", Opt: "1", Bad: "1", Hidden: "1"}
-	sample.Inner, sample.oaJSONNameDupA.Dup, sample.oaJSONNameDupB.Dup = "1", "1", "1"
-	sample.oaJSONNameShadow.Q, sample.Deep, sample.Nested.V = "1", "1", "1"
+	sample.Inner, sample.Nested.V = "1", "1"
 	raw, err := json.Marshal(sample)
 	if err != nil {
 		t.Fatalf("json.Marshal: %v", err)
@@ -4075,7 +4152,7 @@ func TestGenerateOpenAPI_JSONBodyUsesEncodingJSONNames(t *testing.T) {
 	if err := json.Unmarshal(raw, &marshaled); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	want := []string{"-", "Bad", "Opt", "Plain", "base", "deep", "hidden", "keyword", "nested"}
+	want := []string{"-", "Bad", "Opt", "Plain", "base", "hidden", "keyword", "nested"}
 	if got := oaSortedKeys(marshaled); !reflect.DeepEqual(got, want) {
 		t.Fatalf("encoding/json 键集合 = %v, want %v", got, want)
 	}
@@ -4256,8 +4333,8 @@ func TestIndexLess(t *testing.T) {
 }
 
 // TestGenerateOpenAPI_RoleSplitConstraints 锁死请求/响应角色隔离：同一类型同时作 Req 与 Res 时生成两份
-// schema——请求变体（裸名）读取 time_format/nonzero/default；响应变体（<Type>Response）一律不读，
-// 时间恒为 date-time 字符串，不输出 required 与 default，容器内时间元素同样不按标签展开。
+// schema——请求变体的 default/nonzero 约束生效，但 JSON body 的 time_format 不生效（恒为 date-time）；
+// 响应变体一律不读请求侧标签，时间同样为 date-time 字符串，不输出 required 与 default。
 func TestGenerateOpenAPI_RoleSplitConstraints(t *testing.T) {
 	type roleSplitBody struct {
 		At      time.Time    `json:"at" time_format:"unix" nonzero:"true"`
@@ -4284,8 +4361,8 @@ func TestGenerateOpenAPI_RoleSplitConstraints(t *testing.T) {
 		t.Fatalf("请求变体 schema roleSplitBody 缺失")
 	}
 	reqProps := reqSchema["properties"].(map[string]any)
-	if at := reqProps["at"].(map[string]any); at["type"] != "integer" || at["format"] != "int64" {
-		t.Errorf("请求侧 time_format=unix 应映射为 integer: got %v", at)
+	if at := reqProps["at"].(map[string]any); at["type"] != "string" || at["format"] != "date-time" {
+		t.Errorf("JSON body 的 time_format 不生效，应为 date-time: got %v", at)
 	}
 	if required := reqSchema["required"]; !reflect.DeepEqual(required, []any{"at"}) {
 		t.Errorf("请求侧 required = %v, want [at]", required)
@@ -4293,13 +4370,13 @@ func TestGenerateOpenAPI_RoleSplitConstraints(t *testing.T) {
 	if note := reqProps["note"].(map[string]any); note["default"] != "n" {
 		t.Errorf("请求侧 default 应展示: got %v", note)
 	}
-	// 容器内的时间元素同样按容器的 time_format 展开（文档与运行时一致）
-	if items := reqProps["days"].(map[string]any)["items"].(map[string]any); items["type"] != "integer" {
-		t.Errorf("请求侧 []time.Time 元素应为 integer: got %v", items)
+	// JSON body 的容器时间元素同样按 encoding/json 描述为 date-time。
+	if items := reqProps["days"].(map[string]any)["items"].(map[string]any); items["type"] != "string" {
+		t.Errorf("JSON body []time.Time 元素应为 date-time: got %v", items)
 	}
 	ptrItems := reqProps["ptrDays"].(map[string]any)["items"].(map[string]any)
-	if ptrItems["type"] != "integer" || ptrItems["nullable"] != true {
-		t.Errorf("请求侧 []*time.Time 元素应为 nullable integer: got %v", ptrItems)
+	if ptrItems["type"] != "string" || ptrItems["nullable"] != true {
+		t.Errorf("JSON body []*time.Time 元素应为 nullable date-time: got %v", ptrItems)
 	}
 
 	resSchema, ok := schemas["roleSplitBodyResponse"].(map[string]any)
@@ -4484,6 +4561,318 @@ func TestGenerateOpenAPI_JSONNamedEmbedRequired(t *testing.T) {
 	}
 	if rec := serveRequest(t, r, http.MethodPost, "/emb-optional", "{}"); rec.Code != http.StatusOK {
 		t.Fatalf("emb-optional: expected 200 (default satisfies), got %d; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+type oaTextBlob []byte
+
+func (oaTextBlob) MarshalText() ([]byte, error) { return []byte("x"), nil }
+
+type oaPtrJSONBlob []byte
+
+func (*oaPtrJSONBlob) MarshalJSON() ([]byte, error) { return []byte(`""`), nil }
+
+// TestIsJSONByteSlice 锁死 byte slice 识别：默认 []byte/named byte slice 为 true；
+// json.RawMessage、自定义 MarshalJSON/MarshalText、非 byte 元素/固定数组为 false。
+func TestIsJSONByteSlice(t *testing.T) {
+	type oaBlob []byte
+	cases := []struct {
+		name string
+		typ  reflect.Type
+		want bool
+	}{
+		{"[]byte", reflect.TypeOf([]byte(nil)), true},
+		{"[]uint8", reflect.TypeOf([]uint8(nil)), true},
+		{"named byte slice", reflect.TypeOf(oaBlob(nil)), true},
+		{"json.RawMessage", reflect.TypeOf(json.RawMessage(nil)), false},
+		{"text marshaler", reflect.TypeOf(oaTextBlob(nil)), false},
+		{"pointer json marshaler", reflect.TypeOf(oaPtrJSONBlob(nil)), false},
+		{"[]int", reflect.TypeOf([]int(nil)), false},
+		{"[2]byte", reflect.TypeOf([2]byte{}), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isJSONByteSlice(tc.typ); got != tc.want {
+				t.Fatalf("isJSONByteSlice(%v) = %v, want %v", tc.typ, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGenerateOpenAPI_JSONBodyByteSlice 锁死 []byte 的 Req/Res 拆分：
+// 请求侧（JSON 与 query/form）是字节数组（items 0..255），默认 JSON 响应是 base64 字符串。
+func TestGenerateOpenAPI_JSONBodyByteSlice(t *testing.T) {
+	type oaByteReq struct {
+		Data []byte `json:"data"`
+	}
+	type oaByteRes struct {
+		Data []byte `json:"data"`
+	}
+	r := NewRouter()
+	r.POST("/bytes", func(_ context.Context, _ oaByteReq) (oaByteRes, error) { return oaByteRes{}, nil })
+	r.GET("/bytes", func(_ context.Context, _ oaByteReq) (oaByteRes, error) { return oaByteRes{}, nil })
+
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Bytes", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	reqData := schemas["oaByteReq"].(map[string]any)["properties"].(map[string]any)["data"].(map[string]any)
+	resData := schemas["oaByteResResponse"].(map[string]any)["properties"].(map[string]any)["data"].(map[string]any)
+
+	if reqData["type"] != "array" {
+		t.Fatalf("request []byte schema = %v, want array", reqData)
+	}
+	reqItems := reqData["items"].(map[string]any)
+	if reqItems["type"] != "integer" || reqItems["minimum"] != 0 || reqItems["maximum"] != 255 {
+		t.Fatalf("request []byte items = %v, want integer 0..255", reqItems)
+	}
+	if resData["type"] != "string" || resData["format"] != "byte" {
+		t.Fatalf("response []byte schema = %v, want {type:string, format:byte}", resData)
+	}
+
+	// query 绑定按逐元素 uint8 处理，schema 同样是 0..255 的整数数组。
+	get := doc["paths"].(map[string]any)["/bytes"].(map[string]any)["get"].(map[string]any)
+	param := get["parameters"].([]any)[0].(map[string]any)["schema"].(map[string]any)
+	if param["type"] != "array" {
+		t.Fatalf("query []byte schema = %v, want array", param)
+	}
+	items := param["items"].(map[string]any)
+	if items["type"] != "integer" || items["maximum"] != 255 {
+		t.Fatalf("query []byte items = %v, want integer 0..255", items)
+	}
+}
+
+// TestGenerateOpenAPI_NamedByteSlice 锁死命名 []byte 类型：请求侧仍是字节数组，
+// 默认 JSON 响应与精确 []byte 一样是 base64。
+func TestGenerateOpenAPI_NamedByteSlice(t *testing.T) {
+	type oaNamedBlob []byte
+	type oaNamedBlobReq struct {
+		Data oaNamedBlob `json:"data"`
+	}
+	type oaNamedBlobRes struct {
+		Data oaNamedBlob `json:"data"`
+	}
+	r := NewRouter()
+	r.POST("/named-blob", func(_ context.Context, req oaNamedBlobReq) (oaNamedBlobRes, error) {
+		return oaNamedBlobRes(req), nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "NamedBlob", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	reqData := schemas["oaNamedBlobReq"].(map[string]any)["properties"].(map[string]any)["data"].(map[string]any)
+	resData := schemas["oaNamedBlobResResponse"].(map[string]any)["properties"].(map[string]any)["data"].(map[string]any)
+	if reqData["type"] != "array" {
+		t.Fatalf("named request []byte = %v, want array", reqData)
+	}
+	if resData["type"] != "string" || resData["format"] != "byte" {
+		t.Fatalf("named response []byte = %v, want string/byte", resData)
+	}
+	rec := serveRequest(t, r, http.MethodPost, "/named-blob", `{"data":[104,101,108,108,111]}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"data":"aGVsbG8="`) {
+		t.Fatalf("named []byte response = %d %s, want base64 aGVsbG8=", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGenerateOpenAPI_ByteSliceDefault 锁死 []byte default 的请求侧表示：
+// 运行时 default 语法是逗号分隔的 uint8，请求 schema 展示对应的字节数组；
+// 默认 JSON 响应仍按 encoding/json 输出 base64。
+func TestGenerateOpenAPI_ByteSliceDefault(t *testing.T) {
+	type oaByteDefaultReq struct {
+		Data []byte `json:"data" default:"1,2"`
+	}
+	type oaByteDefaultRes struct {
+		Data []byte `json:"data"`
+	}
+	r := NewRouter()
+	r.POST("/byte-default", func(_ context.Context, req oaByteDefaultReq) (oaByteDefaultRes, error) {
+		return oaByteDefaultRes(req), nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "ByteDefault", Version: "1"})
+	props := doc["components"].(map[string]any)["schemas"].(map[string]any)["oaByteDefaultReq"].(map[string]any)["properties"].(map[string]any)
+	if got := props["data"].(map[string]any)["default"]; !reflect.DeepEqual(got, []any{int64(1), int64(2)}) {
+		t.Fatalf("[]byte request default = %#v, want [1 2]", got)
+	}
+	rec := serveRequest(t, r, http.MethodPost, "/byte-default", `{}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"data":"AQI="`) {
+		t.Fatalf("[]byte default 运行时响应 = %d %s, want base64 AQI=", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGenerateOpenAPI_MultipartFlatFieldsOnly 锁死 multipart 顶层 schema 只包含
+// bindValues 实际可写入的扁平字段：命名 struct/map/数组不进入 schema，文件字段保留。
+func TestGenerateOpenAPI_MultipartFlatFieldsOnly(t *testing.T) {
+	type oaFlatNested struct {
+		City string `json:"city"`
+	}
+	type oaFlatReq struct {
+		Title  string                `json:"title"`
+		Nested oaFlatNested          `json:"nested"`
+		Meta   map[string]string     `json:"meta"`
+		Arr    [2]int                `json:"arr"`
+		File   *multipart.FileHeader `json:"file"`
+	}
+	r := NewRouter()
+	r.POST("/flat-upload", func(_ context.Context, _ oaFlatReq) (oaFileUploadRes, error) {
+		return oaFileUploadRes{}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Flat", Version: "1"})
+	schemas := doc["components"].(map[string]any)["schemas"].(map[string]any)
+	props := schemas["oaFlatReq"].(map[string]any)["properties"].(map[string]any)
+	if got := oaSortedKeys(props); !reflect.DeepEqual(got, []string{"file", "title"}) {
+		t.Fatalf("multipart 属性 = %v, want [file title]", got)
+	}
+}
+
+// TestGenerateOpenAPI_DefaultValueValidation 锁死 default 值的文档/运行时一致性：
+// 非法值不展示 default（NaN 也不能出现在文档中）；字符串按运行时规则 Trim；
+// 零值 default 不能满足 nonzero，required 与 requestBody.required 必须与运行时 400 对齐。
+func TestGenerateOpenAPI_DefaultValueValidation(t *testing.T) {
+	type oaDefaultValidationReq struct {
+		BadInt   int     `json:"badInt" default:"abc"`
+		BadBool  bool    `json:"badBool" default:"yes"`
+		BadFloat float64 `json:"badFloat" default:"NaN"`
+		BadSlice []int   `json:"badSlice" default:"1,x"`
+		SpaceStr string  `json:"spaceStr" default:"  x  "`
+		ZeroNN   int     `json:"zeroNN" nonzero:"true" default:"0"`
+		EmptyNN  string  `json:"emptyNN" nonzero:"true" default:""`
+		BadNN    int     `json:"badNN" nonzero:"true" default:"abc"`
+		GoodNN   int     `json:"goodNN" nonzero:"true" default:"1"`
+	}
+	type oaDefaultValidationRes struct{}
+	r := NewRouter()
+	r.POST("/default-validation", func(_ context.Context, _ oaDefaultValidationReq) (oaDefaultValidationRes, error) {
+		return oaDefaultValidationRes{}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Default", Version: "1"})
+	if _, err := json.Marshal(doc); err != nil {
+		t.Fatalf("非法 default 不应让文档不可序列化: %v", err)
+	}
+
+	obj := doc["components"].(map[string]any)["schemas"].(map[string]any)["oaDefaultValidationReq"].(map[string]any)
+	props := obj["properties"].(map[string]any)
+	for _, name := range []string{"badInt", "badBool", "badFloat", "badSlice", "badNN"} {
+		if _, has := props[name].(map[string]any)["default"]; has {
+			t.Errorf("%s 的非法 default 不应展示: %v", name, props[name])
+		}
+	}
+	if got := props["spaceStr"].(map[string]any)["default"]; got != "x" {
+		t.Errorf("spaceStr.default = %v, want x（运行时 TrimSpace）", got)
+	}
+	if got := props["zeroNN"].(map[string]any)["default"]; got != int64(0) {
+		t.Errorf("zeroNN.default = %v, want 0", got)
+	}
+	if got, has := props["emptyNN"].(map[string]any)["default"]; !has || got != "" {
+		t.Errorf("emptyNN.default = %v, want 空字符串", got)
+	}
+	if got := props["goodNN"].(map[string]any)["default"]; got != int64(1) {
+		t.Errorf("goodNN.default = %v, want 1", got)
+	}
+
+	required := map[string]bool{}
+	if list, ok := obj["required"].([]any); ok {
+		for _, name := range list {
+			required[name.(string)] = true
+		}
+	}
+	for _, name := range []string{"zeroNN", "emptyNN", "badNN"} {
+		if !required[name] {
+			t.Errorf("%s 无法被 default 满足 nonzero，应在 required 中: %v", name, required)
+		}
+	}
+	if required["goodNN"] {
+		t.Errorf("goodNN 的 default 满足 nonzero，不应 required: %v", required)
+	}
+
+	body := doc["paths"].(map[string]any)["/default-validation"].(map[string]any)["post"].(map[string]any)["requestBody"].(map[string]any)
+	if body["required"] != true {
+		t.Errorf("requestBody.required = %v, want true", body["required"])
+	}
+
+	if rec := serveRequest(t, r, http.MethodPost, "/default-validation", `{}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("省略无法满足 nonzero 的字段应 400: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serveRequest(t, r, http.MethodPost, "/default-validation", `{"zeroNN":1,"emptyNN":"x","badNN":1}`); rec.Code != http.StatusOK {
+		t.Fatalf("显式满足 nonzero 应 200: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGenerateOpenAPI_PathParamDefaultOnlyOptional 锁死必选 path 参数不展示
+// 永远无效的 default；可选参数省略时 default 生效，schema 保留。
+func TestGenerateOpenAPI_PathParamDefaultOnlyOptional(t *testing.T) {
+	type oaPathDefaultReq struct {
+		ID int `json:"id" default:"99"`
+	}
+	type oaPathDefaultRes struct {
+		ID int `json:"id"`
+	}
+	type oaCatchDefaultReq struct {
+		Rest string `json:"rest" default:"fallback"`
+	}
+	type oaCatchDefaultRes struct {
+		Rest string `json:"rest"`
+	}
+	r := NewRouter()
+	r.GET("/pd/{id}", func(_ context.Context, req oaPathDefaultReq) (oaPathDefaultRes, error) {
+		return oaPathDefaultRes(req), nil
+	})
+	r.GET("/pd-opt/{id?}", func(_ context.Context, req oaPathDefaultReq) (oaPathDefaultRes, error) {
+		return oaPathDefaultRes(req), nil
+	})
+	r.GET("/pd-catch/{rest...}", func(_ context.Context, req oaCatchDefaultReq) (oaCatchDefaultRes, error) {
+		return oaCatchDefaultRes(req), nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "PD", Version: "1"})
+	paths := doc["paths"].(map[string]any)
+	pathSchema := func(path string) map[string]any {
+		op := paths[path].(map[string]any)["get"].(map[string]any)
+		return op["parameters"].([]any)[0].(map[string]any)["schema"].(map[string]any)
+	}
+	if got := pathSchema("/pd/{id}"); got["default"] != nil {
+		t.Errorf("必选 path 参数不应展示 default: %v", got)
+	}
+	if got := pathSchema("/pd-opt/{id}"); got["default"] != int64(99) {
+		t.Errorf("可选 path 参数应展示 default 99: %v", got)
+	}
+	if got := pathSchema("/pd-catch/{rest}"); got["default"] != "fallback" {
+		t.Errorf("通配尾段零段命中保留 default，应展示: %v", got)
+	}
+
+	if rec := serveRequest(t, r, http.MethodGet, "/pd-opt", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"id":99`) {
+		t.Fatalf("可选 path 省略应使用 default 99: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serveRequest(t, r, http.MethodGet, "/pd/7", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"id":7`) {
+		t.Fatalf("必选 path 应使用路径值: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serveRequest(t, r, http.MethodGet, "/pd-catch", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"rest":"fallback"`) {
+		t.Fatalf("通配尾段零段命中应保留 default: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serveRequest(t, r, http.MethodGet, "/pd-catch/x", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"rest":"x"`) {
+		t.Fatalf("通配尾段捕获值应覆盖 default: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestGenerateOpenAPI_DashCommaRequired 锁死 json:"-," 与 form:"-" json:"x" 的字段
+// 仍参与 JSON required 推断；精确 json:"-" 的字段整体排除，不产生属性也不产生 required。
+func TestGenerateOpenAPI_DashCommaRequired(t *testing.T) {
+	type oaDashSchemaReq struct {
+		Dash     string `json:"-," nonzero:"true"`
+		FormDash string `form:"-" json:"v" nonzero:"true"`
+		Hidden   string `json:"-" nonzero:"true"`
+	}
+	type oaDashSchemaRes struct{}
+	r := NewRouter()
+	r.POST("/dash-schema", func(_ context.Context, _ oaDashSchemaReq) (oaDashSchemaRes, error) {
+		return oaDashSchemaRes{}, nil
+	})
+	doc := GenerateOpenAPI(r, OpenAPIInfo{Title: "Dash", Version: "1"})
+	obj := doc["components"].(map[string]any)["schemas"].(map[string]any)["oaDashSchemaReq"].(map[string]any)
+	props := obj["properties"].(map[string]any)
+	if got := oaSortedKeys(props); !reflect.DeepEqual(got, []string{"-", "v"}) {
+		t.Fatalf("JSON 属性 = %v, want [- v]", got)
+	}
+	required := map[string]bool{}
+	for _, name := range obj["required"].([]any) {
+		required[name.(string)] = true
+	}
+	if !required["-"] || !required["v"] || required["Hidden"] {
+		t.Fatalf("required = %v, want [- v]", required)
 	}
 }
 

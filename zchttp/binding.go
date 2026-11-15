@@ -37,9 +37,13 @@ var defaultTimeLayouts = []string{
 // 默认值已在 ServeHTTP 阶段通过预计算模板深拷贝完成，此处不再重复执行 applyDefaults。
 // 用于提前解析 Req 的场景（如路由命中后立即绑定，将结果注入 ctx，
 // 后续在 core 层再做校验）。
+// 按来源分别判定：存在 Form 链可绑定字段时才解析/绑定 query；选中的 body 来源存在
+// 可绑定字段时才读取 body。两者都没有时不读取 body、不解析 query。
+// query 一旦参与绑定就严格：URL query 语法错误或已知字段转换失败直接返回错误
+// （最终由 HttpEngine 包装为 *BindingError 并返回 400）。
 // 按 method 分流：GET/DELETE/HEAD 仅绑定 query；其余方法（POST/PUT/PATCH 等）
-// 采用合并绑定——先绑定 query 参数，再绑定请求体，body 中出现的字段覆盖
-// query 已绑定的同名字段，body 中缺失的字段保留 query 绑定值
+// 先严格绑定 query，再绑定请求体，body 中出现的字段覆盖 query 已绑定的同名字段，
+// body 中缺失的字段保留 query 绑定值
 // （兼容 REST 常见的"query 放控制参数 + body 放资源数据"混合传参风格）。
 // keepRawBody 为真（Req 顶层嵌入 KeepRawBody）时无论 method 均仅绑定 query，
 // r.Body 不被读取，原样留给中间件与 handler。
@@ -50,20 +54,40 @@ var defaultTimeLayouts = []string{
 // meta 为注册阶段预计算的 structMeta，避免请求阶段重复反射解析。
 // multipartMaxMemory 为 multipart/form-data 解析的内存缓冲上限（字节）。
 func bindRequestData(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartMaxMemory int64, keepRawBody bool) error {
+	if meta.hasFormText {
+		queryValues, err := parseStrictQuery(r)
+		if err != nil {
+			return err
+		}
+		if err := bindQueryValues(reqPtr, queryValues, meta); err != nil {
+			return err
+		}
+	}
 	if keepRawBody {
-		return bindValues(reqPtr, r.URL.Query(), nil, meta)
+		return nil
 	}
 	switch r.Method {
 	case http.MethodGet, http.MethodDelete, http.MethodHead:
-		return bindValues(reqPtr, r.URL.Query(), nil, meta)
+		return nil
 	default:
-		// 合并绑定：先绑 query 再绑 body，body 覆盖同名字段。
-		// bindValues 为尽力绑定恒返回 nil，错误仅可能来自 bindBody（如 JSON 解析失败）
-		if err := bindValues(reqPtr, r.URL.Query(), nil, meta); err != nil {
-			return err
+		if !meta.hasAnyBody {
+			return nil
 		}
 		return bindBody(r, reqPtr, meta, multipartMaxMemory)
 	}
+}
+
+// parseStrictQuery 严格解析 URL query：与 r.URL.Query() 不同，语法错误会返回而不是丢弃。
+// 这样 GET/DELETE/HEAD 与 form/JSON 等所有来源对非法 query 的行为一致。
+func parseStrictQuery(r *http.Request) (url.Values, error) {
+	if r.URL == nil {
+		return nil, nil
+	}
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("invalid query string: %w", err)
+	}
+	return values, nil
 }
 
 // bindBody 处理携带请求体的方法，依据 Content-Type 选择 JSON、表单或 multipart 绑定。
@@ -81,43 +105,62 @@ func bindBody(r *http.Request, reqPtr reflect.Value, meta structMeta, multipartM
 
 	switch contentType {
 	case "application/json":
+		if !meta.hasJSON {
+			return nil
+		}
 		return decodeJSONBody(r.Body, reqPtr.Interface())
 	case "application/x-www-form-urlencoded":
+		if !meta.hasFormText {
+			return nil
+		}
 		values, err := parseURLEncodedBody(r)
 		if err != nil {
 			return err
 		}
 		return bindValues(reqPtr, values, nil, meta)
 	case "multipart/form-data":
-		// 超出部分由 net/http 写入临时文件
-		if err := r.ParseMultipartForm(multipartMaxMemory); err != nil {
-			return err
-		}
-		if r.MultipartForm == nil {
+		if !meta.hasFormText && !meta.hasFormFile {
 			return nil
 		}
+		// 超出部分由 net/http 写入临时文件；去掉 query 后再解析，避免没有 query
+		// 绑定字段时仍因 query 解析错误而失败。
+		fake := requestWithoutQuery(r)
+		if err := fake.ParseMultipartForm(multipartMaxMemory); err != nil {
+			return err
+		}
+		r.MultipartForm = fake.MultipartForm
+		r.Form = fake.Form
+		r.PostForm = fake.PostForm
 		return bindValues(reqPtr, r.MultipartForm.Value, r.MultipartForm.File, meta)
 	default:
 		// 未知 Content-Type：若有请求体则尝试按 JSON 解析，否则不绑定
+		if !meta.hasJSON {
+			return nil
+		}
 		return decodeJSONBody(r.Body, reqPtr.Interface())
 	}
 }
 
-// parseURLEncodedBody 解析 urlencoded 请求体并返回待绑定的表单值。
-// net/http 的 ParseForm 只对 POST/PUT/PATCH 读取 body，其余方法（OPTIONS/TRACE/CONNECT）
-// 会静默忽略 body。这里用浅拷贝伪装成 POST 复用标准库完整的读取逻辑，再把表单副作用
-// 写回原请求，使"除 GET/DELETE/HEAD 外一律合并绑定 body"的契约对 urlencoded 与
-// JSON/multipart 保持一致，同时保留 ParseForm 的 10 MB 上限与错误语义。
-func parseURLEncodedBody(r *http.Request) (url.Values, error) {
-	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch:
-		if err := r.ParseForm(); err != nil {
-			return nil, err
-		}
-		return r.PostForm, nil
-	}
+// requestWithoutQuery 复制 request 并清空 URL query，用于只解析 body 的表单/multipart，
+// 避免 ParseForm/ParseMultipartForm 顺带解析并校验 query。
+func requestWithoutQuery(r *http.Request) *http.Request {
 	fake := new(http.Request)
 	*fake = *r
+	if r.URL != nil {
+		u := *r.URL
+		u.RawQuery = ""
+		fake.URL = &u
+	}
+	return fake
+}
+
+// parseURLEncodedBody 只解析 urlencoded 请求体并返回待绑定的表单值。
+// net/http 的 ParseForm 只对 POST/PUT/PATCH 读取 body，其余方法（OPTIONS/TRACE/CONNECT）
+// 会静默忽略 body；这里用浅拷贝伪装成 POST 复用标准库读取逻辑，同时清空 query，
+// 避免 body 解析顺带解析/校验 query。保留 ParseForm 的 10 MB 上限与错误语义。
+func parseURLEncodedBody(r *http.Request) (url.Values, error) {
+	// 只解析 body：复制 request 并清空 query，避免 ParseForm 顺带解析/校验 query。
+	fake := requestWithoutQuery(r)
 	fake.Method = http.MethodPost
 	if err := fake.ParseForm(); err != nil {
 		return nil, err
@@ -149,16 +192,28 @@ func decodeJSONBody(body io.Reader, dst any) error {
 	return errors.New("request body must contain exactly one JSON value")
 }
 
-// bindValues 将 values（query 或表单字段）与 files（上传文件）按字段标签映射到结构体。
+// bindValues 将表单 body 的 values/files 按字段标签映射到结构体。
 // meta 为注册阶段预计算的 structMeta，直接遍历其 fields 避免请求阶段反射。
+// 表单 body 与 query 一样采用严格绑定：已知字段转换失败返回错误，由调用方包装为
+// BindingError 并返回 400；未知参数与不可绑定类型仍按既有规则跳过。
 func bindValues(reqPtr reflect.Value, values map[string][]string, files map[string][]*multipart.FileHeader, meta structMeta) error {
+	return bindValuesMode(reqPtr, values, files, meta, "form")
+}
+
+// bindQueryValues 严格绑定 query：任何已知字段的值转换失败都会返回错误，
+// 由调用方包装为 BindingError 并返回 400；未知参数与不可绑定类型仍按既有规则跳过。
+func bindQueryValues(reqPtr reflect.Value, values map[string][]string, meta structMeta) error {
+	return bindValuesMode(reqPtr, values, nil, meta, "query")
+}
+
+func bindValuesMode(reqPtr reflect.Value, values map[string][]string, files map[string][]*multipart.FileHeader, meta structMeta, source string) error {
 	elem := reqPtr.Elem()
 	if elem.Kind() != reflect.Struct {
 		return nil
 	}
 	for i := range meta.fields {
 		fm := &meta.fields[i]
-		if fm.name == "" || fm.name == "-" {
+		if fm.name == "" {
 			continue
 		}
 		fieldValue := fieldByIndex(elem, fm.indices)
@@ -176,8 +231,10 @@ func bindValues(reqPtr reflect.Value, values map[string][]string, files map[stri
 		if !ok || len(vs) == 0 {
 			continue
 		}
-		// 单个字段转换失败时跳过，保持尽力绑定（time 标签已预解析）
-		_ = setFieldValue(fieldValue, vs, fm.timeFormat, fm.timeLocation)
+		// 单字段转换失败立即返回错误，不写入半成品；错误信息标明来源。
+		if err := setFieldValue(fieldValue, vs, fm.timeFormat, fm.timeLocation); err != nil {
+			return fmt.Errorf("invalid %s parameter %q: %w", source, fm.name, err)
+		}
 	}
 	return nil
 }
@@ -207,13 +264,31 @@ func bindPathParams(reqPtr reflect.Value, params []pathParamBinding, values []st
 	return nil
 }
 
-// resolveFieldName 解析字段绑定名：优先 form 标签，其次 json 标签，最后使用字段名
-func resolveFieldName(field reflect.StructField) string {
-	if name := tagName(field.Tag.Get("form")); name != "" {
-		return name
+// resolveFormName 解析 Form 链（query/form/multipart/path）绑定名：
+//   - form:"-" 无条件跳过，返回空；
+//   - form 标签有普通名字时直接使用；
+//   - 无 form 时，普通 json 名作为兼容 fallback；
+//   - json:"-"、json:"-," 是 JSON 语义专用值，不污染 Form 链，回退字段名；
+//   - 最后回退字段名。
+func resolveFormName(field reflect.StructField) string {
+	if formTag, ok := field.Tag.Lookup("form"); ok {
+		name := tagName(formTag)
+		if name == "-" {
+			return ""
+		}
+		if name != "" {
+			return name
+		}
 	}
-	if name := tagName(field.Tag.Get("json")); name != "" {
-		return name
+	if jsonTag, ok := field.Tag.Lookup("json"); ok {
+		name := tagName(jsonTag)
+		if name == "-" {
+			// json:"-" 与 json:"-," 的 "-" 都是 JSON 语义，Form 链回退字段名。
+			return field.Name
+		}
+		if name != "" {
+			return name
+		}
 	}
 	return field.Name
 }
@@ -256,9 +331,17 @@ func setFieldValue(fieldValue reflect.Value, values []string, timeFormat string,
 		if !isScalarType(fieldValue.Type().Elem()) {
 			return nil
 		}
+		old := fieldValue
 		slice := reflect.MakeSlice(fieldValue.Type(), len(values), len(values))
 		for i, v := range values {
-			v = strings.TrimSpace(v)
+			// 时间切片的空字符串元素表示“跳过该元素并保留原值”，
+			// 与标量 time.Time 的空值不写入保持一致；其余类型（如 string）的空值仍正常写入。
+			if v == "" && isTimeValueType(fieldValue.Type().Elem()) {
+				if i < old.Len() {
+					slice.Index(i).Set(old.Index(i))
+				}
+				continue
+			}
 			if err := setScalar(slice.Index(i), v, timeFormat, loc); err != nil {
 				return err
 			}
@@ -267,6 +350,11 @@ func setFieldValue(fieldValue reflect.Value, values []string, timeFormat string,
 		return nil
 	}
 	return setScalar(fieldValue, values[0], timeFormat, loc)
+}
+
+// isTimeValueType 判断类型（含指针）是否为 time.Time，用于识别时间切片的空字符串元素。
+func isTimeValueType(t reflect.Type) bool {
+	return derefType(t) == timeType
 }
 
 // setScalar 将单个字符串转换并写入标量字段，支持指针、字符串、布尔、有符号/无符号整型、
@@ -354,8 +442,9 @@ func isScalarType(t reflect.Type) bool {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 		reflect.Float32, reflect.Float64:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // isQueryBindableType 判定字段能否被 query/form 扁平绑定写入：标量（含任意层指针）

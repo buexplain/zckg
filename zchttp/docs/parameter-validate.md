@@ -9,7 +9,7 @@
 `nonzero` 标签与 `default` 标签**独立解析、互不影响**：
 
 - **校验阶段**：只要字段标记了 `nonzero:"true"`，就始终校验零值（所见即所得），不受 `default` 标签影响。
-- **文档生成阶段**：`nonzero:"true"` 且不存在**受支持并被元数据识别的** `default` → 文档中标记为**必填**；其它情况（存在受支持的 `default`、`nonzero:"false"`、未标注 `nonzero` 或其值无法解析为 true）视为**可选**。仅存在不受支持类型的 `default` 标签不会取消 required，详见 `openapi.md`。
+- **文档生成阶段**：`nonzero:"true"` 且不存在**受支持、可解析且能满足 nonzero** 的 `default` → 文档中标记为**必填**；其它情况（存在满足 nonzero 的 `default`、`nonzero:"false"`、未标注 `nonzero` 或其值无法解析为 true）视为**可选**。不受支持类型、无法解析的值（如 `int default:"abc"`）以及零值 default（`default:"0"`、`default:""`）都不会取消 required，详见 `openapi.md`。
 
 ### 递归校验
 
@@ -62,7 +62,7 @@ type Invoice struct {
 要点：
 
 - 校验仅针对显式 `nonzero:"true"` 的字段，普通字段传零值不会报错。
-- `nonzero` 与 `default` 独立：带有受支持 `default` 的 `nonzero:"true"` 字段在请求阶段**仍然会校验零值**（所见即所得），但在 OpenAPI 文档中标记为可选；不受支持类型上的 `default` 不改变 required 推断。
+- `nonzero` 与 `default` 独立：带有 `default` 的 `nonzero:"true"` 字段在请求阶段**仍然会校验零值**（所见即所得）；只有 default 能解析且本身非零时，OpenAPI 才把字段标记为可选，否则保持 required。不受支持类型或无法解析的值都不会改变 required 推断。
 - 嵌套结构体的 `nonzero` 字段通常仅在**父字段非零**时递归校验；父字段为零值时子字段被跳过。两个例外是：匿名嵌入字段没有“父字段判零”环节，其内部 `nonzero` 等价于顶层必填；固定数组即使整体为零值也始终逐元素递归。
 - 仅顶层 Req 的 `Validate()` 方法会被自动调用；嵌套结构体若需自定义校验逻辑，请在顶层 `Validate()` 中手动调用。
 

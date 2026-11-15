@@ -7,12 +7,12 @@
 handler 的签名固定为：
 
 ```go
-func(ctx context.Context, req Req) (Res, error)
+type Handler func(ctx context.Context, req Req) (Res, error)
 ```
 
 - `Req` 既可以是结构体值类型，也可以是结构体指针类型（`*T`）；两者均受支持。
 - 引擎在绑定阶段始终使用指向底层结构体的指针（`*T`）进行赋值与校验，再按 handler 声明类型决定传入值还是指针。
-- 未导出字段（小写开头）会被跳过，不参与绑定与校验。
+- 普通未导出字段（小写开头）会被跳过，不参与绑定与校验；未导出值嵌入是例外，内部导出字段仍会展开（见下文“匿名嵌入结构体展开”）。
 
 ```go
 type CreateUserReq struct {
@@ -20,8 +20,13 @@ type CreateUserReq struct {
     Age  *int   `json:"age"`
 }
 
-func CreateUser(ctx context.Context, req CreateUserReq) (CreateUserRes, error) { ... }
-// 或指针形态：func CreateUser(ctx context.Context, req *CreateUserReq) (...)
+type CreateUserRes struct{}
+
+func CreateUser(ctx context.Context, req CreateUserReq) (CreateUserRes, error) {
+    // ...
+    return CreateUserRes{}, nil
+}
+// 或指针形态：func CreateUserPtr(ctx context.Context, req *CreateUserReq) (*CreateUserRes, error) { ... }
 ```
 
 ### 匿名嵌入结构体展开
@@ -54,7 +59,7 @@ type Req struct {
 
 | 标签 | 作用 | 说明 |
 | --- | --- | --- |
-| `json` | 绑定名 / 序列化名 | query / form / 路径参数的绑定名解析优先级 `form` > `json` > 字段名（取逗号前部分）；JSON 请求体与响应只按 `json` 标签（`encoding/json` 规则）。写在 Res 上时只用到「序列化名」这一半 |
+| `json` | 绑定名 / 序列化名 | Form 链（query/form/路径）的绑定名优先级 `form` > 普通 `json` 名 > 字段名；`json:"-"` 只跳过 JSON，Form 链回退字段名；`json:"-,"` 的 JSON 键为 `-`，Form 链回退字段名。JSON 请求体与响应只按 `json` 标签（`encoding/json` 规则），`json:"-"` 是排除。`form:"-"` 只跳过 Form 链，不影响 JSON。写在 Res 上时只用到「序列化名」这一半 |
 | `ignore` | 文档排除 | `ignore:"true"` 把字段从 OpenAPI 文档中排除（请求 schema / query 或响应 schema），不影响绑定与校验；path 参数声明受规范强制、不受其影响，详见 `openapi.md` |
 | `example` | 字段示例值 | 仅用于 OpenAPI 文档生成，按字段类型自动转换为对应 JSON 类型，详见 `openapi.md` |
 | `description` | 字段描述 | 仅用于 OpenAPI 文档生成；写在 Req 内嵌的 `OpenAPIMeta` 上则为操作级描述，见「Req 独有」 |
@@ -64,15 +69,17 @@ type Req struct {
 
 ### Req 独有
 
-以下标签只在请求侧有语义——运行时填充 / 校验 / 解析，以及请求 schema 的生成。Res 不参与绑定与校验，响应时间恒由 `encoding/json` 序列化为 RFC3339 字符串，因此这些标签写在 Res 字段上不产生任何效果，响应 schema 也一律不读：
+以下标签只在请求侧有语义——运行时填充 / 校验 / 解析，以及请求 schema 的生成（其中 `time_format`/`time_location` 只参与表单绑定形态的请求 schema，JSON 请求体不读）。Res 不参与绑定与校验，响应时间恒由 `encoding/json` 序列化为 RFC3339 字符串，因此这些标签写在 Res 字段上不产生任何效果，响应 schema 也一律不读：
 
 | 标签 | 作用 | 说明 |
 | --- | --- | --- |
 | `form` | 绑定名 | 仅作用于 query / 表单 / 路径参数，优先级高于 `json`；对 JSON 请求体无效 |
-| `default` | 默认值 | 仅对标量类型（及其切片/指针）生效，注册阶段预填充到模板，详见 `parameter-binding.md` |
-| `nonzero` | 非零值校验 | `"true"` 校验非零值、`"false"` 不校验，并据此推断请求 schema 的 `required`，详见 `parameter-validate.md` |
-| `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，支持值、指针与单层切片的 `time.Time` 字段，详见 `parameter-binding.md` |
-| `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`，解析失败降级并输出 `slog.Warn` |
+| `default` | 默认值 | 仅对标量类型（及其切片/指针）生效，且值必须能被运行时解析；注册阶段预填充到模板，详见 `parameter-binding.md` |
+| `nonzero` | 非零值校验 | `"true"` 校验非零值、`"false"` 不校验，并据此推断请求 schema 的 `required`；只有能解析且满足 nonzero 的 `default` 才会让字段变为可选 |
+| `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，仅作用于 query/form/multipart/path，支持值、指针与单层切片的 `time.Time` 字段；JSON 请求体不读取该标签 |
+| `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`，解析失败降级并输出 `slog.Warn`；仅作用于表单绑定链路，JSON 请求体不读取 |
+
+> `default`/`nonzero` 的 OpenAPI `required` 推断只把“能解析且能满足 nonzero”的 default 视为有效：`int default:"abc"`、`default:"0"`、`string default:""` 都不会取消 required。`time_format`/`time_location` 只作用于 query/form/multipart/path；JSON 请求体由 `encoding/json` 处理，`time.Time` 只接受 RFC3339 字符串（响应同样恒为 date-time）。
 
 **操作级标签**同样属于 Req 独有：只能写在 `Req` 中嵌入的 `zchttp.OpenAPIMeta` 上——`Res` 不参与操作级元信息解析（写在 Res 上注册时会输出 `slog.Warn`）。它是空结构体，不参与绑定与校验：
 
@@ -97,7 +104,7 @@ type Req struct {
 
 ### `json` — 绑定名 / 序列化名
 
-绑定名解析优先级：`form` > `json` > 字段名（取逗号前部分）。该优先级用于 query / 表单 / 路径参数与校验错误路径；JSON 请求体与响应的键只由 `json` 标签决定（见下节 `form`）。
+绑定名解析优先级：`form` > 普通 `json` 名 > 字段名（取逗号前部分）。该优先级用于 query / 表单 / 路径参数与校验错误路径；`json:"-"`、`json:"-,"` 是 JSON 专用值，Form 链回退字段名。JSON 请求体与响应的键只由 `json` 标签决定（见下节 `form`）。
 
 ```go
 type Req struct {
@@ -108,7 +115,7 @@ type Req struct {
 
 ### `form` — 绑定名（优先级高于 `json`）
 
-常用于 query 参数或表单字段，当 `form` 与 `json` 同时存在时，query / 表单 / 路径参数按 `form` 绑定；JSON 请求体由 `encoding/json` 解码，只认 `json` 标签（无 json 名时用字段名，键名大小写不敏感），`form` 标签对其无效，OpenAPI 的 JSON schema 同样按 json 名生成。
+常用于 query 参数或表单字段。`form:"-"` 无条件跳过 Form 链；当 `form` 与 `json` 同时存在且 `form` 非 `-` 时，query / 表单 / 路径参数按 `form` 绑定；JSON 请求体由 `encoding/json` 解码，只认 `json` 标签（无 json 名时用字段名，键名大小写不敏感），`form` 标签对其无效，OpenAPI 的 JSON schema 同样按 json 名生成。
 
 ```go
 type Req struct {
@@ -199,7 +206,7 @@ type OrderReq struct {
 
 #### 不支持的类型
 
-以下类型的 `default` 标签值会被忽略（注册时会输出 `slog.Warn`）：`struct`、`*struct`、`[]struct`、`[]*struct`、`map[K]V`、`*map[K]V`、`time.Time`，以及任意非标量的指针/切片/数组，包括指向容器的指针（`*[]T`、`*map[K]V`）与容器的容器（`[][]T`、`[]*[]T`、`map[K][]T`）。
+以下类型的 `default` 标签值会被忽略（注册时会输出 `slog.Warn`）：`struct`、`*struct`、`[]struct`、`[]*struct`、`map[K]V`、`*map[K]V`、`time.Time`，以及任意非标量的指针/切片/数组，包括指向容器的指针（`*[]T`、`*map[K]V`）与容器的容器（`[][]T`、`[]*[]T`、`map[K][]T`）。类型虽然受支持、但标签值无法被运行时解析时（如 `int default:"abc"`、`bool default:"yes"`、`float64 default:"NaN"`、`[]int default:"1,x"`），同样按未设置处理并输出 `slog.Warn`；标量 default 会先 `TrimSpace`，与运行时填充一致。
 
 #### 容器嵌套深度限制
 

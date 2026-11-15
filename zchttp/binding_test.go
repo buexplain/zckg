@@ -501,6 +501,45 @@ func TestPostQueryBodyMergedBinding(t *testing.T) {
 	}
 }
 
+// TestBind_JSONNullWithPointerDefault 锁死 PB-01 方案 A：显式 JSON null 与字段未传等价，
+// 指针字段存在 default 时会在请求阶段回填默认值，显式 null 不能清除默认值。
+func TestBind_JSONNullWithPointerDefault(t *testing.T) {
+	type req struct {
+		Age *int `json:"age" default:"18"`
+	}
+	type res struct {
+		Age *int `json:"age"`
+	}
+	e := NewEngine()
+	e.Router.POST("/null-default", func(_ context.Context, q req) (res, error) { return res(q), nil })
+
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"explicit null refills default", `{"age":null}`, 18},
+		{"absent refills default", `{}`, 18},
+		{"explicit zero overrides default", `{"age":0}`, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/null-default", strings.NewReader(tc.body))
+			request.Header.Set("Content-Type", "application/json")
+			e.ServeHTTP(rec, request)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var got res
+			decodeData(t, rec, &got)
+			if got.Age == nil || *got.Age != tc.want {
+				t.Fatalf("Age = %v, want %d", got.Age, tc.want)
+			}
+		})
+	}
+}
+
 // TestMergedBinding_JSONNullAndZero 锁定合并绑定中 body 覆盖粒度（由 JSON 解码语义决定）：
 // 1. body 显式传入的零值（如 "page": 0）覆盖 query 值——JSON 解码对显式出现的字段一律写入；
 // 2. body 中 JSON null 对非指针字段为 no-op，保留 query 值；
@@ -1509,39 +1548,27 @@ func TestBindJSONMapNestedPtrValue(t *testing.T) {
 	}
 }
 
-// ========== BUG4 验证测试 ==========
-
-// TestBindBody_MultipartNilForm 验证当 ParseMultipartForm 成功但 r.MultipartForm 为 nil 时不会 panic
-// 正常情况下 ParseMultipartForm 成功后 MultipartForm 不会为 nil，
-// 但通过直接调用 bindBody 并手动设置 MultipartForm=nil 来模拟极端场景
-func TestBindBody_MultipartNilForm(t *testing.T) {
-	type multiReq struct {
-		Name string `form:"name"`
+// TestParseStrictQuery_NilURL 覆盖 parseStrictQuery 对 URL 为 nil 的防御分支。
+func TestParseStrictQuery_NilURL(t *testing.T) {
+	values, err := parseStrictQuery(&http.Request{})
+	if err != nil {
+		t.Fatalf("nil URL should not error: %v", err)
 	}
+	if values != nil {
+		t.Fatalf("nil URL values = %v, want nil", values)
+	}
+}
 
-	meta := buildStructMeta(reflect.TypeOf(multiReq{}))
-	reqVal := reflect.New(reflect.TypeOf(multiReq{}))
-
-	// 构造一个 MultipartForm = nil 的 http.Request
-	r := httptest.NewRequest(http.MethodPost, "/test", nil)
-	r.Header.Set("Content-Type", "multipart/form-data")
-	// 手动设置 MultipartForm 为 nil（模拟 ParseMultipartForm 已经调用但结果异常）
-	r.MultipartForm = nil
-
-	// 如果 BUG4 存在，此处会 panic: nil pointer dereference
-	defer func() {
-		if rec := recover(); rec != nil {
-			t.Fatalf("BUG4 confirmed: bindBody panics when MultipartForm is nil: %v", rec)
-		}
-	}()
-
-	// 直接调用 bindBody，跳过 ParseMultipartForm（因为没有 body）
-	// 注意：bindBody 内部会先调用 ParseMultipartForm，我们需要直接测试 nil 场景
-	// 实际上 ParseMultipartForm 会报错导致提前返回，所以这个 bug 在生产中不会触发
-	// 但我们仍然验证代码逻辑一致性
-	err := bindBody(r, reqVal, meta, 0)
-	// ParseMultipartForm 会失败，所以这里会提前返回 error，不会走到 nil 分支
-	_ = err
+// TestSetUnix_UnknownUnit 覆盖 setUnix 对未知时间单位的防御分支。
+func TestSetUnix_UnknownUnit(t *testing.T) {
+	var tv time.Time
+	err := setUnix(reflect.ValueOf(&tv).Elem(), "0", 0, time.UTC)
+	if err == nil {
+		t.Fatal("unknown unix unit should return error")
+	}
+	if !strings.Contains(err.Error(), "unsupported unix timestamp unit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 // TestSetScalar_SelfReferentialPtr 验证自引用指针类型不会使 setScalar 无限递归（栈溢出），
@@ -2207,8 +2234,8 @@ func TestBindURLEncodedBodyAllBodyMethods(t *testing.T) {
 			if got := r.PostForm.Get("nick"); got != "body" {
 				t.Fatalf("PostForm[nick] = %q, want body", got)
 			}
-			if values := r.Form["nick"]; len(values) != 2 || values[0] != "body" || values[1] != "q" {
-				t.Fatalf("Form[nick] = %q, want [body q] (body values before query values)", values)
+			if values := r.Form["nick"]; len(values) != 1 || values[0] != "body" {
+				t.Fatalf("Form[nick] = %q, want [body] (body-only parse, query parsed separately)", values)
 			}
 		})
 	}
@@ -2510,6 +2537,13 @@ func TestBindMultipartMaxMemoryTempFile(t *testing.T) {
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	engine.ServeHTTP(rec, req)
+	if req.MultipartForm != nil {
+		t.Cleanup(func() {
+			if err := req.MultipartForm.RemoveAll(); err != nil {
+				t.Errorf("cleanup multipart temp files: %v", err)
+			}
+		})
+	}
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d, body: %s", rec.Code, rec.Body.String())
@@ -2564,7 +2598,7 @@ func TestBindValues_UnsettableFieldSkipped(t *testing.T) {
 		"public":  {"ok"},
 		"private": {"x"},
 	}, nil, meta); err != nil {
-		t.Fatalf("bindValues 尽力绑定应恒返回 nil: %v", err)
+		t.Fatalf("不可设置字段应跳过，不应返回错误: %v", err)
 	}
 	got := reqPtr.Interface().(*hiddenFieldReq)
 	if got.Public != "ok" {
@@ -2592,9 +2626,9 @@ func TestBindPathParams_UnsettableFieldSkipped(t *testing.T) {
 	}
 }
 
-// TestBindValues_InvalidPointerPreservesOriginal 验证 query/form 转换失败不会分配 nil 指针，
-// 也不会覆盖字段原有值。
-func TestBindValues_InvalidPointerPreservesOriginal(t *testing.T) {
+// TestBindValues_InvalidConversionReturnsError 验证表单 body 转换失败立即返回错误，
+// 且不会分配 nil 指针或覆盖字段原有值。
+func TestBindValues_InvalidConversionReturnsError(t *testing.T) {
 	type req struct {
 		Page    *int       `json:"page"`
 		Enabled *bool      `json:"enabled"`
@@ -2610,14 +2644,49 @@ func TestBindValues_InvalidPointerPreservesOriginal(t *testing.T) {
 		"when":    {"bad"},
 		"preset":  {"bad"},
 	}
-	if err := bindValues(reflect.ValueOf(&got), values, nil, meta); err != nil {
-		t.Fatalf("尽力绑定不应返回字段转换错误: %v", err)
+	err := bindValues(reflect.ValueOf(&got), values, nil, meta)
+	if err == nil {
+		t.Fatal("表单 body 转换失败应返回错误")
+	}
+	if !strings.Contains(err.Error(), "invalid form parameter") {
+		t.Fatalf("错误应标明 form 来源，实际: %v", err)
 	}
 	if got.Page != nil || got.Enabled != nil || got.When != nil {
 		t.Fatalf("失败绑定不得分配 nil 指针: %+v", got)
 	}
 	if got.Preset == nil || *got.Preset != 7 {
 		t.Fatalf("失败绑定应保留原值 7，实际: %v", got.Preset)
+	}
+}
+
+// TestBindValues_EmptyTimeSliceElementsPreserveOriginal 验证时间切片的空字符串元素
+// 跳过解析并保留原位置旧值；非空元素仍按 time_format 正常解析。
+func TestBindValues_EmptyTimeSliceElementsPreserveOriginal(t *testing.T) {
+	type req struct {
+		S  []time.Time  `form:"s" time_format:"2006-01-02" time_location:"UTC"`
+		SP []*time.Time `form:"sp" time_format:"2006-01-02" time_location:"UTC"`
+	}
+	old0 := time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC)
+	old1 := time.Date(2021, 2, 3, 0, 0, 0, 0, time.UTC)
+	got := req{
+		S:  []time.Time{old0, old1},
+		SP: []*time.Time{&old0, &old1},
+	}
+	meta := buildStructMeta(reflect.TypeOf(got))
+	err := bindValues(reflect.ValueOf(&got), map[string][]string{
+		"s":  {"", "2024-03-05"},
+		"sp": {"", "2024-03-06"},
+	}, nil, meta)
+	if err != nil {
+		t.Fatalf("empty time slice element should be skipped, got error: %v", err)
+	}
+	want0 := time.Date(2024, 3, 5, 0, 0, 0, 0, time.UTC)
+	want1 := time.Date(2024, 3, 6, 0, 0, 0, 0, time.UTC)
+	if len(got.S) != 2 || !got.S[0].Equal(old0) || !got.S[1].Equal(want0) {
+		t.Fatalf("S = %v, want first original and second parsed", got.S)
+	}
+	if len(got.SP) != 2 || got.SP[0] == nil || !got.SP[0].Equal(old0) || got.SP[1] == nil || !got.SP[1].Equal(want1) {
+		t.Fatalf("SP = %v, want first original pointer and second parsed", got.SP)
 	}
 }
 
@@ -3103,7 +3172,14 @@ type bindDiffNested struct {
 // bindDiffReq 是差分测试用的 Req：覆盖 form/json 绑定名差异、标量、切片、指针、
 // 嵌套结构体、map、忽略字段与上传文件。字段保持扁平，避免把匿名嵌入展开语义
 // 混入本次差分（该语义由既有测试覆盖）。
+type BindDiffEmbedded struct {
+	Embedded string `json:"embedded"`
+}
+
+type bindDiffBytes []byte
+
 type bindDiffReq struct {
+	BindDiffEmbedded
 	Nick     string                  `json:"name" form:"nick"`
 	Page     int                     `json:"page"`
 	Active   bool                    `json:"active"`
@@ -3111,6 +3187,10 @@ type bindDiffReq struct {
 	Tags     []string                `json:"tags"`
 	Nums     []int                   `json:"nums"`
 	Score    *int                    `json:"score"`
+	Bytes    []byte                  `json:"bytes"`
+	Named    bindDiffBytes           `json:"named_bytes"`
+	Dash     string                  `json:"-,"`
+	FormDash string                  `form:"-" json:"form_dash"`
 	Ignored  string                  `json:"-"`
 	Nested   bindDiffNested          `json:"nested"`
 	Extra    map[string]string       `json:"extra"`
@@ -3126,6 +3206,7 @@ type bindDiffFileSnapshot struct {
 
 // bindDiffSnapshot 把 Req 转成可比较快照，避免直接比较两个 parser 产生的文件头指针。
 type bindDiffSnapshot struct {
+	Embedded string
 	Nick     string
 	Page     int
 	Active   bool
@@ -3133,6 +3214,10 @@ type bindDiffSnapshot struct {
 	Tags     []string
 	Nums     []int
 	Score    *int
+	Bytes    []byte
+	Named    []byte
+	Dash     string
+	FormDash string
 	Ignored  string
 	Nested   bindDiffNested
 	Extra    map[string]string
@@ -3143,12 +3228,17 @@ type bindDiffSnapshot struct {
 
 func snapshotBindDiff(req bindDiffReq) bindDiffSnapshot {
 	snapshot := bindDiffSnapshot{
+		Embedded: req.Embedded,
 		Nick:     req.Nick,
 		Page:     req.Page,
 		Active:   req.Active,
 		Ratio:    req.Ratio,
 		Tags:     req.Tags,
 		Nums:     req.Nums,
+		Bytes:    req.Bytes,
+		Named:    []byte(req.Named),
+		Dash:     req.Dash,
+		FormDash: req.FormDash,
 		Ignored:  req.Ignored,
 		Nested:   req.Nested,
 		Extra:    req.Extra,
@@ -3186,13 +3276,21 @@ var refBindFileHeaderPtrType = reflect.TypeOf((*multipart.FileHeader)(nil))
 
 // refBindFieldName 独立实现文档约定的绑定名解析：form > json > 字段名。
 func refBindFieldName(field reflect.StructField) string {
-	if tag := field.Tag.Get("form"); tag != "" {
-		if name := refBindTagName(tag); name != "" {
+	if tag, ok := field.Tag.Lookup("form"); ok {
+		name := refBindTagName(tag)
+		if name == "-" {
+			return ""
+		}
+		if name != "" {
 			return name
 		}
 	}
-	if tag := field.Tag.Get("json"); tag != "" {
-		if name := refBindTagName(tag); name != "" {
+	if tag, ok := field.Tag.Lookup("json"); ok {
+		name := refBindTagName(tag)
+		if name == "-" {
+			return field.Name
+		}
+		if name != "" {
 			return name
 		}
 	}
@@ -3206,10 +3304,10 @@ func refBindTagName(tag string) string {
 	return tag
 }
 
-// refBindValues 用反射按绑定名把 values/files 写入结构体：
-// 文件字段优先于普通值、标量取首值且不去空白、切片逐值去空白后整体提交、
-// 转换失败保持字段原值（尽力绑定）。仅处理扁平结构体字段。
-func refBindValues(dst reflect.Value, values map[string][]string, files map[string][]*multipart.FileHeader) {
+// refBindValues 用反射按 Form 绑定名把 values/files 写入结构体：
+// 文件字段优先于普通值、标量取首值、切片整体提交、转换失败返回错误。
+// 仅处理扁平结构体字段与无 json 名的匿名值嵌入。
+func refBindValues(dst reflect.Value, values map[string][]string, files map[string][]*multipart.FileHeader) error {
 	typ := dst.Type()
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
@@ -3217,11 +3315,17 @@ func refBindValues(dst reflect.Value, values map[string][]string, files map[stri
 			continue
 		}
 		name := refBindFieldName(field)
-		if name == "" || name == "-" {
+		if name == "" {
 			continue
 		}
 		fieldValue := dst.Field(i)
 		if !fieldValue.CanSet() {
+			continue
+		}
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			if err := refBindValues(fieldValue, values, files); err != nil {
+				return err
+			}
 			continue
 		}
 		switch {
@@ -3240,25 +3344,40 @@ func refBindValues(dst reflect.Value, values map[string][]string, files map[stri
 		if !ok || len(fieldValues) == 0 {
 			continue
 		}
-		refBindFieldValue(fieldValue, fieldValues)
+		if err := refBindFieldValueStrict(fieldValue, fieldValues); err != nil {
+			return fmt.Errorf("invalid parameter %q: %w", name, err)
+		}
 	}
+	return nil
 }
 
-func refBindFieldValue(fieldValue reflect.Value, values []string) {
+// refBindQueryValues 是 query 的严格参考实现：等价于没有文件的 refBindValues；
+// 未知参数、不可绑定容器与文件字段按实现规则跳过。用于差分测试的 query 侧。
+func refBindQueryValues(dst reflect.Value, values map[string][]string) error {
+	return refBindValues(dst, values, nil)
+}
+
+func refBindFieldValueStrict(fieldValue reflect.Value, values []string) error {
 	if fieldValue.Kind() == reflect.Slice {
 		if !refIsScalarType(fieldValue.Type().Elem()) {
-			return
+			return nil
 		}
 		parsed := reflect.MakeSlice(fieldValue.Type(), len(values), len(values))
 		for i, value := range values {
-			if !refParseScalar(parsed.Index(i), strings.TrimSpace(value)) {
-				return
+			if !refParseScalar(parsed.Index(i), value) {
+				return fmt.Errorf("invalid value %q", value)
 			}
 		}
 		fieldValue.Set(parsed)
-		return
+		return nil
 	}
-	refParseScalar(fieldValue, values[0])
+	if !refIsScalarType(fieldValue.Type()) {
+		return nil
+	}
+	if !refParseScalar(fieldValue, values[0]) {
+		return fmt.Errorf("invalid value %q", values[0])
+	}
+	return nil
 }
 
 func refIsScalarType(t reflect.Type) bool {
@@ -3327,9 +3446,14 @@ func refParseScalar(fieldValue reflect.Value, value string) bool {
 func refBindRequest(t *testing.T, tc bindDiffCase) (bindDiffReq, error) {
 	t.Helper()
 	var dst bindDiffReq
-	// 与 net/url.Values.Query 一致：忽略解析错误，保留已解析部分
-	queryValues, _ := url.ParseQuery(tc.rawQuery)
-	refBindValues(reflect.ValueOf(&dst).Elem(), queryValues, nil)
+	// query 严格解析：语法错误直接报错；已知字段转换失败也报错。
+	queryValues, queryErr := url.ParseQuery(tc.rawQuery)
+	if queryErr != nil {
+		return dst, queryErr
+	}
+	if err := refBindQueryValues(reflect.ValueOf(&dst).Elem(), queryValues); err != nil {
+		return dst, err
+	}
 	if tc.keepRaw {
 		return dst, nil
 	}
@@ -3359,7 +3483,9 @@ func refBindRequest(t *testing.T, tc bindDiffCase) (bindDiffReq, error) {
 		if _, queryErr := url.ParseQuery(tc.rawQuery); queryErr != nil {
 			return dst, queryErr
 		}
-		refBindValues(reflect.ValueOf(&dst).Elem(), bodyValues, nil)
+		if err := refBindValues(reflect.ValueOf(&dst).Elem(), bodyValues, nil); err != nil {
+			return dst, err
+		}
 	case "multipart/form-data":
 		boundary := params["boundary"]
 		if boundary == "" {
@@ -3369,9 +3495,12 @@ func refBindRequest(t *testing.T, tc bindDiffCase) (bindDiffReq, error) {
 		if err != nil {
 			return dst, err
 		}
-		refBindValues(reflect.ValueOf(&dst).Elem(), form.Value, form.File)
+		bindErr := refBindValues(reflect.ValueOf(&dst).Elem(), form.Value, form.File)
 		if cleanupErr := form.RemoveAll(); cleanupErr != nil {
 			t.Fatalf("case %s: cleanup reference multipart temp files: %v", tc.name, cleanupErr)
+		}
+		if bindErr != nil {
+			return dst, bindErr
 		}
 		// ParseMultipartForm 内部先执行 ParseForm，query 非法时在 multipart 解析成功后返回该错误
 		if _, queryErr := url.ParseQuery(tc.rawQuery); queryErr != nil {
@@ -3473,8 +3602,8 @@ func buildBindDiffMultipart(t testing.TB, fields []bindDiffField, files []bindDi
 }
 
 // curatedBindDiffCases 覆盖文档中的关键绑定语义：方法分流（含 OPTIONS/TRACE/CONNECT）、
-// query/body 覆盖、KeepRawBody、JSON null/显式零值/重复键/尾随值、form 尽力绑定、
-// Content-Type 选择、multipart 文件。
+// query 严格绑定、query/body 覆盖、KeepRawBody、JSON null/显式零值/重复键/尾随值、
+// form body 尽力绑定、Content-Type 选择、multipart 文件。
 func curatedBindDiffCases(t testing.TB) []bindDiffCase {
 	t.Helper()
 	multipartBody, multipartCT := buildBindDiffMultipart(t,
@@ -3508,8 +3637,11 @@ func curatedBindDiffCases(t testing.TB) []bindDiffCase {
 		{name: "post_json_case_insensitive", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"NAME":"b","PAGE":7}`), maxMemory: 32 << 20},
 		{name: "post_json_wrong_type", method: http.MethodPost, rawQuery: "page=1", contentType: "application/json", body: []byte(`{"page":"abc"}`), maxMemory: 32 << 20},
 		{name: "post_json_nested_and_map", method: http.MethodPost, rawQuery: "nick=q&fo=q", contentType: "application/json", body: []byte(`{"nested":{"key":"k","num":3},"extra":{"a":"b"},"FormOnly":"x"}`), maxMemory: 32 << 20},
+		{name: "post_json_bytes_dash_embed", method: http.MethodPost, rawQuery: "bytes=9&embedded=q", contentType: "application/json", body: []byte(`{"bytes":[1,2],"named_bytes":[3,4],"-":"d","form_dash":"fd","embedded":"e"}`), maxMemory: 32 << 20},
+		{name: "get_bytes_embed", method: http.MethodGet, rawQuery: "bytes=1&bytes=2&named_bytes=3&embedded=e", contentType: "", body: nil, maxMemory: 32 << 20},
+		{name: "post_form_bytes_embed", method: http.MethodPost, rawQuery: "", contentType: "application/x-www-form-urlencoded", body: []byte("bytes=1&bytes=2&named_bytes=3&embedded=e"), maxMemory: 32 << 20},
 		{name: "post_form_partial_override", method: http.MethodPost, rawQuery: "nick=q&page=1&tags=q1&tags=q2", contentType: "application/x-www-form-urlencoded", body: []byte("nick=body&page=0&tags=f1&tags=f2"), maxMemory: 32 << 20},
-		{name: "post_form_invalid_keeps_query", method: http.MethodPost, rawQuery: "page=3&active=true", contentType: "application/x-www-form-urlencoded", body: []byte("page=abc&active=notabool"), maxMemory: 32 << 20},
+		{name: "post_form_invalid_body_error", method: http.MethodPost, rawQuery: "page=3&active=true", contentType: "application/x-www-form-urlencoded", body: []byte("page=abc&active=notabool"), maxMemory: 32 << 20},
 		{name: "post_form_malformed_escape", method: http.MethodPost, rawQuery: "", contentType: "application/x-www-form-urlencoded", body: []byte("page=%zz"), maxMemory: 32 << 20},
 		{name: "post_form_semicolon", method: http.MethodPost, rawQuery: "", contentType: "application/x-www-form-urlencoded", body: []byte("page=1;active=true"), maxMemory: 32 << 20},
 		{name: "post_json_keep_raw", method: http.MethodPost, rawQuery: "nick=q&page=1", contentType: "application/json", body: []byte(`{"name":"body","page":9}`), maxMemory: 32 << 20, keepRaw: true},
@@ -3524,14 +3656,14 @@ func curatedBindDiffCases(t testing.TB) []bindDiffCase {
 		{name: "post_multipart_truncated", method: http.MethodPost, rawQuery: "nick=q", contentType: multipartCT, body: truncatedMultipart, maxMemory: 32 << 20},
 		{name: "post_multipart_no_boundary", method: http.MethodPost, rawQuery: "nick=q", contentType: "multipart/form-data", body: multipartBody, maxMemory: 32 << 20},
 		{name: "post_multipart_small_memory", method: http.MethodPost, rawQuery: "", contentType: smallMemoryCT, body: smallMemoryBody, maxMemory: 1},
-		{name: "query_malformed_escape_ignored", method: http.MethodGet, rawQuery: "nick=q&bad=%zz", contentType: "", body: nil, maxMemory: 32 << 20},
-		{name: "slice_invalid_element_keeps_nil", method: http.MethodGet, rawQuery: "nums=1&nums=bad", contentType: "", body: nil, maxMemory: 32 << 20},
-		{name: "slice_trims_elements", method: http.MethodGet, rawQuery: "tags=%20a%20&tags=b", contentType: "", body: nil, maxMemory: 32 << 20},
+		{name: "query_malformed_escape_error", method: http.MethodGet, rawQuery: "nick=q&bad=%zz", contentType: "", body: nil, maxMemory: 32 << 20},
+		{name: "query_slice_invalid_element_error", method: http.MethodGet, rawQuery: "nums=1&nums=bad", contentType: "", body: nil, maxMemory: 32 << 20},
+		{name: "slice_not_trimmed", method: http.MethodGet, rawQuery: "tags=%20a%20&tags=b", contentType: "", body: nil, maxMemory: 32 << 20},
 		{name: "scalar_not_trimmed", method: http.MethodGet, rawQuery: "nick=%20q%20", contentType: "", body: nil, maxMemory: 32 << 20},
 	}
 }
 
-var bindDiffKeys = []string{"nick", "name", "page", "active", "ratio", "tags", "nums", "score", "fo", "unknown", "nested", "extra", "file", "files", "-"}
+var bindDiffKeys = []string{"nick", "name", "page", "active", "ratio", "tags", "nums", "score", "bytes", "named_bytes", "dash", "Dash", "form_dash", "FormDash", "embedded", "ignored", "Ignored", "fo", "unknown", "nested", "extra", "file", "files", "-"}
 
 func refRandomKey(rng *rand.Rand) string {
 	return bindDiffKeys[rng.Intn(len(bindDiffKeys))]
@@ -3767,8 +3899,8 @@ func generateBindDiffRandomCases(t *testing.T, rng *rand.Rand, count int) []bind
 }
 
 // TestBindStdlibDifferential 用 stdlib 解析结果作为 oracle 校验 query/form/JSON/multipart 绑定：
-// 参考流程独立实现 form > json > 字段名映射、标量取首值、切片整组提交、失败保持原值、
-// body 覆盖 query、GET/DELETE/HEAD 忽略 body、未知 Content-Type 回退 JSON。
+// 参考流程独立实现 form > json > 字段名映射、query 严格错误、表单 body 失败保持原值、
+// 标量取首值、切片整组提交、body 覆盖 query、GET/DELETE/HEAD 忽略 body、未知 Content-Type 回退 JSON。
 // 定向用例覆盖文档锁死的边界；随机用例覆盖方法 × Content-Type × body 组合。
 func TestBindStdlibDifferential(t *testing.T) {
 	meta := buildStructMeta(reflect.TypeOf(bindDiffReq{}))
@@ -3791,6 +3923,729 @@ func TestBindStdlibDifferential(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestBind_TimeFormatIgnoredForJSONBody 锁死 time_format 的生效边界：
+// JSON 请求体由 encoding/json 处理，Unix 数字必须 400、RFC3339 字符串 200；
+// 同一 Req 的 GET query 仍按 time_format 解析数字时间戳。
+func TestBind_TimeFormatIgnoredForJSONBody(t *testing.T) {
+	type jsonTimeReq struct {
+		At   time.Time            `json:"at" time_format:"unix"`
+		Days []time.Time          `json:"days" time_format:"unix"`
+		Map  map[string]time.Time `json:"m" time_format:"unix"`
+	}
+	type jsonTimeRes struct {
+		At time.Time `json:"at"`
+	}
+	e := NewEngine()
+	e.Router.POST("/time-json", func(_ context.Context, req jsonTimeReq) (jsonTimeRes, error) {
+		return jsonTimeRes{At: req.At}, nil
+	})
+	e.Router.GET("/time-json", func(_ context.Context, req jsonTimeReq) (jsonTimeRes, error) {
+		return jsonTimeRes{At: req.At}, nil
+	})
+
+	for _, tc := range []struct {
+		name string
+		body string
+		code int
+	}{
+		{"数字", `{"at":1700000000}`, http.StatusBadRequest},
+		{"字符串", `{"at":"2023-11-14T22:13:20Z"}`, http.StatusOK},
+		{"数字切片", `{"days":[1700000000]}`, http.StatusBadRequest},
+		{"数字 map", `{"m":{"k":1700000000}}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serveJSONOn(t, e, http.MethodPost, "/time-json", tc.body)
+			if rec.Code != tc.code {
+				t.Fatalf("POST %s = %d, want %d; body=%s", tc.body, rec.Code, tc.code, rec.Body.String())
+			}
+		})
+	}
+
+	// query 仍按 time_format 解析：数字时间戳应 200 且为同一时刻。
+	rec := serveJSONOn(t, e, http.MethodGet, "/time-json?at=1700000000", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET query unix = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got jsonTimeRes
+	decodeData(t, rec, &got)
+	if !got.At.Equal(time.Unix(1700000000, 0)) {
+		t.Fatalf("GET query time = %v, want %v", got.At, time.Unix(1700000000, 0))
+	}
+}
+
+// TestBind_ByteSliceJSON 锁死 []byte 的 JSON 语义：请求接受 base64 字符串
+// （编码器也接受数字数组），响应必须是 base64 字符串而非整数数组。
+func TestBind_ByteSliceJSON(t *testing.T) {
+	type byteReq struct {
+		Data []byte `json:"data"`
+	}
+	type byteRes struct {
+		Data []byte `json:"data"`
+	}
+	e := NewEngine()
+	e.Router.POST("/bytes", func(_ context.Context, req byteReq) (byteRes, error) {
+		return byteRes(req), nil
+	})
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"base64", `{"data":"aGVsbG8="}`},
+		{"数字数组", `{"data":[104,101,108,108,111]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serveJSONOn(t, e, http.MethodPost, "/bytes", tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("POST %s = %d; body=%s", tc.body, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), `"data":"aGVsbG8="`) {
+				t.Fatalf("响应应为 base64 字符串，实际: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestBind_ByteSliceFormSources 锁死 query/form/multipart 的 byte slice 运行时绑定：
+// 三种来源都按重复的十进制字节参数逐元素解析，响应仍走默认 JSON 的 base64。
+// 命名类型 formBlob 同时覆盖“底层 []byte”的命名类型。
+func TestBind_ByteSliceFormSources(t *testing.T) {
+	type formBlob []byte
+	type byteReq struct {
+		Data formBlob `json:"data"`
+	}
+	type byteRes struct {
+		Data formBlob `json:"data"`
+	}
+	e := NewEngine()
+	handler := func(_ context.Context, req byteReq) (byteRes, error) {
+		return byteRes(req), nil
+	}
+	e.Router.GET("/bytes-form", handler)
+	e.Router.POST("/bytes-form", handler)
+
+	var multipartBody bytes.Buffer
+	mw := multipart.NewWriter(&multipartBody)
+	for _, v := range []string{"104", "101", "108", "108", "111"} {
+		fw, err := mw.CreateFormField("data")
+		if err != nil {
+			t.Fatalf("create form field: %v", err)
+		}
+		if _, err := fw.Write([]byte(v)); err != nil {
+			t.Fatalf("write form field: %v", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	formBody := url.Values{"data": {"104", "101", "108", "108", "111"}}.Encode()
+	cases := []struct {
+		name        string
+		method      string
+		target      string
+		contentType string
+		body        string
+	}{
+		{"query", http.MethodGet, "/bytes-form?data=104&data=101&data=108&data=108&data=111", "", ""},
+		{"urlencoded", http.MethodPost, "/bytes-form", "application/x-www-form-urlencoded", formBody},
+		{"multipart", http.MethodPost, "/bytes-form", mw.FormDataContentType(), multipartBody.String()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var req *http.Request
+			if tc.body == "" {
+				req = httptest.NewRequest(tc.method, tc.target, nil)
+			} else {
+				req = httptest.NewRequest(tc.method, tc.target, strings.NewReader(tc.body))
+				if tc.contentType != "" {
+					req.Header.Set("Content-Type", tc.contentType)
+				}
+			}
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s = %d; body=%s", tc.name, rec.Code, rec.Body.String())
+			}
+			var got byteRes
+			decodeData(t, rec, &got)
+			if string(got.Data) != "hello" {
+				t.Fatalf("%s data = %q, want hello", tc.name, got.Data)
+			}
+			if !strings.Contains(rec.Body.String(), `"data":"aGVsbG8="`) {
+				t.Fatalf("%s response = %s, want base64", tc.name, rec.Body.String())
+			}
+		})
+	}
+
+	// query 严格：超出 uint8 的值直接 400，不做截断或忽略。
+	t.Run("invalid query byte value is 400", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/bytes-form?data=300", nil)
+		e.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("invalid query byte value = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "invalid query") {
+			t.Fatalf("400 body should mention invalid query: %s", rec.Body.String())
+		}
+	})
+}
+
+// TestBind_DashCommaAndFormDashTags 锁死 json:"-," 与 form:"-" json:"x" 的标签语义：
+// default 照常填充、nonzero 照常校验；只有精确 json:"-" 才整体排除。
+func TestBind_DashCommaAndFormDashTags(t *testing.T) {
+	type dashReq struct {
+		Dash     string `json:"-," default:"d" nonzero:"true"`
+		FormDash string `form:"-" json:"v" default:"v" nonzero:"true"`
+	}
+	type dashRes struct {
+		Dash string `json:"dash"`
+		V    string `json:"v"`
+	}
+	e := NewEngine()
+	e.Router.POST("/dash", func(_ context.Context, req dashReq) (dashRes, error) {
+		return dashRes{Dash: req.Dash, V: req.FormDash}, nil
+	})
+
+	rec := serveJSONOn(t, e, http.MethodPost, "/dash", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("省略字段应由 default 满足 nonzero: %d %s", rec.Code, rec.Body.String())
+	}
+	var got dashRes
+	decodeData(t, rec, &got)
+	if got.Dash != "d" || got.V != "v" {
+		t.Fatalf("default 未填充: %+v", got)
+	}
+
+	rec = serveJSONOn(t, e, http.MethodPost, "/dash", `{"-":"","v":""}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("显式零值应触发 nonzero 400: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestBind_ExcludedOnlyReqKeepsBody 锁死 PB-04：只有 json:"-" 整体排除字段的 Req
+// 不读取 body（handler 仍可通过 RequestFromContext 读取原样 body）；query 仍严格校验。
+func TestBind_ExcludedOnlyReqKeepsBody(t *testing.T) {
+	type excludedReq struct {
+		Secret string `json:"-"`
+	}
+	type rawRes struct {
+		Body string `json:"body"`
+	}
+	e := NewEngine()
+	e.Router.POST("/excluded", func(ctx context.Context, _ excludedReq) (rawRes, error) {
+		r, _ := RequestFromContext(ctx)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return rawRes{}, err
+		}
+		return rawRes{Body: string(body)}, nil
+	})
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/excluded", strings.NewReader(`{"x":1}`))
+	request.Header.Set("Content-Type", "application/json")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("excluded-only expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got rawRes
+	decodeData(t, rec, &got)
+	if got.Body != `{"x":1}` {
+		t.Fatalf("excluded-only Req body was consumed: %q", got.Body)
+	}
+
+	rec = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/excluded?bad=%zz", strings.NewReader(`{"x":1}`))
+	request.Header.Set("Content-Type", "application/json")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("excluded-only invalid query expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid query") {
+		t.Fatalf("400 body should mention invalid query: %s", rec.Body.String())
+	}
+}
+
+// TestBind_FormDashOnlyReqReadsJSON 验证 form:"-" 只跳过 query/form，不阻止 JSON 接收：
+// 即使 Req 只有该字段，也会读取 body 并按 json 标签绑定。
+func TestBind_FormDashOnlyReqReadsJSON(t *testing.T) {
+	type formDashReq struct {
+		Hidden string `form:"-" json:"hidden"`
+	}
+	type formDashRes struct {
+		Hidden string `json:"hidden"`
+	}
+	e := NewEngine()
+	e.Router.POST("/form-dash", func(_ context.Context, q formDashReq) (formDashRes, error) {
+		return formDashRes(q), nil
+	})
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/form-dash?bad=%zz", strings.NewReader(`{"hidden":"x"}`))
+	request.Header.Set("Content-Type", "application/json")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("form:-only expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got formDashRes
+	decodeData(t, rec, &got)
+	if got.Hidden != "x" {
+		t.Fatalf("form:-only JSON field = %q, want x", got.Hidden)
+	}
+}
+
+// TestBind_JSONDashCommaOnlyReqReadsBody 验证 json:"-," 不是跳过参数绑定：
+// 绑定名 "-" 是合法 JSON 字段名，Req 只有该字段时仍读取 body 并绑定。
+func TestBind_JSONDashCommaOnlyReqReadsBody(t *testing.T) {
+	type dashReq struct {
+		Dash string `json:"-,"`
+	}
+	type dashRes struct {
+		Dash string `json:"dash"`
+	}
+	e := NewEngine()
+	e.Router.POST("/json-dash", func(_ context.Context, q dashReq) (dashRes, error) {
+		return dashRes(q), nil
+	})
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/json-dash", strings.NewReader(`{"-":"dash"}`))
+	request.Header.Set("Content-Type", "application/json")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("json:-, expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got dashRes
+	decodeData(t, rec, &got)
+	if got.Dash != "dash" {
+		t.Fatalf("json:-,- field = %q, want dash", got.Dash)
+	}
+}
+
+// TestBind_JSONDashOnlyKeepsJSONBodyAndBindsForm 验证 json:"-" 只跳过 JSON：
+// 同名 GET/query 参数仍走 Form 链；POST JSON 不读取 body。
+func TestBind_JSONDashOnlyKeepsJSONBodyAndBindsForm(t *testing.T) {
+	type req struct {
+		Secret string `json:"-"`
+	}
+	type res struct {
+		Secret string `json:"secret"`
+		Body   string `json:"body"`
+	}
+	e := NewEngine()
+	e.Router.POST("/json-dash-only", func(ctx context.Context, q req) (res, error) {
+		r, _ := RequestFromContext(ctx)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return res{}, err
+		}
+		return res{Secret: q.Secret, Body: string(body)}, nil
+	})
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/json-dash-only?Secret=query", strings.NewReader(`{"Secret":"body"}`))
+	request.Header.Set("Content-Type", "application/json")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got res
+	decodeData(t, rec, &got)
+	if got.Secret != "query" {
+		t.Fatalf("json:\"-\" field should bind query by field name, got %q", got.Secret)
+	}
+	if got.Body != `{"Secret":"body"}` {
+		t.Fatalf("JSON body should be untouched for json:\"-\" only Req, got %q", got.Body)
+	}
+}
+
+// TestBind_JSONDashOnlyFormBinds 验证 json:"-" 只跳过 JSON：表单 body 仍按字段名绑定。
+func TestBind_JSONDashOnlyFormBinds(t *testing.T) {
+	type req struct {
+		Secret string `json:"-"`
+	}
+	type res struct {
+		Secret string `json:"secret"`
+	}
+	e := NewEngine()
+	e.Router.POST("/json-dash-form", func(_ context.Context, q req) (res, error) { return res(q), nil })
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/json-dash-form", strings.NewReader("Secret=body"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got res
+	decodeData(t, rec, &got)
+	if got.Secret != "body" {
+		t.Fatalf("json:\"-\" field should bind form by field name, got %q", got.Secret)
+	}
+}
+
+// TestBind_FormDashOnlySkipsQuery 验证 form:"-" 只跳过 Form 链：
+// Req 只有该字段时没有 query 可绑定字段，非法 query 也不解析/不报错。
+func TestBind_FormDashOnlySkipsQuery(t *testing.T) {
+	type req struct {
+		Hidden string `form:"-" json:"hidden"`
+	}
+	e := NewEngine()
+	e.Router.GET("/form-dash-get", func(_ context.Context, _ req) (struct{}, error) { return struct{}{}, nil })
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/form-dash-get?bad=%zz", nil)
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("form:\"-\" only Req should not validate query, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestBind_FormDashOnlyFormKeepsBody 验证 form:"-" 的 Req 在表单请求下没有 Form
+// 可绑定字段，因此不解析/不消费 body。
+func TestBind_FormDashOnlyFormKeepsBody(t *testing.T) {
+	type req struct {
+		Hidden string `form:"-" json:"hidden"`
+	}
+	type res struct {
+		Body string `json:"body"`
+	}
+	e := NewEngine()
+	e.Router.POST("/form-dash-form", func(ctx context.Context, _ req) (res, error) {
+		r, _ := RequestFromContext(ctx)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return res{}, err
+		}
+		return res{Body: string(body)}, nil
+	})
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/form-dash-form?bad=%zz", strings.NewReader("Hidden=body"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got res
+	decodeData(t, rec, &got)
+	if got.Body != "Hidden=body" {
+		t.Fatalf("form:\"-\" only form body should be untouched, got %q", got.Body)
+	}
+}
+
+// TestBind_FormDashOnlyMultipartKeepsBody 验证 form:"-" 的 Req 在 multipart 请求下
+// 没有 Form/文件可绑定字段，不解析/不消费 body。
+func TestBind_FormDashOnlyMultipartKeepsBody(t *testing.T) {
+	type req struct {
+		Hidden string `form:"-" json:"hidden"`
+	}
+	type res struct {
+		Body string `json:"body"`
+	}
+	e := NewEngine()
+	e.Router.POST("/form-dash-multipart", func(ctx context.Context, _ req) (res, error) {
+		r, _ := RequestFromContext(ctx)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return res{}, err
+		}
+		return res{Body: string(body)}, nil
+	})
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/form-dash-multipart", strings.NewReader("not-a-multipart-body"))
+	request.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got res
+	decodeData(t, rec, &got)
+	if got.Body != "not-a-multipart-body" {
+		t.Fatalf("multipart body should be untouched, got %q", got.Body)
+	}
+}
+
+// TestBind_JSONDashOnlyUnknownContentTypeKeepsBody 验证 json:"-" 的 Form 字段
+// 在未知 Content-Type 下不会因为 JSON 回退而读取 body。
+func TestBind_JSONDashOnlyUnknownContentTypeKeepsBody(t *testing.T) {
+	type req struct {
+		Secret string `form:"secret" json:"-"`
+	}
+	type res struct {
+		Body string `json:"body"`
+	}
+	e := NewEngine()
+	e.Router.POST("/json-dash-unknown", func(ctx context.Context, _ req) (res, error) {
+		r, _ := RequestFromContext(ctx)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return res{}, err
+		}
+		return res{Body: string(body)}, nil
+	})
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/json-dash-unknown", strings.NewReader("not-json"))
+	request.Header.Set("Content-Type", "text/plain")
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got res
+	decodeData(t, rec, &got)
+	if got.Body != "not-json" {
+		t.Fatalf("unknown-CT body should be untouched when JSON has no fields, got %q", got.Body)
+	}
+}
+
+// TestBind_NoFieldsSkipsQueryValidation 验证空 Req（无字段）不进行任何绑定：
+// 不读取 body、不解析/校验 query；非法 query 也不会 400。
+func TestBind_NoFieldsSkipsQueryValidation(t *testing.T) {
+	e := NewEngine()
+	e.Router.GET("/empty", func(_ context.Context, _ struct{}) (struct{}, error) { return struct{}{}, nil })
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/empty?bad=%zz", nil)
+	e.ServeHTTP(rec, request)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty Req should skip invalid query validation, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestBind_ValuesNotTrimmed 锁死 query/form 值不做 TrimSpace：标量与切片都保留首尾空格。
+func TestBind_ValuesNotTrimmed(t *testing.T) {
+	type req struct {
+		Nick string   `json:"nick"`
+		Tags []string `json:"tags"`
+	}
+	type res struct {
+		Nick string   `json:"nick"`
+		Tags []string `json:"tags"`
+	}
+	e := NewEngine()
+	e.Router.GET("/trim", func(_ context.Context, q req) (res, error) { return res(q), nil })
+
+	rec := httptest.NewRecorder()
+	engineReq := httptest.NewRequest(http.MethodGet, "/trim?nick=%20q%20&tags=%20a%20&tags=b", nil)
+	e.ServeHTTP(rec, engineReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got res
+	decodeData(t, rec, &got)
+	if got.Nick != " q " {
+		t.Fatalf("scalar Nick = %q, want %q", got.Nick, " q ")
+	}
+	if len(got.Tags) != 2 || got.Tags[0] != " a " || got.Tags[1] != "b" {
+		t.Fatalf("slice Tags = %#v, want [\" a \" \"b\"]", got.Tags)
+	}
+}
+
+// TestBind_QueryStrictErrors 锁死 query 的严格绑定：语法错误或已知字段转换失败
+// 在所有请求来源上都返回 400；即使 body 提供了同名字段的合法值，也不能救回非法 query。
+func TestBind_QueryStrictErrors(t *testing.T) {
+	type req struct {
+		Page int `json:"page" form:"page"`
+	}
+	type res struct {
+		Page int `json:"page"`
+	}
+	e := NewEngine()
+	handler := func(_ context.Context, q req) (res, error) { return res(q), nil }
+	e.Router.GET("/strict", handler)
+	e.Router.POST("/strict", handler)
+
+	var multipartBody bytes.Buffer
+	mw := multipart.NewWriter(&multipartBody)
+	if err := mw.WriteField("page", "2"); err != nil {
+		t.Fatalf("write multipart field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	send := func(method, target, contentType string, body []byte) *httptest.ResponseRecorder {
+		var req *http.Request
+		if body == nil {
+			req = httptest.NewRequest(method, target, nil)
+		} else {
+			req = httptest.NewRequest(method, target, bytes.NewReader(body))
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec
+	}
+
+	cases := []struct {
+		name        string
+		method      string
+		target      string
+		contentType string
+		body        []byte
+		wantCode    int
+		wantPage    int
+	}{
+		{"GET conversion error", http.MethodGet, "/strict?page=abc", "", nil, http.StatusBadRequest, 0},
+		{"GET syntax error", http.MethodGet, "/strict?page=%zz", "", nil, http.StatusBadRequest, 0},
+		{"GET unknown parameter ignored", http.MethodGet, "/strict?unknown=x", "", nil, http.StatusOK, 0},
+		{"JSON conversion cannot be rescued by body", http.MethodPost, "/strict?page=abc", "application/json", []byte(`{"page":2}`), http.StatusBadRequest, 0},
+		{"JSON syntax cannot be rescued by body", http.MethodPost, "/strict?page=%zz", "application/json", []byte(`{"page":2}`), http.StatusBadRequest, 0},
+		{"form conversion cannot be rescued by body", http.MethodPost, "/strict?page=abc", "application/x-www-form-urlencoded", []byte("page=2"), http.StatusBadRequest, 0},
+		{"form syntax cannot be rescued by body", http.MethodPost, "/strict?page=%zz", "application/x-www-form-urlencoded", []byte("page=2"), http.StatusBadRequest, 0},
+		{"form valid query body overrides", http.MethodPost, "/strict?page=2", "application/x-www-form-urlencoded", []byte("page=3"), http.StatusOK, 3},
+		{"multipart conversion cannot be rescued by body", http.MethodPost, "/strict?page=abc", mw.FormDataContentType(), multipartBody.Bytes(), http.StatusBadRequest, 0},
+		{"multipart syntax cannot be rescued by body", http.MethodPost, "/strict?page=%zz", mw.FormDataContentType(), multipartBody.Bytes(), http.StatusBadRequest, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := send(tc.method, tc.target, tc.contentType, tc.body)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("%s = %d, want %d; body=%s", tc.name, rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantCode == http.StatusBadRequest {
+				if !strings.Contains(rec.Body.String(), "invalid query") {
+					t.Fatalf("400 body should mention invalid query, got: %s", rec.Body.String())
+				}
+				return
+			}
+			var got res
+			decodeData(t, rec, &got)
+			if got.Page != tc.wantPage {
+				t.Fatalf("%s page = %d, want %d", tc.name, got.Page, tc.wantPage)
+			}
+		})
+	}
+}
+
+// TestBind_FormBodyStrictErrors 锁死 urlencoded/multipart 的 body 字段转换失败：
+// 与 query 一样返回 400，不跳过、不保留旧值；合法 body 仍正常覆盖 query。
+func TestBind_FormBodyStrictErrors(t *testing.T) {
+	type req struct {
+		Page int `json:"page" form:"page"`
+	}
+	type res struct {
+		Page int `json:"page"`
+	}
+	e := NewEngine()
+	e.Router.POST("/form-strict", func(_ context.Context, q req) (res, error) { return res(q), nil })
+
+	var invalidMultipart bytes.Buffer
+	mw := multipart.NewWriter(&invalidMultipart)
+	if err := mw.WriteField("page", "abc"); err != nil {
+		t.Fatalf("write multipart field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	send := func(target, contentType string, body []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, target, bytes.NewReader(body))
+		req.Header.Set("Content-Type", contentType)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec
+	}
+
+	cases := []struct {
+		name        string
+		target      string
+		contentType string
+		body        []byte
+		wantCode    int
+		wantPage    int
+	}{
+		{"form body conversion error", "/form-strict", "application/x-www-form-urlencoded", []byte("page=abc"), http.StatusBadRequest, 0},
+		{"form body error not rescued by query", "/form-strict?page=3", "application/x-www-form-urlencoded", []byte("page=abc"), http.StatusBadRequest, 0},
+		{"multipart body conversion error", "/form-strict", mw.FormDataContentType(), invalidMultipart.Bytes(), http.StatusBadRequest, 0},
+		{"form body valid", "/form-strict", "application/x-www-form-urlencoded", []byte("page=3"), http.StatusOK, 3},
+		{"form unknown field ignored", "/form-strict", "application/x-www-form-urlencoded", []byte("unknown=x"), http.StatusOK, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := send(tc.target, tc.contentType, tc.body)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("%s = %d, want %d; body=%s", tc.name, rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantCode == http.StatusBadRequest {
+				if !strings.Contains(rec.Body.String(), "invalid form parameter") {
+					t.Fatalf("400 body should mention invalid form parameter, got: %s", rec.Body.String())
+				}
+				return
+			}
+			var got res
+			decodeData(t, rec, &got)
+			if got.Page != tc.wantPage {
+				t.Fatalf("%s page = %d, want %d", tc.name, got.Page, tc.wantPage)
+			}
+		})
+	}
+}
+
+// TestBind_TimeReferenceDifferential 用 time.Unix / time.Parse 作为独立 oracle 校验
+// 时间字段的 query/form（unix，含指针与切片）与 JSON（RFC3339）绑定结果。
+func TestBind_TimeReferenceDifferential(t *testing.T) {
+	type req struct {
+		At       time.Time    `json:"at" form:"at" time_format:"unix" time_location:"UTC"`
+		Ptr      *time.Time   `json:"ptr" form:"ptr" time_format:"unix" time_location:"UTC"`
+		Slice    []time.Time  `json:"slice" form:"slice" time_format:"unix" time_location:"UTC"`
+		SlicePtr []*time.Time `json:"slice_ptr" form:"slice_ptr" time_format:"unix" time_location:"UTC"`
+	}
+	type res struct {
+		At       time.Time    `json:"at"`
+		Ptr      *time.Time   `json:"ptr"`
+		Slice    []time.Time  `json:"slice"`
+		SlicePtr []*time.Time `json:"slice_ptr"`
+	}
+	e := NewEngine()
+	e.Router.GET("/time-diff", func(_ context.Context, q req) (res, error) { return res(q), nil })
+	e.Router.POST("/time-diff", func(_ context.Context, q req) (res, error) { return res(q), nil })
+
+	want0 := time.Unix(1700000000, 0).UTC()
+	want1 := time.Unix(1700000001, 0).UTC()
+	check := func(t *testing.T, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var got res
+		decodeData(t, rec, &got)
+		if !got.At.Equal(want0) || got.Ptr == nil || !got.Ptr.Equal(want0) {
+			t.Fatalf("scalar time = %v / %v, want %v", got.At, got.Ptr, want0)
+		}
+		if len(got.Slice) != 2 || !got.Slice[0].Equal(want0) || !got.Slice[1].Equal(want1) {
+			t.Fatalf("slice = %v, want [%v %v]", got.Slice, want0, want1)
+		}
+		if len(got.SlicePtr) != 2 || got.SlicePtr[0] == nil || !got.SlicePtr[0].Equal(want0) ||
+			got.SlicePtr[1] == nil || !got.SlicePtr[1].Equal(want1) {
+			t.Fatalf("slice ptr = %v, want [%v %v]", got.SlicePtr, want0, want1)
+		}
+	}
+
+	query := "at=1700000000&ptr=1700000000&slice=1700000000&slice=1700000001&slice_ptr=1700000000&slice_ptr=1700000001"
+	check(t, func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/time-diff?"+query, nil))
+		return rec
+	}())
+
+	form := "at=1700000000&ptr=1700000000&slice=1700000000&slice=1700000001&slice_ptr=1700000000&slice_ptr=1700000001"
+	check(t, func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/time-diff", strings.NewReader(form))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		e.ServeHTTP(rec, request)
+		return rec
+	}())
+
+	body := `{"at":"2023-11-14T22:13:20Z","ptr":"2023-11-14T22:13:20Z","slice":["2023-11-14T22:13:20Z","2023-11-14T22:13:21Z"],"slice_ptr":["2023-11-14T22:13:20Z","2023-11-14T22:13:21Z"]}`
+	check(t, func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/time-diff", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		e.ServeHTTP(rec, request)
+		return rec
+	}())
 }
 
 // FuzzBindDifferential 用 stdlib 参考实现差分校验 query/form/JSON/multipart 绑定：

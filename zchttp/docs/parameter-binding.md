@@ -11,6 +11,29 @@
 
 ## 一、绑定来源：按 method 与 Content-Type 分流
 
+### 0. Req 字段的两个来源投影
+
+同一个 Req 字段最多有两套独立绑定语义，不能跨来源混用：
+
+| 字段标签 | Form 链（query / urlencoded / multipart / path） | JSON body |
+| --- | --- | --- |
+| 无标签 | 字段名 | 字段名 |
+| `form:"q"` | `q` | 字段名或 json 名 |
+| `form:"-"` | **不参与** | 按 json 标签/字段名正常参与 |
+| `json:"x"` | `x`（普通 json 名作为 fallback） | `x` |
+| `json:"-"` | **回退字段名**（JSON 的特殊值不污染 Form 链） | **不参与** |
+| `json:"-,"` | **回退字段名** | 键名 `-` |
+| `form:"-" json:"x"` | 不参与 | `x` |
+
+规则：
+
+- `form:"-"` **无条件跳过 Form 链**；
+- `json:"-"` 只跳过 JSON；Form 链按字段名继续绑定；
+- `json:"-,"` 的 `-` 只对 JSON 生效；Form 链回退字段名；
+- 普通 `json:"x"` 仍作为 Form 链 fallback，兼容现有接口；
+- Path 参数完全复用 Form 链；
+- JSON body 由 `encoding/json` 解码，Form 标签不参与。
+
 ### 1. GET / DELETE / HEAD
 
 绑定 URL query 参数（`r.URL.Query()`）。
@@ -19,11 +42,17 @@
 GET /search?keyword=go&page=3
 ```
 
+> 只有 Req 存在 **Form 链可绑定字段** 时才解析并校验 query。URL query 语法错误（如非法百分号转义、非法分隔符），或已知字段的值无法转换（如 `page=abc`），都会返回 400；未知参数忽略。没有 Form 链可绑定字段时，不解析 query、不校验 query。
+
 ### 2. POST / PUT / PATCH 等带请求体的方法
 
 > 例外：Req 嵌入 `zchttp.KeepRawBody` 时，无论 method 均按上一节 GET / DELETE / HEAD 规则只绑定 query，请求体原样保留，见“2.2 保留原始请求体（KeepRawBody）”。
 
-采用**合并绑定**：先绑定 URL query 参数，再按 `Content-Type` 绑定请求体，**body 中出现的字段覆盖 query 已绑定的同名字段**，body 中缺失的字段保留 query 绑定值（兼容 REST 常见的"query 放控制参数 + body 放资源数据"混合传参风格，如 `POST /orders/batch?dryRun=true` + JSON 资源体）。
+采用**合并绑定**：先严格校验并绑定 URL query 参数，再按 `Content-Type` 绑定请求体，**body 中出现的字段覆盖 query 已绑定的同名字段**，body 中缺失的字段保留 query 绑定值（兼容 REST 常见的"query 放控制参数 + body 放资源数据"混合传参风格，如 `POST /orders/batch?dryRun=true` + JSON 资源体）。
+
+> 只有 query 存在 Form 链可绑定字段时才解析/校验 query；只有选中的 body 来源存在可绑定字段时才读取 body。两者都没有时，Req 不进行任何绑定，body 原样保留、非法 query 也不报错。
+>
+> query 的非法值不会被 body 覆盖“救回”：在 query 来源参与绑定、且 body 对同名字段提供合法值时，query 语法错误或转换失败仍在 body 绑定前返回 400。body 只覆盖已经合法绑定的 query 值。
 
 > ⚠️ **行为变更提示（breaking change）**：早期版本中这类方法仅绑定 body、query 参数被静默忽略；当前版本 query 参数会生效。若你的接口依赖"query 被忽略"的旧行为（如同名参数刻意只认 body），升级后需确认 query 传参不会意外影响字段值。
 
@@ -36,7 +65,7 @@ GET /search?keyword=go&page=3
 | `multipart/form-data` | `r.ParseMultipartForm(MultipartFormMaxMemory)` 后绑定表单字段与上传文件 |
 | 其他（有请求体时） | 回退按 JSON 解析 |
 
-> urlencoded body 对除 GET/DELETE/HEAD 外的**所有**方法生效（含 OPTIONS/TRACE/CONNECT）。框架不直接依赖 `net/http.ParseForm` 的方法白名单（其只对 POST/PUT/PATCH 读取 body），而是为其余方法显式补读请求体，避免同一 Content-Type 在不同方法下行为不一致。
+> urlencoded body 对除 GET/DELETE/HEAD 外的**所有**方法生效（含 OPTIONS/TRACE/CONNECT）。框架复制 request 并清空 query 后解析 body，只绑定 Form 链；query 由独立的严格解析流程处理，不会因 body 解析再次校验 query。
 
 **body 覆盖 query 的粒度由解码器语义决定**（以 JSON 为例）：
 
@@ -44,7 +73,7 @@ GET /search?keyword=go&page=3
 | --- | --- |
 | 显式出现（含显式零值，如 `"page": 0`、`"source": ""`） | 覆盖 query 值 |
 | `null`，目标字段为非指针类型 | JSON 解码 no-op，**保留 query 值** |
-| `null`，目标字段为指针类型 | 标准库语义置 `nil`，覆盖 query 值 |
+| `null`，目标字段为指针类型 | 标准库语义置 `nil`，覆盖 query 值；若该字段有 `default`，请求阶段会因 nil 回填默认值（显式 null 不能清除 default） |
 | 未出现 | 保留 query 值 |
 
 表单（`x-www-form-urlencoded` / `multipart`）同理：body 中出现的字段覆盖同名 query 值，未出现则保留。
@@ -68,14 +97,16 @@ GET /search?keyword=go&page=3
 两个字段的关系：`MaxBodyBytes` 是请求体的**整体入口上限**（先于任何解析生效）；`MultipartFormMaxMemory` 仅控制 multipart 解析时的**内存缓冲上限**（文件部分超出时写入临时文件；非文件部分共享该上限 + 10 MB，超出即失败；整体仍受 `MaxBodyBytes` 约束）。需要大文件上传时两者需同步调大。
 
 ```go
-engine := zchttp.NewEngine()
-engine.MaxBodyBytes = 64 << 20          // 请求体整体上限 64 MB
-engine.MultipartFormMaxMemory = 32 << 20 // multipart 内存缓冲上限，超出落盘
+func example() {
+    engine := zchttp.NewEngine()
+    engine.MaxBodyBytes = 64 << 20          // 请求体整体上限 64 MB
+    engine.MultipartFormMaxMemory = 32 << 20 // multipart 内存缓冲上限，超出落盘
+}
 ```
 
 ### 2.2 保留原始请求体（KeepRawBody）
 
-反向代理、webhook 原始请求体验签、流式上传等场景需要 handler 拿到**未被读取的原始请求体**。只要 Req 有可绑定字段，引擎就会在中间件与 handler 之前按 Content-Type 读取请求体且不回填；在 Req 中嵌入 `zchttp.KeepRawBody` 即可声明“本 Req 不绑定请求体”：
+反向代理、webhook 原始请求体验签、流式上传等场景需要 handler 拿到**未被读取的原始请求体**。引擎只对当前请求来源中**存在可绑定字段**的部分读取：有 Form 链字段才解析 query；选中的 body 来源有可绑定字段才读取 body。在 Req 中嵌入 `zchttp.KeepRawBody` 即可声明“本 Req 不绑定请求体”。完全空 Req、`json:"-"` 且 `form:"-"` 的字段、或当前来源没有可绑定字段时，不读取 body；`form:"-"` 只跳过 Form 链，`json:"-"` 只跳过 JSON，二者互不影响；`json:"-,"` 的 `-` 只用于 JSON 键名。query 是否存在严格校验取决于 Form 链是否有可绑定字段：
 
 ```go
 type WebhookReq struct {
@@ -106,10 +137,10 @@ func webhook(ctx context.Context, req WebhookReq) (WebhookRes, error) {
 	return WebhookRes{OK: true}, nil
 }
 
-r.POST("/webhook", webhook)
+// 注册：r.POST("/webhook", webhook)
 ```
 
-**语义：嵌入 `KeepRawBody` 的 Req，无论 HTTP 方法，均按 GET / DELETE / HEAD 规则绑定**——只绑定 query 与路径参数，`r.Body` 不被读取，原样留给中间件与 handler（经 `RequestFromContext` 获取）。默认值、`nonzero` 校验、`Validator`、“路径参数 > query”覆盖顺序均不变。
+**语义：嵌入 `KeepRawBody` 的 Req，无论 HTTP 方法，均按 GET / DELETE / HEAD 规则绑定**——只绑定 query 与路径参数，`r.Body` 不被读取，原样留给中间件与 handler（经 `RequestFromContext` 获取）。query 仍严格校验（语法错误或转换失败 400）；默认值、`nonzero` 校验、`Validator`、“路径参数 > query”覆盖顺序均不变。
 
 识别与校验规则：
 
@@ -134,21 +165,42 @@ r.POST("/webhook", webhook)
 若路由注册时使用了 `{name}` / `{name?}` / `{name...}` 路径参数（详见 `routing.md` 中“路由参数”章节），参数值在 query/body 绑定**之后**由 `bindPathParams` 写入 Req，规则如下：
 
 - **参数名即字段绑定名**：按 form > json > 字段名优先级解析，注册阶段预计算绑定关系，参数名无对应字段时注册即 panic。
+- **绑定名唯一性**：注册阶段分别检测 Form 链重复名与 JSON 重复名，任一重复都 panic；匿名嵌入展开后的重复也算。
 - **覆盖语义**：三级覆盖链 **path > body > query**（路径参数是更精确的意图，优先级最高；带 body 方法内部为 body > query，见上节）。
 - **类型由字段声明决定**：复用 `setScalar` 转换，支持 string/bool/int 全系/uint 全系/float/指针与 `time.Time`（时间字段的 `time_format`/`time_location` 标签同样生效，指针形态也是）；目标字段为 slice、map、结构体等其他类型时注册即 panic（时间切片因此不能作路径参数）。
-- **失败语义区别于尽力绑定**：单个参数转换失败立即返回错误（包装为 `BindingError` 返回 400），而非跳过。
+- **失败语义**：某个来源存在可绑定字段并参与绑定后，该来源内 query/form/multipart/path 字段转换失败立即返回 400；JSON body 解码失败同样 400。没有可绑定字段的来源不解析、不校验、不报错。
 - **可选参数省略**：`{name?}` 未出现在请求路径中时不写入字段，保留模板 `default` 值或零值。
 - **通配尾段**：`{name...}` 捕获剩余全部路径（已百分号解码、可含 `/`、不做路径清理）；零段命中（如 `/dify/{rest...}` 收到 `/dify`）时同可选参数省略，不写入字段。
 
 ## 二、字段名解析规则
 
-字段绑定名按以下优先级解析（取标签逗号前的名称部分，如 `name,omitempty` → `name`）：
+### 1. Form 链（query / urlencoded / multipart / path）
 
-1. `form` 标签
-2. `json` 标签
-3. 结构体字段名
+按以下优先级解析：
 
-字段名为空或为 `-` 时跳过该字段；未导出字段（小写开头）跳过。
+1. `form` 标签：`form:"-"` 无条件跳过；普通名字直接使用；
+2. `json` 标签中的**普通名字**作为兼容 fallback；
+3. 结构体字段名。
+
+`json:"-"` 与 `json:"-,"` 是 JSON 专用特殊值，不参与 Form 链命名，Form 链回退结构体字段名。`form:"-"` 只跳过 Form 链，字段仍可被 JSON 绑定。
+
+### 2. JSON body
+
+完全按 `encoding/json`：
+
+- `json:"-"` 跳过；
+- `json:"-,"` 键名为 `-`；
+- 普通 `json:"x"` 键名为 `x`；
+- 无 json 名时使用字段名；
+- `form` 标签不影响 JSON。
+
+### 3. 重复名
+
+Form 链绑定名重复、JSON 名重复都在注册期 panic。Req 定义必须显式无歧义；匿名嵌入展开后的重复也算。
+
+### 4. Req 级读取判定
+
+不存在任何可接收参数的字段时，引擎不读取 body、不解析/校验 query。是否存在可接收字段按**当前请求的来源**判断，具体见第一节的来源投影与下面各节。
 
 上述绑定名作用于 query / 表单 / multipart / 路径参数。JSON 请求体由 `encoding/json` 直接解码，只认 `json` 标签（无 json 名时用字段名，键名大小写不敏感，`json:"-"` 永不绑定），`form` 标签对其无效；例如 `form:"q" json:"keyword"` 的字段在 JSON 中只接受 `keyword`（`KEYWORD` 也可），不接受 `q`。OpenAPI 的 JSON schema 按同一规则命名，见 `openapi.md`。
 
@@ -179,14 +231,16 @@ type Req struct {
 | `[]*multipart.FileHeader` | 多文件上传 |
 | 嵌套结构体 | 仅 JSON 路径支持（`json.Decoder` 递归反序列化）；query/form 路径不递归具名嵌套结构体，但匿名嵌入展开后的字段视为扁平字段处理 |
 
-> **尽力绑定策略**：query/form 单字段类型转换失败时跳过该字段且保持绑定前原值，不会中断整个请求。无默认值的 nil 指针仍为 nil，因此其 `nonzero:"true"` 校验会失败；已有默认值或已有指针值也不会被失败输入覆盖。路径参数转换失败不采用此策略，而是返回 400。
+> **来源参与绑定后严格**：query、urlencoded/multipart body、路径参数的已知字段转换失败立即返回 400；JSON body 解码失败同样 400。不会跳过失败字段或保留旧值。没有可绑定字段的来源完全不解析、不校验。未知参数与不可绑定类型（map/struct/文件等）仍按既有规则忽略。body 不能覆盖或豁免非法 query（仅当 query 来源参与绑定）。无默认值的 nil 指针在字段未传时仍为 nil，因此其 `nonzero:"true"` 校验会失败；已有默认值或已有指针值不会被失败输入覆盖（失败输入现在直接 400）。
+>
+> query/form 参数值**不做 TrimSpace**：标量与切片一致，首尾空格原样保留；`default` 标签值仍按默认值规则 Trim（见第六节）。
 
 ### map 类型绑定
 
 map 类型字段的绑定行为因来源而异：
 
 - **JSON 绑定**：支持 `encoding/json` 能解码的 map 类型，例如 `map[string]any`、`map[string]string`、`map[string]int`、`map[string]*Struct`。JSON 对象键通常需为 string、整数类型或实现标准库支持的文本解码接口；不支持的键值类型会绑定失败并返回 400。
-- **query / form 绑定**：`bindValues` 遍历 `structMeta.fields` 调用 `setFieldValue` → `setScalar`，map 类型不在 switch case 中，被跳过并保持绑定前原值。
+- **query / form 绑定**：`bindValues` 遍历 `structMeta.fields` 调用 `setFieldValue` → `setScalar`，map 类型不在 switch case 中，按不可绑定类型跳过（不算字段转换失败）。
 
 因此，若 handler 的 Req 包含 map 字段，应使用 JSON 请求体，并遵守 `encoding/json` 的可解码类型约束。
 
@@ -198,24 +252,30 @@ map 类型字段的绑定行为因来源而异：
 GET /search?tags=a&tags=b&tags=c   →   Tags []string{"a","b","c"}
 ```
 
+`[]byte` 及底层为 `[]byte` 的命名类型按字节切片绑定：query/form/multipart 传重复的十进制字节参数（如 `data=104&data=101`），JSON 请求体传数字数组（如 `[104,101]`）。默认 JSON 响应由 `encoding/json` 编码为 base64 字符串，这是响应序列化行为，不属于请求绑定。JSON 请求体契约以数字数组为准；`encoding/json` 额外接受 base64 字符串属于标准库宽容行为，不在框架契约内，框架不额外校验或拒绝。
+
 ## 四、time.Time 解析
 
-`time.Time` 字段通过 `time_format` 与 `time_location` 标签控制解析方式。
+`time.Time` 字段通过 `time_format` 与 `time_location` 标签控制解析方式。这两个标签只作用于**表单绑定链路**（query / x-www-form-urlencoded / multipart / path）；JSON 请求体由 `encoding/json` 直接解码，不读取这两个标签，时间字段必须使用 RFC3339 字符串。
 
 ### 支持的时间字段形态
 
-两个标签对所有能被 `setScalar` 写入的时间形态生效，且**逐个元素**应用（切片中每个元素都按同一标签解析）：
+两个标签对表单绑定链路中所有能被 `setScalar` 写入的时间形态生效，且**逐个元素**应用（切片中每个元素都按同一标签解析）：
 
 | 字段形态 | 是否解析标签 | 说明 |
 | --- | --- | --- |
 | `time.Time` | ✅ | 基础形态 |
-| `*time.Time` | ✅ | 任意层指针（如 `**time.Time`）均可，解析后落到最内层值 |
+| `*time.Time` | ✅ | 最多 32 层指针（如 `**time.Time`）均可，解析后落到最内层值；超出按不支持处理（防自引用命名类型） |
 | `[]time.Time` | ✅ | 切片元素逐个解析 |
 | `[]*time.Time` | ✅ | 每个元素分配独立值后解析 |
 | `[][]time.Time`、`*[]time.Time` | ❌ | 绑定链路不支持多层容器与切片指针，标签不生效（注册期不会报错，字段保持绑定前值/零值，不会被写入） |
 | `map[K]time.Time` | ❌ | map 值不参与标量绑定 |
 
+> 时间切片的空字符串元素表示“跳过该元素并保留原位置旧值”（模板/default 或 nil），不会写成零时间；`[]time.Time` 与 `[]*time.Time` 一致。其余类型（如 `[]string`）的空字符串仍按正常值处理。
+
 > 只有"请求侧"会解析时间：Res 结构体不参与绑定，`time.Time` 响应字段由 `encoding/json` 序列化，恒输出 RFC3339 字符串，`time_format`/`time_location` 写在 Res 上不生效。
+>
+> JSON 请求体同样不经过 `setScalar`：`time_format`/`time_location` 不生效，`time.Time` 字段只接受 RFC3339 字符串；`[]time.Time`、`map[K]time.Time` 也按 `encoding/json` 的字符串规则解码。OpenAPI 的 JSON 请求体/响应 schema 因此恒为 `date-time`，只有 query/form/multipart/path 才会按 `unix*` 生成 `integer`。
 
 ### time_format 标签
 
@@ -273,10 +333,15 @@ handler 中通过标准库使用文件：
 
 ```go
 func upload(ctx context.Context, req UploadReq) (Res, error) {
-    if req.File != nil {
-        f, err := req.File.Open()   // 打开文件流
-        // req.File.Filename, req.File.Size ...
+    if req.File == nil {
+        return Res{}, nil
     }
+    f, err := req.File.Open()   // 打开文件流
+    if err != nil {
+        return Res{}, zchttp.NewBindingError(err)
+    }
+    defer f.Close()
+    // 从 f 读取内容；req.File.Filename、req.File.Size 可读
     return Res{}, nil
 }
 ```
@@ -287,15 +352,17 @@ func upload(ctx context.Context, req UploadReq) (Res, error) {
 
 ### default 标签支持范围
 
-`default` 标签仅在以下类型上生效（`isDefaultSupported` 返回 true，`hasDefault` 置为 true）：
+`default` 标签仅在以下类型上生效（`isDefaultSupported` 返回 true），并且**值必须能被运行时解析**才会置 `hasDefault=true`：
 
 - 标量：`string`、`bool`、`int/uint` 全系列、`float32`/`float64`
-- 标量指针：`*string`、`*int`、`*bool` 等（任意层指针，如 `**int`）
+- 标量指针：`*string`、`*int`、`*bool` 等（最多 32 层指针，如 `**int`；超出按不支持处理）
 - 标量切片：`[]string`、`[]int`、`[]*int`、`[]**int` 等（元素必须是标量或标量指针）
+
+> 类型支持不等于值合法：`int` 的 `default:"abc"`、`bool` 的 `default:"yes"`、浮点的 `NaN`/`+Inf`、含非法元素的 `[]int default:"1,x"` 都视为无法解析，注册期输出 `slog.Warn`，`hasDefault=false`，运行时永不填充，OpenAPI 也不展示该 default。标量值按运行时规则先 `TrimSpace`（如 `default:"  x  "` 实际填充 `"x"`）；切片先 TrimSpace 再去除首尾逗号，Trim 后为空视为空切片。
 
 > 指向容器、容器的容器与数组（如 `*[]int`、`[][]int`、`[]*[]int`、`[N]int`）**不在支持范围**：`setFieldValue` 不会展开这些形态，注册期按“不支持类型”告警且永不填充；OpenAPI 也不会为它们展示 `default`（与运行时一致）。
 
-> ⚠️ **误用检测为告警级（非阻断）**：`default` 写在上述范围之外（如 `time.Time`、`map`、`struct`、`*[]int`）或写在请求阶段永不可达的路径上时，注册期仅输出 `slog.Warn` 告警（含路由与 handler 位置），**不会 panic 或拒绝注册**，误用字段将"永不填充默认值"。生产环境若将日志级别调至 Error 则该提示不可见，请保持启动期日志可见并及时关注 Warn 输出。
+> ⚠️ **误用检测为告警级（非阻断）**：`default` 写在上述范围之外（如 `time.Time`、`map`、`struct`、`*[]int`）、值无法解析（如 `int` 的 `"abc"`、`NaN`），或写在请求阶段永不可达的路径上时，注册期仅输出 `slog.Warn` 告警（含路由与 handler 位置），**不会 panic 或拒绝注册**，误用字段将"永不填充默认值"。生产环境若将日志级别调至 Error 则该提示不可见，请保持启动期日志可见并及时关注 Warn 输出。
 
 ### 两阶段填充规则
 
@@ -373,13 +440,16 @@ type OrderReq struct {
 | `Raw` | `map[string]any` | ❌ | 跳过（map 不支持 default） | 跳过 |
 | `Extra` | `any` | ❌ | 跳过（any 不支持 default） | 跳过 |
 
+> 显式 JSON `null` 对指针字段与“未传”在解码后都是 nil，无法区分；存在 `default` 时请求阶段会回填默认值，显式 `null` 不能清除 default。显式零值（如 `&0`、`&""`）不是 nil，不会被回填。
+
 #### 关键要点
 
 1. **`hasDefault=true` 的字段**（标量/标量指针/标量切片）在注册阶段**全部填充**；请求阶段仅**指针类型**的 nil 字段填充，值类型跳过以避免覆盖用户显式传入的零值（如 `{"page": 0}` 不应被改成 `1`）。
 2. **`hasDefault=false` 的容器字段**（struct/map/切片）自身不支持 `default` 标签，但注册阶段会穷尽其内部所有零值字段；请求阶段在绑定创建子元素后，再对 nil 指针子字段补填。
 3. **值 struct 与指针 struct 的关键差异**：`Addr Address` 模板为零值 struct → 注册阶段递归预填子字段；`BillAddr *Address` 模板为 nil → 注册阶段跳过，其子字段默认值仅在请求阶段（JSON 传入后）生效。
-4. **OpenAPI 文档**展示 `default` 的规则与填充保证一致：**指针类型**字段在其所属 struct 可被 `applyDefaults` 到达时展示（`reachedByDefaults` 追踪）；**值类型**字段仅在其所在 struct 被值嵌套可达（顶层或值类型 struct 字段链）时展示（`reachedViaValue` 追踪）。多层容器（如 `map[K][]Struct`）中的 struct 不可达，其指针和值字段的 `default` 均不展示。详见 `openapi.md` 中 decorate 决策矩阵。
+4. **OpenAPI 文档**展示 `default` 的规则与填充保证一致：只有能被运行时解析的 default 才会展示；**指针类型**字段在其所属 struct 可被 `applyDefaults` 到达时展示（`reachedByDefaults` 追踪）；**值类型**字段仅在其所在 struct 被值嵌套可达（顶层或值类型 struct 字段链）时展示（`reachedViaValue` 追踪）。多层容器（如 `map[K][]Struct`）中的 struct 不可达，其指针和值字段的 `default` 均不展示。详见 `openapi.md` 中 decorate 决策矩阵。
 5. **不支持 default 的类型**（`map`、`any`、`*struct`、`[]struct`、`time.Time` 等）设置 `default` 标签无效，`isDefaultSupported` 返回 false，`hasDefault` 恒为 false；字段不会被填充，注册期会输出 `slog.Warn`（Warn 被日志级别过滤时可能不可见）。
+6. **类型支持但值无法解析**（如 `int default:"abc"`、`bool default:"yes"`、`float64 default:"NaN"`、`[]int default:"1,x"`）同样按未设置处理：`hasDefault=false`，注册期告警，运行时与 OpenAPI 都不填充/不展示；`nonzero:"true"` 字段因此仍按必填推断。
 
 ### 注册阶段：模板预填
 
@@ -416,12 +486,14 @@ type Req struct {
 | 场景 | 结果 |
 | --- | --- |
 | 请求**未传递**该字段 | 保留默认值（注册阶段模板预填） |
-| query/form 请求**传递了但解析失败**（如 `page=abc`） | 保持绑定前原值：有 default 时保留默认值，无 default 的 nil 指针仍为 nil |
+| `default` 标签值本身**无法解析** | 注册期告警，按未设置处理：字段保持零值，OpenAPI 不展示该 default；`nonzero:"true"` 时仍按必填处理 |
+| query 或 form/multipart body 字段**传递了但解析失败**（如 `page=abc`、非法转义） | **400**：不保留默认值，body 也不能覆盖豁免 |
+| JSON body 字段类型不匹配 | JSON 解码失败，返回 400 |
 | 请求**传递且解析成功** | 使用请求值（覆盖默认值） |
 
 规则要点：
 
-- 默认值由注册阶段 `applyDefaults` 一次性填充到模板中，请求时浅拷贝获得带默认值的实例。
+- 默认值由注册阶段 `applyDefaults` 一次性填充到模板中，请求时浅拷贝获得带默认值的实例；只有 `hasDefault=true`（类型支持且值可解析）的字段参与填充。
 - 若模板中存在非 nil 的指针/切片/map 字段（`needsDeepCopy` 为 true），请求时会先执行 `deepCopyDefaults` 断开共享引用，再执行绑定覆盖。
 - 显式传递等于零值的值（如 `page=0`、`active=false`）在顶层字段中会被正确保留（模板预填后被 JSON 覆盖）；在嵌套容器（slice/map 元素）中，值类型字段若用户传了零值，该零值也会被保留——请求阶段仅填充 nil 指针，不处理值类型，因此不会用默认值覆盖用户的零值输入。
 - 切片默认值以逗号分隔（如 `default:"a,b,c"`）。Trim 后为空（`default:""`、`default:" "`、`default:",,,"`）视为**空切片** `[]`，而非含单个空元素的切片 `[""]`。逗号是分隔符、无转义机制，元素值本身不能包含逗号。

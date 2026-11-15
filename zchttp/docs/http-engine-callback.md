@@ -37,7 +37,10 @@ type HttpEngine struct {
 ```go
 // 将引擎设置为 server 的 Handler 并调用 ListenAndServe 启动监听；
 // 不包含优雅关闭逻辑，需要时由调用方自行管理所传入的 *http.Server（如 Shutdown）
-func (e *HttpEngine) Run(server *http.Server) error
+func (e *HttpEngine) Run(server *http.Server) error {
+    server.Handler = e
+    return server.ListenAndServe()
+}
 ```
 
 ## 二、统一 JSON 结构与默认回调
@@ -68,7 +71,10 @@ type Response struct {
 
 ```go
 // 判断请求头 Accept 是否包含 text/html 或 text/plain
-func WantHtml(r *http.Request) bool
+func WantHtml(r *http.Request) bool {
+    accept := r.Header.Get("Accept")
+    return strings.Contains(accept, "text/html") || strings.Contains(accept, "text/plain")
+}
 ```
 
 `DefaultErrorHandler`、`DefaultValidationErrorHandler`、`DefaultNotFoundHandler` 与 `DefaultPanicHandler` 均依据它选择响应格式：
@@ -104,8 +110,11 @@ func DefaultPanicHandler(w http.ResponseWriter, r *http.Request, recovered any) 
         "error", recovered,
         "stack", string(stack),
     )
-    // 若响应未写入，返回 500
-    ...
+    // 若响应未写入，返回 500；响应体按 WantHtml 选择 HTML/JSON（此处省略）
+    if IsResponseWritten(w) {
+        return
+    }
+    w.WriteHeader(http.StatusInternalServerError)
 }
 ```
 
@@ -153,54 +162,65 @@ func download(ctx context.Context, req Req) (Res, error) {
 ### 统一响应包装
 
 ```go
-engine := zchttp.NewEngine()
-engine.OnResponse = func(w http.ResponseWriter, r *http.Request, res any) {
-    w.Header().Set("Content-Type", "application/json")
-    _ = json.NewEncoder(w).Encode(map[string]any{
-        "code": 0,
-        "data": res,
-    })
+func example() {
+    engine := zchttp.NewEngine()
+    engine.OnResponse = func(w http.ResponseWriter, r *http.Request, res any) {
+        w.Header().Set("Content-Type", "application/json")
+        _ = json.NewEncoder(w).Encode(map[string]any{
+            "code": 0,
+            "data": res,
+        })
+    }
 }
 ```
 
 ### 自定义校验失败响应（如返回业务错误码）
 
 ```go
-engine.OnValidationError = func(w http.ResponseWriter, r *http.Request, err error) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusBadRequest)
-    _ = json.NewEncoder(w).Encode(map[string]any{
-        "code": 1001,
-        "msg":  err.Error(),
-    })
+func example() {
+    engine := zchttp.NewEngine()
+    engine.OnValidationError = func(w http.ResponseWriter, r *http.Request, err error) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusBadRequest)
+        _ = json.NewEncoder(w).Encode(map[string]any{
+            "code": 1001,
+            "msg":  err.Error(),
+        })
+    }
 }
 ```
 
 ### 自定义错误响应
 
 ```go
-engine.OnError = func(w http.ResponseWriter, r *http.Request, err error) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusBadRequest)
-    _ = json.NewEncoder(w).Encode(map[string]any{
-        "code": 1,
-        "msg":  err.Error(),
-    })
+func example() {
+    engine := zchttp.NewEngine()
+    engine.OnError = func(w http.ResponseWriter, r *http.Request, err error) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusBadRequest)
+        _ = json.NewEncoder(w).Encode(map[string]any{
+            "code": 1,
+            "msg":  err.Error(),
+        })
+    }
 }
 ```
 
 ### 自定义 panic 响应
 
 ```go
-engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
-    // 自定义 panic 告警（如发送到监控系统）
-    alertSystem.Send("panic", recovered)
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusInternalServerError)
-    _ = json.NewEncoder(w).Encode(map[string]any{
-        "code": 500,
-        "msg":  "internal server error",
-    })
+func example() {
+    engine := zchttp.NewEngine()
+    engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
+        // 自定义 panic 告警（如发送到监控系统）
+        alertSystem.Send("panic", recovered)
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusInternalServerError)
+        _ = json.NewEncoder(w).Encode(map[string]any{
+            "code": 500,
+            "msg":  "internal server error",
+        })
+    }
 }
 ```
 
@@ -222,6 +242,8 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 ## 八、在 handler 与中间件中获取上下文资源
 
 handler 的签名固定为 `func(ctx context.Context, req Req) (Res, error)`，不直接暴露 `*http.Request`、`http.ResponseWriter` 与 `*HttpEngine`。引擎在 `ServeHTTP` 中已将三者注入 `ctx`，可通过以下方法获取：
+
+以下为 API 签名（非完整实现）：
 
 ```go
 func RequestFromContext(ctx context.Context) (*http.Request, bool)

@@ -185,18 +185,25 @@ func recoverError(ctx context.Context, w http.ResponseWriter, r *http.Request, n
 
 `HttpEngine.ServeHTTP` 内置 `defer recover`，捕获 handler 或中间件中的 panic，交由 `OnPanic` 回调处理（默认 `DefaultPanicHandler`）。中间件无需自行处理 panic，引擎层已覆盖；回调收到最近一次成功传给 `next` 的 w/r：
 
+默认处理逻辑由引擎内部调用（签名示意）：
+
 ```go
-// 默认 panic 处理：输出 slog.Error + 堆栈，返回 500 错误；
-// 若响应已写入（IsResponseWritten）则跳过，避免重复写头；支持 HTML 格式（WantHtml）
-DefaultPanicHandler(w, r, recovered)
+func example(w http.ResponseWriter, r *http.Request, recovered any) {
+    // 输出 slog.Error + 堆栈，返回 500 错误；
+    // 若响应已写入（IsResponseWritten）则跳过，避免重复写头；支持 HTML 格式（WantHtml）
+    DefaultPanicHandler(w, r, recovered)
+}
 ```
 
 自定义 panic 处理：
 
 ```go
-engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
-    slog.Default().Error("panic", "recovered", recovered)
-    w.WriteHeader(http.StatusInternalServerError)
+func example() {
+    engine := zchttp.NewEngine()
+    engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
+        slog.Default().Error("panic", "recovered", recovered)
+        w.WriteHeader(http.StatusInternalServerError)
+    }
 }
 ```
 
@@ -207,11 +214,13 @@ engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
 中间件通过 `Use(...)` 注册，分为全局与分组两级：
 
 ```go
-r := zchttp.NewRouter()
-r.Use(logger, recoverError)         // 全局中间件
+func example() {
+    r := zchttp.NewRouter()
+    r.Use(logger, recoverError)         // 全局中间件
 
-api := r.Group("/api", authMiddleware)   // 分组中间件
-api.GET("/users", listUsers)
+    api := r.Group("/api", authMiddleware)   // 分组中间件
+    api.GET("/users", listUsers)
+}
 ```
 
 关键规则：
@@ -232,7 +241,9 @@ func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next Ne
     return err
 }
 
-r := zchttp.NewRouter()
-r.Use(logger)
-r.GET("/ping", pingHandler)
+func example() {
+    r := zchttp.NewRouter()
+    r.Use(logger)
+    r.GET("/ping", pingHandler)
+}
 ```
