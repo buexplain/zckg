@@ -177,13 +177,13 @@ go test ./...
 
 | 模块       | 覆盖率   |
 |----------|-------|
-| zcconfig | 99.4% |
+| zcconfig | 99.5% |
 | zcdb     | 98.8% |
-| zchttp   | 99.6% |
-| zcmodel  | 98.4% |
+| zchttp   | 99.7% |
+| zcmodel  | 98.3% |
 | zcquit   | 98.3% |
 
-> 语句覆盖率（2026-10-17 实测），运行 `go test ./... -cover` 复现（zcdb 集成测试在数据库可达时计入）。
+> 语句覆盖率（2026-11-15 实测），运行 `go test ./... -cover` 复现（zcdb 集成测试在数据库可达时计入）。
 
 本地准备 MySQL / PostgreSQL 测试环境：
 
