@@ -77,6 +77,8 @@ func mergeMap(dst, src map[string]any) {
 // Config 从业务配置存储中按 key 查找值，转换为 T 类型返回。
 // key 支持用 "." 做分隔符，按层级递归查找嵌套的 map[string]any{}。
 // 例如 key 为 "app.database.host" 时，依次查找 configData["app"]["database"]["host"]。
+// "." 一律作为分隔符、无法转义：注册在 map 里、字面含 "." 的 key 无法按路径读到；
+// 空路径段（如 "app."）按空字符串键查找。
 //
 // 行为约定：
 //   - key 不存在（任一层级缺少节点）时返回默认值 def；
@@ -134,7 +136,7 @@ func ConfigAll() map[string]any {
 // 主要用于测试场景下的状态重置。
 func reset() {
 	envMu.Lock()
-	envData = make(map[string]any)
+	envData = make(map[string]string)
 	envMu.Unlock()
 
 	configMu.Lock()

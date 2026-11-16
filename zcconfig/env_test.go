@@ -3,10 +3,10 @@ package zcconfig
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -215,6 +215,8 @@ func TestEnv_OsEnvFallbackConversion(t *testing.T) {
 	})
 }
 
+// TestEnvAll 验证零拷贝返回的是内部存储（map[string]string），
+// 装载阶段不做类型推断，数字字面量保留为原文。
 func TestEnvAll(t *testing.T) {
 	resetForTest(t)
 	content := "A=1\nB=hello\n"
@@ -224,16 +226,17 @@ func TestEnvAll(t *testing.T) {
 	if len(all) != 2 {
 		t.Errorf("期望 2 个 key，实际 %d", len(all))
 	}
-	if v, ok := all["A"]; !ok || v != 1 {
-		t.Errorf("期望 A=1，实际 %v", v)
+	if v, ok := all["A"]; !ok || v != "1" {
+		t.Errorf("期望 A=\"1\"（原文），实际 %v", v)
 	}
 	if v, ok := all["B"]; !ok || v != "hello" {
-		t.Errorf("期望 B=hello，实际 %v", v)
+		t.Errorf("期望 B=\"hello\"，实际 %v", v)
 	}
 }
 
-// .env 中 "1"/"0" 被 parseValue 推断为 int，经 cast 数值→bool 特判转为 bool
-func TestEnv_BoolFromIntString(t *testing.T) {
+// TestEnv_BoolFromLiteralOneZero 验证 .env 中 "1"/"0" 作为文本由 strconv.ParseBool 解析为 bool，
+// 与 OS 通道同一条解析路径（装载阶段不再把 1/0 推断为 int）。
+func TestEnv_BoolFromLiteralOneZero(t *testing.T) {
 	resetForTest(t)
 	content := "BOOL_ONE=1\nBOOL_ZERO=0\n"
 	loadTestEnv(t, content)
@@ -286,7 +289,7 @@ func TestLoadEnv_FileNotFound(t *testing.T) {
 	}
 }
 
-// ZCC-03/04：单行超过 1MB 上限应返回 bufio.ErrTooLong，且错误信息包含文件路径
+// TestLoadEnv_LineTooLong 验证单行超过 1MB 上限时返回 bufio.ErrTooLong，且错误信息包含文件路径
 func TestLoadEnv_LineTooLong(t *testing.T) {
 	resetForTest(t)
 	longVal := strings.Repeat("a", 1024*1024+1)
@@ -300,6 +303,43 @@ func TestLoadEnv_LineTooLong(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), path) {
 		t.Errorf("错误信息期望包含文件路径 %q，实际 %q", path, err.Error())
+	}
+}
+
+// TestLoadEnv_LineLimitBoundary 锁死扫描上限的确切边界：
+// 单行内容为 1MB-1 字节时可加载；达到 1MB 即返回 bufio.ErrTooLong，
+// 且文件末尾是否有换行符不影响该边界（bufio.Scanner 的上限是 token 长度，不是“行+换行符”）。
+func TestLoadEnv_LineLimitBoundary(t *testing.T) {
+	const mb = 1024 * 1024
+
+	t.Run("below_limit_with_newline", func(t *testing.T) {
+		resetForTest(t)
+		value := strings.Repeat("a", mb-3) // 行内容 = "K=" + value = 1MB-1 字节
+		loadTestEnv(t, "K="+value+"\n")
+		if got := len(Env("K", "")); got != len(value) {
+			t.Errorf("期望读到 %d 字节，实际 %d", len(value), got)
+		}
+	})
+
+	for _, trailingNewline := range []bool{true, false} {
+		name := "at_limit_with_newline"
+		if !trailingNewline {
+			name = "at_limit_without_newline"
+		}
+		t.Run(name, func(t *testing.T) {
+			resetForTest(t)
+			content := "K=" + strings.Repeat("a", mb-2) // 行内容恰好 1MB
+			if trailingNewline {
+				content += "\n"
+			}
+			err := LoadEnv(writeTestFile(t, content))
+			if err == nil {
+				t.Fatalf("单行达到 1MB 期望返回错误")
+			}
+			if !errors.Is(err, bufio.ErrTooLong) {
+				t.Errorf("期望 errors.Is(err, bufio.ErrTooLong)，实际 %v", err)
+			}
+		})
 	}
 }
 
@@ -382,12 +422,12 @@ func TestLoadEnv_BOMIndentedFirstLine(t *testing.T) {
 			for _, tt := range []struct {
 				name  string
 				first string
-				want  map[string]any
+				want  map[string]string
 			}{
-				{"export", "ExPoRt \tFIRST=ok", map[string]any{"FIRST": "ok", "SECOND": "kept"}},
-				{"comment", "# COMMENT=must_not_load", map[string]any{"SECOND": "kept"}},
-				{"key", "FIRST=ok", map[string]any{"FIRST": "ok", "SECOND": "kept"}},
-				{"blank", "", map[string]any{"SECOND": "kept"}},
+				{"export", "ExPoRt \tFIRST=ok", map[string]string{"FIRST": "ok", "SECOND": "kept"}},
+				{"comment", "# COMMENT=must_not_load", map[string]string{"SECOND": "kept"}},
+				{"key", "FIRST=ok", map[string]string{"FIRST": "ok", "SECOND": "kept"}},
+				{"blank", "", map[string]string{"SECOND": "kept"}},
 			} {
 				t.Run(leading.name+"/"+indent.name+"/"+tt.name, func(t *testing.T) {
 					resetForTest(t)
@@ -415,7 +455,7 @@ func TestEnv_NilInterfaceDefKeyExistsPanics(t *testing.T) {
 	})
 }
 
-// TestEnv_NamedBoolConversion 验证 .env 推断的数值与布尔值、OS 字符串均可转换为具名 bool。
+// TestEnv_NamedBoolConversion 验证 .env 文本与 OS 字符串均可转换为具名 bool。
 func TestEnv_NamedBoolConversion(t *testing.T) {
 	type Flag bool
 	for _, source := range []string{"file", "os"} {
@@ -463,70 +503,186 @@ func TestEnv_NamedStringConversion(t *testing.T) {
 	}
 }
 
-// TestEnv_DurationUnits 验证原始或带引号的 30 搭配 5s 默认值仍为 30ns，显式 30s 才是秒。
+// TestEnv_DurationUnits 验证 .env 文本必须带时间单位才能读取为 time.Duration：
+// "30s" 得到 30 秒；裸数字 "30"（含带引号形式）缺少单位，属类型不符 panic，
+// 不会像改动前那样被推断为 int 后静默转成 30ns。
 func TestEnv_DurationUnits(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		input string
-		want  time.Duration
 	}{
-		{"raw_number", "30", 30 * time.Nanosecond},
-		{"double_quoted_number", `"30"`, 30 * time.Nanosecond},
-		{"single_quoted_number", "'30'", 30 * time.Nanosecond},
-		{"explicit_seconds", "30s", 30 * time.Second},
+		{"raw_number", "30"},
+		{"double_quoted_number", `"30"`},
+		{"single_quoted_number", "'30'"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			resetForTest(t)
 			const key = "ZCCONFIG_DURATION_UNITS"
 			loadTestEnv(t, key+"="+tt.input+"\n")
-			if got := Env(key, 5*time.Second); got != tt.want {
-				t.Errorf("Env 值 %q 配默认 5s 期望 %v，实际 %v", tt.input, tt.want, got)
+			assertTypeMismatchPanic(t, key, reflect.TypeFor[time.Duration](), reflect.TypeFor[string](), func() {
+				Env(key, 5*time.Second)
+			})
+		})
+	}
+
+	t.Run("explicit_seconds", func(t *testing.T) {
+		resetForTest(t)
+		const key = "ZCCONFIG_DURATION_UNITS"
+		loadTestEnv(t, key+"=30s\n")
+		if got := Env(key, 5*time.Second); got != 30*time.Second {
+			t.Errorf("Env 值 %q 配默认 5s 期望 30s，实际 %v", "30s", got)
+		}
+	})
+}
+
+// --- 装载侧不做类型推断：原文保留、通道差分、有损字面量 fail-fast ---
+
+// envReadResult 描述一次 Env[T] 读取的可比较结果：成功值，或 panic 的 *TypeMismatchError 诊断类型。
+// 不比较错误消息，因为消息内含 key，而差分用例的两条通道使用不同 key。
+type envReadResult struct {
+	value    string
+	panicked bool
+	expected reflect.Type
+	actual   reflect.Type
+}
+
+// readEnvOutcome 执行一次读取并归一为 envReadResult，供两条通道逐项比对。
+func readEnvOutcome[T any](f func() T) (res envReadResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			res.panicked = true
+			var mismatch *TypeMismatchError
+			if err, ok := r.(error); ok && errors.As(err, &mismatch) {
+				res.expected = mismatch.Expected
+				res.actual = mismatch.Actual
 			}
+		}
+	}()
+	res.value = fmt.Sprint(f())
+	return res
+}
+
+// assertEnvChannelParity 断言同一字面量经 .env 与 OS 环境变量两条通道读取为 T 时结果完全一致
+// （同成功且值相等，或同 panic 且期望/实际类型相等）。
+func assertEnvChannelParity[T any](t *testing.T, fileKey, osKey string, def T) {
+	t.Helper()
+	fileRes := readEnvOutcome(func() T { return Env(fileKey, def) })
+	osRes := readEnvOutcome(func() T { return Env(osKey, def) })
+	if fileRes != osRes {
+		t.Errorf("key %q/%q 通道不一致：.env=%+v，OS=%+v", fileKey, osKey, fileRes, osRes)
+	}
+}
+
+// TestEnv_ChannelParity 是本模块的权威差分用例：同一字面量分别经 .env 文件与 OS 环境变量作为存储来源，
+// 对每个目标类型的读取结果（成功值或 panic 的诊断类型）必须完全一致。
+// 权威依据：两条通道的存储值都是文本，Env[T] 只在读取侧解析；os.LookupEnv 天然提供纯文本源。
+// .env 通道一次性加载全部字面量；OS 通道用 t.Setenv（含 t.Setenv 的用例不得 t.Parallel）。
+func TestEnv_ChannelParity(t *testing.T) {
+	resetForTest(t)
+	literals := []string{
+		"123", "-1", "200", "99.99", "1e3", "007", "+5", "true", "2", "1", "0",
+		"10s", "1h30m", "abc", "hello", "1.0", "99999999999999999999",
+	}
+
+	var content strings.Builder
+	for i, literal := range literals {
+		fmt.Fprintf(&content, "ZCCONFIG_PARITY_FILE_%d=%s\n", i, literal)
+	}
+	loadTestEnv(t, content.String())
+	for i, literal := range literals {
+		t.Setenv(fmt.Sprintf("ZCCONFIG_PARITY_OS_%d", i), literal)
+	}
+
+	for i, literal := range literals {
+		fileKey := fmt.Sprintf("ZCCONFIG_PARITY_FILE_%d", i)
+		osKey := fmt.Sprintf("ZCCONFIG_PARITY_OS_%d", i)
+		t.Run(fmt.Sprintf("literal_%d_%s", i, literal), func(t *testing.T) {
+			assertEnvChannelParity(t, fileKey, osKey, "")
+			assertEnvChannelParity(t, fileKey, osKey, 0)
+			assertEnvChannelParity(t, fileKey, osKey, int8(0))
+			assertEnvChannelParity(t, fileKey, osKey, int64(0))
+			assertEnvChannelParity(t, fileKey, osKey, uint(0))
+			assertEnvChannelParity(t, fileKey, osKey, float32(0))
+			assertEnvChannelParity(t, fileKey, osKey, 0.0)
+			assertEnvChannelParity(t, fileKey, osKey, false)
+			assertEnvChannelParity(t, fileKey, osKey, time.Duration(0))
 		})
 	}
 }
 
-func TestParseValue_LargeInteger(t *testing.T) {
-	// 超大整数应保留为 string，不应降级为 float64
-	v := parseValue("99999999999999999999")
-	if _, ok := v.(string); !ok {
-		t.Errorf("超大整数期望保留为 string，实际类型 %T", v)
+// TestEnv_RawTextPreserved 验证装载阶段不再推断类型：数字/布尔字面量以 string 读取时返回文件原文
+// （含前导零、尾随零、指数、大写布尔、正负号），且 EnvAll 的 value 全部为 string。
+func TestEnv_RawTextPreserved(t *testing.T) {
+	resetForTest(t)
+	loadTestEnv(t, "ZERO_PAD=007\nTRAIL_ZERO=1.50\nEXPONENT=1e3\nUPPER_TRUE=TRUE\nPLUS=+5\nNEG_ZERO=-0\nQUOTED=\"123\"\n")
+
+	want := map[string]string{
+		"ZERO_PAD":   "007",
+		"TRAIL_ZERO": "1.50",
+		"EXPONENT":   "1e3",
+		"UPPER_TRUE": "TRUE",
+		"PLUS":       "+5",
+		"NEG_ZERO":   "-0",
+		"QUOTED":     "123",
 	}
-	// 带小数点或指数的值仍应解析为 float64
-	if f := parseValue("1.5"); f != 1.5 {
-		t.Errorf("parseValue(\"1.5\") 期望 1.5，实际 %v", f)
+	for key, wantVal := range want {
+		// 默认值带不可能出现的空格，防止“返回默认值”被误判为读取成功
+		if got := Env(key, " fallback "); got != wantVal {
+			t.Errorf("Env(%q, string) 期望原文 %q，实际 %q", key, wantVal, got)
+		}
 	}
-	if f := parseValue("1e100"); f != 1e100 {
-		t.Errorf("parseValue(\"1e100\") 期望 1e100，实际 %v", f)
+
+	all := EnvAll()
+	if len(all) != len(want) {
+		t.Fatalf("EnvAll 期望 %d 个 key，实际 %d：%v", len(want), len(all), all)
+	}
+	for key, wantVal := range want {
+		got, ok := all[key]
+		if !ok {
+			t.Errorf("EnvAll 缺少 key %q", key)
+			continue
+		}
+		if got != wantVal {
+			t.Errorf("EnvAll[%q] 期望原文 %q，实际 %q", key, wantVal, got)
+		}
 	}
 }
 
-// TestParseValue_IntBoundary 验证整型推断按平台 int 位宽（strconv.IntSize）解析：
-// 平台范围内的最大值解析为 int；超出范围的值保持 string，不静默截断。
-// 测试按 strconv.IntSize 动态取边界，在 32 位/64 位平台上均可通过。
-func TestParseValue_IntBoundary(t *testing.T) {
-	var maxIntStr, overflowStr string
-	if strconv.IntSize == 64 {
-		maxIntStr = "9223372036854775807"
-		overflowStr = "9223372036854775808"
-	} else {
-		maxIntStr = "2147483647"
-		overflowStr = "2147483648"
-	}
+// TestEnv_LossyLiteralFailFast 验证改动前因装载侧类型推断而被静默接受的字面量，
+// 现在一律 panic(*TypeMismatchError)：窄化溢出、无符号负数、float→int 截断、
+// 裸数字当作 time.Duration、非法 bool 字面量。改动前这些行分别得到 -56 / 18446744073709551615 / 99 / 30ns / true。
+func TestEnv_LossyLiteralFailFast(t *testing.T) {
+	resetForTest(t)
+	loadTestEnv(t, "OUT_OF_RANGE=200\nNEGATIVE=-1\nFRACTION=99.99\nNO_UNIT=30\nBOOL_TWO=2\n")
 
-	// 平台 int 最大值：解析为 int 且无截断
-	v := parseValue(maxIntStr)
-	n, ok := v.(int)
-	if !ok {
-		t.Fatalf("parseValue(%q) 期望解析为 int，实际类型 %T", maxIntStr, v)
-	}
-	if strconv.FormatInt(int64(n), 10) != maxIntStr {
-		t.Errorf("parseValue(%q) 期望 %s，实际 %d（截断）", maxIntStr, maxIntStr, n)
-	}
+	assertTypeMismatchPanic(t, "OUT_OF_RANGE", reflect.TypeFor[int8](), reflect.TypeFor[string](), func() {
+		Env("OUT_OF_RANGE", int8(0))
+	})
+	assertTypeMismatchPanic(t, "NEGATIVE", reflect.TypeFor[uint](), reflect.TypeFor[string](), func() {
+		Env("NEGATIVE", uint(0))
+	})
+	assertTypeMismatchPanic(t, "FRACTION", reflect.TypeFor[int](), reflect.TypeFor[string](), func() {
+		Env("FRACTION", 0)
+	})
+	assertTypeMismatchPanic(t, "NO_UNIT", reflect.TypeFor[time.Duration](), reflect.TypeFor[string](), func() {
+		Env("NO_UNIT", time.Second)
+	})
+	assertTypeMismatchPanic(t, "BOOL_TWO", reflect.TypeFor[bool](), reflect.TypeFor[string](), func() {
+		Env("BOOL_TWO", false)
+	})
+}
 
-	// 超出平台 int 范围：保持 string（32 位平台不截断为负值/零值）
-	v = parseValue(overflowStr)
-	if _, ok := v.(string); !ok {
-		t.Errorf("parseValue(%q) 期望保持 string，实际类型 %T（发生了截断）", overflowStr, v)
+// TestEnv_LargeIntegerText 验证超出 int64 的整数不再被推断或截断：
+// 文本读取完整保留（与 OS 通道一致），整数读取按 strconv 规则失败并 panic。
+func TestEnv_LargeIntegerText(t *testing.T) {
+	resetForTest(t)
+	const literal = "99999999999999999999"
+	loadTestEnv(t, "BIG="+literal+"\n")
+
+	if got := Env("BIG", ""); got != literal {
+		t.Errorf("Env(BIG, string) 期望原文 %q，实际 %q", literal, got)
 	}
+	assertTypeMismatchPanic(t, "BIG", reflect.TypeFor[int](), reflect.TypeFor[string](), func() {
+		Env("BIG", 0)
+	})
 }
