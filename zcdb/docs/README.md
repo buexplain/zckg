@@ -35,7 +35,6 @@ func example() {
 | 每个 API 的签名、SQL、边界与错误 | [reference/](reference/) 下的分文件参考 |
 | 分页、事务、动态条件、UPSERT 等任务写法 | [how-to/](how-to/) |
 | 旧版本升级与破坏性变更 | [migration/breaking-changes.md](migration/breaking-changes.md) |
-| 模块行为的历史审查记录 | [consistency-review.md](consistency-review.md)、[consistency-review-20261116.md](consistency-review-20261116.md) |
 
 ## 四层模型
 
