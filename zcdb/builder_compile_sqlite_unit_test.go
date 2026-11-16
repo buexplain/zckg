@@ -229,7 +229,7 @@ func TestSQLiteGrammar_WriteOrderLimitRejected(t *testing.T) {
 	})
 }
 
-// TestSQLiteGrammar_ExpressionPlaceholderBoundary 锁死 compile.md「占位符边界」矩阵在 SQLite 的形态：
+// TestSQLiteGrammar_ExpressionPlaceholderBoundary 锁死 reference/builder-compile.md「占位符边界」矩阵在 SQLite 的形态：
 // Expression 内嵌的 `?` 在所有路径都原样保留（SQLite 没有 $N 转换），且 Expression 不新增绑定参数。
 func TestSQLiteGrammar_ExpressionPlaceholderBoundary(t *testing.T) {
 	expr := NewExpression("a ? b")

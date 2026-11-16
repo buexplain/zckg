@@ -352,7 +352,8 @@ func (b *Builder) validateWriteBuilder() error {
 
 // hasEffectiveWhere 判断 WHERE 是否实际收窄了操作范围：
 // 按 SQL 优先级（AND 先于 OR）把条件静态归约为恒真/恒假/未知，仅「未知」与「恒假」计为有效限定。
-// 空嵌套组、空 WhereRaw 编译时被跳过，不计入；空 WhereNotIn（编译为 1 = 1）与
+// 空嵌套组与空字符串 WhereRaw 不计入；纯空白 WhereRaw 在保护判定中同样不计入，
+// 但它在 WHERE 编译阶段仍会输出空白条件（SQL 非法），不要依赖保护判定「跳过」它；空 WhereNotIn（编译为 1 = 1）与
 // 子查询无有效条件的 EXISTS/NOT EXISTS 不按行收窄，计为恒真；空 WhereIn（0 = 1）计为恒假。
 // 因此普通条件与空 WhereNotIn 形成的 OR 恒真组合同样被拒绝。
 func (b *Builder) hasEffectiveWhere() bool {

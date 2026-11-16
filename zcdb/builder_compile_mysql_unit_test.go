@@ -298,7 +298,7 @@ func TestMySQLGrammar_WriteOrderLimit(t *testing.T) {
 	})
 }
 
-// TestMySQLGrammar_ExpressionPlaceholderBoundary 锁死 compile.md「占位符边界」矩阵在 MySQL 的形态：
+// TestMySQLGrammar_ExpressionPlaceholderBoundary 锁死 reference/builder-compile.md「占位符边界」矩阵在 MySQL 的形态：
 // Expression 内嵌的 `?` 在所有路径（WHERE/HAVING/IN/LIKE/NULL 安全比较、Raw 绑定、JOIN ON 值、
 // UPDATE SET、INSERT VALUES）都原样保留（MySQL 没有 $N 转换），且 Expression 不新增绑定参数。
 func TestMySQLGrammar_ExpressionPlaceholderBoundary(t *testing.T) {

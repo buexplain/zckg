@@ -242,7 +242,7 @@ type exprPlaceholderCase struct {
 }
 
 // runExpressionPlaceholderCases 执行 Expression `?` 边界用例，供三方言的编译单测共用。
-// 用例覆盖 compile.md「占位符边界」小节列出的全部路径：WHERE/HAVING/IN/LIKE/NULL 安全比较、
+// 用例覆盖 reference/builder-compile.md「占位符边界」小节列出的全部路径：WHERE/HAVING/IN/LIKE/NULL 安全比较、
 // Raw 绑定（WhereRaw/HavingRaw/GroupByRaw/JoinBuilder.Raw）、JOIN ON 值、UPDATE SET、INSERT VALUES。
 func runExpressionPlaceholderCases(t *testing.T, g Grammar, cases []exprPlaceholderCase) {
 	t.Helper()

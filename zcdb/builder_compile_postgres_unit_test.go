@@ -178,7 +178,7 @@ func TestPostgresGrammar_InsertGetIdUnsupported(t *testing.T) {
 	}
 }
 
-// TestPostgresGrammar_ExpressionPlaceholderBoundary 锁死 compile.md「占位符边界」矩阵在 PostgreSQL 的形态：
+// TestPostgresGrammar_ExpressionPlaceholderBoundary 锁死 reference/builder-compile.md「占位符边界」矩阵在 PostgreSQL 的形态：
 // WHERE/HAVING/IN/LIKE/NULL 安全比较与 Raw 绑定中的 `?` 原样保留（成为非法占位符）；
 // UPDATE SET 与 JOIN ON 值比较会把 `?` 转成 `$N` 并占用编号（Expression 本身仍不新增绑定参数，
 // 因此 $N 没有配对参数——这正是文档要求「不要在 Expression 中使用 ?」的原因）。

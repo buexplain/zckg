@@ -52,7 +52,7 @@ func (b *Builder) Limit(n int) *Builder {
 	return b
 }
 
-// Offset 设置查询结果偏移量。n<=0 时不输出；n>0 且未设置 Limit 时，
+// Offset 设置查询结果偏移量。n<=0 时不输出；n>0 且 Limit 未设置或 <=0（两者都不输出 LIMIT）时，
 // MySQL 自动补 LIMIT 18446744073709551615、SQLite 自动补 LIMIT -1（两方言要求 OFFSET
 // 与 LIMIT 同时出现），PostgreSQL 直接输出 OFFSET。
 //

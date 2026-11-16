@@ -157,7 +157,8 @@ func (b *Builder) Primary() *Builder {
 // Force 全表操作标记、强制主库标记与注释（含显式清空）；副本上继续链式修改不会影响原 Builder，反之亦然。
 // 绑定值本身（Value/Min/Max 及 Bindings 元素，类型为 any）不做深拷贝：若传入切片、map 或指针，
 // 副本与原 Builder 共享同一份底层数据；编译与执行不会修改它们，因此无需复制。
-// First/Value/Paginate/CursorBy 等终端方法内部即用 Clone 避免污染调用方的 Builder。
+// First/Value/CursorBy 等终端方法内部即用 Clone 避免污染调用方的 Builder；
+// Paginate 不克隆，它经 ToCount 的临时状态保存/恢复复用原 Builder（见 builder_query.go）。
 // 若子查询图存在环（自引用/互引用，如 TableSub/Union 传入自身），深拷贝会无限递归，
 // 此时返回携带 ErrCyclicQuery 的副本（经后续编译方法报错）而非递归崩溃；
 // 子 Builder 携带累积错误时同样返回携带该错误的副本。

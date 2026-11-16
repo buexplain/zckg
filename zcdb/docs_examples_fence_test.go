@@ -16,7 +16,8 @@ import (
 )
 
 // minDocsGoBlocks 是当前文档的 Go 块数量下限，用于发现「提取规则失效导致零提取」的假通过。
-const minDocsGoBlocks = 90
+// 分层文档（concepts/reference/how-to/migration）当前约 210 个 Go 块，取 150 留出正常增删余量。
+const minDocsGoBlocks = 150
 
 var (
 	goFenceStartRE = regexp.MustCompile("^```go\\b")
@@ -24,14 +25,28 @@ var (
 	placeholderRE  = regexp.MustCompile(`^\s*\.\.\.\s*$|\{\s*\.\.\.\s*\}`)
 )
 
-// TestDocsGoBlockSyntax 逐个校验 docs/*.md 的 Go 代码块可被 Go 语法解析（不要求编译）。
+// TestDocsGoBlockSyntax 逐个校验 docs/ 下（含子目录）Markdown 的 Go 代码块可被 Go 语法解析（不要求编译）。
 func TestDocsGoBlockSyntax(t *testing.T) {
-	files, err := filepath.Glob(filepath.Join("docs", "*.md"))
+	var files []string
+	err := filepath.WalkDir("docs", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+		// 审查报告不是用户文档，不参与示例门禁。
+		if strings.HasPrefix(filepath.Base(path), "consistency-review") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("枚举 docs/*.md 失败: %v", err)
+		t.Fatalf("枚举 docs 失败: %v", err)
 	}
 	if len(files) == 0 {
-		t.Fatal("未找到 docs/*.md")
+		t.Fatal("未找到 docs 下的 Markdown 文档")
 	}
 	total := 0
 	for _, file := range files {

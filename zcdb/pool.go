@@ -14,7 +14,7 @@ const defaultConnectTimeout = 5 * time.Second
 
 // Pool 数据库连接池，封装主从 *sql.DB 的创建和配置。
 // 生命周期约定：Close 幂等（重复调用返回 nil）；Close 后 AddSlave 返回 ErrPoolClosed；
-// Close 后 Pick 仍返回已关闭的连接（后续查询报 sql: database is closed），详见 docs/connection.md。
+// Close 后 Pick 仍返回已关闭的连接（后续查询报 sql: database is closed），详见 docs/concepts/execution-routing.md。
 type Pool struct {
 	mu            sync.RWMutex  // 保护 slaves 切片的并发读写
 	master        *sql.DB       // 主库连接（写操作 + 事务）
