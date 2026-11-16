@@ -1,18 +1,19 @@
-# 请求结构体（Req）定义与标签
+# Req/Res 与结构体标签
 
-本文档介绍 handler 的请求结构体（`Req`）如何定义、支持哪些标签。参数绑定的来源与类型转换细节见 `parameter-binding.md`；校验规则见 `parameter-validate.md`。相关实现位于 `binding.go`（绑定）、`meta.go`（标签解析）与 `validate.go`（校验）。
+本文说明 handler 的 Req/Res 形态、匿名嵌入展开，以及各标签在 Req/Res 上的作用边界。完整标签表、类型矩阵与默认值/错误规则见 [reference.md](reference.md)；绑定细节见 [parameter-binding.md](parameter-binding.md)，校验见 [parameter-validate.md](parameter-validate.md)。
 
-## 一、handler 签名与 Req 形态
+适合：定义接口入参与返回值的业务开发者。
 
-handler 的签名固定为：
+## 一、handler 签名
 
 ```go
 type Handler func(ctx context.Context, req Req) (Res, error)
 ```
 
-- `Req` 既可以是结构体值类型，也可以是结构体指针类型（`*T`）；两者均受支持。
-- 引擎在绑定阶段始终使用指向底层结构体的指针（`*T`）进行赋值与校验，再按 handler 声明类型决定传入值还是指针。
-- 普通未导出字段（小写开头）会被跳过，不参与绑定与校验；未导出值嵌入是例外，内部导出字段仍会展开（见下文“匿名嵌入结构体展开”）。
+- `Req` 可为 struct 或 `*struct`；`Res` 同理。
+- 引擎在绑定/校验阶段始终用 `*Req` 指针操作底层结构体，最后按 handler 声明类型传值或传指针。
+- 普通未导出字段跳过，不参与绑定/校验；未导出匿名值嵌入会展开，未导出匿名指针嵌入跳过（见下）。
+- 签名不合法在注册期 panic，不会等到运行时。
 
 ```go
 type CreateUserReq struct {
@@ -23,379 +24,151 @@ type CreateUserReq struct {
 type CreateUserRes struct{}
 
 func CreateUser(ctx context.Context, req CreateUserReq) (CreateUserRes, error) {
-    // ...
     return CreateUserRes{}, nil
 }
-// 或指针形态：func CreateUserPtr(ctx context.Context, req *CreateUserReq) (*CreateUserRes, error) { ... }
 ```
 
-### 匿名嵌入结构体展开
+## 二、两套来源投影
 
-Go 的匿名嵌入（embedded struct）字段在 **query / form / 路径参数**中会被**展开（flatten）为顶层字段**：`Base` 的导出字段等价于 `Req` 自身的顶层字段，按字段绑定名直接绑定。JSON 请求体遵循 `encoding/json` 的字段规则——**无 json 名的**匿名嵌入展开到父级；**带 json 名的**匿名嵌入（如 `Base \`json:"base"\``）作为父级的嵌套对象，父级扁平键无效（JSON body schema 同此规则，见 `openapi.md`）。
+同一个 Req 字段最多有两套独立语义：
+
+| 标签 | Form 链（query/urlencoded/multipart/path） | JSON body |
+| --- | --- | --- |
+| 无标签 | 字段名 | 字段名 |
+| `form:"q"` | `q` | 字段名或 json 名 |
+| `form:"-"` | 不参与 | 按 json 标签/字段名参与 |
+| `json:"x"` | `x`（普通 json 名 fallback） | `x` |
+| `json:"-"` | 回退字段名 | 不参与 |
+| `json:"-,"` | 回退字段名 | 键名 `-` |
+
+- Form 链优先级：`form` > 普通 `json` 名 > 字段名。
+- JSON 完全按 `encoding/json`，`form` 标签无效。
+- Path 参数复用 Form 链绑定名。
+- `form:"-"` 只跳过 Form 链；`json:"-"` 只跳过 JSON。
+
+## 三、匿名嵌入
+
+- **query / form / path**：匿名嵌入（值或 `*struct`）展开为顶层字段，按子字段绑定名直接绑定。
+- **JSON**：按 `encoding/json`——无 json 名的匿名嵌入展开到父级；带 json 名的匿名嵌入作为父级嵌套对象。
+- 嵌入指针在注册期由 `fieldByIndex` 物化，内部 default 与顶层一样在注册期填充；内部 `nonzero` 没有“父字段判零”环节，等价于顶层必填。
+- 未导出匿名指针嵌入（`type Req struct { *base }`）不展开：query/form 不绑定、不填默认值、不做 nonzero、OpenAPI 不输出；JSON 只有在 Req 还有其他 JSON 可绑定字段、body 被解码时才可能报 `json: cannot set embedded pointer to unexported struct`（400）。只含该嵌入的 Req 不读取 body，JSON 内容不会被绑定。
+- 展开后的字段与顶层字段在 Form 链/默认值/校验上等价；JSON 仍按 json 标签规则。
 
 ```go
 type Base struct {
     Name string `json:"name" nonzero:"true"`
     Page int    `json:"page" default:"1"`
 }
+
 type Req struct {
     *Base
     Note string `json:"note"`
 }
-// name / page / note 均可直接按顶层字段绑定。
+// query/form: name / page / note 都是顶层绑定名
+// JSON: name / page / note 同样展开（Base 无 json 名）
 ```
 
-展开字段与顶层字段完全等价，关键语义：
+## 四、标签速查
 
-- **默认值填充**：嵌入指针在注册期模板中被 `fieldByIndex` 自动物化，其内部带 `default` 的字段与顶层字段一样在注册阶段填充。
-- **必填校验**：嵌入字段**没有**「父字段判零」环节——即使客户端完全不传嵌入对象，其内部 `nonzero:"true"` 字段仍会被强制校验（等价于顶层必填字段）。这与普通 `*Struct` 嵌套字段「父字段非零才递归校验」的规则不同（见 `parameter-validate.md`）。
-- **未导出指针嵌入不受支持**：`type Req struct { *base }`（类型名小写）注册时被跳过展开并输出 `slog.Warn` 引导改用导出类型名或值嵌入，其内部字段不进入可绑定集合（query / 表单不绑定、不填默认值、不做 nonzero 校验，OpenAPI 也不输出）。JSON 请求体不经过该元数据：`encoding/json` 对 nil 未导出嵌入指针无法赋值，因此 JSON 中**出现**该嵌入的导出字段时解码失败并返回 400（`json: cannot set embedded pointer to unexported struct`），不出现时请求正常处理——并非一律静默忽略。未导出**值**嵌入（`type Req struct { base }`）不受影响，内部导出字段仍可正常绑定、填充默认值与 nonzero 校验。
+完整表与优先级见 [reference.md](reference.md) 的“标签总览”。这里只列用途：
 
-## 二、结构体标签总览
-
-框架读取的全部标签按「能写在哪里」分成三组：**共有**（写在 Req 或 Res 的字段上都生效）、**Req 独有**（只有 Req 读取；写在 Res 上既不改运行时行为也不改文档，属无效配置）、**Res 独有**（当前为空）。
-
-### Req 与 Res 共有
-
-| 标签 | 作用 | 说明 |
+| 标签 | 作用 | 生效侧 |
 | --- | --- | --- |
-| `json` | 绑定名 / 序列化名 | Form 链（query/form/路径）的绑定名优先级 `form` > 普通 `json` 名 > 字段名；`json:"-"` 只跳过 JSON，Form 链回退字段名；`json:"-,"` 的 JSON 键为 `-`，Form 链回退字段名。JSON 请求体与响应只按 `json` 标签（`encoding/json` 规则），`json:"-"` 是排除。`form:"-"` 只跳过 Form 链，不影响 JSON。写在 Res 上时只用到「序列化名」这一半 |
-| `ignore` | 文档排除 | `ignore:"true"` 把字段从 OpenAPI 文档中排除（请求 schema / query 或响应 schema），不影响绑定与校验；path 参数声明受规范强制、不受其影响，详见 `openapi.md` |
-| `example` | 字段示例值 | 仅用于 OpenAPI 文档生成，按字段类型自动转换为对应 JSON 类型，详见 `openapi.md` |
-| `description` | 字段描述 | 仅用于 OpenAPI 文档生成；写在 Req 内嵌的 `OpenAPIMeta` 上则为操作级描述，见「Req 独有」 |
-| `deprecated` | 字段废弃标记 | `deprecated:"true"` 使 schema 与 query / path 参数对象输出 `"deprecated": true`，废弃原因写在 `description` 中；写在 `OpenAPIMeta` 上则为操作级废弃，详见 `openapi.md` |
+| `json` | Form 链 fallback / JSON 键名 / 响应序列化名 | Req + Res |
+| `form` | Form 链绑定名，优先于 json | Req |
+| `default` | 默认值（两阶段填充） | Req |
+| `nonzero` | 零值校验 + required 推断 | Req |
+| `time_format` | 表单链路时间解析格式 | Req |
+| `time_location` | 表单链路时间解析时区 | Req |
+| `ignore` | 从 OpenAPI schema/query 排除 | Req + Res |
+| `example` | OpenAPI 示例值 | Req + Res |
+| `description` | OpenAPI 描述 | Req + Res |
+| `deprecated` | OpenAPI 废弃标记 | Req + Res |
+| `OpenAPIMeta` 上的 `tags`/`summary`/`description`/`deprecated` | 操作级元信息 | Req |
+| `KeepRawBody`（嵌入） | 不读取请求体 | Req |
 
-> 共有组只有两类标签：**改键名**（`json`）与**改文档**（`ignore`/`example`/`description`/`deprecated`）。Res 不参与参数绑定与校验，因此任何影响运行时行为的标签都进不了这一组。
+写在 Res 上的 `form`/`default`/`nonzero`/`time_format`/`time_location` 无任何效果；`Res` 没有专属标签。
 
-### Req 独有
+## 五、默认值
 
-以下标签只在请求侧有语义——运行时填充 / 校验 / 解析，以及请求 schema 的生成（其中 `time_format`/`time_location` 只参与表单绑定形态的请求 schema，JSON 请求体不读）。Res 不参与绑定与校验，响应时间恒由 `encoding/json` 序列化为 RFC3339 字符串，因此这些标签写在 Res 字段上不产生任何效果，响应 schema 也一律不读：
+- 仅对标量（及其切片/指针）生效；值必须能被运行时解析，否则注册期告警并按未设置处理。
+- 两阶段：注册期填模板中“注册期可达”的零值字段；请求期只补 nil 指针。
+- 顶层字段、值类型 struct 链、固定数组元素在注册期可预填；nil 指针/切片/map 中的字段要等请求期创建元素后补 nil 指针。
+- 嵌套指针 struct 的值类型字段 default 不生效；指针字段在请求阶段可补。
+- 切片/map 元素的值类型字段 default 不生效；指针字段请求阶段补。
+- 显式请求值优先于 default；显式零值不会被请求阶段覆盖；显式 JSON `null` 对指针会置 nil（有 default 时请求阶段回填），对切片/map 会置 nil 且不恢复默认值。
 
-| 标签 | 作用 | 说明 |
-| --- | --- | --- |
-| `form` | 绑定名 | 仅作用于 query / 表单 / 路径参数，优先级高于 `json`；对 JSON 请求体无效 |
-| `default` | 默认值 | 仅对标量类型（及其切片/指针）生效，且值必须能被运行时解析；注册阶段预填充到模板，详见 `parameter-binding.md` |
-| `nonzero` | 非零值校验 | `"true"` 校验非零值、`"false"` 不校验，并据此推断请求 schema 的 `required`；只有能解析且满足 nonzero 的 `default` 才会让字段变为可选 |
-| `time_format` | 时间解析格式 | `unix`/`unixmilli`/… 或 Go layout，仅作用于 query/form/multipart/path，支持值、指针与单层切片的 `time.Time` 字段；JSON 请求体不读取该标签 |
-| `time_location` | 时间解析时区 | 如 `Asia/Shanghai`，默认 `time.Local`，解析失败降级并输出 `slog.Warn`；仅作用于表单绑定链路，JSON 请求体不读取 |
+示例与容器深度矩阵见 [parameter-binding.md](parameter-binding.md) 的“默认值机制”，完整规则见 [reference.md](reference.md)。
 
-> `default`/`nonzero` 的 OpenAPI `required` 推断只把“能解析且能满足 nonzero”的 default 视为有效：`int default:"abc"`、`default:"0"`、`string default:""` 都不会取消 required。`time_format`/`time_location` 只作用于 query/form/multipart/path；JSON 请求体由 `encoding/json` 处理，`time.Time` 只接受 RFC3339 字符串（响应同样恒为 date-time）。
+## 六、时间标签
 
-**操作级标签**同样属于 Req 独有：只能写在 `Req` 中嵌入的 `zchttp.OpenAPIMeta` 上——`Res` 不参与操作级元信息解析（写在 Res 上注册时会输出 `slog.Warn`）。它是空结构体，不参与绑定与校验：
-
-| 标签 | 说明 |
-| --- | --- |
-| `tags` | 操作标签，以 `/` 分隔多个标签，如 `"A/B"` → `["A", "B"]` |
-| `summary` | 操作摘要，缺省时回退为 handler 函数名 |
-| `description` | 操作详细描述 |
-| `deprecated` | `deprecated:"true"` 标记操作为已废弃，废弃原因写在 `description` 中 |
-
-### Res 独有
-
-无。`Res` 没有专属标签，它只复用共有组里的标签。
-
-> 原因：`Res` 的职责只有「被序列化后写回客户端」——既不绑定参数、也不执行校验与默认值填充，所以请求侧那五个约束标签（`form`/`default`/`nonzero`/`time_format`/`time_location`）写在 Res 上无从生效。若要在响应侧表达「该字段总会返回」这类契约，请写在 `description` 里，不要用 `nonzero` 兼职。
-
-> 同一类型同时用作 Req 与 Res 时，OpenAPI 会生成两份 schema：请求变体用类型名（如 `User`），响应变体固定追加 `Response` 后缀（如 `UserResponse`），后者只保留共有组的标签。
-
-详见 `openapi.md`。
-
-## 三、标签示例
-
-### `json` — 绑定名 / 序列化名
-
-绑定名解析优先级：`form` > 普通 `json` 名 > 字段名（取逗号前部分）。该优先级用于 query / 表单 / 路径参数与校验错误路径；`json:"-"`、`json:"-,"` 是 JSON 专用值，Form 链回退字段名。JSON 请求体与响应的键只由 `json` 标签决定（见下节 `form`）。
+- `time_format`/`time_location` 只作用于 query/form/multipart/path。
+- JSON 请求体与响应由 `encoding/json` 处理：`time.Time` 只接受/输出 RFC3339 字符串，标签不参与。
+- 支持 `time.Time`、其多级指针、`[]time.Time`、`[]*time.Time`；其他容器不参与标量绑定。
+- 未设置 `time_format` 时自动探测：数字按位数推断时间戳精度，非数字尝试常见布局。
+- `time_location` 默认 `time.Local`；解析失败降级并告警。
 
 ```go
 type Req struct {
-    UserName string `json:"user_name"` // 绑定名为 "user_name"
-    Email    string `json:"email,omitempty"` // 绑定名为 "email"（取逗号前部分）
+    CreatedAt time.Time `json:"created_at" time_format:"2006-01-02"`
+    Timestamp time.Time `json:"timestamp" time_format:"unix"`
 }
 ```
 
-### `form` — 绑定名（优先级高于 `json`）
+## 七、nonzero
 
-常用于 query 参数或表单字段。`form:"-"` 无条件跳过 Form 链；当 `form` 与 `json` 同时存在且 `form` 非 `-` 时，query / 表单 / 路径参数按 `form` 绑定；JSON 请求体由 `encoding/json` 解码，只认 `json` 标签（无 json 名时用字段名，键名大小写不敏感），`form` 标签对其无效，OpenAPI 的 JSON schema 同样按 json 名生成。
+- `nonzero:"true"` 校验零值；`"false"`/未标注不校验。
+- 递归进入嵌套 struct/指针/单层容器；固定数组即使全零也逐元素；nil/空切片、nil map 无元素；多层容器不穿透。
+- 与 default 独立：校验看默认值填充后的值；OpenAPI 只有能解析且非零的 default 才能取消 required。
+- 错误路径用 Form 链绑定名；切片/数组不附加索引；map 追加 key。
 
-```go
-type Req struct {
-    Keyword string `json:"keyword" form:"q"` // query/表单绑定名为 "q"（form 优先）；JSON 请求体的键为 "keyword"
-    Page    int    `json:"page" form:"page"` // 绑定名为 "page"
-}
-```
+详见 [parameter-validate.md](parameter-validate.md)。
 
-### `default` — 默认值
-
-为字段设置默认值，仅对标量类型（及其切片/指针）生效。默认值的填充分**两个阶段**：
-
-| 阶段 | 时机 | 填充范围 | 说明 |
-| --- | --- | --- | --- |
-| 注册阶段 | 路由注册时 | 所有零值字段 | 预填充到模板，作为每个请求的初始值 |
-| 请求阶段 | 参数绑定后 | 仅 nil 指针字段 | 补填绑定过程中动态创建的子元素中的默认值，值类型跳过以避免覆盖用户显式传入的零值 |
-
-#### 顶层字段
-
-顶层 Req 中的所有字段（无论值类型还是指针类型）均在**注册阶段**被填充到模板，请求时通过模板浅拷贝继承：
-
-```go
-type ListReq struct {
-    Page     int      `json:"page" default:"1"`          // 值类型：注册阶段填充 → 请求未传时为 1
-    Keyword  string   `json:"keyword" default:"all"`     // 值类型：注册阶段填充 → 请求未传时为 "all"
-    Sort     *string  `json:"sort" default:"created_at"` // 指针类型：注册阶段填充 → 请求未传时为 "created_at"
-    Tags     []string `json:"tags" default:"go,web"`     // 切片：逗号分隔，注册阶段填充
-}
-```
-
-#### 嵌套值结构（值嵌套 struct）
-
-值嵌套的 struct 在注册阶段已存在（非 nil），其内部字段可被注册阶段到达并填充：
-
-```go
-type Address struct {
-    City    string  `json:"city" default:"Beijing"`     // ✅ 值类型：注册阶段可到达 → 填充生效
-    Zip     *string `json:"zip" default:"100000"`       // ✅ 指针类型：注册阶段递归进入 Address 后填充 → 填充生效
-}
-
-type CreateUserReq struct {
-    Name    string  `json:"name" nonzero:"true"`
-    Address Address `json:"address"`                    // 值嵌套：注册阶段 Address 已存在，递归可达
-}
-// City 未传 → "Beijing"，Zip 未传 → "100000"（均在注册阶段填充到模板）
-```
-
-#### 嵌套指针结构体（`*Struct`）
-
-指针嵌套的 struct 在注册阶段为 nil，其内部的**值类型字段**无法被注册阶段到达，default 不生效；**指针类型字段**在请求阶段绑定创建子结构体后可被补填：
-
-```go
-type Company struct {
-    Name    string  `json:"name" default:"Acme"`
-    Country *string `json:"country" default:"CN"`
-}
-
-type CreateUserReq struct {
-    Name    string   `json:"name" nonzero:"true"`
-    Company *Company `json:"company"`                   // 指针嵌套：注册阶段为 nil
-}
-// Company 未传 → Company 整体为 nil，Name/Country 均无默认值
-// Company 传了 {} → Name 为空字符串（default 不生效），Country 为 "CN"（指针补填生效）
-//
-// Name 为何不生效：请求阶段动态创建的结构体中，只有指针字段才能区分客户端是否传递（nil = 未传，非 nil = 已传），
-// 值类型字段无法区分“未传”与“显式传零值”，故请求阶段不填充值类型字段。
-```
-
-#### 切片 / Map 中的结构体元素
-
-切片和 Map 的元素是绑定阶段动态创建的，行为与指针嵌套类似——只有指针类型字段的 default 能在请求阶段补填：
-
-```go
-type Item struct {
-    Qty    *int    `json:"qty" default:"1"`             // ✅ 指针类型：请求阶段补填 → 生效
-    Status *string `json:"status" default:"active"`     // ✅ 指针类型：请求阶段补填 → 生效
-    Note   string  `json:"note" default:"none"`         // ❌ 值类型：动态创建的元素无法被注册阶段到达 → 不生效，在请求阶段无法区分零值 → 不生效
-}
-
-type OrderReq struct {
-    OrderNo string             `json:"orderNo" nonzero:"true"`
-    Items   []Item             `json:"items"`           // 值元素切片
-    Extras  map[string]*Item   `json:"extras"`          // 指针元素 map
-}
-// Items[0] 传 {"qty":null,"status":null} → Qty=1, Status="active"（nil 指针被补填）
-// Items[0] 传 {} → Note 仍为空字符串（值类型 default 不生效）
-```
-
-#### 不支持的类型
-
-以下类型的 `default` 标签值会被忽略（注册时会输出 `slog.Warn`）：`struct`、`*struct`、`[]struct`、`[]*struct`、`map[K]V`、`*map[K]V`、`time.Time`，以及任意非标量的指针/切片/数组，包括指向容器的指针（`*[]T`、`*map[K]V`）与容器的容器（`[][]T`、`[]*[]T`、`map[K][]T`）。类型虽然受支持、但标签值无法被运行时解析时（如 `int default:"abc"`、`bool default:"yes"`、`float64 default:"NaN"`、`[]int default:"1,x"`），同样按未设置处理并输出 `slog.Warn`；标量 default 会先 `TrimSpace`，与运行时填充一致。
-
-#### 容器嵌套深度限制
-
-框架对**默认值填充**、**nonzero 校验**、**OpenAPI 文档生成**的支持范围不同，以下按容器类型分类说明：
-
-##### 支持的单层容器
-
-| 容器类型 | 默认值填充 | nonzero 校验 | Schema 结构 | default 展示 | description/example | required 计算 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `[]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-| `[]*Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-| `map[K]Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-| `map[K]*Struct` | ✅ 指针字段请求阶段补填；❌ 值字段不生效 | ✅ 递归校验每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-| `[N]Struct` | ✅ N 个元素注册期均存在，值字段与指针字段 default 均填充 | ✅ 即使数组整体为零值也递归每个元素 | ✅ | ✅ 当前仅展示指针字段 | ✅ | ✅ |
-| `[N]*Struct` | nil 元素不创建；绑定创建非 nil 元素后仅补填指针子字段 | ✅ 递归每个非 nil 元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-
-> 固定长度数组与切片不完全相同：`[N]Struct` 的元素在注册模板中始终存在，所以元素内值字段 default 也会预填，且全零数组仍逐元素执行 nonzero；nil 切片没有元素可预填或校验。数组和切片的错误路径当前都不附加元素索引。
-
-##### 不支持的多层容器
-
-| 容器类型 | 默认值填充 | nonzero 校验 | Schema 结构 | default 展示 | description/example | required 计算 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `[][]Struct` | ❌ 无法穿透第二层切片 | ❌ 无法穿透第二层切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
-| `[]map[K]Struct` | ❌ 无法穿透切片+map | ❌ 无法穿透切片+map | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
-| `map[K][]Struct` | ❌ 无法穿透 map+切片 | ❌ 无法穿透 map+切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
-| `map[K][]*Struct` | ❌ 无法穿透 map+切片 | ❌ 无法穿透 map+切片 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
-| `map[K][N]Struct` | ❌ 无法穿透 map+数组 | ❌ 无法穿透 map+数组 | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
-| `map[K]map[K]Struct` | ❌ 无法穿透 map+map | ❌ 无法穿透 map+map | ✅ | ❌ 不展示¹ | ✅ | ✅（但不校验） |
-
-> ¹ 若该结构体类型同时被用在单层容器中，则 `default` 会展示（类型可达性是按类型标记的，非按路径）
-
-##### 指针包裹容器（与对应单层容器行为一致）
-
-| 容器类型 | 默认值填充 | nonzero 校验 | Schema 结构 | default 展示 | description/example | required 计算 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `*[]Struct` | 非 nil 且已有元素时可递归；绑定创建元素后仅补填指针子字段 | ✅ 非 nil 时递归每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-| `*[N]Struct` | 模板为 nil 时注册期不可达；绑定创建数组后仅补填指针子字段 | ✅ 非 nil 时递归每个元素 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-| `*map[K]Struct` | 非 nil 且已有值时可递归；绑定创建值后仅补填指针子字段 | ✅ 非 nil 时递归每个值 | ✅ | ✅ 仅指针字段 | ✅ | ✅ |
-
-> 指针本身在非 nil 时不会阻断递归；但 nil 的容器指针在注册模板中没有可达元素，因此不能等同于直接声明的 `[N]Struct`。请求绑定创建容器后，请求阶段仍只填充 nil 指针子字段。
-
-##### 示例：多层容器的行为差异
-
-```go
-// 单层容器中的结构体
-type SingleItem struct {
-    Name     string `json:"name" nonzero:"true"`              // 必填字段
-    IsActive *bool  `json:"isActive" default:"true"`          // 指针字段有默认值
-}
-
-// 多层容器中的结构体（与 SingleItem 字段相同，但仅用于多层容器）
-type MultiItem struct {
-    Name     string `json:"name" nonzero:"true"`              // 必填字段
-    IsActive *bool  `json:"isActive" default:"true"`          // 指针字段有默认值
-}
-
-type Req struct {
-    // ✅ 单层容器：指针字段默认值生效，nonzero 校验生效
-    Items    []SingleItem           `json:"items"`             // 指针 default✅ nonzero✅
-    Extras   map[string]*SingleItem `json:"extras"`            // 指针 default✅ nonzero✅
-    
-    // ❌ 多层容器：默认值和校验均不生效
-    DeepMap  map[string][]MultiItem `json:"deepMap"`           // 指针 default❌ nonzero❌
-    Nested   [][]MultiItem          `json:"nested"`            // 指针 default❌ nonzero❌
-}
-```
-
-**行为说明：**
-
-- `Items[0].Name`（`SingleItem`）：nonzero 校验生效，空字符串会报错
-- `Items[0].IsActive`（`SingleItem`）：未传时自动填充 `true`（请求阶段补填 nil 指针）
-- `SingleItem` 的值类型字段（如 `Name`）即使带 `default` 也**不生效**（切片元素的值类型字段无法被注册阶段到达，请求阶段也不填充值类型）
-- `DeepMap["key"][0].Name`（`MultiItem`）：nonzero 校验**不生效**，空字符串不会报错（框架无法穿透 `map[K][]Struct`）
-- `DeepMap["key"][0].IsActive`（`MultiItem`）：未传时**不会**自动填充 `true`（框架无法穿透 `map[K][]Struct`）
-- OpenAPI 文档中 `SingleItem` 的 `IsActive` 的 `default` 值**展示**；`MultiItem` 的 `IsActive` 的 `default` 值**不展示**（因为框架知道该默认值无法生效）
-
-##### 启动期警告
-
-当检测到多层容器中的字段带有 `default` 标签时，框架会在启动时输出警告日志（`handler` 字段输出 handler 的定义位置 `文件:行号`；普通 handler 与闭包均使用该格式，仅当运行时取不到文件信息（`<autogenerated>`）时降级为函数名）：
-
-```
-WARN default tag on pointer field in non-defaults-reachable struct, never applied
-  route=POST /api/create
-  handler=/app/main.go:20
-  struct=MultiItem
-  field=IsActive
-  type=*bool
-```
-
-该警告帮助开发者及时发现 `default` 标签配置错误（虽然 JSON 反序列化不受影响，但框架增强功能无法生效）。
-
-### `time_format` — 时间解析格式
-
-指定 `time.Time` 字段的解析格式。支持 `unix`/`unixmilli`/`unixmicro`/`unixnano` 或 Go layout 字符串。
-
-```go
-type Req struct {
-    CreatedAt time.Time `json:"created_at" time_format:"2006-01-02"`          // Go layout
-    Timestamp time.Time `json:"timestamp" time_format:"unix"`                 // Unix 秒级时间戳
-    Milli     time.Time `json:"milli" time_format:"unixmilli"`               // Unix 毫秒时间戳
-}
-```
-
-### `time_location` — 时间解析时区
-
-指定时间解析的时区，默认 `time.Local`。解析失败时降级为 `time.Local` 并输出 `slog.Warn`。
-
-```go
-type Req struct {
-    MeetingTime time.Time `json:"meeting_time" time_format:"2006-01-02 15:04" time_location:"Asia/Shanghai"`
-}
-```
-
-### `nonzero` — 非零值校验
-
-标记字段是否必须为非零值。`"true"` 表示校验，`"false"` 或不标注表示不校验。校验的详细规则（递归行为、与 `default` 的关系等）见 `parameter-validate.md`。
-
-```go
-type Req struct {
-    Name   string `json:"name" nonzero:"true"`   // 必填：空字符串会报错
-    Age    int    `json:"age" nonzero:"false"`   // 不校验：传 0 不报错
-    Email  string `json:"email"`                 // 不校验：未标注等同于 nonzero:"false"
-}
-```
-
-### `ignore` — 文档排除
-
-`ignore:"true"` 将字段从 OpenAPI 文档的 body schema 与 query 中排除，不影响绑定与校验。
-
-**例外**：路径绑定字段的 `ignore` 无法抑制 path 参数声明 —— OpenAPI 要求路径模板的每个占位符都有对应 `in: path` 参数，抑制声明会产生非法文档。此时 `ignore` 的作用只剩"从 body schema 排除"（GET / DELETE / HEAD 的路径字段本就不会重复进入 query，故 `ignore` 对其无额外效果）。
-
-```go
-type Req struct {
-    Name   string `json:"name" nonzero:"true"`
-    Secret string `json:"secret" ignore:"true"` // 文档中不展示，但绑定与校验正常
-}
-```
-
-```go
-// 路径字段：路由 /orders/{id} 绑定 ID。ignore 只把 id 从 body schema 移除，path 声明仍生成。
-type Req struct {
-    ID string `json:"id" ignore:"true"`
-    Q  string `json:"q"`
-}
-```
-
-### `example` / `description` — 文档信息
-
-仅用于 OpenAPI 文档生成。`example` 按字段类型自动转换为对应的 JSON 类型。
-
-```go
-type Req struct {
-    Name  string `json:"name" nonzero:"true" description:"用户姓名" example:"张三"`
-    Age   int    `json:"age" description:"年龄" example:"25"`
-    Active bool  `json:"active" description:"是否激活" example:"true"`
-}
-```
-
-### `OpenAPIMeta` 嵌入 — 操作级元信息
-
-在 `Req` 中嵌入 `zchttp.OpenAPIMeta`，声明操作标签、摘要、描述。
+## 八、文档标签与 OpenAPIMeta
 
 ```go
 type ListUserReq struct {
     zchttp.OpenAPIMeta `tags:"User/Account" summary:"用户列表" description:"分页查询用户"`
-    Keyword string `json:"keyword" default:"" description:"搜索关键字"`
-    Page    int    `json:"page" default:"1"`
+
+    Keyword string `json:"keyword" description:"搜索关键字" example:"go"`
+    Page    int    `json:"page" default:"1" description:"页码"`
+    Secret  string `json:"secret" ignore:"true"` // 文档不展示，仍参与绑定
 }
 ```
 
-## 四、综合示例
+- `ignore:"true"` 从请求/响应 schema 与 query 排除；path 声明仍保留。
+- `example` 按字段 schema 类型转换；`description`/`deprecated` 只影响文档。
+- `OpenAPIMeta` 只能嵌入 Req（顶层）；标签 `tags`/`summary`/`description`/`deprecated` 生成操作级元信息；写在 Res 上会告警且无效。
+- 值类型嵌套 struct 的 `deprecated` 会作为 `$ref` 兄弟键写入，但 OpenAPI 3.0 工具忽略；需要生效用指针嵌套。
+
+## 九、综合示例
 
 ```go
 type CreateUserReq struct {
     zchttp.OpenAPIMeta `tags:"User Management" summary:"创建用户" description:"创建一个新的用户账户"`
 
-    Name      string    `json:"name" nonzero:"true" description:"用户姓名" example:"张三"`
-    Email     string    `json:"email" nonzero:"true" description:"邮箱地址" example:"user@example.com"`
-    Age       *int      `json:"age" description:"年龄" example:"25"`
-    Status    string    `json:"status" default:"active" description:"账户状态"`
-    Tags      []string  `json:"tags" default:"new" description:"用户标签"`
-    Birthday  time.Time `json:"birthday" time_format:"2006-01-02" time_location:"Asia/Shanghai" description:"生日"`
-    Internal  string    `json:"internal" ignore:"true"` // 不参与文档
+    Name     string    `json:"name" nonzero:"true" description:"用户姓名" example:"张三"`
+    Email    string    `json:"email" nonzero:"true" description:"邮箱地址" example:"user@example.com"`
+    Age      *int      `json:"age" description:"年龄" example:"25"`
+    Status   string    `json:"status" default:"active" description:"账户状态"`
+    Tags     []string  `json:"tags" default:"new" description:"用户标签"`
+    Birthday time.Time `json:"birthday" time_format:"2006-01-02" time_location:"Asia/Shanghai" description:"生日"`
+    Internal string    `json:"internal" ignore:"true"` // 不参与文档
+}
+
+type CreateUserRes struct {
+    ID int64 `json:"id"`
 }
 ```
 
-## 五、相关文档
+## 十、代码与测试
 
-- 参数绑定来源、字段类型、`time.Time` 解析、`default` 机制、文件上传：`parameter-binding.md`
-- 校验规则（`nonzero` 递归校验、`Validate()` 自定义校验、错误处理）：`parameter-validate.md`
-- OpenAPI 文档生成、`OpenAPIMeta`、字段级文档标签：`openapi.md`
-- 回调机制与错误分发、自定义响应/错误/校验失败处理：`http-engine-callback.md`
+| 概念 | 源码 | 测试 |
+| --- | --- | --- |
+| 字段元信息、来源投影、匿名嵌入、重复名 | `meta.go` | `meta_test.go` |
+| 默认值两阶段 | `defaults.go` | `defaults_test.go` |
+| 时间解析 | `binding.go` | `binding_test.go` |
+| nonzero/Validate | `validate.go` | `validate_test.go` |
+| 标签的 OpenAPI 映射 | `openapi.go` | `openapi_test.go` |
+
+继续阅读：[reference.md](reference.md)（完整标签/类型/默认值/错误）、[parameter-binding.md](parameter-binding.md)（绑定）、[parameter-validate.md](parameter-validate.md)（校验）、[openapi.md](openapi.md)（文档生成）。

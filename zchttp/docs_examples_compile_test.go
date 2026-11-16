@@ -1,6 +1,6 @@
 package zchttp_test
 
-// docs/openapi.md、docs/routing.md、docs/parameter-binding.md 示例代码的编译级校验
+// docs/openapi.md、docs/recipes.md、docs/parameter-binding.md 示例代码的编译级校验
 // （对应“文档与代码一致”中的示例可编译性）。
 // 手工收录文档示例，不自动读取 Markdown；文档示例变更须同步本文件。
 // 使用外部测试包（zchttp_test）以调用方视角校验 API 写法，不伪造任何测试存根。
@@ -147,7 +147,7 @@ func docRequestBodyProps(t *testing.T, schemas, op map[string]any) map[string]an
 	return props
 }
 
-// ===== routing.md「使用场景：反向代理」示例（逐字收录） =====
+// ===== recipes.md「反向代理（保留原始请求体）」示例（代表性收录） =====
 
 type ProxyReq struct {
 	zchttp.KeepRawBody
@@ -207,7 +207,7 @@ func registerProxyDocExample(r *zchttp.Router, authMiddleware zchttp.MiddlewareH
 	g.Any("/{rest...}", difyProxy)
 }
 
-// ===== routing.md「使用场景：静态文件服务」示例（逐字收录） =====
+// ===== recipes.md「静态文件服务」示例（代表性收录） =====
 
 type StaticReq struct {
 	File string `json:"file"`
@@ -237,7 +237,7 @@ func registerStaticDocExample(r *zchttp.Router) {
 	static.HEAD("/{file...}", serveStatic)
 }
 
-// ===== parameter-binding.md「2.2 保留原始请求体（KeepRawBody）」示例（逐字收录） =====
+// ===== parameter-binding.md「KeepRawBody」示例（代表性收录） =====
 
 type WebhookReq struct {
 	// 声明：请求体原样保留，不解析
@@ -272,7 +272,7 @@ func registerWebhookDocExample(r *zchttp.Router) {
 	r.POST("/webhook", webhook)
 }
 
-// TestDocExamples_CatchAllProxy 编译并运行 routing.md 反向代理示例（不连接上游）：
+// TestDocExamples_CatchAllProxy 编译并运行 recipes.md 反向代理示例（不连接上游）：
 // Any 为九个受支持的方法注册 KeepRawBody + 通配尾段且均经过分组中间件；Rest 解码为含 .. 的路径时
 // 返回 400；Rewrite 以 EscapedPath 去前缀，%2F 原始转义保留且请求指向 upstream；BufferPool 提供 32 KB 缓冲。
 func TestDocExamples_CatchAllProxy(t *testing.T) {
@@ -318,7 +318,7 @@ func TestDocExamples_CatchAllProxy(t *testing.T) {
 	}
 }
 
-// TestDocExamples_CatchAllStatic 编译并运行 routing.md 静态文件示例：assets 为 os.DirFS("./public")，
+// TestDocExamples_CatchAllStatic 编译并运行 recipes.md 静态文件示例：assets 为 os.DirFS("./public")，
 // 按当前目录解析，故用 t.Chdir 切到临时目录（因此不可并行）。锁死：零段命中回退 index.html；
 // 多级路径返回文件内容；HEAD 无响应体；%2e%2e 穿越请求被拒绝且不泄漏 public 之外的文件内容。
 func TestDocExamples_CatchAllStatic(t *testing.T) {
@@ -410,10 +410,10 @@ func TestDocExamples_KeepRawBody(t *testing.T) {
 	}
 }
 
-// docRouteMiddlewareReq 对应 routing.md「注册路由」一节路由级中间件示例的空请求结构。
+// docRouteMiddlewareReq 对应 routing.md「创建与注册」一节路由级中间件示例的空请求结构。
 type docRouteMiddlewareReq struct{}
 
-// TestDocExamples_RouteMiddleware 编译并运行 routing.md「注册路由」一节的路由级中间件示例：
+// TestDocExamples_RouteMiddleware 编译并运行 routing.md「创建与注册」一节的路由级中间件示例：
 // 路由级中间件只对本次注册的路由生效，且执行位置位于全局与分组中间件之后（最内层）。
 func TestDocExamples_RouteMiddleware(t *testing.T) {
 	var order []string
@@ -453,5 +453,51 @@ func writeDocFile(t *testing.T, name, content string) {
 	}
 	if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
 		t.Fatalf("写入 %s 失败: %v", name, err)
+	}
+}
+
+// TestDocExamples_OpenAPIJSONEndpoint 编译并运行 recipes.md「OpenAPI 挂载」示例：
+// handler 的 Res 必须是 struct（不能直接返回 map），文档由 handler 直接写入 ResponseWriter；
+// 默认 OnResponse 因 written 跳过，响应根对象是 OpenAPI 文档而非 Response{data} 包装。
+func TestDocExamples_OpenAPIJSONEndpoint(t *testing.T) {
+	engine := zchttp.NewEngine()
+
+	var doc map[string]any
+	engine.Router.GET("/openapi.json", func(ctx context.Context, _ struct{}) (struct{}, error) {
+		w, ok := zchttp.ResponseWriterFromContext(ctx)
+		if !ok {
+			return struct{}{}, errors.New("response writer not found")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		return struct{}{}, json.NewEncoder(w).Encode(doc)
+	})
+
+	// 注册完文档路由后再生成，doc 会包含 /openapi.json 自身。
+	doc = zchttp.GenerateOpenAPI(engine.Router, zchttp.OpenAPIInfo{
+		Title:   "Doc",
+		Version: "1.0.0",
+	})
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/openapi.json", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /openapi.json = %d, want 200，body=%q", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &root); err != nil {
+		t.Fatalf("OpenAPI 根文档解析失败: %v，body=%q", err, rec.Body.String())
+	}
+	if root["openapi"] == nil || root["paths"] == nil {
+		t.Fatalf("响应根对象应为 OpenAPI 文档，实际: %v", root)
+	}
+	if _, wrapped := root["data"]; wrapped {
+		t.Fatalf("响应不应被 Response{data} 包装，实际: %v", root)
+	}
+	paths, _ := root["paths"].(map[string]any)
+	if _, ok := paths["/openapi.json"]; !ok {
+		t.Fatalf("文档应包含 /openapi.json 自身，实际 paths=%v", paths)
 	}
 }

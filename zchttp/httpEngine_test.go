@@ -1829,3 +1829,44 @@ func TestServeHTTP_ConcurrentStress(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestServeHTTP_BindErrorSkipsPath 验证 query/body 绑定失败时 path 参数不写入：
+// 中间件通过 BoundReqFromContext 读到模板 default 7 与 *BindingError，而不是路径值 5；
+// handler 不会被调用。该用例锁死 docs/architecture.md 与 docs/parameter-binding.md
+// 中“仅在 bindRequestData 成功后才 bindPathParams”的条件描述。
+func TestServeHTTP_BindErrorSkipsPath(t *testing.T) {
+	type bindErrPathReq struct {
+		ID int `json:"id" default:"7"`
+	}
+
+	var seenID int
+	var seenErr error
+	handlerCalled := false
+	e := NewEngine()
+	e.Router.POST("/probe/{id}", func(_ context.Context, req bindErrPathReq) (struct{}, error) {
+		handlerCalled = true
+		return struct{}{}, nil
+	}, func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
+		req, err := BoundReqFromContext[*bindErrPathReq](ctx)
+		if req != nil {
+			seenID = req.ID
+		}
+		seenErr = err
+		return next(w, r)
+	})
+
+	rec := serveJSONOn(t, e, http.MethodPost, "/probe/5", `{bad`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400，body=%q", rec.Code, rec.Body.String())
+	}
+	var be *BindingError
+	if !errors.As(seenErr, &be) {
+		t.Fatalf("BoundReqFromContext 应返回 *BindingError，实际: %v", seenErr)
+	}
+	if seenID != 7 {
+		t.Fatalf("绑定失败时 path 不应写入，ID 应为 default 7，实际: %d", seenID)
+	}
+	if handlerCalled {
+		t.Fatal("绑定失败时 handler 不应被调用")
+	}
+}

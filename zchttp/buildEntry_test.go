@@ -1004,18 +1004,19 @@ func TestBuildEntry_NeedsRequestPhaseDefaults(t *testing.T) {
 }
 
 type pathParamTypeReq struct {
-	S   []string       `json:"s"`
-	M   map[string]int `json:"m"`
-	St  testReq        `json:"st"`
-	PS  *[]string      `json:"ps"`
-	Ch  chan int       `json:"ch"`
-	I   *int           `json:"i"`
-	PP  **uint8        `json:"pp"`
-	T   time.Time      `json:"t"`
-	PT  *time.Time     `json:"pt"`
-	F   float32        `json:"f"`
-	B   bool           `json:"b"`
-	Str string         `json:"str"`
+	S    []string       `json:"s"`
+	M    map[string]int `json:"m"`
+	St   testReq        `json:"st"`
+	PS   *[]string      `json:"ps"`
+	Ch   chan int       `json:"ch"`
+	Data []byte         `json:"data"`
+	I    *int           `json:"i"`
+	PP   **uint8        `json:"pp"`
+	T    time.Time      `json:"t"`
+	PT   *time.Time     `json:"pt"`
+	F    float32        `json:"f"`
+	B    bool           `json:"b"`
+	Str  string         `json:"str"`
 }
 
 type pathParamTypeRes struct{}
@@ -1025,8 +1026,8 @@ func pathParamTypeHandler(_ context.Context, _ pathParamTypeReq) (pathParamTypeR
 }
 
 // TestAttachPathParamBindings_RejectsNonScalarTarget 锁死路径参数目标字段类型的注册期校验：
-// slice、map、结构体、指向 slice 的指针、chan 等 setScalar 不支持的类型注册即 panic，消息含参数名、
-// 字段名与字段类型；标量、多级指针标量、time.Time 及其指针正常注册。
+// slice（含 []byte）、map、结构体、指向 slice 的指针、chan 等 setScalar 不支持的类型注册即 panic，
+// 消息含参数名、字段名与字段类型；标量、多级指针标量、time.Time 及其指针正常注册。
 func TestAttachPathParamBindings_RejectsNonScalarTarget(t *testing.T) {
 	rejected := []struct{ param, field, typ string }{
 		{"s", `"S"`, "[]string"},
@@ -1034,6 +1035,7 @@ func TestAttachPathParamBindings_RejectsNonScalarTarget(t *testing.T) {
 		{"st", `"St"`, "zchttp.testReq"},
 		{"ps", `"PS"`, "*[]string"},
 		{"ch", `"Ch"`, "chan int"},
+		{"data", `"Data"`, "[]uint8"},
 	}
 	for _, c := range rejected {
 		t.Run("reject_"+c.param, func(t *testing.T) {

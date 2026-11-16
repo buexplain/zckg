@@ -1,21 +1,16 @@
-# 中间件规则
+# 中间件
 
-本框架采用**洋葱模型（Onion Model）**实现中间件，支持前置逻辑、后置逻辑与短路控制。相关实现位于 `middleware.go`，执行位于 `httpEngine.go` 的 `ServeHTTP`。
+本文说明 `zchttp` 的中间件签名、洋葱模型、`next` 规则、w/r 替换、上下文访问与注册快照。实现细节（chainRunner、位图、requestState）见 [internals.md](internals.md) 的“中间件链”一节。
 
-## 一、中间件签名
+适合：需要鉴权、日志、追踪、压缩、响应捕获等横切逻辑的开发者。
+
+## 一、签名与基本写法
 
 ```go
 type NextFunc func(w http.ResponseWriter, r *http.Request) error
 
 type MiddlewareHandler func(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error
 ```
-
-- `next` 调用**之前**的逻辑为「前置」处理。
-- `next(w, r)` 返回**之后**的逻辑为「后置」处理。
-- 返回值 `error` 会向上层中间件传播。
-- `next` 接收的 `w` 和 `r` 将传递给下游；若无需替换，原样传入当前收到的 `w` 和 `r` 即可。传入新的 `r` 时，其 `r.Context()` 同时成为下游中间件与 handler 的 `ctx`（见第三节）。
-
-标准写法：
 
 ```go
 func myMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
@@ -26,114 +21,66 @@ func myMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, n
 }
 ```
 
-## 二、洋葱模型执行顺序
+- `next` 之前是前置，`next` 返回之后是后置。
+- 返回值 error 向上层中间件传播；最终由引擎按类型分发。
+- 不调用 `next` 即短路，后续中间件与 handler 都不执行。
+- `next` 必须在当前中间件所属 goroutine 内同步调用；跨 goroutine 属未定义行为。
 
-中间件按注册顺序由外到内包裹，handler 位于最内层。假设注册了中间件 A、B，则执行顺序为：
-
-```
-A 前置 → B 前置 → handler → B 后置 → A 后置
-```
-
-流程示意：
+## 二、洋葱模型
 
 ```
-请求进入
-  │
-  ▼
-Middleware A ── 前置逻辑
-  │
-  ├──▶ Middleware B ── 前置逻辑
-  │     │
-  │     ├──▶ Handler（最内层）
-  │     │
-  │  ◀──┤ B 后置逻辑
-  │
-  ◀──┤ A 后置逻辑
-  │
-  ▼
-响应返回
+A 前置 → B 前置 → core（校验 + handler） → B 后置 → A 后置
 ```
 
-该链由 `runChain` 执行：`middlewares[0]` 在最外层，`finalHandler`（handler 调用）在最内层。每层的 `next` 仅允许调用一次，重复调用不会重新执行下游链与 handler，而是直接返回 `ErrNextCalledMultipleTimes`，避免业务副作用被重复触发。
+- `middlewares[0]` 最外层，`finalHandler`（core）最内层。
+- 校验发生在 core 内：各层前置已执行、后置尚未执行；路由级中间件紧贴 core，不直接紧贴裸 handler。
+- 每层的 `next` 只能调用一次；重复调用返回 `ErrNextCalledMultipleTimes`，不会重新执行下游/handler。
 
-实现上不为每层构造闭包：执行状态由池化的 `chainRunner` 对象承载，各层 `next()` 是否已调用以 `uint64` 位图按层号记录（热路径零闭包分配）；仅当中间件层数超过 64 层（极罕见场景）时回退为递归实现（`runChainRecursive`），语义与防重规则完全一致。
-
-> **并发约束**：`next()` 必须在中间件所属的 goroutine 内调用，不得另起 goroutine 调用 `next()`。内部调用状态标记（位图 / bool）未做并发安全保护。
-
-## 三、替换 ResponseWriter 与 Request
-
-中间件可通过 `next(w, r)` 向下游传递替换的 `http.ResponseWriter` 或 `*http.Request`。典型场景包括 gzip 压缩、响应体捕获、请求头注入等：
+## 三、替换 w / r
 
 ```go
-// gzip 压缩中间件
 func gzipMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     gz := gzip.NewWriter(w)
     wrapped := &gzipResponseWriter{Writer: gz, ResponseWriter: w}
-    err := next(wrapped, r)   // 下游及 Context 访问器观察到 wrapped
+    err := next(wrapped, r)
     gz.Close()
     return err
 }
 ```
 
-每次成功调用 `next(w, r)` 时，引擎都会先把这组对象记录为当前请求状态，再进入下一层。因此以下位置观察到的是同一组、最近一次传给 `next` 的对象：
+每次成功调用 `next(w,r)`：
 
-- 下游中间件与最内层 core；
-- 业务 handler 通过 `ResponseWriterFromContext(ctx)`、`RequestFromContext(ctx)` 取得的对象；
-- `OnResponse`、`OnError`、`OnValidationError` 与 `OnPanic` 回调收到的对象。
+- 引擎把这对对象记录为当前请求状态；
+- 下游中间件、core、handler 通过 `ResponseWriterFromContext`/`RequestFromContext` 看到最近一次传入的对象；
+- `OnResponse`/`OnError`/`OnValidationError`/`OnPanic` 也使用这组对象；
+- 外层中间件自身的 `w/r` 变量不变，但通过 ctx 访问器读到的是最新状态。
 
-多层中间件可逐层替换。外层把 `w2/r2` 传给 `next`、内层再把 `w3/r3` 传给 `next` 时，core、Context 访问器和链后回调最终都使用 `w3/r3`。该状态在调用返回时不会回退为外层对象。
+多层替换时，最终 core/访问器/回调使用最内层最后传入的 w/r；调用返回后状态不回退到外层对象。
 
-### 通过 `r.WithContext` 向下游注入值
-
-传给 `next` 的 `r` 与当前层收到的不是同一对象时，`r.Context()` 会成为下游中间件的 `ctx` 参数以及业务 handler 的 `ctx` 参数，与标准库 `r.WithContext` 的习惯一致：
+### `r.WithContext` 注入值
 
 ```go
 func traceMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     ctx = context.WithValue(ctx, traceKey{}, newTraceID())
-    return next(w, r.WithContext(ctx)) // 下游中间件与 handler 的 ctx.Value(traceKey{}) 均可读到
+    return next(w, r.WithContext(ctx))
 }
 ```
 
-- 新 Context 若由中间件收到的 `ctx` 派生（已含框架请求状态），下游直接使用它。
-- 新 Context 若由原始 `r.Context()` 或其他上下文派生（不含框架请求状态），引擎会在其上补挂同一份请求状态，因此下游 `ctx` 上的 `RequestFromContext`、`ResponseWriterFromContext`、`EngineFromContext`、`BoundReqFromContext`、`BoundResFromContext` 仍可用。
-- 原样传入 `r` 时下游 `ctx` 与当前层相同；外层中间件自身的 `ctx` 参数不会被下游的替换改变，外层后置阶段读取 `BoundResFromContext(ctx)` 等访问器不受影响（同一份请求状态）。
+- 传入的 `r` 与当前不同对象时，下游 `ctx` 改为 `r.Context()`。
+- 如果新 ctx 不含框架请求状态，引擎会补挂同一份 `requestState`，所以 `RequestFromContext`、`ResponseWriterFromContext`、`EngineFromContext`、`BoundReqFromContext`、`BoundResFromContext` 仍可用。
+- 原样传入 `r` 时下游 ctx 与当前层相同；外层中间件的 ctx 参数不受下游替换影响。
 
-替换 `*http.Request` 不会重新执行参数绑定：`BoundReqFromContext` 仍返回进入中间件链之前已经绑定的 Req。若无需替换 w/r，原样透传即可：
+替换 `*http.Request` 不会重新绑定参数：`BoundReqFromContext` 仍返回进入中间件链之前已经绑定的 Req。
 
-```go
-func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-    start := time.Now()
-    err := next(w, r)   // 原样传递，不替换
-    slog.Default().Info("http request", "method", r.Method, "path", r.URL.Path, "cost", time.Since(start))
-    return err
-}
-```
+## 四、在中间件中读 Req/Res
 
-> 自定义 ResponseWriter 若要让默认回调正确判断是否已经写响应，应保留底层写入能力并正确转发所需接口；引擎自身的响应包装器会跟踪写操作。详细规则见 `http-engine-callback.md`。
-
-## 四、短路控制
-
-中间件**不调用 `next()`** 即可短路，后续中间件与 handler 都不会执行：
-
-```go
-func authMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-    if !authorized(r) {
-        w.WriteHeader(http.StatusUnauthorized)
-        return nil          // 不调用 next，直接短路
-    }
-    return next(w, r)
-}
-```
-
-### 在中间件中获取已解析的 Req
-
-路由命中后引擎会立即绑定请求数据并注入 `ctx`，中间件可通过泛型方法 `BoundReqFromContext` 获取类型安全的 Req，在 `next()` 之前做前置检查：
+### 已绑定 Req
 
 ```go
 func authMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     req, err := zchttp.BoundReqFromContext[LoginReq](ctx)
     if err != nil {
-        // 绑定阶段出错（如 JSON 格式错误），交由 core 层路由到 OnValidationError
+        // 绑定阶段出错（*BindingError）：交给 core 统一 400
         return next(w, r)
     }
     if req.Token == "" {
@@ -144,18 +91,16 @@ func authMiddleware(ctx context.Context, w http.ResponseWriter, r *http.Request,
 }
 ```
 
-> 此时 Req 已完成数据绑定但尚未做参数校验（nonzero / Validate），校验在 core 层执行。若绑定阶段出错，`BoundReqFromContext` 会返回 `*BindingError`。
->
-> 以值类型 `BoundReqFromContext[LoginReq]` 取得的是浅拷贝副本，修改其非引用字段不影响 handler；以指针类型 `BoundReqFromContext[*LoginReq]` 取得的是 handler 即将使用的同一实例，在 `next()` 之前修改其字段会改变 handler 收到的入参（且该修改发生在 nonzero / Validate 校验之前）。只读观察时请用值类型。类型参数与路由 Req 类型不符时同样返回 `ErrBoundReqNotFound`，与「ctx 中没有 Req」无法区分。
+- 此时 Req 已完成数据绑定，但尚未做 nonzero/Validate；校验在 core。
+- 绑定出错时 `BoundReqFromContext` 返回 `*BindingError`。
+- 值类型 `BoundReqFromContext[LoginReq]` 得到浅拷贝；`*LoginReq` 得到 handler 即将使用的同一实例，`next` 前修改会影响 handler 入参，且修改发生在校验之前。
+- 类型参数与注册 Req 类型不符时返回 `ErrBoundReqNotFound`，与 ctx 中没有 Req 无法区分。
 
-### 在中间件中获取 handler 的响应 Res
-
-handler 执行完毕后（`next()` 返回），可通过 `BoundResFromContext` 获取 handler 的返回值，在 `next()` 之后做后置处理：
+### handler 的 Res
 
 ```go
 func responseLogger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
     err := next(w, r)
-    // 后置逻辑：获取 handler 的 Res
     res, resErr := zchttp.BoundResFromContext[MyRes](ctx)
     if resErr == nil {
         slog.Default().Info("response", "res", res)
@@ -164,96 +109,56 @@ func responseLogger(ctx context.Context, w http.ResponseWriter, r *http.Request,
 }
 ```
 
+`BoundResFromContext` 只在 `next()` 返回后可用；handler 未成功或类型不符返回 `ErrBoundResNotFound`。
+
 ## 五、错误传播
 
-- handler 返回的 `error` 会作为 `next()` 的返回值向上传播。
-- 每层中间件都能捕获、包装或拦截该错误。
-- 若错误一路传播到最外层仍未被处理，引擎按错误类型分发：`*BindingError`（绑定失败）与 `*ValidationError`（参数校验失败）交由 `OnValidationError`（默认 **HTTP 400**），其余错误交由 `OnError`（默认 **HTTP 500**）。详见 `http-engine-callback.md`。
-
-```go
-func recoverError(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-    err := next(w, r)
-    if err != nil {
-        slog.Default().Error("handler error", "err", err)
-        // 可选择返回 nil 拦截错误，或继续向上返回 err
-    }
-    return err
-}
-```
+- handler/下游中间件的 error 作为 `next` 返回值向上传播；每层可捕获、包装、拦截。
+- 最外层仍返回 error 时，引擎按类型分发：
+  - `*BindingError` / `*ValidationError` → `OnValidationError`（默认 400）；
+  - 其余 → `OnError`（默认 500）。
+- 中间件返回 nil 可吞掉错误；返回包装后的 error 会改变类型分发。
 
 ## 六、panic 恢复
 
-`HttpEngine.ServeHTTP` 内置 `defer recover`，捕获 handler 或中间件中的 panic，交由 `OnPanic` 回调处理（默认 `DefaultPanicHandler`）。中间件无需自行处理 panic，引擎层已覆盖；回调收到最近一次成功传给 `next` 的 w/r：
+`ServeHTTP` 入口有 `defer recover`，覆盖路由、绑定、中间件、handler、回调。中间件无需自行 recover。
 
-默认处理逻辑由引擎内部调用（签名示意）：
+- `OnPanic` 收到最近一次成功传给 `next` 的 w/r；
+- 默认 `DefaultPanicHandler` 记录 panic 与 stack，未写响应才返回 500；
+- 自定义 `OnPanic` 若再次 panic，引擎第二层 recover 记录并兜底 500，不会递归调用 `OnPanic`。
 
-```go
-func example(w http.ResponseWriter, r *http.Request, recovered any) {
-    // 输出 slog.Error + 堆栈，返回 500 错误；
-    // 若响应已写入（IsResponseWritten）则跳过，避免重复写头；支持 HTML 格式（WantHtml）
-    DefaultPanicHandler(w, r, recovered)
-}
-```
+## 七、注册与快照
 
-自定义 panic 处理：
-
-```go
-func example() {
-    engine := zchttp.NewEngine()
-    engine.OnPanic = func(w http.ResponseWriter, r *http.Request, recovered any) {
-        slog.Default().Error("panic", "recovered", recovered)
-        w.WriteHeader(http.StatusInternalServerError)
-    }
-}
-```
-
-`OnPanic` 自身若再次 panic，引擎会进行第二层 recover、记录错误，并在响应尚未写入时兜底写入 HTTP 500；该二次 panic 不会继续传播到 `net/http`。
-
-## 七、注册方式
-
-中间件有三级注册入口：全局 `Use(...)`、分组（`Group` 创建时传入或组内 `Use(...)` 追加）与路由级（注册方法的尾部变参）：
+三级入口：
 
 ```go
 func example() {
     r := zchttp.NewRouter()
-    r.Use(logger, recoverError)              // 全局中间件
-
-    api := r.Group("/api", authMiddleware)   // 分组中间件
-    api.GET("/users", listUsers, auditMiddleware) // 路由级中间件：仅 /api/users
+    r.Use(logger, recoverError)                    // 全局
+    api := r.Group("/api", authMiddleware)         // 分组
+    api.GET("/users", listUsers, auditMiddleware)  // 路由级
 }
 ```
 
-关键规则：
+- 注册路由时快照 `[全局..., 最外层分组..., 当前分组..., 路由级...]`，之后 `Use` 不影响已注册路由。
+- 子分组保留父分组引用：先建子组、后给父组 `Use`，子路由注册时仍继承。
+- 路由级中间件只作用于本次注册的路由；`Any` 的 9 个方法共用同一份；注册后修改传入切片不影响快照。
+- 框架不校验 nil、不去重：nil 中间件请求期 panic 由 `OnPanic` 兜底；重复传入会执行多次。
+- 路由级中间件位于链的最内层，紧贴 core（校验 + handler）。
 
-- **只对此后注册的路由生效**：注册路由时会将全局中间件、当前分组祖先链与路由级中间件的当前状态快照到路由条目；已注册路由不受后续 `Use(...)` 影响。
-- 子分组保留父分组引用。先创建子分组、后向父分组追加中间件时，之后注册的子路由仍会继承新增中间件。
-- 路由级中间件只作用于本次注册的那条路由；`Any` 的 9 个方法共用同一份路由级中间件。传入的切片在注册后即使被修改，也不影响已注册路由。
-- 最终链顺序为 `[全局中间件..., 最外层分组中间件..., 当前分组中间件..., 路由级中间件...]`；路由级位于链的最内层、紧贴 handler。
-- 与 `Use(...)` 一致，框架不校验中间件是否为 nil，也不去重：nil 中间件会在请求期 panic 并由 `OnPanic` 兜底，重复传入的同一中间件会执行多次。
+## 八、常见坑
 
-```go
-func exampleRouteLevel(r *zchttp.Router, logger, auth, audit zchttp.MiddlewareHandler) {
-    r.Use(logger)
-    api := r.Group("/api", auth)
-    api.GET("/users", listUsers, audit) // 执行顺序: logger → auth → audit → handler
-}
-```
+- 在中间件里重新绑定/解析 body：引擎不会重新绑定；替换 request 也不会。
+- 在 `next` 之前修改指针 Req 的字段：会影响 handler 入参，且发生在校验之前；只读请用值类型。
+- 在中间件中捕获 panic：可以，但会绕过引擎的统一 `OnPanic`；非必要不要这样做。
+- 自定义 ResponseWriter 未透传 `Written()`：默认回调无法判断是否已写，可能重复写响应。详见 [http-engine-callback.md](http-engine-callback.md)。
 
-> 注册与快照的细节详见 `routing.md`。
+## 九、代码与测试
 
-## 八、完整示例
+| 概念 | 源码 | 测试 |
+| --- | --- | --- |
+| 链执行、next 防重、位图 | `middleware.go` | `middleware_test.go` |
+| requestState、Context 访问器 | `context.go` | `context_test.go` |
+| 中间件快照、core 位置 | `buildEntry.go`、`httpEngine.go` | `buildEntry_test.go`、`httpEngine_test.go` |
 
-```go
-func logger(ctx context.Context, w http.ResponseWriter, r *http.Request, next NextFunc) error {
-    start := time.Now()
-    err := next(w, r)
-    slog.Default().Info("http request", "method", r.Method, "path", r.URL.Path, "cost", time.Since(start))
-    return err
-}
-
-func example() {
-    r := zchttp.NewRouter()
-    r.Use(logger)
-    r.GET("/ping", pingHandler)
-}
-```
+继续阅读：[internals.md](internals.md)（chainRunner/位图）、[architecture.md](architecture.md)（请求生命周期）、[http-engine-callback.md](http-engine-callback.md)（回调与响应）。

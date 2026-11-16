@@ -1,82 +1,74 @@
-# 参数校验规则
+# 参数校验
 
-本文档介绍 `zchttp` 框架的参数校验机制，包括 `nonzero` 非零值校验、`Validate()` 自定义业务校验，以及校验的执行顺序与错误处理。Req 结构体的定义与标签总览见 `request.md`。相关实现位于 `validate.go`（校验执行）与 `meta.go`（标签解析）。
+本文说明 `zchttp` 的参数校验：`nonzero` 非零值校验、`Validate()` 自定义业务校验、执行顺序与错误处理。完整错误/状态码见 [reference.md](reference.md)，递归实现见 [internals.md](internals.md) 的“校验”一节。
 
-## 一、非零值校验（nonzero）
+适合：需要声明式必填或跨字段校验的业务开发者。
 
-`nonzero` 标签的解析在注册阶段由 `buildStructMeta` 完成并存入 `fieldMeta.nonzero`，运行时 `validateNonzero` 和 OpenAPI 文档生成均读取该预计算结果。具名嵌套结构体的 meta 在递归校验首次使用时经 `cachedStructMeta` 构建并进入进程级缓存（`sync.Map`）；匿名嵌入结构体会在构建当前 meta 时递归展开为扁平字段，因此 `fieldMeta.indices` 可能是多级索引路径。
+## 一、心智模型
 
-`nonzero` 标签与 `default` 标签**独立解析、互不影响**：
+- `nonzero` 是**声明式零值校验**：只检查 `reflect.Value.IsZero`，不做业务规则。
+- `Validate()` 是**顶层 Req 的自定义校验**：在绑定和 nonzero 之后调用，可以访问全部字段。
+- 两者都发生在 core 层、handler 之前；校验失败返回 `*ValidationError`，默认 400。
+- 校验只看绑定/默认值填充后的最终值；`default` 不会让 nonzero 失效（默认值非零则通过，零值仍失败）。
 
-- **校验阶段**：只要字段标记了 `nonzero:"true"`，就始终校验零值（所见即所得），不受 `default` 标签影响。
-- **文档生成阶段**：`nonzero:"true"` 且不存在**受支持、可解析且能满足 nonzero** 的 `default` → 文档中标记为**必填**；其它情况（存在满足 nonzero 的 `default`、`nonzero:"false"`、未标注 `nonzero` 或其值无法解析为 true）视为**可选**。不受支持类型、无法解析的值（如 `int default:"abc"`）以及零值 default（`default:"0"`、`default:""`）都不会取消 required，详见 `openapi.md`。
+## 二、nonzero
 
-### 递归校验
-
-`validateNonzero` 会递归进入嵌套结构体、结构体指针字段、单层容器（`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`）及其非 nil 指针包裹，校验所有 `nonzero:"true"` 字段。固定数组始终具有 N 个元素，即使数组整体为零值也逐元素校验；nil/空切片和 nil map 没有元素可校验。多层容器（如 `map[K][]Struct`、`map[K][N]Struct`）的内部元素无法穿透，详见 `request.md` 中“容器嵌套深度限制”章节。规则如下：
-
-| 本级字段 | 零值 | 行为 |
-|---------|------|------|
-| `nonzero:"true"` | 是 | 报错 `"is required"`（嵌套字段带绑定名路径，如 `"company.name"`），不递归 |
-| `nonzero:"true"` | 否 | 校验通过，若为嵌套结构体/指针/单层容器元素（切片/数组/map）则递归进入子字段 |
-| 未标注 `nonzero` | 是 | 通常跳过；固定数组例外，仍递归其全部现存元素 |
-| 未标注 `nonzero` | 否 | 不报本级，但若为嵌套结构体/指针/单层容器元素（切片/数组/map）则递归进入子字段 |
-
-典型场景——收货地址必填，发票选填但填了就必须校验抬头和金额：
+### 1. 声明与语义
 
 ```go
 type Req struct {
-    Name    string   `json:"name" nonzero:"true"`
-    Addr    Address  `json:"addr" nonzero:"true" description:"收货地址"`
-    Invoice *Invoice `json:"invoice" description:"发票，选填"`
+    Name  string   `json:"name" nonzero:"true"`
+    Age   int      `json:"age" nonzero:"false"`
+    Email string   `json:"email"`
+    Addr  Address  `json:"addr" nonzero:"true"`
+    Note  *Invoice `json:"note"`
 }
 
 type Address struct {
     City       string `json:"city" nonzero:"true"`
     PostalCode string `json:"postalCode" nonzero:"true"`
-    Phone      string `json:"phone"`
 }
 
 type Invoice struct {
-    Header string `json:"header" nonzero:"true" description:"抬头"`
-    Amount string `json:"amount" nonzero:"true" description:"金额"`
-    Email  string `json:"email"`
+    Header string `json:"header" nonzero:"true"`
+    Amount string `json:"amount" nonzero:"true"`
 }
 ```
 
-- `Addr` 标记了 `nonzero:"true"` 且非零 → 递归校验 `City`、`PostalCode`。
-- `Invoice` 未标 `nonzero`：`nil` → 跳过；非 `nil` → 递归校验 `Header`、`Amount`。
+- `nonzero:"true"` 且零值 → 错误 `"is required"`；字段名用 Form 链绑定名，嵌套路径如 `addr.city`。
+- `nonzero:"true"` 且非零 → 通过，若为 struct/指针/容器则继续递归。
+- 未标注/`"false"`/非法值 → 不校验该字段；零值时通常跳过，固定数组例外。
+- `Age nonzero:"false"` 与未标注等价；传 0 不报错。
 
-递归过程通过 `visited map[visitKey]bool`（`visitKey` 同时记录指针地址与类型，避免值类型首字段与父结构体共享地址时被误判为循环引用）记录已访问的节点，防止循环引用导致无限递归。
+### 2. 零值
 
-嵌套字段的校验错误路径使用**字段绑定名**（json/form tag，与 API 命名一致），例如 `company.name`、`addr.city`。当前切片/数组递归不附加元素索引，因此第 3 个 `items` 元素失败仍为 `items.name`；map 会附加 `fmt.Sprint(key)`，例如 `children.zzz_bad.name`。map key 中的点号不做转义，调用方不应把该路径当作可无歧义反解析的机器协议。
+`reflect.Value.IsZero`：nil 指针/切片/接口、空字符串、0、false、全零 struct 都是零值。
 
-### 零值判定与快速跳过
+### 3. 递归范围
 
-运行时 `validateNonzero` 遍历 `meta.fields`，零值判定使用 `reflect.Value.IsZero`：nil 指针/切片、空字符串、数字 0、bool false 等均视为零值。
+- 嵌套 struct、`*struct`（非 nil）、单层容器：`[]Struct`、`[]*Struct`、`[N]Struct`、`[N]*Struct`、`map[K]Struct`、`map[K]*Struct`，以及它们的非 nil 指针包裹。
+- 固定数组即使整体为零也逐元素校验；nil/空切片、nil map 无元素可校验。
+- 多层容器（`map[K][]Struct`、`[][]Struct` 等）不穿透。
+- 切片/数组错误路径不附加索引（第 3 个 `items` 元素失败仍是 `items.name`）；map 追加 `fmt.Sprint(key)`，key 中的点号不转义。
+- 匿名嵌入字段没有“父字段判零”环节，内部 nonzero 等价于顶层必填。
 
-**快速跳过（注册期传递性预计算）**：注册阶段由 `hasNonzeroInTree` 扫描 Req **整棵类型树**（穿透嵌套结构体、指针、切片/数组/map 容器），判定任意深度是否存在 `nonzero:"true"` 字段，结果存入路由条目的 `needsNonzeroValidation` 标记。请求阶段仅当该标记为 `true` 时才执行 `validateNonzero` 遍历，全树无 nonzero 字段的接口整体跳过，避免无意义的反射遍历。
+### 4. 与 default 的关系
 
-> 该标记是**传递性**的：顶层无 nonzero 但嵌套层有（如 `Addr Address` 未标注而 `City` 标了 nonzero）也计为 `true`。若仅统计 Req 顶层字段做跳过决策，会漏校验嵌套层 nonzero 字段，故扫描必须穿透整棵类型树。
+- 校验看默认值填充后的值：`default:"x"` 的非空字符串通过 nonzero；`default:"0"`/`default:""` 仍是零值，失败。
+- 只有“类型支持、值可解析、本身非零”的 default 才能让 OpenAPI 的字段变为可选；否则 required。非法/不支持的 default 不改变 required。
+- 字段未传且无 default 的 nil 指针会失败 nonzero；显式传零值同样失败。
 
-要点：
+## 三、快速跳过
 
-- 校验仅针对显式 `nonzero:"true"` 的字段，普通字段传零值不会报错。
-- `nonzero` 与 `default` 独立：带有 `default` 的 `nonzero:"true"` 字段在请求阶段**仍然会校验零值**（所见即所得）；只有 default 能解析且本身非零时，OpenAPI 才把字段标记为可选，否则保持 required。不受支持类型或无法解析的值都不会改变 required 推断。
-- 嵌套结构体的 `nonzero` 字段通常仅在**父字段非零**时递归校验；父字段为零值时子字段被跳过。两个例外是：匿名嵌入字段没有“父字段判零”环节，其内部 `nonzero` 等价于顶层必填；固定数组即使整体为零值也始终逐元素递归。
-- 仅顶层 Req 的 `Validate()` 方法会被自动调用；嵌套结构体若需自定义校验逻辑，请在顶层 `Validate()` 中手动调用。
+注册期 `hasNonzeroInTree` 扫描 Req 整棵类型树（穿透嵌套 struct/指针/切片/数组/map），任意深度存在 `nonzero:"true"` 就置 `needsNonzeroValidation=true`；请求期只有为 true 才执行遍历。该标记是传递性的，避免顶层无 nonzero 但嵌套层有时漏检。
 
-## 二、自定义业务校验（Validate）
-
-声明式 `nonzero` 只能表达单字段非零值。若需跨字段、业务规则等更丰富的校验，可让 `Req` 结构体实现 `Validator` 接口：
+## 四、Validate()
 
 ```go
 type Validator interface {
     Validate() error
 }
 ```
-
-绑定与 `nonzero` 校验均通过后，若 `Req` 实现了该接口（值接收者或指针接收者均可），引擎会自动调用其 `Validate()`。注册阶段通过 `structMeta.implementsValidator` 预判断是否实现该接口，避免请求阶段重复反射：
 
 ```go
 type CreateEventReq struct {
@@ -92,49 +84,60 @@ func (r CreateEventReq) Validate() error {
 }
 ```
 
-`Validate()` 返回值处理：
+- 只有顶层 Req 的 `Validate()` 自动调用；嵌套 struct 需要在顶层 `Validate` 中手动调用。
+- 值接收者或指针接收者均可；注册期用 `implementsValidator` 预判断。
+- 返回 `nil` 或 typed-nil（如 `(*ValidationError)(nil)`）→ 通过。
+- 返回 `*ValidationError` → 直接透传（可带 Field/Err）。
+- 返回其他 error → 包装为 `*ValidationError{Message: err.Error(), Err: err}`，`errors.Is/As` 可穿透。
+- `Validate()` 是运行时任意代码，不参与 OpenAPI 静态推导。
 
-- 返回 `nil` 或装在 `error` 接口里的 typed-nil（如 `(*ValidationError)(nil)`）→ 校验通过，与 handler 返回值的 nil 判定同一语义；
-- 返回 `*ValidationError` → 直接透传（可携带 `Field` 等结构化信息，可用 `NewValidationError(Field, Message, Err)` 构造或直接结构体字面量）；
-- 返回其他普通 `error` → 自动兜底包装为 `*ValidationError`（保留原始错误链，`errors.Is/As` 可穿透）。
+## 五、执行顺序与错误
 
-> `Validate()` 是运行时任意 Go 代码，不会被反射提取为 OpenAPI schema 约束，因此不影响生成的文档。
-
-## 三、校验执行顺序与错误处理
-
-`ServeHTTP` 的执行流程分为两阶段：
-
-**阶段一：路由命中后立即绑定（`bindRequestData`）**
+一次请求的校验顺序：
 
 ```
-浅拷贝模板（含默认值）→ 深拷贝引用字段 → 绑定（query/form/multipart/JSON）
+绑定（query/body/path）
+  → 请求阶段默认值（仅 nil 指针）
+  → 中间件链
+  → core：validateNonzero → validateCustom(Validate)
+  → handler
 ```
 
-绑定完成后将 Req 注入 `ctx`，中间件可通过 `BoundReqFromContext` 提前检查。此时尚未做参数校验。若绑定失败，错误（`*BindingError`）随 Req 一同注入 ctx，core 层统一处理。
+- 绑定失败时 core 直接返回 `*BindingError`，不执行校验。
+- 校验失败 → `*ValidationError`；默认 `OnValidationError` 返回 400，并把 `err.Error()` 回显。
+- 其他错误（handler/中间件）→ `OnError`（默认 500）。
+- 默认回调都先判断 `IsResponseWritten`；已写响应则跳过。
 
-**阶段二：洋葱模型 core 层校验（`validateRequest`）**
-
-```
-validateNonzero → validateCustom(Validate)
-```
-
-所有中间件执行完毕后，core 层对绑定阶段产出的 Req 进行校验（直接使用闭包捕获的 `reqPtr`，不再从 ctx 取值）。
-
-任一校验失败都会产生 `*ValidationError`：
+错误类型：
 
 ```go
 type ValidationError struct {
-    Field   string // 校验失败的字段名（绑定名路径，如 "company.name"，业务校验可留空；留空时 Error() 只返回 Message）
-    Message string // 失败原因
-    Err     error  // 可选：包装底层错误，支持 errors.Is/As 穿透
+    Field   string // 绑定名路径；业务校验可留空
+    Message string
+    Err     error  // 可选，支持 errors.Is/As
 }
+
+type BindingError struct {
+    Message string
+    Err     error
+}
+
+func NewValidationError(field, message string, err error) *ValidationError
+func NewBindingError(err error) *BindingError
 ```
 
-`*BindingError`（绑定失败，由引擎经 `NewBindingError(err)` 包装底层错误构造，`Error()` 直接返回底层错误文案）与 `*ValidationError`（校验失败，`Err` 为 nil 时 `Error()` 返回 `field "<Field>" <Message>` 形式；`Field` 为空时只返回 `<Message>`，不输出 `field ""` 前缀）在 `ServeHTTP` 中通过 `errors.As` 被识别，统一路由到 `OnValidationError` 回调（默认 `DefaultValidationErrorHandler`，返回 **400**）；其余非校验错误走 `OnError`（默认 **500**）。回调的自定义方式见 `http-engine-callback.md`。
+| 类型 | 产生位置 | Error() | 默认状态码 |
+| --- | --- | --- | --- |
+| `*BindingError` | query/body/path 绑定 | 底层错误文案 | 400 |
+| `*ValidationError` | nonzero / Validate | Err 非 nil 用其文案；否则 `field "<Field>" <Message>`；Field 空只返回 Message | 400 |
 
-## 四、相关文档
+## 六、代码与测试
 
-- Req 结构体定义与标签总览：`request.md`
-- 参数绑定来源、字段类型、`time.Time` 解析、`default` 机制、文件上传：`parameter-binding.md`
-- OpenAPI 文档生成、`OpenAPIMeta`、字段级文档标签：`openapi.md`
-- 回调机制与错误分发、自定义响应/错误/校验失败处理：`http-engine-callback.md`
+| 概念 | 源码 | 测试 |
+| --- | --- | --- |
+| nonzero 递归、固定数组、map 路径 | `validate.go` | `validate_test.go` |
+| hasNonzeroInTree | `validate.go` | `validate_test.go` |
+| Validator、typed-nil、错误包装 | `validate.go`、`errors.go` | `validate_test.go`、`errors_test.go` |
+| 请求顺序、错误分发 | `httpEngine.go` | `httpEngine_test.go` |
+
+继续阅读：[reference.md](reference.md)（错误/限制/不变量）、[internals.md](internals.md)（校验实现）、[middleware.md](middleware.md)（校验在链中的位置）。

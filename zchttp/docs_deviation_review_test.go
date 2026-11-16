@@ -31,7 +31,7 @@ func docReviewDoJSON(t *testing.T, h http.Handler, method, target, body string) 
 }
 
 // DEV-02/DEV-03：NewEngine 默认 MaxBodyBytes 与 MultipartFormMaxMemory 均为 32 MB
-// （parameter-binding.md 2.1 节、http-engine-callback.md 第一节/第七步）。
+// （parameter-binding.md「body 大小限制」、http-engine-callback.md「默认回调」/「全链路」）。
 func TestDocReview_NewEngineDefaults(t *testing.T) {
 	e := NewEngine()
 	// 直接断言文档声称的 32 MB（而非引用常量），常量被改动时本测试能暴露文档偏离
@@ -65,7 +65,7 @@ func TestDocReview_ReadFromMarksWritten(t *testing.T) {
 	}
 }
 
-// parameter-binding.md 一节：POST 等方法合并绑定（先 query 后 body），
+// parameter-binding.md「带 body 的方法」：POST 等方法合并绑定（先 query 后 body），
 // body 覆盖 query 的粒度表（显式零值覆盖 / null 非指针保留 / null 指针置 nil / 未出现保留）。
 type drMergeReq struct {
 	Page int     `json:"page"`
@@ -114,7 +114,7 @@ func TestDocReview_MergeBindingGranularity(t *testing.T) {
 	}
 }
 
-// request.md 容器嵌套深度矩阵 + DEV-04：
+// reference.md 容器深度矩阵 + request.md 默认值说明 + DEV-04：
 // 单层容器 nonzero/default 生效；多层容器均不生效；
 // Res 侧不读 default/nonzero（响应无默认值填充、无校验），同一类型的响应 schema 以 <Type>Response
 // 命名且不含请求侧约束，故两处断言分别锁死请求变体与响应变体的差异。

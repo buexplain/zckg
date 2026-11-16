@@ -122,7 +122,7 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
   - `zcdb/docs/README.md`（入口 + 文档地图；分层：`getting-started.md`、`concepts/`、`reference/`、`how-to/`、`migration/`）
   - `zcmodel/docs/README.md`（索引 + 总览；分主题：`quickstart.md`、`api.md`、`generated-code.md`、`tags-ddl-index.md`、`types-and-naming.md`、`regeneration.md`、`architecture.md`、`pipeline.md`、`skeleton-merge.md`、`testing.md`、`glossary.md`、`code-map.md`；`zcmodel.md` 为兼容入口）
   - `zcquit/docs/zcquit.md`
-  - `zchttp/docs/*.md`（`routing.md`、`parameter-binding.md`、`parameter-validate.md`、`request.md`、`middleware.md`、`http-engine-callback.md`、`openapi.md`）
+  - `zchttp/docs/README.md`（入口 + 心智模型 + 文档/代码地图；分主题：`architecture.md`、`routing.md`、`request.md`、`parameter-binding.md`、`parameter-validate.md`、`middleware.md`、`http-engine-callback.md`、`openapi.md`、`reference.md`、`internals.md`、`recipes.md`）
 
 **四者一致性原则（必须遵守）**：任何修复或功能变更涉及代码、注释、文档、测试的，必须同步修改对应部分，禁止只改代码不改文档（或反之）。实现逻辑、函数注释、用户文档、回归测试用例必须保持严格一致。
 
