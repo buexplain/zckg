@@ -501,9 +501,49 @@ func splitGeneratedCode(code, structName, methodName string) (structText, method
 	return structText, methodText, nil
 }
 
+// structSpecText 去掉生成结构体声明中的 type 关键字，得到可放入 type (...) 块的 Spec 形态文本
+// （保留其 Doc 注释）。关键字与类型名由 AST 定位，避免 Doc 注释或 tag 值中出现
+// 「type <结构体名>」字样时按子串搜索截错位置——那会把注释删成半截、把关键字留在块内，
+// 使落盘自校验报语法错误。declText 为空或无法解析时原样返回
+// （生成代码此前已由 splitGeneratedCode 解析校验，正常不会走到解析失败分支）。
+func structSpecText(declText, name string) string {
+	if declText == "" {
+		return ""
+	}
+	const prefix = "package p\n\n"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", prefix+declText+"\n", parser.ParseComments)
+	if err != nil {
+		return declText
+	}
+	tf := fset.File(file.Pos())
+	base := len(prefix)
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != name {
+				continue
+			}
+			// gd.Pos() 为 type 关键字位置，spec.Pos() 为类型名位置；两者的源码偏移差即
+			// 「type」及其后空白，删掉后块内只剩「Name struct {...}」与前置 Doc 注释。
+			kw, nm := tf.Offset(gd.Pos())-base, tf.Offset(spec.Pos())-base
+			if kw >= 0 && nm > kw && nm <= len(declText) {
+				return declText[:kw] + declText[nm:]
+			}
+		}
+	}
+	return declText
+}
+
 // writeOrReplaceStruct 将 Entity 和 DO 结构体（含关联方法）写入文件，采用「骨架保持式合并」。
 //
 // 骨架 = 原文件顶层的元素序列（原文件头、package 行、import、各顶层声明、文件尾注释）。
+// 声明之间允许用显式分号分隔（如 `package p; var X = 1`、`type A struct{}; var X = 1`），
+// 分号只是分隔符、不进入重建产物。
 // 合并时骨架的排列结构原封不动——有哪些声明、按什么顺序、各自在什么位置都不变：
 // 属于生成区的声明（Entity/DO 结构体、ToDO/ToEntity 方法）在各自原位替换为新内容，
 // 用户声明（含其前置游离注释、同行尾注释、声明间游离注释与文件尾注释）的内容与顺序保留在原位置。
@@ -514,18 +554,20 @@ func splitGeneratedCode(code, structName, methodName string) (structText, method
 // 即使它们之间夹着用户代码也不搬动。生成声明在原文件中缺失时（首次引入 DO、用户手删过 ToDO 等）
 // 按配对落点补入：Entity 结构体↔ToDO、DO 结构体↔ToEntity 互为配对，结构体缺失补在其方法前、
 // 方法缺失补在其结构体后；两个都缺或都无配对时，追加到最后一个生成声明之后
-// （原文件没有任何生成声明时置于首个用户声明之前），并按标准顺序
-// Entity 结构体 → ToDO → DO 结构体 → ToEntity 排列。
-// 当结构体位于同一个 type 块内时，槽位是整个块：结构体缺失补在块前、方法缺失补在块后，
-// 不会插入块内；上述标准顺序只在独立声明之间保证。
+// （原文件没有任何生成声明时置于首个用户声明之前）。
+// 同一落点可能同时有配对插入与无配对追加，统一按标准顺序
+// Entity 结构体 → ToDO → DO 结构体 → ToEntity 排列，配对关系只决定插入位置。
+// 当结构体位于同一个 type 块内时，槽位是整个块：方法缺失补在整个块之后、不会插入块内，
+// 块内结构体把与其配对的方法钉在块后，因此当更靠前的生成声明也缺失时，完整标准顺序不保证
+// （同一落点内插入的声明仍按上述标准顺序排列）。
 // 同类生成声明出现多份时（如用户手写的值接收者 ToDO 与生成的指针接收者 ToDO 共存），
 // 首个槽位原位替换、其余重复槽位移除，避免同名方法共存导致编译失败。
 //
 // type 声明块按 Spec 粒度处理：块内生成 Spec 就地替换为新结构体、不再生成的生成 Spec 剔除，
 // 重复生成的 Spec（含跨槽位重复）只保留首个、其余剔除，用户类型（含各自注释）与块内
 // 不附着于任何 Spec 的游离注释原样保留；仅含一个生成 Spec 的声明以独立声明形态输出
-// （不保留括号块），与首次生成的形态保持一致；但若存在块级 Doc 或块内游离注释，
-// 则保留括号块，以免展开时丢失这些注释。
+// （不保留括号块），与首次生成的形态保持一致；但若存在块级 Doc 或生成 Spec 区间外的
+// 其他注释（块内游离注释、`(`/`)` 同行注释等），则保留括号块，以免展开时丢失这些注释。
 //
 // go/parser 不会把 package 声明之前的 build tags/文件级注释放进 file.Decls，重建时按源码偏移
 // 显式前置保留；已有文件的包名尊重原文件，仅新建文件使用目录推导包名（见 packageNameOf）。
@@ -582,16 +624,9 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 	}
 	// genSpecText 为结构体的「Spec 形态」文本：去掉 type 关键字、保留 Doc 注释，
 	// 用于把新结构体就地替换进 type (…) 块（块内 Spec 不带 type 关键字）。
-	specTextFor := func(declText, name string) string {
-		marker := "type "
-		if i := strings.Index(declText, marker+name); i >= 0 {
-			return declText[:i] + declText[i+len(marker):]
-		}
-		return declText
-	}
 	genSpecText := map[genKind]string{
-		genEntType: specTextFor(entStructText, entityName),
-		genDoType:  specTextFor(doStructText, doName),
+		genEntType: structSpecText(entStructText, entityName),
+		genDoType:  structSpecText(doStructText, doName),
 	}
 
 	fset := token.NewFileSet()
@@ -624,21 +659,36 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		}
 		return len(origContent)
 	}
-	// lineCommentEnd 若 end 之后同一行（仅隔空格/制表符）紧跟注释组、且注释组起点早于 limit，
-	// 返回该注释组的结束偏移，否则原样返回 end。用于把 `var X = 1 // c`、`func F() {} // c`
-	// 这类位于声明 End() 之后的行尾注释并入声明区间。
+	// lineCommentEnd 若 end 之后同一行（仅隔空格/制表符/显式分号）紧跟注释组、且注释组起点早于 limit，
+	// 返回该注释组的结束偏移，否则原样返回 end。用于把 `var X = 1 // c`、`func F() {} // c`、
+	// `type A struct{}; // c` 这类位于声明 End() 之后的行尾注释并入声明区间。
 	lineCommentEnd := func(end, limit int) int {
 		for _, cg := range file.Comments {
 			from := off(cg.Pos())
 			if from < end {
 				continue
 			}
-			if from >= limit || strings.TrimLeft(string(origContent[end:from]), " \t") != "" {
+			if from >= limit || strings.TrimLeft(string(origContent[end:from]), " \t;") != "" {
 				break
 			}
 			return off(cg.End())
 		}
 		return end
+	}
+
+	// skipDeclSeparators 跳过声明之间的空格、制表符与显式分号分隔符（如 `package p; var X = 1`、
+	// `type A struct{}; var X = 1`），返回下一个声明或文件尾的偏移。分号只是语句分隔符，
+	// 若留在骨架里会被拼到下一个声明之前，产出孤立的 ";" 而无法通过落盘前的语法自校验。
+	skipDeclSeparators := func(pos int) int {
+		for pos < len(origContent) {
+			switch origContent[pos] {
+			case ' ', '\t', ';':
+				pos++
+			default:
+				return pos
+			}
+		}
+		return pos
 	}
 
 	// 保留 package 声明之前的全部原文（build tags、文件级注释）与原 package 行（含同行尾注释）：
@@ -883,7 +933,7 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 	// 若同一本地名已绑定到别的路径，追加默认导入会形成重复绑定，必须报错而不是写出坏文件。
 	existingImportNames := make(map[string]string)
 
-	prev := pkgEnd
+	prev := skipDeclSeparators(pkgEnd)
 	pending := "" // 被移除声明之前的游离注释，顺延给下一个保留声明
 	takeLead := func(lead string) string {
 		s := strings.TrimLeft(pending+lead, " \t\r\n")
@@ -895,7 +945,7 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 		start := declStarts[i]
 		end := lineCommentEnd(off(decl.End()), nextStart(i))
 		lead := string(origContent[prev:start])
-		prev = end
+		prev = skipDeclSeparators(end)
 		body := string(origContent[start:end])
 
 		switch d := decl.(type) {
@@ -956,7 +1006,8 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 				case len(d.Specs) == 1 && userCount == 0 && dropCount == 0:
 					// 单一生成类型（标准的独立 type 声明，或仅含一个生成类型的括号块）：
 					// 通常以独立声明形态就地替换，不保留括号块，与首次生成的形态一致。
-					// 例外：块级 Doc 或块内游离注释存在时保留括号块，否则展开会静默丢弃这些注释。
+					// 例外：块级 Doc 或生成 Spec 区间外的其他注释（块内游离注释、`(`/`)` 同行注释等）
+					// 存在时保留括号块，否则展开会静默丢弃这些注释。
 					k, _ := generatedTypeKind(d.Specs[0])
 					if seenGen[k] {
 						pending += lead
@@ -1156,6 +1207,12 @@ func writeOrReplaceStruct(filePath, entityName, entityCode, doName, doCode strin
 			}
 		}
 		beforeMap[base] = append(beforeMap[base], unpaired...)
+	}
+	// 同一落点可能同时有配对插入（结构体前/方法后）与无配对追加：配对关系只决定插入位置，
+	// 不改变同一落点内各声明的先后，统一按生成声明的标准顺序输出。
+	for pos := range beforeMap {
+		kinds := beforeMap[pos]
+		sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
 	}
 
 	// 按骨架顺序输出各槽位：生成声明槽位在原位替换为新内容，用户槽位原样，缺失的生成声明按落点插入。

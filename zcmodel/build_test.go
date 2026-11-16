@@ -1104,6 +1104,39 @@ func (d *UserDO) ToEntity() {}
 	}
 }
 
+// TestWriteOrReplaceStruct_SemicolonSeparatedDecls 回归锁死显式分号分隔的合法存量文件：
+// `package p; var X = 1`、`type A struct{}; var X = 1`、同一行两个 import 声明以及
+// `type A struct{}; // c` 这类行尾注释，再生成时分号只作分隔符、不残留为孤立语句，
+// 用户声明与行尾注释保留，产物通过编译级类型检查。
+func TestWriteOrReplaceStruct_SemicolonSeparatedDecls(t *testing.T) {
+	entityCode := "type UserEntity struct {\n\tID int64\n\tCreatedAt time.Time\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n\tCreatedAt any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	cases := []struct{ name, orig string }{
+		{"package 与声明同行", "package model; var X = 1\n"},
+		{"用户声明同行", "package model\n\ntype A struct{}; var X = 1\n"},
+		{"生成声明同行", "package model\n\ntype UserEntity struct{ ID int }; var X = 1\n"},
+		{"分号后行尾注释", "package model\n\ntype A struct{}; // TRAILING-SEMICOLON\n\nvar X = 1\n"},
+		{"同一行两个 import 声明", "package model\n\nimport \"fmt\"; import \"strings\"\n\nvar X = 1\nvar _ = fmt.Sprint\nvar _ = strings.ToUpper\n"},
+		{"文件尾分号", "package model\n\ntype A struct{}; var X = 1;"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := writeAndVerify(t, tc.orig, entityCode, doCode, []string{"time"})
+			if regexp.MustCompile(`(?m)^[ \t]*;`).MatchString(got) {
+				t.Errorf("产物不应残留孤立分号\n%s", truncateForLog(got))
+			}
+			assertContains(t, got, "var X = 1", "用户声明应保留")
+			if tc.name == "分号后行尾注释" {
+				assertContains(t, got, "// TRAILING-SEMICOLON", "分号后的行尾注释应保留")
+			}
+			if tc.name == "同一行两个 import 声明" {
+				assertContainsAll(t, got, []string{`"fmt"`, `"strings"`, `var _ = fmt.Sprint`}, "同行 import 声明应保留")
+			}
+			typeCheckGoSource(t, got)
+		})
+	}
+}
+
 // TestWriteOrReplaceStruct_RemoveUnusedImports 验证再生成时移除旧生成代码引用过、
 // 而新生成代码与保留的用户代码都不再引用的 import spec（如删去最后一个时间列后的 time）：
 // 单行 import 整体移除；import 块只移除该 spec 所在整行（连同其 Doc 与尾注释，CRLF 文件同样不留空行）、
@@ -1548,6 +1581,30 @@ func TestWriteOrReplaceStruct_MissingGenDeclsUnpairedFallback(t *testing.T) {
 	}
 }
 
+// TestWriteOrReplaceStruct_SharedInsertionOrder 锁定配对插入与无配对追加落在同一位置时的顺序：
+// 块内只有 DO，而 Entity 结构体、ToDO 与 ToEntity 均缺失时，三个声明都补在块后，
+// 仍按标准顺序（Entity 结构体 → ToDO → ToEntity）输出，而不是按配对/无配对的发现顺序。
+func TestWriteOrReplaceStruct_SharedInsertionOrder(t *testing.T) {
+	orig := `package model
+
+type (
+	UserDO struct {
+		ID any
+	}
+)
+`
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertDeclOrder(t, got, []string{
+		"UserDO struct {",
+		"type UserEntity struct {",
+		"func (e *UserEntity) ToDO()",
+		"func (d *UserDO) ToEntity()",
+	}, "同一落点上的配对插入与无配对追加应按标准顺序排列")
+	typeCheckGoSource(t, got)
+}
+
 // TestWriteOrReplaceStruct_SingleSpecTypeBlockNormalized 锁定仅含一个生成 Spec 的 type 括号块
 // 以独立声明形态输出（不保留括号块），与首次生成的形态一致。
 func TestWriteOrReplaceStruct_SingleSpecTypeBlockNormalized(t *testing.T) {
@@ -1675,6 +1732,48 @@ func (d *UserDO) ToEntity() {}
 	assertContains(t, got, "// lead free comment", "块前游离注释应保留")
 	assertNotContains(t, got, "type (", "没有块内注释时应展开为独立声明")
 	assertContains(t, got, "type UserEntity struct {", "生成结构体应写入")
+	typeCheckGoSource(t, got)
+}
+
+// TestWriteOrReplaceStruct_SingleSpecTypeBlockTrailingComment 锁定单 Spec 括号块中位于生成 Spec
+// 区间之外、但仍在声明区间内的注释（`type (` 同行注释、`)` 行尾注释）也会保留括号块：
+// 展开为独立声明会丢失这些注释，与「注释随声明原位保留」的契约冲突。
+func TestWriteOrReplaceStruct_SingleSpecTypeBlockTrailingComment(t *testing.T) {
+	entityCode := "type UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	cases := []struct{ name, orig, comment string }{
+		{"左括号同行注释", "package model\n\ntype ( // AFTER-LPAREN\n\tUserEntity struct {\n\t\tID int\n\t}\n)\n", "// AFTER-LPAREN"},
+		{"右括号行尾注释", "package model\n\ntype (\n\tUserEntity struct {\n\t\tID int\n\t}\n) // AFTER-RPAREN\n", "// AFTER-RPAREN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := writeAndVerify(t, tc.orig, entityCode, doCode, nil)
+			assertContains(t, got, "type (", "含括号同行注释时应保留括号块")
+			assertContains(t, got, tc.comment, "括号同行注释应保留")
+			typeCheckGoSource(t, got)
+		})
+	}
+}
+
+// TestWriteOrReplaceStruct_BlockSpecTextWithKeywordInComment 回归锁死 structSpecText 的 AST 定位：
+// 生成结构体 Doc 注释中出现「type UserEntity」字样时，块内 Spec 替换仍只删除真正的 type 关键字，
+// 不得把注释中的字样删成半截、把关键字留在块内（那会让落盘自校验报语法错误）。
+func TestWriteOrReplaceStruct_BlockSpecTextWithKeywordInComment(t *testing.T) {
+	orig := `package model
+
+// block doc
+type (
+	Helper struct{}
+	UserEntity struct {
+		ID int
+	}
+)
+`
+	entityCode := "// UserEntity 说明：type UserEntity 只是注释里的字样\ntype UserEntity struct {\n\tID int64\n}\n\nfunc (e *UserEntity) ToDO() {}"
+	doCode := "type UserDO struct {\n\tID any\n}\n\nfunc (d *UserDO) ToEntity() {}"
+	got := writeAndVerify(t, orig, entityCode, doCode, nil)
+	assertContains(t, got, "type UserEntity 只是注释里的字样", "Doc 注释中的同名字样应原样保留")
+	assertContains(t, got, "type (", "混合 type 块形态应保留")
 	typeCheckGoSource(t, got)
 }
 
@@ -2168,6 +2267,52 @@ func TestSplitGeneratedCode(t *testing.T) {
 			t.Fatal("语法非法的生成代码应返回解析错误")
 		}
 	})
+}
+
+// TestStructSpecText 验证生成结构体文本转换为 type 块内 Spec 形态：删掉 type 关键字、保留 Doc 注释；
+// 关键字与类型名按 AST 定位，Doc 注释或字段 tag 中出现「type <结构体名>」字样时不得误删；
+// 空文本、语法非法文本与不匹配的类型名原样返回。
+func TestStructSpecText(t *testing.T) {
+	tests := []struct {
+		name     string
+		declText string
+		want     string
+	}{
+		{
+			"无 Doc 的独立声明",
+			"type UserEntity struct {\n\tID int64\n}",
+			"UserEntity struct {\n\tID int64\n}",
+		},
+		{
+			"带 Doc 的声明",
+			"// UserEntity 表实体\ntype UserEntity struct {\n\tID int64\n}",
+			"// UserEntity 表实体\nUserEntity struct {\n\tID int64\n}",
+		},
+		{
+			"Doc 中出现同名字样",
+			"// UserEntity 说明：type UserEntity 只是注释里的字样\ntype UserEntity struct {\n\tID int64\n}",
+			"// UserEntity 说明：type UserEntity 只是注释里的字样\nUserEntity struct {\n\tID int64\n}",
+		},
+		{"字段 tag 中出现同名字样",
+			"type UserEntity struct {\n\tID int64 `description:\"type UserEntity 出现于 tag\"`\n}",
+			"UserEntity struct {\n\tID int64 `description:\"type UserEntity 出现于 tag\"`\n}",
+		},
+		{
+			"其他声明在前",
+			"const C = 1\ntype UserEntity struct{}",
+			"const C = 1\nUserEntity struct{}",
+		},
+		{"空文本", "", ""},
+		{"语法非法原样返回", "type UserEntity struct {", "type UserEntity struct {"},
+		{"类型名不匹配原样返回", "type OtherEntity struct{}", "type OtherEntity struct{}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := structSpecText(tt.declText, "UserEntity"); got != tt.want {
+				t.Errorf("structSpecText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 // TestWriteOrReplaceStruct_InvalidGeneratedCode 验证存量文件再生成时，
