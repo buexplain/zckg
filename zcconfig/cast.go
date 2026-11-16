@@ -30,16 +30,22 @@ func (e *TypeMismatchError) Error() string {
 // 源值 v 为 nil 时不参与转换，返回 (def, false)，由调用方（Env / Config）视为“无值”返回默认值，
 // 因此 nil 不会触发 TypeMismatchError。
 //
-// 转换优先级：
-//  1. 直接类型断言 v.(T)；
-//  2. string → time.Duration：time.ParseDuration；
-//  3. string → 数值 / bool / 具名 string：strconv 解析或 reflect 转换；
-//  4. 数值（含具名）→ bool：C 语言惯例，零值为 false、非零为 true；
-//  5. 数值 → string：拒绝转换，避免 Go 中 int → string 的 Unicode 码点语义（65 → "A"）；
-//  6. reflect 通用转换：Value.CanConvert（含同底层结构体、切片 → 数组）。
+// 转换优先级（编号与 docs/zcconfig.md 的「转换优先级」一致）：
+//  1. v == nil → 未命中（由调用方视为“无值”返回 def）；
+//  2. 直接类型断言 v.(T)；
+//  3. string → time.Duration：time.ParseDuration；
+//  4. string → 数值 / bool / 具名 string：strconv 解析或 reflect 转换；
+//  5. 数值（含具名）→ bool：C 语言惯例，零值为 false、非零为 true；
+//  6. 数值 → string：拒绝转换，避免 Go 中 int → string 的 Unicode 码点语义（65 → "A"）；
+//  7. 数值 → time.Duration：拒绝转换，避免裸数值被当作纳秒解释（3306 → 3.306µs）；
+//  8. 数值族之间：只允许静态无损子集（同族加宽、无符号→更宽有符号、整型→浮点按尾数位），
+//     跨族与窄化一律拒绝，避免 reflect 原生语义静默截断、回绕或丢精度；
+//  9. reflect 通用转换：Value.CanConvert（含同底层结构体、切片 → 数组）；
+//  10. 全部失败 → 未命中。
 //
 // 目标为接口类型时只接受直接类型断言，即值必须实现该接口；接口目标不参与后续任何转换。
-// 普通与具名 string 可互转；数值特判涵盖整数（含 uintptr）与浮点，不含 complex。
+// 普通与具名 string 可互转；数值特判涵盖整数（含 uintptr）与浮点，不含 complex；
+// complex 仅参与第 8 步的同族加宽。
 // 全部规则均不适用时返回 (def, false)。
 func cast[T any](v any, def T) (T, bool) {
 	if v == nil {
@@ -97,7 +103,8 @@ func cast[T any](v any, def T) (T, bool) {
 	}
 
 	// 数值类型 -> bool 特判：C 语言惯例，零值为 false，非零为 true。
-	// 此分支解决 .env 中 "1"/"0" 被 parseValue 推断为 int 后无法转 bool 的问题。
+	// 该分支服务于 Config 通道：Register 注册的 map 可携带 int/float64 等数值，调用方以 bool 读取时按 C 惯例转换。
+	// Env 通道存储的是文本，数值字面量走上面的 string 解析分支（"1"/"0" 由 ParseBool 处理）。
 	if rt.Kind() == reflect.Bool && isNumericKind(rv.Kind()) {
 		var isZero bool
 		switch rv.Kind() {
@@ -118,9 +125,23 @@ func cast[T any](v any, def T) (T, bool) {
 		return def, false
 	}
 
+	// 目标为 time.Duration 且源为数值：拒绝转换。
+	// time.Duration 底层是 int64，若放行数值转换，注册的裸数值会被当作纳秒解释（3306 -> 3.306µs），
+	// 单位语义在转换中丢失；需要时长语义时应注册 time.Duration 本身或 "30s" 这类带单位文本。
+	if rt == reflect.TypeFor[time.Duration]() && isNumericKind(rv.Kind()) {
+		return def, false
+	}
+
+	// 数值族之间只允许静态无损子集：同族加宽/等宽、无符号→更宽有符号、整型→浮点按尾数位。
+	// 其余组合（窄化、有符号→无符号、浮点→整数、整数→complex、complex 跨族）一律未命中，
+	// 避免 reflect 兜底按 Go 原生转换语义静默截断、回绕或丢精度。
+	srcNumeric, dstNumeric := isNumericFamilyKind(rv.Kind()), isNumericFamilyKind(rt.Kind())
+	if srcNumeric && dstNumeric && !allowNumericConvert(rv.Type(), rt) {
+		return def, false
+	}
+
 	// 通过 reflect 做通用类型转换。
-	// 注意：此处采用 Go 原生类型转换语义，float -> int 向零截断（99.99 -> 99），
-	// 大位宽 -> 小位宽（如 32 位平台上 int64 -> int）可能溢出；
+	// 走到这里只剩非数值转换（结构体同底层、切片→数组等）与已通过安全子集的数值转换；
 	// 默认值类型应与存储类型匹配；CanConvert 同时检查切片转数组所需的值长度。
 	if rv.CanConvert(rt) {
 		return rv.Convert(rt).Interface().(T), true
@@ -155,5 +176,69 @@ func isNumericKind(k reflect.Kind) bool {
 		reflect.Float32, reflect.Float64:
 		return true
 	}
+	return false
+}
+
+// 数值类型族：族内按位宽加宽无损，跨族转换无法对任意取值保证无损。
+const (
+	numericFamilyNone = iota
+	numericFamilySigned
+	numericFamilyUnsigned
+	numericFamilyFloat
+	numericFamilyComplex
+)
+
+// isNumericFamilyKind 判断 kind 是否属于四个数值族之一（有符号整数、无符号整数、浮点、复数）。
+func isNumericFamilyKind(k reflect.Kind) bool {
+	_, ok := numericFamily(k)
+	return ok
+}
+
+// numericFamily 把数值 kind 归入类型族；非数值 kind 返回 (numericFamilyNone, false)。
+func numericFamily(k reflect.Kind) (int, bool) {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return numericFamilySigned, true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return numericFamilyUnsigned, true
+	case reflect.Float32, reflect.Float64:
+		return numericFamilyFloat, true
+	case reflect.Complex64, reflect.Complex128:
+		return numericFamilyComplex, true
+	}
+	return numericFamilyNone, false
+}
+
+// allowNumericConvert 判断数值族之间的转换是否对源类型的任意取值都无损：
+//  1. 同族且目标位宽 ≥ 源位宽（具名类型按底层位宽，含 complex 同族加宽）；
+//  2. 无符号 → 有符号且目标位宽严格大于源位宽（无符号最大值需放进有符号正半区）；
+//  3. 整数 → 浮点且源整型位宽 ≤ 目标尾数位（float32 24 位、float64 53 位）；
+//  4. 其余组合（窄化、有符号→无符号、浮点→整数、跨族涉及 complex）均返回 false。
+//
+// 调用点须保证 src/dst 都是数值类型（isNumericFamilyKind 双重判断），
+// 因此直接使用 reflect.Type.Bits 取位宽。int/uint/uintptr 的位宽取平台实际值：
+// int64→int 在 64 位平台成立、32 位平台不成立；int→float64 在 64 位平台不成立、32 位平台成立。
+func allowNumericConvert(src, dst reflect.Type) bool {
+	famSrc, _ := numericFamily(src.Kind())
+	famDst, _ := numericFamily(dst.Kind())
+	srcBits, dstBits := src.Bits(), dst.Bits()
+
+	if famSrc == famDst {
+		// 同族：加宽或等宽无损，窄化拒绝
+		return dstBits >= srcBits
+	}
+	if famSrc == numericFamilyUnsigned && famDst == numericFamilySigned {
+		// 无符号 → 有符号：目标必须严格更宽，否则最大值放不进正半区
+		return dstBits > srcBits
+	}
+	if (famSrc == numericFamilySigned || famSrc == numericFamilyUnsigned) && famDst == numericFamilyFloat {
+		// 整数 → 浮点：源整型位宽不得超过目标尾数位，超过即可能丢精度
+		mantissa := 53
+		if dst.Kind() == reflect.Float32 {
+			mantissa = 24
+		}
+		return srcBits <= mantissa
+	}
+	// 剩余组合：有符号→无符号（可能为负）、浮点→整数（可能带小数）、任何跨族涉及 complex
 	return false
 }

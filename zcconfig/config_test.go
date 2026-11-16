@@ -135,6 +135,24 @@ func TestConfig_NilValueReturnsDefault(t *testing.T) {
 	}
 }
 
+// TestConfig_DotSeparatorNotEscapable 锁死 "." 是唯一层级分隔符且不可转义：
+// map 中字面含 "." 的 key 无法按路径读取；空路径段按空字符串键查找。
+func TestConfig_DotSeparatorNotEscapable(t *testing.T) {
+	resetForTest(t)
+	Register("app", func() map[string]any {
+		return map[string]any{
+			"a.b": 42,
+			"":    "empty-segment",
+		}
+	})
+	if got := Config("app.a.b", "def"); got != "def" {
+		t.Errorf(`字面 key "a.b" 不可按路径读取，期望默认值 def，实际 %v`, got)
+	}
+	if got := Config("app.", "def"); got != "empty-segment" {
+		t.Errorf("空路径段应按空字符串键查找，期望 empty-segment，实际 %v", got)
+	}
+}
+
 func TestConfig_NestedRegistration(t *testing.T) {
 	resetForTest(t)
 	Register("app", func() map[string]any {
@@ -562,5 +580,92 @@ func TestConfig_DurationUnitlessStrings(t *testing.T) {
 				t.Errorf("Config 字符串 %q 配默认 5s 期望 %v，实际 %v", tt.input, tt.want, got)
 			}
 		})
+	}
+}
+
+// TestConfig_NumericConversionRejectsLossy 锁死 Config 通道的数值转换只允许静态无损子集：
+// Register 提供的 typed 数值在窄化、有符号→无符号、浮点→整数、整数→浮点超尾数位、
+// 数值→time.Duration 时 panic(*TypeMismatchError)；同族加宽、允许的整型→浮点与数值→bool 正常读取。
+// 对应 cast 层规则见 cast_test.go 的 TestCast_NumericSafeSubsetAllowed/Rejected。
+func TestConfig_NumericConversionRejectsLossy(t *testing.T) {
+	resetForTest(t)
+	Register("app", func() map[string]any {
+		return map[string]any{
+			"price":    99.99,
+			"count":    200,
+			"negative": -1,
+			"flag":     2,
+			"small":    int16(3306),
+			"bits":     uint8(255),
+			"ratio":    float64(3.14),
+			"rate":     float32(2.5),
+			"big":      int64(3306),
+			"timeout":  int64(30),
+			"dur":      time.Duration(30),
+		}
+	})
+
+	rejected := []struct {
+		name     string
+		key      string
+		expected reflect.Type
+		actual   reflect.Type
+		read     func()
+	}{
+		{"float_to_int", "app.price", reflect.TypeFor[int](), reflect.TypeFor[float64](), func() { Config("app.price", 0) }},
+		{"int_narrow", "app.count", reflect.TypeFor[int8](), reflect.TypeFor[int](), func() { Config("app.count", int8(0)) }},
+		{"signed_to_unsigned", "app.negative", reflect.TypeFor[uint](), reflect.TypeFor[int](), func() { Config("app.negative", uint(0)) }},
+		{"int64_to_float64", "app.big", reflect.TypeFor[float64](), reflect.TypeFor[int64](), func() { Config("app.big", 0.0) }},
+		{"float_narrow", "app.ratio", reflect.TypeFor[float32](), reflect.TypeFor[float64](), func() { Config("app.ratio", float32(0)) }},
+		{"numeric_to_duration", "app.timeout", reflect.TypeFor[time.Duration](), reflect.TypeFor[int64](), func() { Config("app.timeout", time.Duration(0)) }},
+	}
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			assertTypeMismatchPanic(t, tt.key, tt.expected, tt.actual, tt.read)
+		})
+	}
+
+	allowed := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"int_to_int64", func(t *testing.T) {
+			if got := Config("app.count", int64(0)); got != int64(200) {
+				t.Errorf("Config int(200) -> int64 期望 200，实际 %d", got)
+			}
+		}},
+		{"int16_to_float64", func(t *testing.T) {
+			if got := Config("app.small", 0.0); got != 3306.0 {
+				t.Errorf("Config int16(3306) -> float64 期望 3306，实际 %v", got)
+			}
+		}},
+		{"uint8_to_uint32", func(t *testing.T) {
+			if got := Config("app.bits", uint32(0)); got != uint32(255) {
+				t.Errorf("Config uint8(255) -> uint32 期望 255，实际 %d", got)
+			}
+		}},
+		{"float32_to_float64", func(t *testing.T) {
+			if got := Config("app.rate", 0.0); got != 2.5 {
+				t.Errorf("Config float32(2.5) -> float64 期望 2.5，实际 %v", got)
+			}
+		}},
+		{"numeric_to_bool", func(t *testing.T) {
+			if got := Config("app.flag", false); got != true {
+				t.Errorf("Config int(2) -> bool 期望按 C 惯例为 true，实际 %v", got)
+			}
+		}},
+		{"duration_self", func(t *testing.T) {
+			if got := Config("app.dur", time.Duration(0)); got != 30 {
+				t.Errorf("Config Duration(30) -> Duration 期望 30，实际 %v", got)
+			}
+		}},
+		{"duration_to_int64", func(t *testing.T) {
+			if got := Config("app.dur", int64(0)); got != int64(30) {
+				t.Errorf("Config Duration(30) -> int64 期望 30，实际 %d", got)
+			}
+		}},
+	}
+	for _, tt := range allowed {
+		t.Run(tt.name, tt.run)
 	}
 }

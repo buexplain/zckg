@@ -16,7 +16,8 @@ type castProbeStringer struct{ Label string }
 func (s castProbeStringer) String() string { return s.Label }
 
 // castProbeStructA/B/Tagged/Diff 用于验证结构体源值的 reflect 转换与拒绝路径：
-// A→B 与 A→Tagged 底层类型相同（tag 不参与底层类型判定），A→Diff 字段不同不可转换。
+// A→B 底层类型相同；A→Tagged 仅 struct tag 不同（Go 转换规则比较结构体类型时忽略 tag）；
+// A→Diff 字段不同，不可转换。
 type castProbeStructA struct {
 	X int
 	Y string
@@ -374,41 +375,123 @@ func TestCast_StringToStructRejected(t *testing.T) {
 	castFails("hello", def)(t)
 }
 
-// --- 非 string 源值，走 reflect ConvertibleTo 路径 ---
+// --- 非 string 源值：数值族安全子集（静态无损才允许） ---
 
-func TestCast_IntToFloat64(t *testing.T) {
-	if v, ok := cast(42, 0.0); !ok || v != 42.0 {
-		t.Errorf("int -> float64 期望 42.0，实际 (%v,%v)", v, ok)
+// numericAllowCase 构造一条"允许"的数值转换断言：cast 必须成功，且结果转回源类型等于原值
+// （无损性 oracle，不照抄 allowNumericConvert 的规则表）。
+func numericAllowCase[S comparable, D comparable](input S, def D, want D) func(t *testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+		got, ok := cast(any(input), def)
+		if !ok {
+			t.Fatalf("cast(%T(%v), %T) 期望允许，实际未命中", input, input, def)
+		}
+		if got != want {
+			t.Errorf("cast(%T(%v), %T) 期望 %v，实际 %v", input, input, def, want, got)
+		}
+		back := reflect.ValueOf(got).Convert(reflect.TypeOf(input)).Interface()
+		if !reflect.DeepEqual(back, any(input)) {
+			t.Errorf("往返转换丢失信息：%T(%v) -> %T(%v) -> %T(%v)", input, input, def, got, back, back)
+		}
 	}
 }
 
-func TestCast_Int64ToInt(t *testing.T) {
-	if v, ok := cast(int64(100), 0); !ok || v != 100 {
-		t.Errorf("int64 -> int 期望 100，实际 (%d,%v)", v, ok)
+// TestCast_NumericSafeSubsetAllowed 验证同族加宽/等宽、无符号→更宽有符号、整型→浮点按尾数位的转换，
+// 并用"结果转回源类型等于原值"证明允许的转换确实无损。
+func TestCast_NumericSafeSubsetAllowed(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"signed_widen", numericAllowCase(int8(-5), int64(0), int64(-5))},
+		{"signed_widen_int32", numericAllowCase(int32(42), int64(0), int64(42))},
+		{"int16_to_float64", numericAllowCase(int16(3306), 0.0, 3306.0)},
+		{"int32_to_float64", numericAllowCase(int32(42), 0.0, 42.0)},
+		{"int8_to_float32", numericAllowCase(int8(-5), float32(0), float32(-5))},
+		{"uint8_to_int16", numericAllowCase(uint8(255), int16(0), int16(255))},
+		{"uint32_to_int64", numericAllowCase(uint32(1<<20), int64(0), int64(1<<20))},
+		{"unsigned_widen", numericAllowCase(uint8(255), uint64(0), uint64(255))},
+		{"uintptr_to_uint64", numericAllowCase(uintptr(42), uint64(0), uint64(42))},
+		{"uint16_to_float32", numericAllowCase(uint16(300), float32(0), float32(300))},
+		{"uint32_to_float64", numericAllowCase(uint32(1<<31), 0.0, float64(1<<31))},
+		{"float_widen", numericAllowCase(float32(2.5), 0.0, 2.5)},
+		{"complex_widen", numericAllowCase(complex64(1+2i), complex128(0), complex128(1+2i))},
+		{"duration_to_int64", numericAllowCase(time.Duration(30), int64(0), int64(30))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
-func TestCast_Float64ToFloat32(t *testing.T) {
-	if v, ok := cast(3.14, float32(0)); !ok || v != float32(3.14) {
-		t.Errorf("float64 -> float32 期望 %f，实际 (%f,%v)", float32(3.14), v, ok)
+// TestCast_NumericSafeSubsetRejected 验证窄化、跨族与浮点→整数一律未命中；
+// 每个用例带一个会出问题的反例值（如 int64(200)→int8 会回绕成 -56），证明拒绝是必要的。
+func TestCast_NumericSafeSubsetRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"int64_to_int8", castFails(int64(200), int8(0))},
+		{"int32_to_int16", castFails(int32(1), int16(0))},
+		{"signed_to_unsigned", castFails(-1, uint64(0))},
+		{"unsigned_to_signed_equal_width", castFails(uint64(1), int64(0))},
+		{"int64_to_float64", castFails(int64(1), 0.0)},
+		{"uint64_to_float64", castFails(uint64(1), 0.0)},
+		{"int32_to_float32", castFails(int32(1), float32(0))},
+		{"float_to_int", castFails(100.0, 0)},
+		{"float_to_int8", castFails(1.5, int8(0))},
+		{"float_narrow", castFails(3.14, float32(0))},
+		{"complex_narrow", castFails(complex128(1+2i), complex64(0))},
+		{"complex_to_int", castFails(complex128(1+2i), int64(0))},
+		{"int_to_complex", castFails(int32(1), complex128(0))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
-// ZCC-02：reflect 兜底采用 Go 原生类型转换语义，float -> int 向零截断。
-// 该截断语义已在 docs/zcconfig.md 显式声明，本测试固化截断行为：
-// 典型触发链为 .env 中 PRICE=99.99 被推断为 float64，调用方 Env("PRICE", 0) 得到 99。
-func TestCast_Float64ToIntTruncation(t *testing.T) {
-	if v, ok := cast(99.99, 0); !ok || v != 99 {
-		t.Errorf("float64(99.99) -> int 期望向零截断为 99，实际 (%d,%v)", v, ok)
+// TestCast_NumericPlatformWidth 验证 int/uint 的位宽按平台实际值参与安全子集判定：
+// 64 位平台 int64→int 等宽可读、int→float64 因 64 位超尾数位被拒；32 位平台反之。
+// uint→int 两个平台都拒绝（位宽相等或更小）。
+func TestCast_NumericPlatformWidth(t *testing.T) {
+	if strconv.IntSize == 64 {
+		t.Run("int64_to_int_allow", numericAllowCase(int64(42), 0, 42))
+		t.Run("int_to_float64_reject", castFails(42, 0.0))
+	} else {
+		t.Run("int64_to_int_reject", castFails(int64(42), 0))
+		t.Run("int_to_float64_allow", numericAllowCase(42, 0.0, 42.0))
 	}
-	if v, ok := cast(-99.99, 0); !ok || v != -99 {
-		t.Errorf("float64(-99.99) -> int 期望向零截断为 -99，实际 (%d,%v)", v, ok)
+	t.Run("int_to_int64_allow", numericAllowCase(42, int64(0), int64(42)))
+	t.Run("uint_to_int_reject", castFails(uint(1), 0))
+}
+
+// TestCast_NumericNamedTypes 验证具名数值类型按底层 kind 与位宽参与规则。
+func TestCast_NumericNamedTypes(t *testing.T) {
+	type Port int
+	type Amount float64
+	type Code uint8
+	t.Run("port_to_int64", numericAllowCase(Port(443), int64(0), int64(443)))
+	t.Run("port_narrow_reject", castFails(Port(443), int8(0)))
+	t.Run("amount_narrow_reject", castFails(Amount(1.5), float32(0)))
+	t.Run("code_to_int16", numericAllowCase(Code(7), int16(0), int16(7)))
+	t.Run("code_to_uint32", numericAllowCase(Code(7), uint32(0), uint32(7)))
+}
+
+// TestCast_NumericToDurationRejected 验证裸数值不会被当作纳秒解释：
+// 目标为 time.Duration 且源为数值时未命中；源为 time.Duration 本身时正常。
+func TestCast_NumericToDurationRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"int", castFails(3306, time.Duration(0))},
+		{"int64", castFails(int64(30), time.Duration(0))},
+		{"uint8", castFails(uint8(30), time.Duration(0))},
+		{"float", castFails(1.5, time.Duration(0))},
+		{"duration_self", castCase(time.Duration(30), time.Duration(0), time.Duration(30))},
+		{"duration_to_int64", castCase(time.Duration(30), int64(0), int64(30))},
 	}
-	if v, ok := cast(100.0, 0); !ok || v != 100 {
-		t.Errorf("float64(100.0) -> int 期望 100，实际 (%d,%v)", v, ok)
-	}
-	if v, ok := cast(1.5, int8(0)); !ok || v != int8(1) {
-		t.Errorf("float64(1.5) -> int8 期望向零截断为 1，实际 (%d,%v)", v, ok)
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
@@ -416,7 +499,7 @@ func TestCast_Float64ToIntTruncation(t *testing.T) {
 
 func TestCast_IntToBool(t *testing.T) {
 	// 数值类型 -> bool 特判：C 语言惯例，零值为 false，非零为 true。
-	// 此特判解决 .env 中 "1"/"0" 被 parseValue 推断为 int 后无法转 bool 的问题。
+	// 该分支服务于 Config 通道（Register 注册的 map 可携带数值）；Env 通道的 "1"/"0" 走 string 解析分支。
 	cases := []struct {
 		value any
 		def   bool
