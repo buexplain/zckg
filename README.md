@@ -11,7 +11,7 @@ Web 应用开发链路。
 
 | 模块                   | 说明                                                                                                     | 文档                                       |
 |----------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------|
-| [zcconfig](zcconfig) | 配置加载与泛型读取：`.env` 文件通道（支持 OS 环境变量回退）+ 业务配置树通道（`.` 分隔路径递归查找），另提供 `DBConfig` DSN 生成                       | [zcconfig.md](zcconfig/docs/zcconfig.md) |
+| [zcconfig](zcconfig) | 配置加载与泛型读取：`.env` 文件通道（支持 OS 环境变量回退）+ 业务配置树通道（`.` 分隔路径递归查找），另提供 `DBConfig` DSN 生成                       | [zcconfig/docs](zcconfig/docs/README.md) |
 | [zcdb](zcdb)         | 基于 `database/sql` 的数据库访问层：Builder 查询构造器（MySQL / PostgreSQL / SQLite 三方言）、主从连接池与读写分离、事务、结构体自动映射、破坏性操作保护 | [zcdb/docs](zcdb/docs/README.md)         |
 | [zchttp](zchttp)     | HTTP 服务框架：基数树路由（静态段优先）、反射式参数绑定与校验、中间件链、可定制回调（响应/错误/panic/404）、OpenAPI 生成                               | [zchttp/docs](zchttp/docs)               |
 | [zcmodel](zcmodel)   | 数据库模型代码生成：输入表结构，输出 Entity/DO 结构体与互转方法的 Go 源码，支持 AST 增量再生成（保留用户自定义代码）                                   | [zcmodel/docs](zcmodel/docs/README.md)    |
@@ -156,7 +156,7 @@ CREATE TABLE users (
 
 ### 各模块独立示例
 
-- **zcconfig**：`.env` 加载与泛型读取 → [zcconfig.md](zcconfig/docs/zcconfig.md)
+- **zcconfig**：`.env` 加载与泛型读取 → [zcconfig/docs](zcconfig/docs/README.md)
 - **zcdb**：Builder 查询、写入、事务、读写分离 → [zcdb/docs/README.md](zcdb/docs/README.md)
 - **zchttp**：路由注册、参数绑定、中间件、OpenAPI → [zchttp/docs](zchttp/docs)
 - **zcmodel**：从表结构生成模型代码 → [zcmodel/docs](zcmodel/docs/README.md)
@@ -178,12 +178,12 @@ go test ./...
 | 模块       | 覆盖率   |
 |----------|-------|
 | zcconfig | 99.5% |
-| zcdb     | 98.8% |
+| zcdb     | 98.9% |
 | zchttp   | 99.7% |
 | zcmodel  | 98.3% |
 | zcquit   | 98.3% |
 
-> 语句覆盖率（2026-11-15 实测），运行 `go test ./... -cover` 复现（zcdb 集成测试在数据库可达时计入）。
+> 语句覆盖率（2026-11-16 实测），运行 `go test ./... -cover` 复现（zcdb 集成测试在数据库可达时计入）。zcconfig 未覆盖语句仅剩 `config.go` 中 1 条不可达的 `return def`（`Config` 循环之后）；数值转换安全子集与 `.env` 原文存储均已由测试锁死。
 
 本地准备 MySQL / PostgreSQL 测试环境：
 

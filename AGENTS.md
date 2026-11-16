@@ -8,7 +8,7 @@
 
 | 模块 | 职责 | 核心文件 |
 |---|---|---|
-| `zcconfig` | 配置加载与读取：`.env` 文件（Env 通道）+ 业务配置树（Config 通道），泛型读取，另提供 `DBConfig` DSN 生成 | `config.go`、`cast.go`、`env.go`、`dbConfig.go` |
+| `zcconfig` | 配置加载与读取：`.env` 文件（Env 通道，值按原文文本存储、类型由读取方决定）+ 业务配置树（Config 通道），泛型读取，另提供 `DBConfig` DSN 生成 | `config.go`、`cast.go`、`env.go`、`dbConfig.go` |
 | `zcdb` | 数据库访问：Builder 查询构造器（MySQL / PostgreSQL / SQLite 三方言）、主从连接池、读写分离、事务、Schema 元数据 | `builder_*.go`、`grammar.go`、`{mysql,postgres,sqlite}_grammar.go`、`{mysql,postgres,sqlite}_schema.go`、`pool.go`、`db_dao.go`、`schema_inspector.go` |
 | `zchttp` | HTTP 框架：路由（基数树，静态段 + 参数段 + 通配尾段同树）、反射式参数绑定与校验、中间件、OpenAPI 生成 | `httpEngine.go`、`router.go`、`router_trie.go`、`binding.go`、`validate.go`、`meta.go`、`openapi.go` |
 | `zcmodel` | 数据库模型代码生成：输入表结构，输出 Entity/DO 结构体与互转方法的 Go 源码，支持 AST 增量再生成 | `generate.go`、`build.go`、`columnTypeToGoType.go` |
@@ -118,7 +118,7 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
 每个模块都有 `docs/` 目录，文档与代码同等重要：
 
 - 模块主文档：
-  - `zcconfig/docs/zcconfig.md`
+  - `zcconfig/docs/README.md`（索引 + 总览；分主题：`env.md`、`config.md`、`cast.md`、`db-config.md`、`errors.md`、`internals.md`、`conventions.md`；`zcconfig.md` 为兼容入口）
   - `zcdb/docs/README.md`（入口 + 文档地图；分层：`getting-started.md`、`concepts/`、`reference/`、`how-to/`、`migration/`）
   - `zcmodel/docs/README.md`（索引 + 总览；分主题：`quickstart.md`、`api.md`、`generated-code.md`、`tags-ddl-index.md`、`types-and-naming.md`、`regeneration.md`、`architecture.md`、`pipeline.md`、`skeleton-merge.md`、`testing.md`、`glossary.md`、`code-map.md`；`zcmodel.md` 为兼容入口）
   - `zcquit/docs/zcquit.md`
@@ -147,5 +147,5 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
 - **zchttp**：`HttpEngine` 必须通过 `NewEngine()` 构造（自动装配默认回调，`MaxBodyBytes` 与 `MultipartFormMaxMemory` 默认 32 MB），禁止字面量构造；handler 签名固定为 `func(ctx context.Context, req Req) (Res, error)`，注册时校验不通过即 panic。
 - **zcquit**：`Shutdown()` 先于 `Listen()` 调用时，`Listen()` 必须立即返回。
 - **zcmodel**：`ColumnTagName` 为空时不生成对应标签；生成文件落盘前经 go/format 语法自校验 + 临时文件原子写入，非法产物不落盘。
-- **zcconfig**：float→int 采用 Go 原生向零截断语义；数值→bool 为 C 风格（非零为 true）；`.env` 解析首行需剥离 UTF-8 BOM；key 不存在（含 Config 路径缺失、值为 nil）返回默认值，key 存在但值无法转换为目标类型（含 Config 路径中途非 map）panic `*TypeMismatchError`（携带 key、期望类型、实际类型），不得静默回退为默认值。
+- **zcconfig**：`.env` 装载只做文本处理（去 BOM / `export` 前缀 / 配对引号 / 首尾空白），值按原文 `string` 存储，**不在装载侧推断类型**，`Env[T]` 在读取时解析；`Config` 通道的数值转换只允许**静态无损子集**（同族加宽、无符号→更宽有符号、整型→浮点按尾数位），窄化、有符号↔无符号非加宽、浮点→整数、数值→`time.Duration` 一律 panic，不得静默截断/回绕；数值→bool 仍为 C 风格；`.env` 解析首行需剥离 UTF-8 BOM；key 不存在（含 Config 路径缺失、值为 nil）返回默认值，key 存在但值无法转换为目标类型（含 Config 路径中途非 map）panic `*TypeMismatchError`（携带 key、期望类型、实际类型），不得静默回退为默认值。
 - **zcdb**：无 WHERE 的 Update/Delete 默认拒绝（需 `Force()`）；`Primary()` 标记的查询强制走主库；三方言的标识符包裹与占位符差异由 Grammar 隔离，勿在 Builder 层写死方言细节。

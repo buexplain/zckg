@@ -21,6 +21,18 @@ func TestRegister_NilDataNoop(t *testing.T) {
 	}
 }
 
+// TestRegister_FnPanicPropagates 验证 Register 不 recover 用户 fn 的 panic：
+// 启动期 fn 内的 panic 会原样向上传播，调用方需要在外层自行 recover。
+func TestRegister_FnPanicPropagates(t *testing.T) {
+	resetForTest(t)
+	defer func() {
+		if r := recover(); r != "fn-boom" {
+			t.Fatalf("期望 panic 原样传播 fn-boom，实际 %v", r)
+		}
+	}()
+	Register("boom", func() map[string]any { panic("fn-boom") })
+}
+
 func assertConfigTree(t *testing.T, want map[string]any) {
 	t.Helper()
 	if got := ConfigAll(); !reflect.DeepEqual(got, want) {

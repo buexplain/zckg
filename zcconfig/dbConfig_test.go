@@ -544,6 +544,8 @@ func TestDBConfig_DriverFormatOnly(t *testing.T) {
 		{"", "pgsql", "postgres"}, {"", "postgresql", "postgres"},
 		{"", "sqlite", "sqlite"}, {"", "sqlite3", "sqlite"},
 		{"oracle", "mysql", ""}, {"", "oracle", ""}, {"", "", ""},
+		// 驱动名大小写敏感：非小写名称不匹配任何格式，返回空 DSN
+		{"MySQL", "mysql", ""},
 	} {
 		t.Run("driver="+tt.driver+"/dialect="+tt.dialect, func(t *testing.T) {
 			cfg := DBConfig{

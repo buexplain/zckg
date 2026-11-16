@@ -64,7 +64,8 @@ type DBConfig struct {
 // 建池时仍需调用方导入驱动并提供实际的 database/sql 注册名。
 //
 // 按 Driver（为空时回退 Dialect）选择 DSN 格式；postgresql/pgsql 视为 postgres，
-// sqlite3 视为 sqlite。这些规则仅选择格式，不注册驱动，也不修改 Driver。
+// sqlite3 视为 sqlite。驱动名大小写敏感（"MySQL" 不匹配任何格式）。这些规则仅选择格式，
+// 不注册驱动，也不修改 Driver。
 //
 //   - mysql：user:pass@tcp(host:port)/database?charset=utf8mb4&parseTime=true&loc=Local
 //     （Database 使用 url.PathEscape，Loc 使用 url.QueryEscape，输入均为原文，不识别预编码；
