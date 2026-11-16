@@ -120,7 +120,7 @@ docker run -d --name zcdb_test_postgres -e POSTGRES_PASSWORD=root -p 5432:5432 p
 - 模块主文档：
   - `zcconfig/docs/zcconfig.md`
   - `zcdb/docs/README.md`（入口 + 文档地图；分层：`getting-started.md`、`concepts/`、`reference/`、`how-to/`、`migration/`）
-  - `zcmodel/docs/zcmodel.md`
+  - `zcmodel/docs/README.md`（索引 + 总览；分主题：`quickstart.md`、`api.md`、`generated-code.md`、`tags-ddl-index.md`、`types-and-naming.md`、`regeneration.md`、`architecture.md`、`pipeline.md`、`skeleton-merge.md`、`testing.md`、`glossary.md`、`code-map.md`；`zcmodel.md` 为兼容入口）
   - `zcquit/docs/zcquit.md`
   - `zchttp/docs/*.md`（`routing.md`、`parameter-binding.md`、`parameter-validate.md`、`request.md`、`middleware.md`、`http-engine-callback.md`、`openapi.md`）
 

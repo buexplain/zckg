@@ -14,7 +14,7 @@ Web 应用开发链路。
 | [zcconfig](zcconfig) | 配置加载与泛型读取：`.env` 文件通道（支持 OS 环境变量回退）+ 业务配置树通道（`.` 分隔路径递归查找），另提供 `DBConfig` DSN 生成                       | [zcconfig.md](zcconfig/docs/zcconfig.md) |
 | [zcdb](zcdb)         | 基于 `database/sql` 的数据库访问层：Builder 查询构造器（MySQL / PostgreSQL / SQLite 三方言）、主从连接池与读写分离、事务、结构体自动映射、破坏性操作保护 | [zcdb/docs](zcdb/docs/README.md)         |
 | [zchttp](zchttp)     | HTTP 服务框架：基数树路由（静态段优先）、反射式参数绑定与校验、中间件链、可定制回调（响应/错误/panic/404）、OpenAPI 生成                               | [zchttp/docs](zchttp/docs)               |
-| [zcmodel](zcmodel)   | 数据库模型代码生成：输入表结构，输出 Entity/DO 结构体与互转方法的 Go 源码，支持 AST 增量再生成（保留用户自定义代码）                                   | [zcmodel.md](zcmodel/docs/zcmodel.md)    |
+| [zcmodel](zcmodel)   | 数据库模型代码生成：输入表结构，输出 Entity/DO 结构体与互转方法的 Go 源码，支持 AST 增量再生成（保留用户自定义代码）                                   | [zcmodel/docs](zcmodel/docs/README.md)    |
 | [zcquit](zcquit)     | 优雅退出：全局可取消上下文 + 信号监听（SIGTERM/SIGINT/SIGQUIT）+ 分级清理 handler，支持 `Shutdown()` 主动触发                        | [zcquit.md](zcquit/docs/zcquit.md)       |
 
 ## 安装
@@ -151,7 +151,7 @@ CREATE TABLE users (
 ```
 
 > handler 的签名固定为 `func(ctx context.Context, req Req) (Res, error)`，其中 Req/Res 必须是**结构体或结构体指针**
-> ，注册时校验不通过会 panic（见 [routing.md](zchttp/docs/routing.md)）；生产代码中建议使用 [zcmodel](zcmodel/docs/zcmodel.md)
+> ，注册时校验不通过会 panic（见 [routing.md](zchttp/docs/routing.md)）；生产代码中建议使用 [zcmodel](zcmodel/docs/README.md)
 > 生成的 Entity/DO 作为请求与响应类型。
 
 ### 各模块独立示例
@@ -159,7 +159,7 @@ CREATE TABLE users (
 - **zcconfig**：`.env` 加载与泛型读取 → [zcconfig.md](zcconfig/docs/zcconfig.md)
 - **zcdb**：Builder 查询、写入、事务、读写分离 → [zcdb/docs/README.md](zcdb/docs/README.md)
 - **zchttp**：路由注册、参数绑定、中间件、OpenAPI → [zchttp/docs](zchttp/docs)
-- **zcmodel**：从表结构生成模型代码 → [zcmodel.md](zcmodel/docs/zcmodel.md)
+- **zcmodel**：从表结构生成模型代码 → [zcmodel/docs](zcmodel/docs/README.md)
 - **zcquit**：信号监听与分级清理 → [zcquit.md](zcquit/docs/zcquit.md)
 
 ## 测试

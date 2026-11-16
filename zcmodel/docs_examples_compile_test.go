@@ -1,6 +1,6 @@
 package zcmodel_test
 
-// docs/zcmodel.md 示例代码的编译级校验（对应「文档与代码一致」中的示例可编译性）。
+// docs/quickstart.md 示例代码的编译级校验（对应「文档与代码一致」中的示例可编译性）。
 // 手工收录文档示例，不自动读取 Markdown；文档示例变更须同步本文件。
 // 使用外部测试包（zcmodel_test）以调用方视角校验 API 写法，不伪造任何测试存根。
 // 除 TestDocExamples_ManualInput 实际执行一次生成流程外，其余函数仅用于编译期核对。
@@ -18,7 +18,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-// docManualInput 对应 docs/zcmodel.md「手工构造 Input 生成」示例的 Input 构造部分。
+// docManualInput 对应 docs/quickstart.md「最小可运行示例」的 Input 构造部分。
 // OutputDir 提为参数便于测试写入临时目录（文档中为 "./model"），其余字段与文档逐项一致。
 func docManualInput(outputDir string) zcmodel.Input {
 	// Nullable 与 Default 为指针：nil 表示「未知 / 无默认值」，需辅助函数取字面量地址
@@ -57,7 +57,7 @@ func docManualExample() {
 	// 生成 ./model/user_order.go：UserOrderEntity + UserOrderDO + ToDO/ToEntity
 }
 
-// docExplicitFieldInfo 对应 docs/zcmodel.md「显式指定字段信息（覆盖自动推导）」示例。
+// docExplicitFieldInfo 对应 docs/quickstart.md「显式指定字段信息（覆盖自动推导）」示例。
 func docExplicitFieldInfo() {
 	columns := []*zcmodel.Column{
 		{
@@ -72,7 +72,7 @@ func docExplicitFieldInfo() {
 	_ = columns
 }
 
-// docSchemaBridge 对应 docs/zcmodel.md「配合 zcdb Schema 从真实数据库生成」示例：
+// docSchemaBridge 对应 docs/quickstart.md「配合 zcdb Schema 从真实数据库生成」示例：
 // NewDBDao 第四参数为列映射标签名（空串使用 db），第五参数为默认 SQL 短业务标识（空串保持无注释基线）。
 // 列元数据经取址桥接为 zcmodel 的 *bool（可空性）并透传 Default/PrimaryKey/Extra；
 // 索引元数据经 inspector.Indexes 桥接为 zcmodel.IndexInfo，生成结构体 doc 注释中的索引块。
@@ -136,7 +136,7 @@ func docSchemaBridge() {
 	}
 }
 
-// TestDocExamples_ManualInput 执行文档「手工构造 Input 生成」示例的 Input，核对文档描述的产物：
+// TestDocExamples_ManualInput 执行文档「最小可运行示例」的 Input，核对文档描述的产物：
 // Entity/DO 各含索引块（PRIMARY 行不显示物理索引名）、主键自增与可空列的 ddl 片段形态符合文档示例。
 func TestDocExamples_ManualInput(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "model")
