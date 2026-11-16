@@ -15,8 +15,16 @@ import (
 	"time"
 )
 
-// quitDocExamples 直接读取正式文档，避免复制示例后与 Markdown 失去同步。
-func quitDocExamples(t *testing.T) []string {
+// docExample 表示文档中的一个完整 Go 示例程序。
+// 文档约定：go 块必须是可直接编译运行的完整程序；伪代码与反例使用 text 块。
+type docExample struct {
+	name   string // 首行「// 示例 N：...」注释，供失败信息定位
+	source string
+}
+
+// quitDocExamples 直接读取正式文档，按出现顺序返回全部 go 代码块，
+// 避免把示例复制进测试后与 Markdown 失去同步。
+func quitDocExamples(t *testing.T) []docExample {
 	t.Helper()
 	path, err := filepath.Abs("docs/zcquit.md")
 	if err != nil {
@@ -27,14 +35,42 @@ func quitDocExamples(t *testing.T) []string {
 		t.Fatalf("读取 %s: %v", path, err)
 	}
 	matches := regexp.MustCompile("(?ms)^```go\n(.*?)^```[ \t]*$").FindAllStringSubmatch(strings.ReplaceAll(string(doc), "\r\n", "\n"), -1)
-	if len(matches) != 4 {
-		t.Fatalf("正式文档应包含 4 段 Go 示例，实际 %d", len(matches))
+	if len(matches) < 3 {
+		t.Fatalf("正式文档应至少包含 3 段完整 Go 示例，实际 %d", len(matches))
 	}
-	examples := make([]string, len(matches))
+	examples := make([]docExample, len(matches))
 	for i, match := range matches {
-		examples[i] = match[1]
+		examples[i] = docExample{name: docExampleName(match[1], i), source: match[1]}
 	}
 	return examples
+}
+
+// docExampleName 取示例首行注释，缺失时回退为序号。
+func docExampleName(source string, index int) string {
+	for _, line := range strings.Split(source, "\n") {
+		if strings.HasPrefix(line, "// 示例 ") {
+			return line
+		}
+		if strings.HasPrefix(line, "package ") {
+			break
+		}
+	}
+	return fmt.Sprintf("第 %d 段示例", index+1)
+}
+
+// findDocExample 按内容特征定位唯一示例；数量不符即失败，防止示例被误删后测试空转。
+func findDocExample(t *testing.T, examples []docExample, want string, match func(docExample) bool) docExample {
+	t.Helper()
+	var found []docExample
+	for _, example := range examples {
+		if match(example) {
+			found = append(found, example)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("文档中应有唯一的 %s 示例，实际匹配 %d 段", want, len(found))
+	}
+	return found[0]
 }
 
 // buildQuitDocExample 在独立临时 module 内编译真实示例，产物仅用于本次测试。
@@ -46,7 +82,8 @@ func buildQuitDocExample(t *testing.T, source string) string {
 	}
 	dir := t.TempDir()
 	mod := fmt.Sprintf("module example.test/zcquitdocs\n\ngo 1.25.11\n\nrequire github.com/buexplain/zckg v0.0.0\n\nreplace github.com/buexplain/zckg => %q\n", filepath.ToSlash(root))
-	for name, content := range map[string]string{"go.mod": mod, "main.go": source} {
+	// 文档示例省略 package 声明，便于直接粘贴进现有 main.go；校验时补齐为完整程序。
+	for name, content := range map[string]string{"go.mod": mod, "main.go": "package main\n\n" + source} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
 			t.Fatalf("写入 %s: %v", name, err)
 		}
@@ -64,28 +101,44 @@ func buildQuitDocExample(t *testing.T, source string) string {
 	return binary
 }
 
-// TestDocExamples_Compile 从 Markdown 提取全部四段示例，补齐片段外壳后执行真实 Go 编译。
-func TestDocExamples_Compile(t *testing.T) {
-	examples := quitDocExamples(t)
-	names := []string{"basic", "levels", "manual_shutdown", "http"}
-	const prelude = "package main\nimport (\"log/slog\"; \"os\"; \"github.com/buexplain/zckg/zcquit\")\n"
-	for i, name := range names {
-		t.Run(name, func(t *testing.T) {
-			source := examples[i]
-			switch i {
-			case 1:
-				source = prelude + "func main() {\n" + source + "\n}\n"
-			case 2:
-				source = prelude + source + "\nfunc healthCheck() error { return nil }\n"
+// TestDocExamples_CompletePrograms 锁死文档约定：每个 go 块都是省略 package 声明的完整示例，
+// 必须自带 import 与 func main，且不得再声明 package（由 buildQuitDocExample 补齐）。
+func TestDocExamples_CompletePrograms(t *testing.T) {
+	for i, example := range quitDocExamples(t) {
+		t.Run(fmt.Sprintf("example-%d", i+1), func(t *testing.T) {
+			if !strings.Contains(example.name, "示例") {
+				t.Fatalf("示例缺少「// 示例 N：」首行注释，名称: %q", example.name)
 			}
-			buildQuitDocExample(t, source)
+			if !strings.Contains(example.source, "\nimport (\n") {
+				t.Fatalf("示例必须包含 import 块，实际:\n%.4096s", example.source)
+			}
+			if !strings.Contains(example.source, "\nfunc main() {") {
+				t.Fatalf("示例必须包含 func main()，实际:\n%.4096s", example.source)
+			}
+			for _, line := range strings.Split(example.source, "\n") {
+				if strings.HasPrefix(line, "package ") {
+					t.Fatalf("示例不应声明 package（校验时统一补齐），实际行: %q", line)
+				}
+			}
 		})
 	}
 }
 
-// TestDocExamples_BasicWaitsForWorker 锁死真实示例的等待 handler、资源级别和启动门顺序，删除等待即失败。
+// TestDocExamples_Compile 编译文档中的全部 Go 示例，每个示例均为独立完整程序。
+func TestDocExamples_Compile(t *testing.T) {
+	for i, example := range quitDocExamples(t) {
+		t.Run(fmt.Sprintf("example-%d", i+1), func(t *testing.T) {
+			buildQuitDocExample(t, example.source)
+		})
+	}
+}
+
+// TestDocExamples_BasicWaitsForWorker 锁死基本示例的等待 handler、资源级别和启动门顺序，删除等待即失败。
 func TestDocExamples_BasicWaitsForWorker(t *testing.T) {
-	source, err := format.Source([]byte(quitDocExamples(t)[0]))
+	example := findDocExample(t, quitDocExamples(t), "基本用法", func(ex docExample) bool {
+		return strings.Contains(ex.source, "<-workerDone") && strings.Contains(ex.source, "zcquit.AddSigHandler(0")
+	})
+	source, err := format.Source([]byte("package main\n\n" + example.source))
 	if err != nil {
 		t.Fatalf("格式化基本示例: %v", err)
 	}
@@ -119,6 +172,9 @@ func TestDocExamples_BasicWaitsForWorker(t *testing.T) {
 
 // TestDocExamples_HTTPPortConflict 用随机本机占用端口运行真实示例，验证启动失败后全部级别恰好清理一次并正常返回。
 func TestDocExamples_HTTPPortConflict(t *testing.T) {
+	example := findDocExample(t, quitDocExamples(t), "HTTP 多级清理", func(ex docExample) bool {
+		return strings.Contains(ex.source, `"net/http"`) && strings.Contains(ex.source, `Addr: ":8080"`)
+	})
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("创建端口占用监听器: %v", err)
@@ -128,7 +184,7 @@ func TestDocExamples_HTTPPortConflict(t *testing.T) {
 			t.Errorf("关闭端口占用监听器: %v", err)
 		}
 	})
-	source := quitDocExamples(t)[3]
+	source := example.source
 	// 注册必须先于服务 goroutine 启动，不能靠调度碰巧晚执行错误分支。
 	start := strings.Index(source, "go func() {")
 	for _, level := range []int{0, 1, 2} {
