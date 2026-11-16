@@ -1,7 +1,7 @@
 // 本文件为跨方言集成测试公共主体：
 // 各方言入口文件（cross_dialect_{sqlite,mysql,postgres}_integration_test.go）负责
 // 建连与门控，测试逻辑集中于此，三方言复用同一套断言。
-// 覆盖目标：终端方法的执行期错误分支、Pluck/Cursor 扫描错误、
+// 覆盖目标：终端方法的执行期错误分支、Pluck/PluckMap/KeyBy/Cursor 扫描错误、
 // Increment/Decrement、InsertUsing/InsertOrIgnoreUsing、批量插入、
 // Upsert 退化分支、NOT IN 系列、空安全表达式、嵌套 Join 删除、事务开启失败、
 // CompileRaw 内联产物的无参执行与字面量往返、值内联的方言差异、
@@ -262,17 +262,17 @@ func crossDialectCommentQueries(t *testing.T, open commentDAOOpener) {
 			}
 			log.check(t, want)
 			b = base.Clone()
-			want = commentCompiledCall(t, b, state.text, func(q *Builder) (string, []any, error) { return q.Select("name", "id").ToSelect() }, 0)
+			want = commentCompiledCall(t, b, state.text, func(q *Builder) (string, []any, error) { return q.Select("id", "name").ToSelect() }, 0)
 			var pairs map[int64]string
-			if err := b.Pluck(ctx, &pairs, "name", "id"); err != nil || !reflect.DeepEqual(pairs, map[int64]string{1: "one", 2: "two", 3: "three"}) {
-				t.Fatalf("Pluck map: pairs=%#v err=%v", pairs, err)
+			if err := b.PluckMap(ctx, &pairs, "id", "name"); err != nil || !reflect.DeepEqual(pairs, map[int64]string{1: "one", 2: "two", 3: "three"}) {
+				t.Fatalf("PluckMap: pairs=%#v err=%v", pairs, err)
 			}
 			log.check(t, want)
 			b = base.Clone()
 			want = commentCompiledCall(t, b, state.text, func(q *Builder) (string, []any, error) { return q.Select("id", "name", "num").ToSelect() }, 0)
 			var keyed map[int64]crossDialectItemRow
-			if err := b.Pluck(ctx, &keyed, "id"); err != nil || !reflect.DeepEqual(keyed, map[int64]crossDialectItemRow{1: {1, "one", 10}, 2: {2, "two", 20}, 3: {3, "three", 30}}) {
-				t.Fatalf("Pluck keyBy: rows=%#v err=%v", keyed, err)
+			if err := b.KeyBy(ctx, &keyed, "id"); err != nil || !reflect.DeepEqual(keyed, map[int64]crossDialectItemRow{1: {1, "one", 10}, 2: {2, "two", 20}, 3: {3, "three", 30}}) {
+				t.Fatalf("KeyBy: rows=%#v err=%v", keyed, err)
 			}
 			log.check(t, want)
 			b = base.Clone().ForPage(2, 2)
@@ -1032,9 +1032,13 @@ func crossDialectTestQueryErrorsOnMissingTable(t *testing.T, dao *DBDao) {
 	if err := dao.Builder().Table(crossDialectMissingTable).Pluck(ctx, &ids, "id"); err == nil {
 		t.Fatal("Pluck 查询不存在的表应报错")
 	}
+	pairs := map[int64]string{}
+	if err := dao.Builder().Table(crossDialectMissingTable).PluckMap(ctx, &pairs, "id", "name"); err == nil {
+		t.Fatal("PluckMap 查询不存在的表应报错")
+	}
 	keyBy := map[int64]crossDialectRow{}
-	if err := dao.Builder().Table(crossDialectMissingTable).Pluck(ctx, &keyBy, "id"); err == nil {
-		t.Fatal("Pluck keyBy 查询不存在的表应报错")
+	if err := dao.Builder().Table(crossDialectMissingTable).KeyBy(ctx, &keyBy, "id"); err == nil {
+		t.Fatal("KeyBy 查询不存在的表应报错")
 	}
 	if _, err := dao.Builder().Table(crossDialectMissingTable).Count(ctx); err == nil {
 		t.Fatal("Count 查询不存在的表应报错")
@@ -1068,31 +1072,31 @@ func crossDialectTestQueryErrorsOnMissingTable(t *testing.T, dao *DBDao) {
 	}
 }
 
-// crossDialectTestPluckScanErrors 覆盖 Pluck 三种模式下扫描类型不匹配的错误分支：
-// 切片模式、map 键值模式、map 键列（keyBy）模式。
+// crossDialectTestPluckScanErrors 覆盖 Pluck/PluckMap/KeyBy 三种 map/切片目标下
+// 扫描类型不匹配的错误分支。
 func crossDialectTestPluckScanErrors(t *testing.T, dao *DBDao) {
 	ctx := context.Background()
 	crossDialectSetupScanTable(t, dao)
 
-	// 切片模式：文本列 'abc' 扫描进 int64 失败
+	// Pluck：文本列 'abc' 扫描进 int64 失败
 	var ids []int64
 	if err := dao.Builder().Table("cross_dialect_scan").Pluck(ctx, &ids, "name"); err == nil {
-		t.Fatal("Pluck 切片模式扫描文本列到 int64 应报错")
+		t.Fatal("Pluck 扫描文本列到 int64 应报错")
 	}
 
-	// map 键值模式：值列（第一列）类型不匹配
-	m := map[string]int64{}
-	if err := dao.Builder().Table("cross_dialect_scan").Pluck(ctx, &m, "name", "id"); err == nil {
-		t.Fatal("Pluck map 模式扫描文本列到 int64 应报错")
+	// PluckMap：键列类型不匹配（文本列 'abc' 扫描进 int64 键）
+	m := map[int64]int64{}
+	if err := dao.Builder().Table("cross_dialect_scan").PluckMap(ctx, &m, "name", "id"); err == nil {
+		t.Fatal("PluckMap 扫描文本列到 int64 键应报错")
 	}
 
-	// keyBy 模式：结构体字段类型与列类型不匹配
+	// KeyBy：结构体字段类型与列类型不匹配
 	type badKeyBy struct {
 		Name int64 `db:"name"`
 	}
 	kb := map[int64]badKeyBy{}
-	if err := dao.Builder().Table("cross_dialect_scan").Pluck(ctx, &kb, "id"); err == nil {
-		t.Fatal("Pluck keyBy 模式扫描文本列到 int64 应报错")
+	if err := dao.Builder().Table("cross_dialect_scan").KeyBy(ctx, &kb, "id"); err == nil {
+		t.Fatal("KeyBy 扫描文本列到 int64 应报错")
 	}
 }
 

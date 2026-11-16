@@ -21,7 +21,7 @@ import (
 	"github.com/buexplain/zckg/zcdb"
 )
 
-// ==================== README.md ====================
+// ==================== getting-started.md ====================
 
 type readmeUser struct {
 	Id   int64  `db:"id"`
@@ -69,7 +69,7 @@ func readmeQuickStart() {
 	fmt.Println(id)
 }
 
-// ==================== compile.md ====================
+// ==================== reference/builder-compile.md ====================
 
 type compileUserUpdate struct {
 	Name *string `db:"name"`
@@ -132,7 +132,7 @@ func compileMdExamples(db *zcdb.DBDao, user readmeUser) {
 	_ = args
 }
 
-// ==================== connection.md ====================
+// ==================== concepts/execution-routing.md ====================
 
 func connectionMdExamples(ctx context.Context) error {
 	pool, err := zcdb.NewPool(zcdb.PoolConfig{
@@ -260,7 +260,7 @@ func connectionMdExamples(ctx context.Context) error {
 	return pool.Ping(ctx)
 }
 
-// ==================== mutate.md ====================
+// ==================== reference/builder-exec.md ====================
 
 func mutateMdExamples(ctx context.Context, db *zcdb.DBDao) {
 	type User struct {
@@ -343,7 +343,7 @@ func mutateMdExamples(ctx context.Context, db *zcdb.DBDao) {
 	}
 }
 
-// ==================== query-builder.md ====================
+// ==================== reference/builder-{core,select,where,join,order-group}.md ====================
 
 func queryBuilderMdExamples(db *zcdb.DBDao) {
 	sqlStr, args, _ := db.Builder().Table("users").Where("age", ">", 18).ToSelect()
@@ -557,7 +557,7 @@ func queryBuilderMdExamples(db *zcdb.DBDao) {
 	_, _ = sqlBase, sqlAdmins
 }
 
-// ==================== query-exec.md ====================
+// ==================== reference/builder-{query,cursor}.md / scanner.md ====================
 
 func queryExecMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 	type User struct {
@@ -607,12 +607,12 @@ func queryExecMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 		return err
 	}
 	var m map[int64]string
-	err = db.Builder().Table("users").Pluck(ctx, &m, "name", "id")
+	err = db.Builder().Table("users").PluckMap(ctx, &m, "id", "name")
 	if err != nil {
 		return err
 	}
 	var mu map[int64]User
-	err = db.Builder().Table("users").Pluck(ctx, &mu, "id")
+	err = db.Builder().Table("users").KeyBy(ctx, &mu, "id")
 	if err != nil {
 		return err
 	}
@@ -671,7 +671,7 @@ func queryExecMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 	return err
 }
 
-// ==================== schema.md ====================
+// ==================== reference/schema.md ====================
 
 func schemaMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 	inspector, err := db.Schema()
@@ -740,7 +740,7 @@ func schemaMdExamples(ctx context.Context, db *zcdb.DBDao) error {
 	return nil
 }
 
-// NewSchemaInspector 也可直接创建（schema.md 第一节）。
+// NewSchemaInspector 也可直接创建（reference/schema.md 第一节）。
 func schemaMdNewInspector(db *zcdb.DBDao) {
 	inspector, err := db.Schema()
 	_, _ = inspector, err
@@ -766,7 +766,7 @@ func sqlCommentDefault(pool *zcdb.Pool) error {
 	return err
 }
 
-// sqlCommentOverride 覆盖 `Comment` 的覆盖与清空两种用法（亦见 query-builder.md）。
+// sqlCommentOverride 覆盖 `Comment` 的覆盖与清空两种用法（亦见 reference/builder-core.md）。
 func sqlCommentOverride(db *zcdb.DBDao) {
 	sql, _, _ := db.Builder().Table("orders").Comment("report:daily").ToSelect()
 	// SQL: SELECT * FROM `orders` /* report:daily */

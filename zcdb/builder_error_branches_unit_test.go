@@ -1,6 +1,6 @@
 // 本文件为 Builder 编译/构造/终端方法的错误前置分支补充单元测试。
 // 覆盖各 To* 方法的 b.err != nil 短路、空表名 ErrEmptyTable、
-// 终端方法（First/Pluck/Count/Exists/Max/Value/Cursor/CursorBy）与便捷写方法
+// 终端方法（First/Pluck/PluckMap/KeyBy/Count/Exists/Max/Value/Cursor/CursorBy）与便捷写方法
 // （InsertUsing/Increment/Decrement/DeleteJoin）的编译错误传播，
 // 以及 JoinBuilder/addJoinOn/addJoinSub/addNested/WhereExists/addHavingBasic 的 error 累积分支。
 // 仅验证错误分支，不依赖数据库连接。
@@ -323,8 +323,9 @@ func TestPublicErrorMessages(t *testing.T) {
 		err  error
 		want string
 	}{
-		{ErrPluckDest, "zcdb: Pluck dest must be a non-nil pointer to a slice or map"},
-		{ErrPluckColumns, "zcdb: Pluck requires 1 column for slice or keyBy map, or 2 columns for scalar map"},
+		{ErrPluckDest, "zcdb: Pluck dest must be a non-nil pointer to a slice (use PluckMap or KeyBy for map destinations)"},
+		{ErrPluckMapDest, "zcdb: PluckMap dest must be a non-nil pointer to a map with non-struct key and value types (use KeyBy for struct values)"},
+		{ErrKeyByDest, "zcdb: KeyBy dest must be a non-nil pointer to a map with struct or struct pointer values"},
 		{ErrNoFields, "zcdb: no usable exported fields for write or keyBy mapping"},
 		{ErrIncrementColumns, "zcdb: Increment/Decrement requires non-empty paired columns and amounts"},
 	} {
@@ -441,15 +442,21 @@ func TestBuilder_TerminalMethodsPropagateCompileError(t *testing.T) {
 			t.Fatalf("expected ErrEmptyTable, got %v", err)
 		}
 	})
-	t.Run("PluckSlice", func(t *testing.T) {
+	t.Run("Pluck", func(t *testing.T) {
 		var ids []int64
 		if err := newTestBuilder(g, nil).Pluck(ctx, &ids, "id"); !errors.Is(err, ErrEmptyTable) {
 			t.Fatalf("expected ErrEmptyTable, got %v", err)
 		}
 	})
-	t.Run("PluckKeyBy", func(t *testing.T) {
+	t.Run("PluckMap", func(t *testing.T) {
+		m := map[int64]string{}
+		if err := newTestBuilder(g, nil).PluckMap(ctx, &m, "id", "name"); !errors.Is(err, ErrEmptyTable) {
+			t.Fatalf("expected ErrEmptyTable, got %v", err)
+		}
+	})
+	t.Run("KeyBy", func(t *testing.T) {
 		m := map[int64]row{}
-		if err := newTestBuilder(g, nil).Pluck(ctx, &m, "id"); !errors.Is(err, ErrEmptyTable) {
+		if err := newTestBuilder(g, nil).KeyBy(ctx, &m, "id"); !errors.Is(err, ErrEmptyTable) {
 			t.Fatalf("expected ErrEmptyTable, got %v", err)
 		}
 	})

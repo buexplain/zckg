@@ -1,7 +1,7 @@
 package zcdb
 
 // 本文件包含 Builder 的 SELECT 查询执行方法（终端方法）：
-// First/Find/Pluck/Paginate/Count/Exists/Value 与聚合 Max/Min/Sum/Avg，
+// First/Find/Pluck/PluckMap/KeyBy/Paginate/Count/Exists/Value 与聚合 Max/Min/Sum/Avg，
 // 以及内部统一查询入口 query（带锁查询与 Primary 标记强制走写连接）。
 
 import (
@@ -71,62 +71,27 @@ func (b *Builder) Find(ctx context.Context, dest any) error {
 	return ScanStructClose(rows, dest, b.tagName())
 }
 
-// Pluck 提取查询结果中的列值到目标容器。
-// dest 为切片指针时提取单列（第一列）：
+// Pluck 提取单列值到切片。
+// dest 必须是切片指针，column 为要提取的列；NULL 值扫描为零值（与 Find 一致）。
 //
 //	var names []string
 //	err := db.Builder().Table("users").OrderBy("id", "ASC").Pluck(ctx, &names, "name")
+//	// SQL: SELECT `name` FROM `users` ORDER BY `id` ASC
 //
-// dest 为 map 指针时提取键值对（第一列为值、第二列为键）：
-//
-//	var m map[int64]string
-//	err := db.Builder().Table("users").Pluck(ctx, &m, "name", "id") // id => name
-//
-// map 值为结构体/结构体指针时进入键列模式（keyBy）：唯一列参数作为键列，整行数据按列映射标签扫描进结构体：
-//
-//	var m map[int64]User // id => User 整行
-//	err := db.Builder().Table("users").Pluck(ctx, &m, "id")
-//
-// NULL 值扫描为零值（与 Find 一致）；map 模式重复键后者覆盖前者，键列为 NULL 时使用零值键。
-// Pluck 会覆盖 Builder 当前的 SELECT 列。
-func (b *Builder) Pluck(ctx context.Context, dest any, columns ...string) error {
+// 目标容器与方法的对应关系：切片用 Pluck，标量 map 用 PluckMap，结构体 map 用 KeyBy。
+// 会覆盖 Builder 当前的 SELECT 列。
+func (b *Builder) Pluck(ctx context.Context, dest any, column string) error {
 	destValue := reflect.ValueOf(dest)
 	if destValue.Kind() != reflect.Ptr || destValue.IsNil() {
 		return ErrPluckDest
 	}
 	destValue = destValue.Elem()
-
-	switch destValue.Kind() {
-	case reflect.Slice:
-		if len(columns) != 1 {
-			return ErrPluckColumns
-		}
-	case reflect.Map:
-		// nil map 初始化，避免 SetMapIndex panic
-		if destValue.IsNil() {
-			destValue.Set(reflect.MakeMap(destValue.Type()))
-		}
-		// map 值类型为结构体/结构体指针时进入键列模式（keyBy）：
-		// 唯一列参数作为键列，整行数据按列映射标签（默认 db）扫描进结构体
-		valType := destValue.Type().Elem()
-		if valType.Kind() == reflect.Ptr {
-			valType = valType.Elem()
-		}
-		if valType.Kind() == reflect.Struct {
-			if len(columns) != 1 {
-				return ErrPluckColumns
-			}
-			return b.pluckKeyBy(ctx, destValue, columns[0])
-		}
-		if len(columns) != 2 {
-			return ErrPluckColumns
-		}
-	default:
+	if destValue.Kind() != reflect.Slice {
 		return ErrPluckDest
 	}
 
 	// 只查询需要的列（覆盖既有 SELECT）
-	b.Select(columns...)
+	b.Select(column)
 	sqlStr, args, err := b.ToSelect()
 	if err != nil {
 		return err
@@ -139,32 +104,114 @@ func (b *Builder) Pluck(ctx context.Context, dest any, columns ...string) error 
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
-		if destValue.Kind() == reflect.Slice {
-			elem := reflect.New(destValue.Type().Elem()).Elem()
-			if err := rows.Scan(&nullSafeField{field: elem}); err != nil {
-				return fmt.Errorf("zcdb: pluck scan row failed: %w", err)
-			}
-			destValue.Set(reflect.Append(destValue, elem))
-			continue
+		elem := reflect.New(destValue.Type().Elem()).Elem()
+		if err := rows.Scan(&nullSafeField{field: elem}); err != nil {
+			return fmt.Errorf("zcdb: pluck scan row failed: %w", err)
 		}
-		// map 模式：第一列为值、第二列为键
-		val := reflect.New(destValue.Type().Elem()).Elem()
+		destValue.Set(reflect.Append(destValue, elem))
+	}
+	return rows.Err()
+}
+
+// PluckMap 提取两列到 map：keyColumn 作为键、valueColumn 作为值，参数顺序与 map[K]V 的声明顺序一致。
+// dest 必须是 map 指针；键/值类型不能是结构体，值类型为结构体/结构体指针时请用 KeyBy。
+// NULL 值扫描为零值；重复键后者覆盖前者。
+//
+//	var m map[int64]string
+//	err := db.Builder().Table("users").PluckMap(ctx, &m, "id", "name") // id => name
+//	// SQL: SELECT `id`, `name` FROM `users`
+//
+// 会覆盖 Builder 当前的 SELECT 列。
+func (b *Builder) PluckMap(ctx context.Context, dest any, keyColumn, valueColumn string) error {
+	destValue := reflect.ValueOf(dest)
+	if destValue.Kind() != reflect.Ptr || destValue.IsNil() {
+		return ErrPluckMapDest
+	}
+	destValue = destValue.Elem()
+	if destValue.Kind() != reflect.Map {
+		return ErrPluckMapDest
+	}
+	// 键/值类型为结构体时无法扫描单列，提前拒绝并指向 KeyBy
+	keyType := destValue.Type().Key()
+	if keyType.Kind() == reflect.Struct || (keyType.Kind() == reflect.Ptr && keyType.Elem().Kind() == reflect.Struct) {
+		return ErrPluckMapDest
+	}
+	valType := destValue.Type().Elem()
+	if valType.Kind() == reflect.Ptr {
+		valType = valType.Elem()
+	}
+	if valType.Kind() == reflect.Struct {
+		return ErrPluckMapDest
+	}
+	// nil map 初始化，避免 SetMapIndex panic
+	if destValue.IsNil() {
+		destValue.Set(reflect.MakeMap(destValue.Type()))
+	}
+
+	// 只查询需要的两列（覆盖既有 SELECT），SQL 列序与参数顺序一致：键、值
+	b.Select(keyColumn, valueColumn)
+	sqlStr, args, err := b.ToSelect()
+	if err != nil {
+		return err
+	}
+
+	rows, err := b.query(ctx, sqlStr, args...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
 		key := reflect.New(destValue.Type().Key()).Elem()
-		if err := rows.Scan(&nullSafeField{field: val}, &nullSafeField{field: key}); err != nil {
+		val := reflect.New(destValue.Type().Elem()).Elem()
+		if err := rows.Scan(&nullSafeField{field: key}, &nullSafeField{field: val}); err != nil {
 			return fmt.Errorf("zcdb: pluck scan row failed: %w", err)
 		}
 		destValue.SetMapIndex(key, val)
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	return nil
+	return rows.Err()
 }
 
-// pluckKeyBy 键列模式（keyBy）：map 值为结构体/结构体指针时，columns 唯一元素作为键列，
+// KeyBy 以 keyColumn 为键，把整行扫描进结构体，构建 map[K]结构体或 map[K]*结构体。
+// dest 必须是 map 指针，值类型为结构体或结构体指针；整行按列映射标签（默认 db，可由 NewDBDao 的 tagName 参数自定义）扫描。
+// 键列若不在结构体字段中，会追加为 SELECT 的最后一列单独扫描。
+// 重复键后者覆盖前者（最后一行生效）；键列为 NULL 时使用零值键。会覆盖 Builder 当前的 SELECT 列。
+//
+//	var byID map[int64]User // id => User 整行
+//	err := db.Builder().Table("users").KeyBy(ctx, &byID, "id")
+//	// SQL: SELECT `id`, `name`, `age` FROM `users`
+func (b *Builder) KeyBy(ctx context.Context, dest any, keyColumn string) error {
+	destValue := reflect.ValueOf(dest)
+	if destValue.Kind() != reflect.Ptr || destValue.IsNil() {
+		return ErrKeyByDest
+	}
+	destValue = destValue.Elem()
+	if destValue.Kind() != reflect.Map {
+		return ErrKeyByDest
+	}
+	// 键类型为结构体时无法扫描单列，与 PluckMap 的边界保持一致
+	keyType := destValue.Type().Key()
+	if keyType.Kind() == reflect.Struct || (keyType.Kind() == reflect.Ptr && keyType.Elem().Kind() == reflect.Struct) {
+		return ErrKeyByDest
+	}
+	valType := destValue.Type().Elem()
+	if valType.Kind() == reflect.Ptr {
+		valType = valType.Elem()
+	}
+	if valType.Kind() != reflect.Struct {
+		return ErrKeyByDest
+	}
+	// nil map 初始化，避免 SetMapIndex panic
+	if destValue.IsNil() {
+		destValue.Set(reflect.MakeMap(destValue.Type()))
+	}
+	return b.keyBy(ctx, destValue, keyColumn)
+}
+
+// keyBy KeyBy 的内部实现：keyColumn 作为键列，
 // 整行数据按列映射标签（默认 db）扫描进结构体后以键列值作为 map 键。
 // 键列若已在结构体字段中则不重复 SELECT，直接复用字段扫描值；否则追加为 SELECT 最后一列。
-func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColumn string) error {
+func (b *Builder) keyBy(ctx context.Context, destMap reflect.Value, keyColumn string) error {
 	valType := destMap.Type().Elem()
 	isPtr := valType.Kind() == reflect.Ptr
 	elemType := valType
@@ -214,7 +261,7 @@ func (b *Builder) pluckKeyBy(ctx context.Context, destMap reflect.Value, keyColu
 			values[keyIndex] = &nullSafeField{field: key}
 		}
 		if err := rows.Scan(values...); err != nil {
-			return fmt.Errorf("zcdb: pluck scan row failed: %w", err)
+			return fmt.Errorf("zcdb: keyBy scan row failed: %w", err)
 		}
 		// 键列在结构体字段中：扫描完成后从字段取值（类型做可转换检查）
 		if keyInFields {

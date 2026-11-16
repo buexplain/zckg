@@ -2191,63 +2191,103 @@ func TestBug_CrossJoinSub_SQL(t *testing.T) {
 	}
 }
 
-// TestBug_Pluck_ArgValidation 验证 Pluck 参数校验错误路径：
-// dest 必须是非 nil 的切片/map 指针；切片与 keyBy map 需 1 列，标量 map 需 2 列。
-func TestBug_Pluck_ArgValidation(t *testing.T) {
+// TestBug_PluckFamily_ArgValidation 验证 Pluck/PluckMap/KeyBy 的参数校验错误路径：
+// Pluck 只接受切片指针，PluckMap 只接受非结构体键/值的 map 指针，KeyBy 只接受结构体值 map 指针；
+// 目标容器本身为 nil 合法（由方法自行初始化），校验通过后继续执行到编译期。
+func TestBug_PluckFamily_ArgValidation(t *testing.T) {
 	b := newTestBuilder(NewSQLiteGrammar(), nil)
 	ctx := context.Background()
 
-	// 非指针 dest
-	var names []string
-	if err := b.Pluck(ctx, names, "name"); !errors.Is(err, ErrPluckDest) {
-		t.Errorf("non-pointer dest: expected ErrPluckDest, got %v", err)
-	}
-	// nil 指针 dest
-	var p *[]string
-	if err := b.Pluck(ctx, p, "name"); !errors.Is(err, ErrPluckDest) {
-		t.Errorf("nil pointer dest: expected ErrPluckDest, got %v", err)
-	}
-	// 结构体指针 dest
-	var s struct{ Name string }
-	if err := b.Pluck(ctx, &s, "name"); !errors.Is(err, ErrPluckDest) {
-		t.Errorf("struct dest: expected ErrPluckDest, got %v", err)
-	}
-	// 切片 dest + 2 列
-	if err := b.Pluck(ctx, &names, "name", "id"); !errors.Is(err, ErrPluckColumns) {
-		t.Errorf("slice dest with 2 columns: expected ErrPluckColumns, got %v", err)
-	}
-	// 切片 dest + 0 列
-	if err := b.Pluck(ctx, &names); !errors.Is(err, ErrPluckColumns) {
-		t.Errorf("slice dest with 0 columns: expected ErrPluckColumns, got %v", err)
-	}
-	// map dest + 1 列
-	var m map[int64]string
-	if err := b.Pluck(ctx, &m, "name"); !errors.Is(err, ErrPluckColumns) {
-		t.Errorf("map dest with 1 column: expected ErrPluckColumns, got %v", err)
-	}
-
-	// keyBy 模式：map 值结构体 + 0 列
 	type User struct {
 		Name string `db:"name"`
 		Id   int    `db:"id"`
 	}
-	var mk map[int64]User
-	if err := b.Pluck(ctx, &mk); !errors.Is(err, ErrPluckColumns) {
-		t.Errorf("keyBy dest with 0 columns: expected ErrPluckColumns, got %v", err)
+
+	// Pluck：非指针 / nil 指针 / 结构体指针 / map 指针（应改用 PluckMap 或 KeyBy）
+	var names []string
+	if err := b.Pluck(ctx, names, "name"); !errors.Is(err, ErrPluckDest) {
+		t.Errorf("Pluck non-pointer dest: expected ErrPluckDest, got %v", err)
 	}
-	// keyBy 模式：map 值结构体 + 2 列
-	if err := b.Pluck(ctx, &mk, "id", "name"); !errors.Is(err, ErrPluckColumns) {
-		t.Errorf("keyBy dest with 2 columns: expected ErrPluckColumns, got %v", err)
+	var p *[]string
+	if err := b.Pluck(ctx, p, "name"); !errors.Is(err, ErrPluckDest) {
+		t.Errorf("Pluck nil pointer dest: expected ErrPluckDest, got %v", err)
 	}
-	// map 值类型非结构体（如嵌套 map）走标量键值对模式：列数仍要求 2 列
-	var mn map[int64]map[string]int
-	if err := b.Pluck(ctx, &mn, "a"); !errors.Is(err, ErrPluckColumns) {
-		t.Errorf("nested map value dest with 1 column: expected ErrPluckColumns, got %v", err)
+	var s struct{ Name string }
+	if err := b.Pluck(ctx, &s, "name"); !errors.Is(err, ErrPluckDest) {
+		t.Errorf("Pluck struct dest: expected ErrPluckDest, got %v", err)
 	}
-	// keyBy 模式：结构体无导出字段
-	var me map[int64]struct{}
-	if err := b.Pluck(ctx, &me, "id"); !errors.Is(err, ErrNoFields) {
-		t.Errorf("keyBy dest with empty struct: expected ErrNoFields, got %v", err)
+	m := map[int64]string{}
+	if err := b.Pluck(ctx, &m, "name"); !errors.Is(err, ErrPluckDest) {
+		t.Errorf("Pluck map dest: expected ErrPluckDest, got %v", err)
+	}
+
+	// PluckMap：nil dest / nil 指针 / 非 map / 结构体值 / 结构体指针值 / 结构体键
+	if err := b.PluckMap(ctx, nil, "id", "name"); !errors.Is(err, ErrPluckMapDest) {
+		t.Errorf("PluckMap nil dest: expected ErrPluckMapDest, got %v", err)
+	}
+	var mp *map[int64]string
+	if err := b.PluckMap(ctx, mp, "id", "name"); !errors.Is(err, ErrPluckMapDest) {
+		t.Errorf("PluckMap nil pointer dest: expected ErrPluckMapDest, got %v", err)
+	}
+	if err := b.PluckMap(ctx, &names, "id", "name"); !errors.Is(err, ErrPluckMapDest) {
+		t.Errorf("PluckMap slice dest: expected ErrPluckMapDest, got %v", err)
+	}
+	var me map[int64]User
+	if err := b.PluckMap(ctx, &me, "id", "name"); !errors.Is(err, ErrPluckMapDest) {
+		t.Errorf("PluckMap struct value dest: expected ErrPluckMapDest, got %v", err)
+	}
+	var mpv map[int64]*User
+	if err := b.PluckMap(ctx, &mpv, "id", "name"); !errors.Is(err, ErrPluckMapDest) {
+		t.Errorf("PluckMap struct pointer value dest: expected ErrPluckMapDest, got %v", err)
+	}
+	var mk map[User]string
+	if err := b.PluckMap(ctx, &mk, "id", "name"); !errors.Is(err, ErrPluckMapDest) {
+		t.Errorf("PluckMap struct key dest: expected ErrPluckMapDest, got %v", err)
+	}
+	var mkp map[*User]string
+	if err := b.PluckMap(ctx, &mkp, "id", "name"); !errors.Is(err, ErrPluckMapDest) {
+		t.Errorf("PluckMap struct pointer key dest: expected ErrPluckMapDest, got %v", err)
+	}
+	// 标量键/值合法：校验通过后继续到编译期，空表名返回 ErrEmptyTable（nil map 由方法初始化）
+	var nilMap map[int64]string
+	if err := b.PluckMap(ctx, &nilMap, "id", "name"); !errors.Is(err, ErrEmptyTable) {
+		t.Errorf("PluckMap valid dest: expected ErrEmptyTable, got %v", err)
+	}
+
+	// KeyBy：nil dest / nil 指针 / 非 map / 标量值 map / 结构体键
+	if err := b.KeyBy(ctx, nil, "id"); !errors.Is(err, ErrKeyByDest) {
+		t.Errorf("KeyBy nil dest: expected ErrKeyByDest, got %v", err)
+	}
+	var kp *map[int64]User
+	if err := b.KeyBy(ctx, kp, "id"); !errors.Is(err, ErrKeyByDest) {
+		t.Errorf("KeyBy nil pointer dest: expected ErrKeyByDest, got %v", err)
+	}
+	if err := b.KeyBy(ctx, &names, "id"); !errors.Is(err, ErrKeyByDest) {
+		t.Errorf("KeyBy slice dest: expected ErrKeyByDest, got %v", err)
+	}
+	if err := b.KeyBy(ctx, &m, "id"); !errors.Is(err, ErrKeyByDest) {
+		t.Errorf("KeyBy scalar value dest: expected ErrKeyByDest, got %v", err)
+	}
+	if err := b.KeyBy(ctx, &mk, "id"); !errors.Is(err, ErrKeyByDest) {
+		t.Errorf("KeyBy struct key dest: expected ErrKeyByDest, got %v", err)
+	}
+	var kkp map[*User]User
+	if err := b.KeyBy(ctx, &kkp, "id"); !errors.Is(err, ErrKeyByDest) {
+		t.Errorf("KeyBy struct pointer key dest: expected ErrKeyByDest, got %v", err)
+	}
+	// KeyBy：结构体无导出字段
+	var empty map[int64]struct{}
+	if err := b.KeyBy(ctx, &empty, "id"); !errors.Is(err, ErrNoFields) {
+		t.Errorf("KeyBy dest with empty struct: expected ErrNoFields, got %v", err)
+	}
+	// 结构体/结构体指针值合法：校验通过后继续到编译期
+	var mu map[int64]User
+	if err := b.KeyBy(ctx, &mu, "id"); !errors.Is(err, ErrEmptyTable) {
+		t.Errorf("KeyBy struct value dest: expected ErrEmptyTable, got %v", err)
+	}
+	var mup map[int64]*User
+	if err := b.KeyBy(ctx, &mup, "id"); !errors.Is(err, ErrEmptyTable) {
+		t.Errorf("KeyBy struct pointer value dest: expected ErrEmptyTable, got %v", err)
 	}
 }
 

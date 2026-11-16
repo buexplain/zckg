@@ -1,191 +1,138 @@
 # zcdb 数据库访问模块
 
-## 概述
+zcdb 是 `database/sql` 之上的查询构造与执行层：**Builder 累积查询意图，Grammar 编译方言 SQL，DBDao 决定走哪个连接并执行，Pool 管理主从连接**。它不绑定具体驱动，也不隐藏数据库语义——SQL 形态、方言差异、事务与路由规则都尽量显式。
 
-zcdb 是一个基于 `database/sql` 的数据库访问模块，核心是 **Builder 查询构造器**：
-
-- **Builder 累积查询状态，Grammar 编译为 SQL**——同一套链式 API 生成 MySQL / PostgreSQL / SQLite 三种方言的 SQL；
-- **主从连接池**：读操作按策略路由到从库，写操作与事务固定走主库，带锁查询与 `Primary()` 标记的查询强制走主库（后者用于写后读场景，不加锁）；
-- **结构体自动映射**：按 `db` 标签（或 snake_case 字段名）在 SQL 列与结构体字段之间双向映射，标签名可在创建 DAO 时自定义；匿名嵌入结构体字段展开为「外层优先」（外层同名列遮蔽嵌入层；同深度冲突取声明顺序靠前者，与 encoding/json 的冲突丢弃语义不同）；
-- **破坏性操作保护**：无 WHERE 条件的 Update/Delete 默认拒绝执行，需显式 `Force()`。
-
-zcdb 本身不依赖具体数据库驱动，需由使用方引入 `database/sql` 驱动并传入驱动名。
-
-> 本文档的 Go 示例统一包在 `func example()` 中，仅用于语法检查与上下文占位（`db`、`ctx` 等是外部变量），不保证可独立运行；可编译性由 `docs_examples_compile_test.go` 单独校验。快速上手为完整程序，仅省略了 `package` 子句。
-
-## 架构
-
-```
-                ┌──────────────────────────────┐
-                │            DBDao             │  面向用户的唯一入口
-                │  Builder() / Schema()        │  Exec/Query/Transaction
-                └──────────────┬───────────────┘
-                               │
-              ┌────────────────┴───────────────┐
-              ▼                                ▼
-     ┌─────────────────┐             ┌──────────────────┐
-     │     Builder     │  编译 SQL   │      Grammar     │
-     │ 累积查询状态     │ ──────────► │  MySQLGrammar    │
-     │ (链式调用)      │             │  PostgresGrammar │
-     └─────────────────┘             │  SQLiteGrammar   │
-              │                      └──────────────────┘
-              │ 执行
-              ▼
-     ┌─────────────────┐    读 → PickReadDB（从库，按策略选择）
-     │      Pool       │    写 → PickWriteDB（主库）
-     │  主从连接池      │    事务 → master.BeginTx
-     └─────────────────┘
-```
-
-## 方言差异总览
-
-| 项目 | MySQL | PostgreSQL | SQLite |
-|---|---|---|---|
-| dialect 取值 | `mysql` | `postgresql` / `postgres` / `pgsql` | `sqlite` / `sqlite3` |
-| 标识符包裹 | 反引号 `` `col` `` | 双引号 `"col"` | 双引号 `"col"` |
-| 占位符 | `?` | `$1`、`$2`… | `?` |
-| 共享锁 | `LOCK IN SHARE MODE` | `FOR SHARE` | 不支持（编译报错） |
-| UNION + 锁 | 支持 | 不支持（编译报错） | 不支持锁 |
-| RIGHT JOIN | 支持 | 支持 | 3.39 以下不支持（框架不做版本检测，由数据库报错） |
-| CROSS JOIN ON | 直译 | 编译为 `INNER JOIN ... ON`（等价） | 直译 |
-| UNION 子查询括号 | 各查询加括号包裹 | 各查询加括号包裹 | 不加括号（SQLite 不允许） |
-| Truncate | `TRUNCATE TABLE` | `TRUNCATE TABLE ... RESTART IDENTITY` | `DELETE FROM` + 清 `sqlite_sequence` |
-| 随机排序 | `RAND()` | `RANDOM()` | `RANDOM()` |
-
-> 本文档的 SQL 示例统一以 **MySQL 形态**给出；PG/SQLite 仅按上表规则变化（包裹符与占位符），存在语义差异处会单独列出。
-
-## 驱动依赖
-
-zcdb 测试使用的驱动组合（可按需替换为任意 `database/sql` 驱动）：
-
-| 数据库 | 驱动包 | 注册名（DriverName） |
-|---|---|---|
-| MySQL | `github.com/go-sql-driver/mysql` | `mysql` |
-| PostgreSQL | `github.com/lib/pq` | `postgres` |
-| SQLite | `modernc.org/sqlite`（纯 Go） | `sqlite` |
-
-## 快速上手
-
-`NewDBDao(pool, dialect, onSQL, tagName, comment)` 必须传五个参数：第四参数控制列映射标签（空串使用 `db`），第五参数是 DAO 默认 SQL **短业务标识**（空串禁用）；旧四参数调用末尾补 `""` 保持无注释 SQL 不变。注释只在 Builder 的最终 SQL 后追加，DAO 原始 SQL 与 Schema 查询不自动追加。
-
-默认值随新 Builder 复制，`Comment` 可覆盖或用空文本清除，`Clone` 保留当前值。注释会把 `unicode.IsControl` 控制字符、`*`、`/` 与 `\` 替换为空格、去首尾空白并按 255 rune 截断，属于有损保存；不得透传外部输入、请求体或秘密。完整生命周期见[查询构造](query-builder.md)的 Comment 小节，DAO 级别的默认值与不可变语义见[连接与 DAO](connection.md)。
+## 30 秒示例
 
 ```go
-// 完整程序：实际运行请置于 package main 中（此处省略 package 子句以便文档语法检查）
-
-import (
-	"context"
-	"fmt"
-
-	"github.com/buexplain/zckg/zcdb"
-	_ "github.com/go-sql-driver/mysql" // 注册 mysql 驱动
-)
-
-type User struct {
-	Id   int64  `db:"id"`
-	Name string `db:"name"`
-	Age  int    `db:"age"`
-}
-
-func main() {
-	// 1. 创建连接池（主库 + 可选从库，创建时即 Ping 验证）
-	pool, err := zcdb.NewPool(zcdb.PoolConfig{
-		DriverName: "mysql",
-		DSN:        "user:pass@tcp(127.0.0.1:3306)/test?parseTime=true",
-		SlaveDSNs:  []string{"user:pass@tcp(127.0.0.1:3307)/test?parseTime=true"},
-	})
+func example() {
+	pool, err := zcdb.NewPool(zcdb.PoolConfig{DriverName: "sqlite", DSN: "file::memory:?cache=shared"})
 	if err != nil {
 		panic(err)
 	}
-
-	// 2. 创建 DAO（dialect 决定 SQL 方言；第四参数为标签名，空串使用 db；第五参数为 SQL 注释，空串禁用）
-	db, err := zcdb.NewDBDao(pool, "mysql", nil, "", "")
+	db, err := zcdb.NewDBDao(pool, "sqlite", nil, "", "")
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-
-	// 3. 查询
 	var users []User
-	err = db.Builder().Table("users").
-		Where("age", ">", 18).
-		OrderBy("id", "ASC").
-		Limit(10).
-		Find(ctx, &users)
-	// SQL:  SELECT * FROM `users` WHERE `age` > ? ORDER BY `id` ASC LIMIT 10
-	// args: [18]
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(users)
-
-	// 4. 写入
-	id, err := db.Builder().Table("users").InsertGetId(ctx, User{Name: "alice", Age: 25})
-	// SQL:  INSERT INTO `users` (`id`, `name`, `age`) VALUES (?, ?, ?)
-	// 说明：零值列也会参与插入；不想插入的列用指针/any 字段并置 nil
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(id)
+	err = db.Builder().Table("users").Where("status", "=", "active").OrderBy("id", "ASC").Find(ctx, &users)
 }
 ```
 
-## 文档索引
+## 文档地图
 
-| 文档 | 内容 |
+| 想知道什么 | 去哪里 |
 |---|---|
-| [connection.md](connection.md) | 连接池、读写分离、事务、原始 SQL、慢 SQL 回调、自定义列映射标签 |
-| [query-builder.md](query-builder.md) | SELECT 构造：表与列、WHERE、JOIN、分组、排序分页、UNION、锁、Comment、Clone |
-| [query-exec.md](query-exec.md) | 查询执行：Find/First/Value/Count/Exists/聚合/Pluck/Paginate/游标迭代 |
-| [mutate.md](mutate.md) | 写操作：Insert/Upsert/Update/Increment/Delete/DeleteJoin/Truncate 与安全防护 |
-| [compile.md](compile.md) | ToXxx 纯编译系列、原始 SQL 内联编译（CompileRaw）与 Expression 原始表达式 |
-| [schema.md](schema.md) | Schema 元数据查询（表列表、字段信息） |
+| 从零跑通一条完整链路 | [getting-started.md](getting-started.md) |
+| 一次查询在内部经历了什么、为什么这样分层 | [concepts/architecture.md](concepts/architecture.md) |
+| Builder 的状态、Clone 与「哪些方法会改自己」 | [concepts/builder-state.md](concepts/builder-state.md) |
+| SQL 怎么编译出来、参数按什么顺序绑定 | [concepts/compile-pipeline.md](concepts/compile-pipeline.md) |
+| 结构体与列怎么映射、NULL/类型怎么转换 | [concepts/mapping.md](concepts/mapping.md) |
+| 读写分离、事务与连接是怎么选定的 | [concepts/execution-routing.md](concepts/execution-routing.md) |
+| 无 WHERE 保护、Expression、注释注入的边界 | [concepts/safety.md](concepts/safety.md) |
+| 每个 API 的签名、SQL、边界与错误 | [reference/](reference/) 下的分文件参考 |
+| 分页、事务、动态条件、UPSERT 等任务写法 | [how-to/](how-to/) |
+| 旧版本升级与破坏性变更 | [migration/breaking-changes.md](migration/breaking-changes.md) |
+| 模块行为的历史审查记录 | [consistency-review.md](consistency-review.md)、[consistency-review-20261116.md](consistency-review-20261116.md) |
 
-## 错误变量速查
+## 四层模型
 
-下表列出 zcdb 自身产生的可导出哨兵错误，均可用 `errors.Is` 精确匹配；驱动/数据库返回的错误原样透传或经 `%w` 包装，同样可用 `errors.Is` 匹配到驱动错误：
+```
+  用户代码
+     │  db.Builder().Table("users").Where(...).OrderBy(...).Find(ctx, &dest)
+     ▼
+┌──────────┐   链式累积状态，不生成 SQL
+│ Builder  │   （表、列、WHERE、JOIN、排序、分页、锁、注释、错误）
+└────┬─────┘
+     │  ToSelect() / ToUpdate() / ...（纯编译，不碰数据库）
+     ▼
+┌──────────┐   标识符包裹、占位符编号、方言差异、绑定参数顺序
+│ Grammar  │   MySQLGrammar / PostgresGrammar / SQLiteGrammar
+└────┬─────┘
+     │  (sqlStr, args, err)
+     ▼
+┌──────────┐   事务检测（ctx）→ 锁/Primary → 读库或写库
+│  DBDao   │   慢 SQL 回调、rows 生命周期
+└────┬─────┘
+     ▼
+┌──────────┐   主库 *sql.DB + 从库列表，路由策略
+│   Pool   │   创建时 Ping 校验；Close 幂等
+└──────────┘
+```
 
-| 变量 | 触发场景 |
+职责边界：
+
+| 层 | 负责 | 不负责 |
+|---|---|---|
+| `Builder` | 收集查询意图、维护链式状态、执行终端方法 | 方言细节、连接选择 |
+| `Grammar` | 把 Builder 状态编译成某方言的 SQL 与参数 | 执行、事务、路由 |
+| `DBDao` | 选连接（事务/主从）、执行、回调、扫描入口 | 构造 SQL 文本 |
+| `Pool` | 主从 `*sql.DB` 生命周期、从库策略 | SQL 语义 |
+
+## 一条查询的五个阶段
+
+1. **构造**：链式方法把状态写入 `Builder`（`table`/`wheres`/`orders`/`columns` …），方法返回同一个 `*Builder` 以支持继续链式。
+2. **编译**：终端方法调用对应的 `ToXxx`（如 `ToSelect`），`Grammar` 按方言生成 SQL 与占位符，绑定参数按固定顺序收集；DAO 默认注释在这一步一次性追加。
+3. **路由**：`DBDao` 检查 `ctx` 是否携带本 Pool 的事务；否则按锁子句、`Primary()`、读/写入口选择主库或从库。
+4. **执行**：通过 `*sql.DB` / `*sql.Tx` 执行，慢 SQL 回调在语句执行后触发（panic 被隔离）。
+5. **扫描**：`Find`/`First` 等把 `*sql.Rows` 按列映射标签写入结构体；`Cursor` 逐行迭代，`ScanStruct` 用于原始 SQL 结果。
+
+阅读顺序建议：先 [getting-started.md](getting-started.md)，再 [concepts/architecture.md](concepts/architecture.md)，之后按需查 [reference/](reference/)。
+
+## 完整文件清单
+
+| 目录 | 文件 | 内容 |
+|---|---|---|
+| 根 | `README.md` | 本文：模型总览、文档地图、约定 |
+| 根 | `getting-started.md` | 可完成的入门教程（SQLite 内存库） |
+| `concepts/` | `architecture.md` | 四层职责与一次查询的生命周期 |
+| `concepts/` | `builder-state.md` | 状态字段、可变性、Clone 与终端方法策略 |
+| `concepts/` | `compile-pipeline.md` | 编译阶段、Grammar 职责、绑定顺序、注释追加 |
+| `concepts/` | `mapping.md` | 标签、嵌入展开、扫描转换、写入提取 |
+| `concepts/` | `execution-routing.md` | 连接池、读写路由、事务、慢 SQL 回调 |
+| `concepts/` | `safety.md` | 破坏性保护、ORDER BY/LIMIT 限制、Expression/注释边界 |
+| `reference/` | `builder-core.md` | NewBuilder、Table/TableSub、Comment、Force、Primary、Clone |
+| `reference/` | `builder-select.md` | Select/AddSelect/SelectRaw/SelectSub/Distinct |
+| `reference/` | `builder-where.md` | 全部 WHERE 家族 |
+| `reference/` | `builder-join.md` | JOIN 与 JoinBuilder |
+| `reference/` | `builder-order-group.md` | GROUP BY/HAVING/ORDER BY/LIMIT/UNION/锁 |
+| `reference/` | `builder-query.md` | Find/First/Value/Count/Exists/聚合/Pluck 族/Paginate |
+| `reference/` | `builder-cursor.md` | Cursor/CursorBy |
+| `reference/` | `builder-exec.md` | Insert/Upsert/Update/Increment/Delete/Truncate |
+| `reference/` | `builder-compile.md` | 15 个 ToXxx、绑定顺序、Expression、CompileRaw |
+| `reference/` | `scanner.md` | ScanStruct/ScanStructClose |
+| `reference/` | `schema.md` | SchemaInspector 与元数据结构 |
+| `reference/` | `terminal-methods.md` | 终端方法语义矩阵与选型 |
+| `reference/` | `dialect-matrix.md` | 三方言差异总表 |
+| `reference/` | `errors.md` | 45 个哨兵按入口分组 |
+| `how-to/` | `pagination.md` | 分页与大偏移、CursorBy 选型 |
+| `how-to/` | `transactions.md` | 事务、嵌套复用、跨 Pool |
+| `how-to/` | `dynamic-queries.md` | 动态条件、Clone、Force、EXISTS 陷阱 |
+| `how-to/` | `upsert.md` | UPSERT/InsertOrIgnore/InsertUsing |
+| `how-to/` | `schema-inspection.md` | 巡检、模型草稿、迁移比对 |
+| `migration/` | `breaking-changes.md` | 破坏性变更与升级清单 |
+
+## 核心约定
+
+- **Builder 不是不可变对象**：链式方法修改自身并返回 `b`；需要保留基线时显式 `Clone()`。各终端方法的克隆策略见 [concepts/builder-state.md](concepts/builder-state.md)。
+- **编译与执行分离**：所有 `ToXxx` 只返回 `(sql, args, err)`，不执行；可把 SQL 交给别的组件执行或写入日志。
+- **错误是值**：可导出的哨兵错误用 `errors.Is` 判定；驱动错误原样透传或 `%w` 包装。完整清单见 [reference/errors.md](reference/errors.md)。
+- **方言差异集中在 Grammar**：Builder 层不写死包裹符与占位符；三方言行为差异汇总在 [reference/dialect-matrix.md](reference/dialect-matrix.md)。
+- **安全边界显式**：无 WHERE 的 Update/Delete 默认拒绝；`Expression` 与原始 SQL 是刻意保留的逃逸口，责任归调用方。见 [concepts/safety.md](concepts/safety.md)。
+
+## 术语
+
+| 术语 | 含义 |
 |---|---|
-| `ErrEmptyTable` | 未设置表名（Table/TableSub）就编译或执行 |
-| `ErrInvalidStruct` | Insert/Update/InsertGetId 数据不是结构体（或其指针/切片），或 ScanStruct 切片元素非法 |
-| `ErrNoFields` | 写入或 Pluck keyBy 映射没有可用导出字段（无可导出字段，或全部字段为 nil/不可用） |
-| `ErrEmptyData` | 插入数据为空 |
-| `ErrInvalidOperator` | 运算符不在白名单内 |
-| `ErrInvalidSubQuery` | WhereExists 等方法的子查询参数类型非法 |
-| `ErrCyclicQuery` | 查询构造器的子查询图存在环（自引用/互引用，如 TableSub/Union 传入自身） |
-| `ErrInvalidWhereInValues` | JoinBuilder 的 WhereIn/WhereNotIn values 参数类型非法（仅支持 `[]any` 或 `*Builder`） |
-| `ErrInvalidAggregate` | 聚合函数不是 MAX/MIN/SUM/AVG |
-| `ErrAggregateGrouped` | 标量 Aggregate 带 GROUP BY/HAVING，应改用 Select + Find 获取分组结果 |
-| `ErrPluckDest` | Pluck 目标不是非 nil 的切片/map 指针（底层容器本身可为 nil） |
-| `ErrPluckColumns` | Pluck 列数不匹配：切片/keyBy map 需 1 列，标量 map 需 2 列 |
-| `ErrDeleteWithoutWhere` / `ErrUpdateWithoutWhere` | 无有效限定条件的 Delete/Update 被保护机制拒绝 |
-| `ErrDeleteWithJoin` | 普通 Delete 带 JOIN（应使用 DeleteJoin） |
-| `ErrWriteOrderLimitUnsupported` | 写语句携带 ORDER BY/LIMIT，但方言或语句形态不支持（PG/SQLite 写语句、MySQL 多表 UPDATE 与 DeleteJoin） |
-| `ErrIncrementColumns` | Increment/Decrement 参数不成对，或 columns/amounts 为空、长度不等 |
-| `ErrInsertUsingColumnMismatch` | InsertUsing/InsertOrIgnoreUsing 的目标列数与子查询 SELECT 列数不一致（子查询列数可静态判定时） |
-| `ErrRawPlaceholderMismatch` | `CompileRaw` 的原始 SQL 占位符数量或 `$N` 编号与参数个数不一致 |
-| `ErrRawValueNotInlinable` | `CompileRaw` 的参数值无法内联成 SQL 字面量（类型不支持、NaN/Inf、Valuer 取值失败） |
-| `ErrUpsertUniqueByRequired` | PG/SQLite 的 Upsert 缺少 uniqueBy |
-| `ErrDeleteJoinNoJoin` | DeleteJoin 没有任何 JOIN |
-| `ErrPgUnionLockNotSupported` | PostgreSQL 下 UNION + 锁 |
-| `ErrSQLiteLockNotSupported` | SQLite 下使用锁子句 |
-| `ErrNotPointer` / `ErrNotStruct` | ScanStruct / Cursor / CursorBy 的 dest 不是指针 / 不是结构体指针 |
-| `ErrCursorFieldNotFound` | 游标列在目标结构体中找不到对应字段 |
-| `ErrCursorFieldUnavailable` | 游标列字段不可用（nil 嵌入指针） |
-| `ErrCursorColumnNull` | 游标列值为 NULL，无法继续分页 |
-| `ErrScanDest` | Scan 目标类型非法（必须是结构体或切片指针） |
-| `ErrScanConvert` | Scan 结果值类型转换失败 |
-| `ErrTxOwnerMismatch` | 事务 context 被传给另一 Pool 的 DAO |
-| `ErrTxBegin` | 开启事务失败（底层错误仍可 `errors.Is`） |
-| `ErrTxCommit` | 提交事务失败（底层错误仍可 `errors.Is`） |
-| `ErrTxRollback` | 回滚事务失败（底层错误仍可 `errors.Is`） |
-| `ErrInsertGetIdUnsupported` | PostgreSQL 方言调用 `InsertGetId`（lib/pq 无 `LastInsertId`） |
-| `ErrDriverNameRequired` | `NewPool` 缺少 DriverName |
-| `ErrDSNRequired` | `NewPool` 缺少 DSN |
-| `ErrPoolConnect` | 主库或从库打开、Ping 失败（底层驱动错误仍可 `errors.Is`） |
-| `ErrPoolClosed` | 连接池已关闭后调用 `AddSlave` |
-| `ErrDialectRequired` / `ErrUnknownDialect` / `ErrPoolRequired` | DAO 创建参数错误 |
-| `ErrSchemaGrammarNotSupported` | 用非内置方言的 Grammar 创建 SchemaInspector（仅内置三方言，消息带出实际类型） |
+| 编译入口 | `ToSelect`、`ToUpdate` 等 `ToXxx` 方法：只生成 SQL 与参数 |
+| 终端方法 | `Find`、`First`、`Update`、`Delete`、`Paginate`、`Cursor` 等：编译并执行 |
+| 绑定参数 | SQL 占位符对应的 `args`，按固定顺序收集 |
+| 列映射标签 | 结构体 tag（默认 `db`），DAO 创建时确定、不可变更 |
+| 主库 / 从库 | 写连接 / 读连接；无配置从库时读操作降级主库 |
+| transient state | 编译期临时修改并在 `defer` 中恢复的 Builder 状态（分页/排序/锁/列） |
+
+## 示例约定
+
+文档中的 Go 示例统一包在 `func example()` 中，`db`、`ctx`、`pool`、模型类型是外部变量，不保证可独立运行；`getting-started.md` 的完整程序补上 `package main` 后可直接运行。示例的语法由仓库门禁 `TestDocsGoBlockSyntax` 与 `doc_go_examples.py --strict` 校验，SQL/args 注释以 MySQL 形态为基线，方言差异单独说明。

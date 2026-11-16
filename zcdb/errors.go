@@ -7,15 +7,19 @@ var (
 	ErrEmptyData = errors.New("zcdb: data is empty")
 	// ErrInvalidStruct 数据不是结构体/结构体指针（或它们的切片）
 	ErrInvalidStruct = errors.New("zcdb: expected a struct or struct pointer")
-	// ErrNoFields 写入或 Pluck keyBy 映射时没有可用的导出字段（包括字段全为 nil/不可用）
+	// ErrNoFields 写入或 KeyBy 映射时没有可用的导出字段（包括字段全为 nil/不可用）
 	ErrNoFields = errors.New("zcdb: no usable exported fields for write or keyBy mapping")
 	// ErrEmptyTable 未设置数据源表名
 	ErrEmptyTable = errors.New("zcdb: table name is required")
 
-	// ErrPluckDest Pluck 目标必须是非 nil 的切片指针或 map 指针；底层切片/map 可为 nil
-	ErrPluckDest = errors.New("zcdb: Pluck dest must be a non-nil pointer to a slice or map")
-	// ErrPluckColumns Pluck 列数不匹配：切片/keyBy map 需 1 列，标量 map 需 2 列
-	ErrPluckColumns = errors.New("zcdb: Pluck requires 1 column for slice or keyBy map, or 2 columns for scalar map")
+	// ErrPluckDest Pluck 目标必须是非 nil 的切片指针；底层切片可为 nil。
+	// map 目标请用 PluckMap（标量值）或 KeyBy（结构体值）
+	ErrPluckDest = errors.New("zcdb: Pluck dest must be a non-nil pointer to a slice (use PluckMap or KeyBy for map destinations)")
+	// ErrPluckMapDest PluckMap 目标必须是非 nil 的 map 指针，且键/值类型不能是结构体；
+	// 值类型为结构体/结构体指针时请用 KeyBy
+	ErrPluckMapDest = errors.New("zcdb: PluckMap dest must be a non-nil pointer to a map with non-struct key and value types (use KeyBy for struct values)")
+	// ErrKeyByDest KeyBy 目标必须是非 nil 的 map 指针，且值类型为结构体或结构体指针
+	ErrKeyByDest = errors.New("zcdb: KeyBy dest must be a non-nil pointer to a map with struct or struct pointer values")
 
 	// ErrDialectRequired DAO 层错误
 	ErrDialectRequired = errors.New("zcdb: dialect is required")

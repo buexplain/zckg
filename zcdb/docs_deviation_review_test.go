@@ -51,9 +51,9 @@ func docAssertSQL(t *testing.T, label string, gotSQL string, gotArgs []any, want
 	}
 }
 
-// ---------- README.md：快速上手与方言差异总览 ----------
+// ---------- getting-started.md：快速上手；reference/dialect-matrix.md：方言差异总览 ----------
 
-// 快速上手示例（README.md）：Find 与 InsertGetId 的 SQL/args 注释。
+// 快速上手示例（getting-started.md）：Find 与 InsertGetId 的 SQL/args 注释。
 func TestDocReview_ReadmeQuickStart(t *testing.T) {
 	sqlStr, args, err := docBuilder(docMySQL).Table("users").
 		Where("age", ">", 18).OrderBy("id", "ASC").Limit(10).ToSelect()
@@ -78,7 +78,7 @@ func TestDocReview_ReadmeQuickStart(t *testing.T) {
 		"INSERT INTO `users` (`id`, `name`, `age`) VALUES (?, ?, ?)", []any{int64(0), "alice", 25})
 }
 
-// 方言差异总览表（README.md）11 行逐项核对。
+// 方言差异总览表（reference/dialect-matrix.md）11 行逐项核对。
 func TestDocReview_ReadmeDialectTable(t *testing.T) {
 	// 共享锁三方言形态
 	sqlStr, args, err := docBuilder(docMySQL).Table("users").Where("id", "=", 1).SharedLock().ToSelect()
@@ -157,7 +157,7 @@ func TestDocReview_ReadmeDialectTable(t *testing.T) {
 		`SELECT * FROM "users" WHERE "age" > $1`, []any{25})
 }
 
-// dialect 取值别名（README.md / connection.md）：pgsql、sqlite3 别名生效。
+// dialect 取值别名（reference/dialect-matrix.md）：pgsql、sqlite3 别名生效。
 func TestDocReview_DialectAliases(t *testing.T) {
 	for _, c := range []struct {
 		dialect string
@@ -183,7 +183,7 @@ func TestDocReview_DialectAliases(t *testing.T) {
 	}
 }
 
-// ---------- compile.md ----------
+// ---------- reference/builder-compile.md ----------
 
 func TestDocReview_CompileMd(t *testing.T) {
 	// ToSelect 三个错误条件
@@ -303,7 +303,7 @@ func TestDocReview_CompileMd(t *testing.T) {
 	sqlStr, args, _ = docBuilder(docMySQL).Table("users").Where("id", "=", 1).ToDelete()
 	docAssertSQL(t, "ToDelete", sqlStr, args, "DELETE FROM `users` WHERE `id` = ?", []any{1})
 
-	// ToTruncate：PG 实际输出带 RESTART IDENTITY（compile.md/mutate.md 示例注释漏写，已修订文档）
+	// ToTruncate：PG 实际输出带 RESTART IDENTITY（reference/builder-compile.md 与 builder-exec.md 的示例注释已修订）
 	sqlTrunc, err := docBuilder(docPostgres).Table("users").ToTruncate()
 	if err != nil || stripTestComment(sqlTrunc) != `TRUNCATE TABLE "users" RESTART IDENTITY` {
 		t.Errorf("ToTruncate/PG: %s, %v", sqlTrunc, err)
@@ -335,7 +335,7 @@ func TestDocReview_CompileMd(t *testing.T) {
 		"UPDATE `users` SET `updated_at` = NOW() WHERE `id` = ?", []any{1})
 }
 
-// ---------- query-builder.md ----------
+// ---------- reference/builder-{core,select,where,join,order-group}.md ----------
 
 func TestDocReview_QueryBuilderMd(t *testing.T) {
 	// TableSub：子查询绑定排在外层 WHERE 之前
@@ -571,7 +571,7 @@ func TestDocReview_QueryBuilderMd(t *testing.T) {
 	}
 }
 
-// ---------- mutate.md ----------
+// ---------- reference/builder-exec.md ----------
 
 func TestDocReview_MutateMd(t *testing.T) {
 	// DeleteJoin 三方言形态与绑定顺序
@@ -650,10 +650,10 @@ func TestDocReview_MutateMd(t *testing.T) {
 	}
 }
 
-// ---------- connection.md / query-exec.md（内存 SQLite 实测执行语义） ----------
+// ---------- concepts/execution-routing.md 与 reference/builder-query.md（内存 SQLite 实测执行语义） ----------
 
 func TestDocReview_ConnectionMd_Lifecycle(t *testing.T) {
-	// 缺失参数错误文案（文档 connection.md 写为无前缀，源码实际带 zcdb: 前缀）
+	// 缺失参数错误文案（concepts/execution-routing.md 已写明带 zcdb: 前缀）
 	if _, err := NewPool(PoolConfig{DSN: ":memory:"}); err == nil || err.Error() != "zcdb: DriverName is required" {
 		t.Errorf("NewPool 缺 DriverName 错误文案: %v", err)
 	}
@@ -698,7 +698,7 @@ func docReviewSQLiteDAO(t *testing.T, onSQL SlowSQLCallback) *DBDao {
 	return dao
 }
 
-// query-exec.md：CursorBy 每批 LIMIT 实际为 chunkSize+1（多取一条探测下一页），
+// reference/builder-query.md：CursorBy 每批 LIMIT 实际为 chunkSize+1（多取一条探测下一页），
 // 文档示例注释写 LIMIT 100，与实际 LIMIT 101 不符（已修订文档）。
 func TestDocReview_QueryExecMd_CursorByLimit(t *testing.T) {
 	var sqls []string
@@ -747,7 +747,7 @@ func TestDocReview_QueryExecMd_CursorByLimit(t *testing.T) {
 	}
 }
 
-// query-exec.md：聚合空集语义表（Max/Min 返回 (0, sql.ErrNoRows)，Sum/Avg 返回 (0, nil)）。
+// reference/builder-query.md：聚合空集语义表（Max/Min 返回 (0, sql.ErrNoRows)，Sum/Avg 返回 (0, nil)）。
 func TestDocReview_QueryExecMd_AggregateEmptySet(t *testing.T) {
 	dao := docReviewSQLiteDAO(t, nil)
 	ctx := context.Background()
@@ -769,7 +769,7 @@ func TestDocReview_QueryExecMd_AggregateEmptySet(t *testing.T) {
 	}
 }
 
-// query-exec.md：Find/First/Value 无结果行为与 First LIMIT 1；Pluck 三模式；Paginate COUNT。
+// reference/builder-query.md：Find/First/Value 无结果行为与 First LIMIT 1；Pluck/PluckMap/KeyBy；Paginate COUNT。
 func TestDocReview_QueryExecMd_TerminalSemantics(t *testing.T) {
 	var sqls []string
 	dao := docReviewSQLiteDAO(t, func(ctx context.Context, _ Grammar, _ time.Duration, sqlStr string, args []any) {
@@ -815,20 +815,20 @@ func TestDocReview_QueryExecMd_TerminalSemantics(t *testing.T) {
 		t.Errorf("Value 无结果应报 sql.ErrNoRows: %v", err)
 	}
 
-	// Pluck 模式一：切片单列
+	// Pluck：切片单列
 	var names []string
 	if err := dao.Builder().Table("users").Where("vip", "=", 1).Pluck(ctx, &names, "name"); err != nil || len(names) != 15 {
-		t.Errorf("Pluck 切片模式: len=%d, %v", len(names), err)
+		t.Errorf("Pluck: len=%d, %v", len(names), err)
 	}
-	// Pluck 模式二：map 键值对（第一列值、第二列键）
+	// PluckMap：键列在前（id => name）
 	var m map[int64]string
-	if err := dao.Builder().Table("users").Pluck(ctx, &m, "name", "id"); err != nil || len(m) != 30 || m[1] != "u1" {
-		t.Errorf("Pluck map 模式: len=%d, m[1]=%q, %v", len(m), m[1], err)
+	if err := dao.Builder().Table("users").PluckMap(ctx, &m, "id", "name"); err != nil || len(m) != 30 || m[1] != "u1" {
+		t.Errorf("PluckMap: len=%d, m[1]=%q, %v", len(m), m[1], err)
 	}
-	// Pluck 模式三：keyBy 结构体
+	// KeyBy：整行按 id 建索引
 	var mu map[int64]User
-	if err := dao.Builder().Table("users").Pluck(ctx, &mu, "id"); err != nil || len(mu) != 30 || mu[2].Name != "u2" {
-		t.Errorf("Pluck keyBy 模式: len=%d, %v", len(mu), err)
+	if err := dao.Builder().Table("users").KeyBy(ctx, &mu, "id"); err != nil || len(mu) != 30 || mu[2].Name != "u2" {
+		t.Errorf("KeyBy: len=%d, %v", len(mu), err)
 	}
 
 	// Paginate：先 COUNT 后数据查询
@@ -878,38 +878,43 @@ func exportedErrSentinels(path string) (map[string]bool, error) {
 	return out, nil
 }
 
-// readmeErrorTableSentinels 提取 README「错误变量速查」表首列列出的哨兵名。
-// 只解析该二级章节内的表格首列，忽略表格解释列与其他章节的散文提及。
-func readmeErrorTableSentinels(path string) (map[string]bool, error) {
+// errorsDocTableSentinels 提取错误参考文档中所有「变量」表首列列出的哨兵名。
+// 只解析表头首列为「变量」的表格，忽略表格解释列与其他章节的散文提及。
+func errorsDocTableSentinels(path string) (map[string]bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
-	inSection := false
 	out := make(map[string]bool)
+	inTable := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "## ") {
-			inSection = trimmed == "## 错误变量速查"
-			continue
-		}
-		if !inSection || !strings.HasPrefix(trimmed, "|") {
+		if !strings.HasPrefix(trimmed, "|") {
+			inTable = false
 			continue
 		}
 		cells := strings.Split(strings.Trim(trimmed, "|"), "|")
 		if len(cells) == 0 {
 			continue
 		}
-		for _, match := range readmeErrCellRE.FindAllStringSubmatch(cells[0], -1) {
+		first := strings.TrimSpace(cells[0])
+		if first == "变量" {
+			inTable = true
+			continue
+		}
+		if !inTable || strings.HasPrefix(first, "---") {
+			continue
+		}
+		for _, match := range readmeErrCellRE.FindAllStringSubmatch(first, -1) {
 			out[match[1]] = true
 		}
 	}
 	return out, nil
 }
 
-// TestDocReview_ErrorTableMatchesExportedSentinels 锁死 README「错误变量速查」表与 errors.go 的导出哨兵一致：
-// 两侧集合必须相等——新增哨兵未写表、或表里残留已删除/改名的哨兵都会失败。
+// TestDocReview_ErrorTableMatchesExportedSentinels 锁死错误参考「reference/errors.md」的全部「变量」表
+// 与 errors.go 的导出哨兵一致：两侧集合必须相等——新增哨兵未写表、或表里残留已删除/改名的哨兵都会失败。
 func TestDocReview_ErrorTableMatchesExportedSentinels(t *testing.T) {
 	codeSentinels, err := exportedErrSentinels("errors.go")
 	if err != nil {
@@ -918,22 +923,22 @@ func TestDocReview_ErrorTableMatchesExportedSentinels(t *testing.T) {
 	if len(codeSentinels) == 0 {
 		t.Fatal("errors.go 中未找到任何导出 Err 变量")
 	}
-	docSentinels, err := readmeErrorTableSentinels("docs/README.md")
+	docSentinels, err := errorsDocTableSentinels("docs/reference/errors.md")
 	if err != nil {
-		t.Fatalf("解析 docs/README.md 失败: %v", err)
+		t.Fatalf("解析 docs/reference/errors.md 失败: %v", err)
 	}
 	if len(docSentinels) == 0 {
-		t.Fatal("README 错误变量速查表未解析到任何 Err 变量")
+		t.Fatal("错误参考表未解析到任何 Err 变量")
 	}
 
 	for name := range codeSentinels {
 		if !docSentinels[name] {
-			t.Errorf("哨兵 %s 已导出但未写入 README 错误变量速查表", name)
+			t.Errorf("哨兵 %s 已导出但未写入 reference/errors.md", name)
 		}
 	}
 	for name := range docSentinels {
 		if !codeSentinels[name] {
-			t.Errorf("README 错误变量速查表列出的 %s 在 errors.go 中不存在", name)
+			t.Errorf("reference/errors.md 列出的 %s 在 errors.go 中不存在", name)
 		}
 	}
 }

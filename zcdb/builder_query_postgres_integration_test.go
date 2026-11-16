@@ -168,7 +168,8 @@ func TestPgInteg_Paginate(t *testing.T) {
 	}
 }
 
-// TestPgInteg_PaginateDefault 验证 Paginate 未设置分页参数时使用默认值（第 1 页，每页 20 条）。
+// TestPgInteg_PaginateDefault 验证 Paginate 未设置分页参数时不会补默认页大小：
+// 数据 SQL 不带 LIMIT/OFFSET，返回全部命中行；分页范围必须由 ForPage 或 Limit+Offset 预设。
 func TestPgInteg_PaginateDefault(t *testing.T) {
 	db := openPgTestDB(t)
 	setupPgUsersTable(t, db)
@@ -330,7 +331,7 @@ func TestPgInteg_CountWithDistinct(t *testing.T) {
 	}
 }
 
-// TestPgInteg_Pluck 验证 Pluck：切片目标提取单列值列表，map 目标提取「值=>键」映射，
+// TestPgInteg_Pluck 验证 Pluck：切片目标提取单列值列表，
 // NULL 值扫描为零值（与 Find 一致），查询链（WHERE/ORDER BY）完整生效。
 func TestPgInteg_Pluck(t *testing.T) {
 	db := openPgTestDB(t)
@@ -363,24 +364,6 @@ func TestPgInteg_Pluck(t *testing.T) {
 		}
 	}
 
-	// map 模式：值=>键 映射（第一列为值、第二列为键，nil map 自动初始化）
-	var m map[int64]string
-	err = db.Builder().Table("users").
-		OrderBy("id", "ASC").
-		Pluck(context.Background(), &m, "name", "id")
-	if err != nil {
-		t.Fatalf("pluck map error: %v", err)
-	}
-	expectMap := map[int64]string{1: "John", 2: "Jane", 3: "", 4: "Bob"}
-	if len(m) != len(expectMap) {
-		t.Fatalf("expected %d entries, got %d: %v", len(expectMap), len(m), m)
-	}
-	for id, exp := range expectMap {
-		if m[id] != exp {
-			t.Errorf("m[%d]: expected %q, got %q", id, exp, m[id])
-		}
-	}
-
 	// 查询链生效：WHERE 过滤 NULL 行，ORDER BY DESC 倒序
 	names = nil
 	err = db.Builder().Table("users").
@@ -401,9 +384,42 @@ func TestPgInteg_Pluck(t *testing.T) {
 	}
 }
 
-// TestPgInteg_PluckKeyBy 验证 Pluck 键列模式（keyBy）：map 值为结构体/结构体指针时，
+// TestPgInteg_PluckMap 验证 PluckMap：map 目标按「键列、值列」顺序提取，
+// nil map 自动初始化，NULL 值扫描为零值（与 Find 一致）。
+func TestPgInteg_PluckMap(t *testing.T) {
+	db := openPgTestDB(t)
+	mustExec(t, db, "DROP TABLE IF EXISTS users")
+	mustExec(t, db, `CREATE TABLE users (
+		id   SERIAL PRIMARY KEY,
+		name TEXT
+	)`)
+	mustExec(t, db, `INSERT INTO users (name) VALUES
+		('John'),
+		('Jane'),
+		(NULL),
+		('Bob')`)
+
+	var m map[int64]string
+	err := db.Builder().Table("users").
+		OrderBy("id", "ASC").
+		PluckMap(context.Background(), &m, "id", "name")
+	if err != nil {
+		t.Fatalf("pluckMap error: %v", err)
+	}
+	expectMap := map[int64]string{1: "John", 2: "Jane", 3: "", 4: "Bob"}
+	if len(m) != len(expectMap) {
+		t.Fatalf("expected %d entries, got %d: %v", len(expectMap), len(m), m)
+	}
+	for id, exp := range expectMap {
+		if m[id] != exp {
+			t.Errorf("m[%d]: expected %q, got %q", id, exp, m[id])
+		}
+	}
+}
+
+// TestPgInteg_KeyBy 验证 KeyBy 键列模式：map 值为结构体/结构体指针时，
 // 唯一列参数作为键列，整行数据按 db tag 扫描进结构体（NULL 扫零值，与 Find 一致）。
-func TestPgInteg_PluckKeyBy(t *testing.T) {
+func TestPgInteg_KeyBy(t *testing.T) {
 	db := openPgTestDB(t)
 	mustExec(t, db, "DROP TABLE IF EXISTS users")
 	mustExec(t, db, `CREATE TABLE users (
@@ -426,9 +442,9 @@ func TestPgInteg_PluckKeyBy(t *testing.T) {
 	var m map[int64]User
 	err := db.Builder().Table("users").
 		OrderBy("id", "ASC").
-		Pluck(context.Background(), &m, "id")
+		KeyBy(context.Background(), &m, "id")
 	if err != nil {
-		t.Fatalf("pluck keyBy struct error: %v", err)
+		t.Fatalf("keyBy struct error: %v", err)
 	}
 	if len(m) != 4 {
 		t.Fatalf("expected 4 entries, got %d: %v", len(m), m)
@@ -449,9 +465,9 @@ func TestPgInteg_PluckKeyBy(t *testing.T) {
 	var mp map[int64]*User
 	err = db.Builder().Table("users").
 		OrderBy("id", "ASC").
-		Pluck(context.Background(), &mp, "id")
+		KeyBy(context.Background(), &mp, "id")
 	if err != nil {
-		t.Fatalf("pluck keyBy ptr error: %v", err)
+		t.Fatalf("keyBy ptr error: %v", err)
 	}
 	if len(mp) != 4 {
 		t.Fatalf("expected 4 ptr entries, got %d", len(mp))
@@ -474,9 +490,9 @@ func TestPgInteg_PluckKeyBy(t *testing.T) {
 	var kb map[int64]userBrief
 	err = db.Builder().Table("users").
 		OrderBy("id", "ASC").
-		Pluck(context.Background(), &kb, "id")
+		KeyBy(context.Background(), &kb, "id")
 	if err != nil {
-		t.Fatalf("pluck keyBy external key error: %v", err)
+		t.Fatalf("keyBy external key error: %v", err)
 	}
 	if len(kb) != 4 {
 		t.Fatalf("expected 4 brief entries, got %d: %v", len(kb), kb)
@@ -532,25 +548,25 @@ func TestPgInteg_AggregateIgnoreSelectSub(t *testing.T) {
 	}
 }
 
-// TestPgInteg_PluckDuplicateKeyOverwrite 集成附录 testPluck（重复 key 覆盖部分）：
-// Pluck map 模式重复键时后值覆盖前值；keyBy 模式重复键列时最后一行覆盖。
-func TestPgInteg_PluckDuplicateKeyOverwrite(t *testing.T) {
+// TestPgInteg_DuplicateKeyOverwrite 覆盖 PluckMap 与 KeyBy 的重复键语义：
+// PluckMap 重复键时后值覆盖前值；KeyBy 重复键列时最后一行覆盖。
+func TestPgInteg_DuplicateKeyOverwrite(t *testing.T) {
 	db := openPgTestDB(t)
 	setupPgUsersTable(t, db)
 
-	// map 值→键 模式：第一列为值、第二列为键；status 键重复时后者（id 更大）覆盖前者
+	// PluckMap：status 作键、id 作值；status 键重复时后者（id 更大）覆盖前者
 	var m map[string]int64
 	err := db.Builder().Table("users").
 		OrderBy("id", "ASC").
-		Pluck(context.Background(), &m, "id", "status")
+		PluckMap(context.Background(), &m, "status", "id")
 	if err != nil {
-		t.Fatalf("pluck error: %v", err)
+		t.Fatalf("pluckMap error: %v", err)
 	}
 	if m["active"] != 4 || m["inactive"] != 5 {
 		t.Errorf("expected active=4 inactive=5 (last wins), got %v", m)
 	}
 
-	// keyBy 模式：插入两条同名记录，后者（id 更大）覆盖前者
+	// KeyBy：插入两条同名记录，后者（id 更大）覆盖前者
 	mustExec(t, db, `INSERT INTO users (name, age, email, status) VALUES
 		('dup', 1, 'dup1@test.com', 'x'),
 		('dup', 2, 'dup2@test.com', 'y')`)
@@ -562,9 +578,9 @@ func TestPgInteg_PluckDuplicateKeyOverwrite(t *testing.T) {
 	err = db.Builder().Table("users").
 		Where("name", "=", "dup").
 		OrderBy("id", "ASC").
-		Pluck(context.Background(), &dup, "name")
+		KeyBy(context.Background(), &dup, "name")
 	if err != nil {
-		t.Fatalf("pluck keyBy dup error: %v", err)
+		t.Fatalf("keyBy dup error: %v", err)
 	}
 	if dup["dup"].Id != 7 || dup["dup"].Age != 2 {
 		t.Errorf("expected last dup row (id=7, age=2), got %+v", dup["dup"])
